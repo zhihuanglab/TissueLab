@@ -1,0 +1,84 @@
+.widget.image-viewer-sidebar {
+    /* Add your custom styles for the sidebar */
+    background-color: #f8f9fa;
+    border-radius: 8px;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+.card-header {
+    position: sticky;
+    top: 0;
+    background-color: #f8f9fa;
+    border-bottom: 0px solid #e9ecef;
+    padding: 0;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.04);
+    z-index: 40;
+}
+
+.enhanced-nav {
+    border: none;
+    margin: 0;
+    display: flex;
+    gap: 0;
+}
+
+.enhanced-nav-item {
+    flex: 1;
+    margin: 0;
+    padding: 0;
+    position: relative;
+}
+
+.nav-link {
+    border: none;
+    border-radius: 0;
+    transition: all 0.2s ease-in-out;
+    font-weight: 500;
+    padding: 0.5rem 0.25rem;
+    margin: 0;
+    text-align: center;
+    font-size: 0.9rem;
+    width: 100%;
+}
+
+.active-link {
+    composes: nav-link;
+    color: #2c3e50;
+    background-color: #f9fafb;
+}
+
+.inactive-link {
+    composes: nav-link;
+    color: #495057;
+    background-color: #dee2e6;
+}
+
+.tab-divider {
+    width: 4px;
+    background-color: transparent;
+    align-self: stretch;
+}
+
+.card-body {
+    /* Styles for the body */
+    /* padding: 8px; */
+}
+
+.enhanced-body {
+    /* Additional styles for enhanced body */
+    /* background-color: #ffffff;
+    border-radius: 0 0 4px 4px; */
+}
+
+.enhanced-header {
+    position: sticky;
+    top: 0;
+    background-color: white;
+    z-index: 1000;
+    border-bottom: 1px solid #dee2e6; /* Optional: adds a border at the bottom */
+}
+
+.enhanced-nav-item:hover .inactive-link {
+    color: #212529 !important;
+    background-color: #ced4da !important;
+}

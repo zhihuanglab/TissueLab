@@ -1,0 +1,46 @@
+.dashboard-container {
+  box-sizing: border-box;
+  height: calc(100vh - 56px); /* Adjust based on your header height */
+  display: flex;
+  width: 100%;
+}
+
+.dashboard-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 20px;
+  max-width: none; /* Remove max-width constraint for better wide screen support */
+  margin: 0 auto;
+  width: 100%;
+}
+
+.widget {
+  background-color: #ffffff;
+  border-radius: 0.75rem;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  display: flex;
+  flex-direction: column;
+}
+
+.widget.history {
+  grid-column: span 2;
+}
+
+.widget .card-header {
+  background-color: #f8f9fa;
+  border-bottom: 1px solid #e0e0e0;
+  font-weight: bold;
+}
+
+.widget .card-body {
+  flex-grow: 1;
+  overflow-y: auto;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+  }
+}

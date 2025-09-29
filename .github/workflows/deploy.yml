@@ -1,0 +1,74 @@
+name: Deploy TissueLab Web
+
+on:
+  # Trigger dev deployment on push to main branch
+  # Trigger prod deployment on push to web branch
+  push:
+    branches: [main, web]
+
+env:
+  PROJECT_ID: tissuelab-2025
+  REGION: us-central1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Run on push to main (dev) OR push to web (prod)
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/web')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Google Auth
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Configure Google Cloud
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Deploy to dev (main branch push)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: app/render
+        run: |
+          echo "SERVICE_NAME=tissuelab-app-dev" >> $GITHUB_ENV
+          echo "Using .env.development for development deployment..."
+          if [ -f .env.production ]; then mv .env.production .env; fi
+          if [ -f .env.development ]; then cp .env.development .env.production; fi
+          echo "Switching to deploy next.config.js..."
+          if [ -f deploy.next.config.js ]; then cp deploy.next.config.js next.config.js; fi
+          echo "Deploying from source to Cloud Run (dev/pre)..."
+          gcloud run deploy tissuelab-app-dev \
+            --source . \
+            --platform managed \
+            --region us-central1 \
+            --allow-unauthenticated \
+            --timeout 300 \
+            --port 8080 \
+            --set-env-vars ENV=dev,BRANCH_NAME=main
+          echo "Restoring original files..."
+          if [ -f .env ]; then rm -f .env.production && mv .env .env.production; fi
+          if [ -f local.next.config.js ]; then cp local.next.config.js next.config.js; fi
+
+      - name: Deploy to prod (web branch push)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/web'
+        working-directory: app/render
+        run: |
+          echo "SERVICE_NAME=tissuelab-app-prod" >> $GITHUB_ENV
+          echo "Switching to deploy next.config.js..."
+          if [ -f deploy.next.config.js ]; then cp deploy.next.config.js next.config.js; fi
+          echo "Deploying from source to Cloud Run (prod)..."
+          gcloud run deploy tissuelab-app-prod \
+            --source . \
+            --platform managed \
+            --region us-central1 \
+            --allow-unauthenticated \
+            --timeout 300 \
+            --port 8080 \
+            --set-env-vars ENV=prod,BRANCH_NAME=web
+          echo "Restoring local next.config.js..."
+          if [ -f local.next.config.js ]; then cp local.next.config.js next.config.js; fi

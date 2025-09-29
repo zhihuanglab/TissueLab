@@ -1,0 +1,157 @@
+.image-viewer-container {
+    display: flex;
+    flex-direction: row;  /* Ensures the sidebar is to the right of the main content */
+    height: calc(100% - 3rem);
+    width: 100%;
+    gap: 0px;  /* Adds space between main content and sidebar */
+}
+
+.image-viewer-main {
+    flex: 1;
+    padding: 0px;
+}
+
+.widget {
+  background-color: #fff;
+  border-radius: 0.25rem;
+  box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+}
+
+.widget .card-header {
+  background-color: #f8f9fa;
+  border-bottom: 1px solid #e9ecef;
+  font-weight: bold;
+  font-size: 18px; /* Larger font size */
+  margin: 0; /* Removes default margin from h1 */
+  padding: 0.5rem 0; /* Remove horizontal padding, adjust vertical padding */
+}
+
+.sidebar-icon-button {
+  width: 40px;
+  height: 40px;
+  margin-bottom: 4px;
+  display: flex;
+  justify-content: center;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  color: #fff;
+}
+
+.sidebar-button-icon {
+  font-size: 20px;
+  margin-bottom: 0px;
+}
+
+.sidebar-button-text {
+  font-size: 11px;
+}
+
+
+.image-viewer-sidebar {
+  width: 300px;  /* Adjust width as needed */
+  align-self: flex-start;  /* Aligns the sidebar to the top */
+  padding: 15px;
+  font-size: 14px; /* Smaller font size */
+}
+
+.image-viewer-sidebar .form-label {
+  font-weight: bold;
+  font-size: 14px; /* Smaller font size */
+}
+
+.image-viewer-sidebar .form-select,
+.image-viewer-sidebar .form-textarea {
+  margin-bottom: 15px;
+  font-size: 14px; /* Smaller font size */
+}
+
+.image-viewer-sidebar .btn {
+  margin-right: 10px;
+  font-size: 14px; /* Smaller font size */
+}
+
+.image-viewer-sidebar .btn:last-child {
+  margin-right: 0;
+}
+
+.image-viewer-sidebar .badge {
+  margin-left: 5px;
+  font-size: 14px; /* Smaller font size */
+}
+
+@media (max-width: 768px) {
+  .image-viewer-container {
+    flex-direction: column;
+  }
+
+  .image-viewer-sidebar {
+    width: 100%;
+    margin-top: 20px;
+  }
+}
+
+.glowingContainer {
+  position: relative;
+  overflow: hidden;
+  padding: 3px;
+  border-radius: 0px;
+  background: linear-gradient(
+    45deg,
+    #000033,    /* Dark Blue */
+    #330033,    /* Dark Purple */
+    #003333,    /* Dark Cyan */
+    #000033     /* Back to Dark Blue */
+  );
+  background-size: 400% 400%;
+  animation: changeBackground 8s ease infinite;
+}
+
+.glowingContainer::before {
+  content: '';
+  position: absolute;
+  inset: 0;  /* Changed from -50% to 0 to align with container */
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    #00ffff 60deg,    /* Cyan */
+    #4666ff 120deg,   /* Electric Blue */
+    #9933ff 180deg,   /* Purple */
+    #00ccff 240deg,   /* Light Blue */
+    #33ffcc 300deg,   /* Turquoise */
+    #0099ff 360deg    /* Azure Blue */
+  );
+  animation: rotateGlow 1s linear infinite;
+  pointer-events: none;
+  opacity: 1;
+}
+
+/* Add this new class for the content container */
+.glowingContainer > * {
+  position: relative;
+  background: white;  /* Or your desired background color */
+  height: 100%;
+  border-radius: 0px; /* Slightly smaller than parent */
+  z-index: 1;
+}
+
+@keyframes rotateGlow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes changeBackground {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}

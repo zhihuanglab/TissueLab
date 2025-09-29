@@ -1,0 +1,97 @@
+{
+    "name": "TissueLab",
+    "version": "0.1.0",
+    "description": "Advancing digital pathology analysis for medical professionals and researchers",
+    "author": {
+        "name": "Huang Group",
+        "email": "zhi.huang@pennmedicine.upenn.edu"
+    },
+    "main": "electron/main.js",
+    "scripts": {
+        "start": "npm run start-electron",
+        "dev": "concurrently --kill-others \"npm run start-electron-dev\" \"npm run start-frontend\"",
+        "start-electron": "electron .",
+        "start-electron-dev": "electron electron/main_electron.js",
+        "start-frontend": "cd render && npm run dev",
+        "start-backend": "cd service && python main.py",
+        "build": "npx electron-packager . TissueLab --platform=win32 --arch=x64 --icon=TissueLab_logo.ico --out=release-builds --overwrite --ignore=render/node_modules --ignore=render/.next",
+        "build-render": "node build-render.js",
+        "dist": "electron-builder --win",
+        "test": "cd render && npm run build && cd .. && npm start",
+        "testall": "conda activate tissuelab && pip install -r ../requirements.txt && npm install && cd render && npm install && npm run build && cd .. && npm start"
+    },
+    "devDependencies": {
+        "@vitejs/plugin-react": "^4.2.1",
+        "autoprefixer": "^10.4.19",
+        "concurrently": "^8.2.2",
+        "electron": "^23.3.13",
+        "electron-builder": "^25.0.5",
+        "electron-is-dev": "^3.0.1",
+        "electron-packager": "^17.1.2",
+        "eslint": "^8.57.0",
+        "eslint-config-prettier": "^9.1.0",
+        "eslint-plugin-prettier": "^5.1.3",
+        "eslint-plugin-react": "^7.34.1",
+        "eslint-plugin-react-hooks": "^4.6.0",
+        "openseadragon": "^4.1.1",
+        "postcss": "^8.4.38",
+        "prettier": "3.2.5",
+        "rcedit": "^4.0.1",
+        "sass": "^1.72.0",
+        "vite": "^5.4.2",
+        "wait-on": "^8.0.0"
+    },
+    "dependencies": {
+        "@coreui/chartjs": "^4.0.0",
+        "@coreui/coreui": "^5.0.0",
+        "@coreui/icons": "^3.0.1",
+        "@coreui/icons-react": "^2.2.1",
+        "@coreui/react": "^5.0.0",
+        "@coreui/react-chartjs": "^3.0.0",
+        "@coreui/utils": "^2.0.2",
+        "@fortawesome/fontawesome-free": "^6.6.0",
+        "@fortawesome/free-solid-svg-icons": "^6.6.0",
+        "@fortawesome/react-fontawesome": "^0.2.2",
+        "@getstation/electron-google-oauth2": "^14.0.0",
+        "@popperjs/core": "^2.11.8",
+        "@radix-ui/react-dropdown-menu": "^2.1.6",
+        "@radix-ui/react-icons": "^1.3.2",
+        "@types/openseadragon": "^4.1.0",
+        "bootstrap": "^5.3.3",
+        "chart.js": "^4.4.2",
+        "classnames": "^2.5.1",
+        "core-js": "^3.36.1",
+        "express": "^4.21.0",
+        "jquery": "^3.7.1",
+        "prop-types": "^15.8.1",
+        "react": "^18.2.0",
+        "react-ace": "^12.0.0",
+        "react-beautiful-dnd": "^13.1.1",
+        "react-dom": "^18.2.0",
+        "react-redux": "^9.1.0",
+        "react-router-dom": "^6.22.3",
+        "redux": "5.0.1",
+        "simplebar-react": "^3.2.4",
+        "tree-kill": "^1.2.2"
+    },
+    "build": {
+        "extraResources": [
+            {
+                "from": "python/TissueLabService/dist/manage",
+                "to": "python/TissueLabService/dist/manage"
+            }
+        ],
+        "asarUnpack": [
+            "hiostory"
+        ],
+        "asar": false,
+        "appId": "com.zhihuanglab.tissuelab",
+        "files": [
+            "**/*"
+        ],
+        "win": {
+            "target": "msi",
+            "icon": "Tissuelab_logo.ico"
+        }
+    }
+}
