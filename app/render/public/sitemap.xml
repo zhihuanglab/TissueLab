@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset
+      xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:xhtml="http://www.w3.org/1999/xhtml"
+      xsi:schemaLocation="http://www.sitemaps.org/schemas/sitemap/0.9
+            http://www.sitemaps.org/schemas/sitemap/0.9/sitemap.xsd">
+
+<url>
+  <loc>https://varys.ai/</loc>
+  <lastmod>2024-01-20T13:10:28+00:00</lastmod>
+  <xhtml:link rel="alternate" hreflang="en" href="https://varys.ai/?lang=en"/>
+  <xhtml:link rel="alternate" hreflang="zh" href="https://varys.ai/?lang=zh"/>
+  <xhtml:link rel="alternate" hreflang="zh-CN" href="https://varys.ai/?lang=zh-CN"/>
+  <xhtml:link rel="alternate" hreflang="zh-SG" href="https://varys.ai/?lang=zh-SG"/>
+  <xhtml:link rel="alternate" hreflang="zh-HK" href="https://varys.ai/?lang=zh-HK"/>
+  <xhtml:link rel="alternate" hreflang="zh-MO" href="https://varys.ai/?lang=zh-MO"/>
+  <xhtml:link rel="alternate" hreflang="zh-TW" href="https://varys.ai/?lang=zh-TW"/>
+</url>
+
+<url>
+  <loc>https://varys.ai/lite</loc>
+  <lastmod>2024-01-20T13:10:28+00:00</lastmod>
+  <xhtml:link rel="alternate" hreflang="en" href="https://varys.ai/lite/?lang=en"/>
+  <xhtml:link rel="alternate" hreflang="zh" href="https://varys.ai/lite/?lang=zh"/>
+  <xhtml:link rel="alternate" hreflang="zh-CN" href="https://varys.ai/lite/?lang=zh-CN"/>
+  <xhtml:link rel="alternate" hreflang="zh-SG" href="https://varys.ai/lite/?lang=zh-SG"/>
+  <xhtml:link rel="alternate" hreflang="zh-HK" href="https://varys.ai/lite/?lang=zh-HK"/>
+  <xhtml:link rel="alternate" hreflang="zh-MO" href="https://varys.ai/lite/?lang=zh-MO"/>
+  <xhtml:link rel="alternate" hreflang="zh-TW" href="https://varys.ai/lite/?lang=zh-TW"/>
+</url>
+
+
+</urlset>

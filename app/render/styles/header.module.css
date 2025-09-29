@@ -1,0 +1,11 @@
+.header-container {
+  @apply sticky top-0 z-10 bg-white dark:bg-gray-800 border-b border-gray-200;
+}
+
+.header-shadow {
+  @apply shadow-sm;
+}
+
+.vr {
+  @apply border-r border-gray-300 dark:border-gray-600;
+}

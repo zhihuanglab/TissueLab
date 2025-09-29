@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[co]
+*$py.class
+
+# Custom
+.DS_Store
+*.log
+.idea
+.vscode
+/old_try
+node_modules
+/my_records
+dist
+#package.json
+#package-lock.json
+libopenjpeg*
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+example_WSI/eye-tracking-experiment/
+example_WSI/**/*.h5
+
+# H5 modification tracking files
+**/h5_modification_counts.json
+
+# cursor
+.cursor
+*.cursorrules
+*.mdc
+
+# cludecode
+.history/

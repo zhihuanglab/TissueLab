@@ -1,0 +1,14 @@
+[config]
+model = "o1"
+model_turbo = "gpt-4o"
+fallback_models = ["anthropic/claude-3-7-sonnet-20250219"]
+response_language = "en-US"
+
+[pr_reviewer]
+extra_instructions = "Please analyze code quality in detail"
+
+[pr_description]
+extra_instructions = "Please generate PR description with detailed change notes"
+
+[pr_code_suggestions]
+extra_instructions = "Please provide code suggestions with detailed explanations for improvements"
