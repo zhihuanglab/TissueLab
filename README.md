@@ -35,6 +35,9 @@ Agentic AI is rapidly advancing in healthcare and biomedical research. However, 
 
 TissueLab integrates tool factories across pathology, radiology, and spatial omics domains. By standardizing inputs, outputs, and capabilities of diverse tools, the system determines when and how to invoke them to address research and clinical questions. Across diverse tasks with clinically meaningful quantifications that inform staging, prognosis, and treatment planning, TissueLab achieves state-of-the-art performance compared with end-to-end vision-language models (VLMs) and other agentic AI systems such as GPT-5. Moreover, TissueLab continuously learns from clinicians, evolving toward improved classifiers and more effective decision strategies. With active learning, it delivers accurate results in unseen disease contexts within minutes, without requiring massive datasets or prolonged retraining. Released as a sustainable open-source ecosystem, TissueLab aims to accelerate computational research and translational adoption in medical imaging while establishing a foundation for the next generation of medical AI.
 
+### Experimental Results:
+https://github.com/zhihuanglab/TissueLab-Experiment  
+
 ### Key Features
 - **🤖 Direct Question-Answering**: Ask natural language questions about medical images
 - **⚡ Automatic Workflow Generation**: AI-powered planning and execution of analysis workflows  
