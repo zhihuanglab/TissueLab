@@ -1,0 +1,209 @@
+{
+  "category_map": {
+    "TissueClassify": [
+      "BiomedParseClassification",
+      "MuskClassification",
+      "TotalSegmentatorClassification"
+    ],
+    "TissueSeg": [
+      "BiomedParseSegmentation",
+      "MuskEmbedding",
+      "TotalSegmentatorSegmentation"
+    ],
+    "NucleiSeg": [
+      "SegmentationNode"
+    ],
+    "NucleiClassify": [
+      "ClassificationNode"
+    ],
+    "SpatialOmics": [
+      "CellCharter"
+    ],
+    "TaskSpecific": [
+      "Ark"
+    ],
+    "CodeAgent": [
+      "GPT-4o Agent"
+    ]
+  },
+  "nodes": {
+    "BiomedParseSegmentation": {
+      "displayName": "BiomedParse Segmentation",
+      "description": "Tissue segmentation for radiology images with pixel-accurate region boundaries. Require BiomedParseClassification to follow it.",
+      "icon": "/images/icons/tissue_segmentation_biomedparse.png",
+      "factory": "TissueSeg",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "h5_group": null,
+      "inputs": null,
+      "outputs": "Region polygons/masks"
+    },
+    "BiomedParseClassification": {
+      "displayName": "BiomedParse Classification",
+      "description": "Tissue classification for radiology images. Must follow BiomedParseSegmentation.",
+      "icon": "/images/icons/tissue_segmentation_biomedparse.png",
+      "factory": "TissueClassify",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "h5_group": null,
+      "inputs": null,
+      "outputs": "Region classifications"
+    },
+    "TotalSegmentatorSegmentation": {
+      "displayName": "TotalSegmentator Segmentation",
+      "description": "Organ segmentation for radiology images. When segmenting brain, brain structure, liver, spleen, prioritize this node over BiomedParse.",
+      "icon": "/images/icons/tissue_segmentation_totalsegmentator.png",
+      "factory": "TissueSeg",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "h5_group": null,
+      "inputs": "Radiology images (CT/MRI)",
+      "outputs": "Organ masks (brain, brain structure, liver, spleen)",
+      "modality": "radiology",
+      "supported_organs": ["brain", "brain structure", "liver", "spleen"]
+    },
+    "TotalSegmentatorClassification": {
+      "displayName": "TotalSegmentator Classification",
+      "description": "Organ classification for radiology images. When classifying brain, brain structure, liver, spleen, prioritize this node over BiomedParse.",
+      "icon": "/images/icons/tissue_classification_totalsegmentator.png",
+      "factory": "TissueClassify",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "h5_group": null,
+      "inputs": "Radiology images (CT/MRI)",
+      "outputs": "Organ classifications (brain, brain structure, liver, spleen)",
+      "modality": "radiology",
+      "supported_organs": ["brain", "brain structure", "liver", "spleen"]
+    },
+    "MuskEmbedding": {
+      "displayName": "Patch Embedding (MUSK)",
+      "description": "Generates patch embeddings for pathology whole slides used downstream by patch classification.",
+      "icon": "/images/icons/patch_encoder_musk.png",
+      "factory": "TissueSeg",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "h5_group": "MuskNode",
+      "inputs": null,
+      "outputs": "Patch embeddings [N,D]",
+      "runtime": {
+        "env_name": "musk",
+        "service_path": "/home/tissuelab-admin/tissuelab/dev-env/Tissuelab-Model-Zoo/patch_classification/MUSK/musk_embedding_taskNode.py",
+        "dependency_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Ctrl-Service/storage/uploads",
+        "python_version": "3.9",
+        "log_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Dev/app/service/storage/tasknode_logs/2025-10-12/MuskEmbedding__musk__20251012_200247.log",
+        "bundle_exists": true,
+        "port": 8043
+      }
+    },
+    "MuskClassification": {
+      "displayName": "MUSK Classification",
+      "description": "Patch-based classification model for pathology whole slides.",
+      "icon": "",
+      "schema": null,
+      "version": null,
+      "factory": "TissueClassify",
+      "h5_group": null,
+      "runtime": {
+        "env_name": "musk",
+        "service_path": "/home/tissuelab-admin/tissuelab/dev-env/Tissuelab-Model-Zoo/patch_classification/MUSK/musk_classification_tasknode.py",
+        "dependency_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Ctrl-Service/storage/uploads",
+        "python_version": "3.10",
+        "log_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Dev/app/service/storage/tasknode_logs/2025-10-12/MuskClassification__musk__20251012_200233.log",
+        "port": 8044,
+        "bundle_exists": true
+      }
+    },
+    "SegmentationNode": {
+      "displayName": "Cell/Nuclei Segmentation",
+      "description": "Instance segmentation of nuclei/cells on WSI with per-nucleus polygons/centroids; prerequisite for per-cell metrics and classification.",
+      "icon": "/images/icons/nuclei_segmentation_stardist.png",
+      "factory": "NucleiSeg",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "h5_group": null,
+      "inputs": null,
+      "outputs": "Per-nucleus contours and centroids",
+      "runtime": {
+        "env_name": "stardist_environment",
+        "service_path": "/home/tissuelab-admin/tissuelab/dev-env/Tissuelab-Model-Zoo/nuclei_segmentation/StarDist/segmentation_taskNode.py",
+        "dependency_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Ctrl-Service/storage/uploads",
+        "python_version": "3.9",
+        "log_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Dev/app/service/storage/tasknode_logs/2025-10-12/SegmentationNode__stardist_environment__20251012_200211.log",
+        "port": 8045,
+        "bundle_exists": false
+      }
+    },
+    "ClassificationNode": {
+      "displayName": "Nuclei Classification (NuClass)",
+      "description": "Per-nucleus classifier assigning classes (e.g., tumor_cell, lymphocyte); consumes nuclei segmentation results.",
+      "icon": "/images/icons/nuclei_classification_tissuelab_nuclass.png",
+      "factory": "NucleiClassify",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "h5_group": null,
+      "inputs": "Per-nucleus contours and centroids",
+      "outputs": "Per-nucleus class probabilities",
+      "runtime": {
+        "env_name": "stardist_environment",
+        "service_path": "/home/tissuelab-admin/tissuelab/dev-env/Tissuelab-Model-Zoo/cell_classification/NuClass/classification_taskNode.py",
+        "dependency_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Ctrl-Service/storage/uploads",
+        "python_version": "3.9",
+        "log_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Dev/app/service/storage/tasknode_logs/2025-10-12/ClassificationNode__stardist_environment__20251012_200138.log",
+        "port": 8046,
+        "bundle_exists": true
+      }
+    },
+    "CellCharter": {
+      "displayName": "CellCharter",
+      "description": "Spatial transcriptomics clustering for identifying tissue domains and cellular neighborhoods. We need nuclei segmentation to precede this tasknode and also nuclei classification to tell us what is the name of the cell clusters.",
+      "icon": "/images/icons/spatial_omics_cellcharter.png",
+      "factory": "SpatialOmics",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "h5_group": null,
+      "inputs": "Spatial transcriptomics data",
+      "outputs": "Cluster assignments and spatial domains"
+    },
+    "Ark": {
+      "displayName": "Ark",
+      "description": "Task-specific model for specifically ONLY chest X-ray analysis with direct prediction scores; standalone model that does not require other nodes.",
+      "icon": "/images/icons/xray_ark.png",
+      "factory": "TaskSpecific",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "h5_group": null,
+      "inputs": "Chest X-ray images",
+      "outputs": "Prediction scores"
+    },
+    "GPT-4o Agent": {
+      "displayName": "Code Calculation",
+      "description": "Custom Python analysis for counts/ratios/spatial queries; no visualization unless explicitly requested.",
+      "icon": "/images/icons/code_generator_tissuelab_code.png",
+      "factory": "CodingAgent",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "h5_group": null,
+      "inputs": null,
+      "outputs": null
+    }
+  },
+  "category_display_names": {
+    "TissueClassify": "Tissue Classification",
+    "TissueSeg": "Tissue Segmentation",
+    "NucleiSeg": "Cell Segmentation + Embedding",
+    "NucleiClassify": "Nuclei Classification",
+    "SpatialOmics": "Spatial Omics Analysis",
+    "TaskSpecific": "Task Specific Analysis",
+    "CodeAgent": "Code Calculation"
+  }
+}

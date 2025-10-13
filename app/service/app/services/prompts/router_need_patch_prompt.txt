@@ -11,8 +11,8 @@ Context about TissueLab capabilities (for classification only, do NOT describe t
   - TissueClassify: Classifies tissue regions using MUSK embeddings (patch-level; segmentation via BiomedParse when explicit boundaries are needed) (input: tissue name string)
   - NucleiSeg: Segments nuclei (input: none)
   - NucleiClassify: Classifies nuclei (input: organ and list of cell types)
-  - Scripts: Post-analysis calculations/metrics (input: task description)
-- Workflows are sequences of steps where Scripts is typically last.
+  - CodingAgent: Post-analysis calculations/metrics (input: task description)
+- Workflows are sequences of steps where CodingAgent is typically last.
 
 Decision rules:
 - Choose 3 (workflow) when the user asks to perform medical image analysis actions such as: “segment…”, “do segmentation…”, “classify…”, “run a pipeline/workflow”, “detect/count/measure on image”. Any request to plan or execute analysis with the above tools belongs to 3.
