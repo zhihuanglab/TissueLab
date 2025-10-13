@@ -181,5 +181,8 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-/storage/
+/storage/*
+!/storage/bundles/
+/storage/bundles/*
 !/storage/bundles/catalog.json
+!/storage/model_registry.json
