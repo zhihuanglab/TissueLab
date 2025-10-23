@@ -26,6 +26,9 @@
 ## 🚀 Platform Access
 **Live Demo**: [www.tissuelab.org](https://www.tissuelab.org)
 
+** 🖥️ YouTube Demonstration Video **
+- [TissueLab Demonstrations](https://www.youtube.com/watch?v=rssWT4Mehqw) - A demonstration video showcasing TissueLab experimental results and visualizations
+
 ## 📄 Research Paper
 **Paper**: [A co-evolving agentic AI system for medical imaging analysis](https://arxiv.org/abs/2509.20279) (arXiv:2509.20279)
 
