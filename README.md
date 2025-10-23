@@ -29,14 +29,14 @@
 ## 📄 Research Paper
 **Paper**: [A co-evolving agentic AI system for medical imaging analysis](https://arxiv.org/abs/2509.20279) (arXiv:2509.20279)
 
+## All Experimental Results and Video Illustrations:
+https://github.com/zhihuanglab/TissueLab-Experiment  
+
 ## 🌟 Abstract
 
 Agentic AI is rapidly advancing in healthcare and biomedical research. However, in medical image analysis, their performance and adoption remain limited due to the lack of a robust ecosystem, insufficient toolsets, and the absence of real-time interactive expert feedback. Here we present **TissueLab**, a co-evolving agentic AI system that allows researchers to ask direct questions, automatically plan and generate explainable workflows, and conduct real-time analyses where experts can visualize intermediate results and refine them. 
 
 TissueLab integrates tool factories across pathology, radiology, and spatial omics domains. By standardizing inputs, outputs, and capabilities of diverse tools, the system determines when and how to invoke them to address research and clinical questions. Across diverse tasks with clinically meaningful quantifications that inform staging, prognosis, and treatment planning, TissueLab achieves state-of-the-art performance compared with end-to-end vision-language models (VLMs) and other agentic AI systems such as GPT-5. Moreover, TissueLab continuously learns from clinicians, evolving toward improved classifiers and more effective decision strategies. With active learning, it delivers accurate results in unseen disease contexts within minutes, without requiring massive datasets or prolonged retraining. Released as a sustainable open-source ecosystem, TissueLab aims to accelerate computational research and translational adoption in medical imaging while establishing a foundation for the next generation of medical AI.
-
-### Experimental Results:
-https://github.com/zhihuanglab/TissueLab-Experiment  
 
 ### Key Features
 - **🤖 Direct Question-Answering**: Ask natural language questions about medical images
