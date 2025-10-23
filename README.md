@@ -26,7 +26,7 @@
 ## 🚀 Platform Access
 **Live Demo**: [www.tissuelab.org](https://www.tissuelab.org)
 
-** 🖥️ YouTube Demonstration Video **
+** 🖥️ YouTube Demonstration Video
 - [TissueLab Demonstrations](https://www.youtube.com/watch?v=rssWT4Mehqw) - A demonstration video showcasing TissueLab experimental results and visualizations
 
 ## 📄 Research Paper
