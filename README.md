@@ -29,8 +29,7 @@
 ## 📄 Research Paper
 **Paper**: [A co-evolving agentic AI system for medical imaging analysis](https://arxiv.org/abs/2509.20279) (arXiv:2509.20279)
 
-## All Experimental Results and Video Illustrations:
-https://github.com/zhihuanglab/TissueLab-Experiment  
+**Experimental Results and Video Illustrations**: https://github.com/zhihuanglab/TissueLab-Experiment  
 
 ## 🌟 Abstract
 
