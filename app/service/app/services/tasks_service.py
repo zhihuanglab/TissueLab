@@ -25,7 +25,6 @@ from io import BytesIO
 from PIL import Image, ImageDraw
 import signal
 import psutil
-from app.services.agent_service import get_agent_service
 from app.utils import resolve_path
 from app.core.settings import settings
 
@@ -592,8 +591,16 @@ async def run_workflow_in_background(wf_id, node_inputs, script_prompt, h5_path,
                     structure = None
                     structure_json = None
                     try:
-                        local_agent_service = get_agent_service()
-                        structure = await local_agent_service.get_h5_structure(h5_file)
+                        # Simple H5 structure reading without agent service
+                        import h5py
+                        with h5py.File(h5_file, 'r') as f:
+                            def get_structure(name, obj):
+                                if isinstance(obj, h5py.Group):
+                                    return {key: get_structure(key, item) for key, item in obj.items()}
+                                elif isinstance(obj, h5py.Dataset):
+                                    return {"shape": obj.shape, "dtype": str(obj.dtype)}
+                                return str(type(obj))
+                            structure = get_structure("/", f["/"])
                         structure_json = json.dumps(structure, indent=2)
                     except Exception as struct_err:
                         logger.warning(f"Failed to fetch local H5 structure for script preview: {struct_err}")

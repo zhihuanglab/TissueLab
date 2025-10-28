@@ -4,7 +4,6 @@ from contextlib import asynccontextmanager
 # Firebase removed for open source
 from app.api.tasks import tasks_router
 from app.api.activation import activation_router
-from app.api.agent import agent_router
 from app.api.load import load_router
 from app.api.celery_load import celery_load_router  # Import Celery router
 from app.api.seg import seg_router
@@ -166,7 +165,6 @@ app.add_exception_handler(StarletteHTTPException, error_handler)
 # router
 app.include_router(tasks_router, prefix="/api/tasks", tags=["tasks"])
 app.include_router(activation_router, prefix="/api/activation", tags=["activation"])
-app.include_router(agent_router, prefix="/api/agent", tags=["agent"])
 app.include_router(load_router, prefix="/api/load", tags=["load"])
 app.include_router(celery_load_router, prefix="/api", tags=["celery"])  # Add Celery router
 app.include_router(seg_router, prefix="/api/seg", tags=["seg"])

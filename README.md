@@ -269,14 +269,6 @@ To use your own OpenAI API key:
 OPENAI_API_KEY=your-open-ai-key
 ```
 
-#### Build Your Own Agent
-Configure custom agent endpoints:
-
-```bash
-# Create app/render/.env.local with:
-PUBLIC_CTRL_SERVICE_HOST=your-agent-host
-PUBLIC_CTRL_SERVICE_API_ENDPOINT=https://your-agent-endpoint.com
-```
 
 ### Frontend Structure
 ```
@@ -284,7 +276,6 @@ app/render/
 ├── components/          # Reusable React components
 │   ├── Dashboard/       # Main dashboard components
 │   ├── ImageViewer/     # Medical image viewer
-│   ├── AgentZoo/        # AI model management
 │   └── ui/              # UI components
 ├── pages/               # Next.js pages (routes)
 │   ├── dashboard.tsx    # Main dashboard
@@ -319,8 +310,6 @@ app/render/
 app/service/
 ├── app/                           # Main FastAPI application
 │   ├── api/                       # API endpoints
-│   │   ├── tasks.py              # Task management endpoints
-│   │   ├── agent.py              # AI agent endpoints
 │   │   ├── seg.py                # Segmentation endpoints
 │   │   ├── load.py               # Data loading endpoints
 │   │   ├── h5.py                 # H5 file management
@@ -362,9 +351,6 @@ python main.py --port 5001
 ```
 
 ### API Endpoints
-- `/api/tasks` - Task management and status
-- `/api/agent` - AI agent interactions
-- `/api/seg` - Image segmentation
 - `/api/load` - Data loading and processing
 - `/api/feedback` - User feedback collection
 - `/ws` - WebSocket connections for real-time updates
