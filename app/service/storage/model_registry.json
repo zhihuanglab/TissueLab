@@ -3,7 +3,8 @@
     "TissueClassify": [
       "BiomedParseClassification",
       "MuskClassification",
-      "TotalSegmentatorClassification"
+      "TotalSegmentatorClassification",
+      "BiomedParseNode"
     ],
     "TissueSeg": [
       "BiomedParseSegmentation",
@@ -24,6 +25,9 @@
     ],
     "CodeAgent": [
       "GPT-4o Agent"
+    ],
+    "Scripts": [
+      "Scripts"
     ]
   },
   "nodes": {
@@ -63,7 +67,12 @@
       "inputs": "Radiology images (CT/MRI)",
       "outputs": "Organ masks (brain, brain structure, liver, spleen)",
       "modality": "radiology",
-      "supported_organs": ["brain", "brain structure", "liver", "spleen"]
+      "supported_organs": [
+        "brain",
+        "brain structure",
+        "liver",
+        "spleen"
+      ]
     },
     "TotalSegmentatorClassification": {
       "displayName": "TotalSegmentator Classification",
@@ -77,7 +86,12 @@
       "inputs": "Radiology images (CT/MRI)",
       "outputs": "Organ classifications (brain, brain structure, liver, spleen)",
       "modality": "radiology",
-      "supported_organs": ["brain", "brain structure", "liver", "spleen"]
+      "supported_organs": [
+        "brain",
+        "brain structure",
+        "liver",
+        "spleen"
+      ]
     },
     "MuskEmbedding": {
       "displayName": "Patch Embedding (MUSK)",
@@ -89,16 +103,7 @@
       "source": "builtin",
       "h5_group": "MuskNode",
       "inputs": null,
-      "outputs": "Patch embeddings [N,D]",
-      "runtime": {
-        "env_name": "musk",
-        "service_path": "/home/tissuelab-admin/tissuelab/dev-env/Tissuelab-Model-Zoo/patch_classification/MUSK/musk_embedding_taskNode.py",
-        "dependency_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Ctrl-Service/storage/uploads",
-        "python_version": "3.9",
-        "log_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Dev/app/service/storage/tasknode_logs/2025-10-12/MuskEmbedding__musk__20251012_200247.log",
-        "bundle_exists": true,
-        "port": 8043
-      }
+      "outputs": "Patch embeddings [N,D]"
     },
     "MuskClassification": {
       "displayName": "MUSK Classification",
@@ -107,16 +112,7 @@
       "schema": null,
       "version": null,
       "factory": "TissueClassify",
-      "h5_group": null,
-      "runtime": {
-        "env_name": "musk",
-        "service_path": "/home/tissuelab-admin/tissuelab/dev-env/Tissuelab-Model-Zoo/patch_classification/MUSK/musk_classification_tasknode.py",
-        "dependency_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Ctrl-Service/storage/uploads",
-        "python_version": "3.10",
-        "log_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Dev/app/service/storage/tasknode_logs/2025-10-12/MuskClassification__musk__20251012_200233.log",
-        "port": 8044,
-        "bundle_exists": true
-      }
+      "h5_group": null
     },
     "SegmentationNode": {
       "displayName": "Cell/Nuclei Segmentation",
@@ -128,16 +124,7 @@
       "source": "builtin",
       "h5_group": null,
       "inputs": null,
-      "outputs": "Per-nucleus contours and centroids",
-      "runtime": {
-        "env_name": "stardist_environment",
-        "service_path": "/home/tissuelab-admin/tissuelab/dev-env/Tissuelab-Model-Zoo/nuclei_segmentation/StarDist/segmentation_taskNode.py",
-        "dependency_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Ctrl-Service/storage/uploads",
-        "python_version": "3.9",
-        "log_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Dev/app/service/storage/tasknode_logs/2025-10-12/SegmentationNode__stardist_environment__20251012_200211.log",
-        "port": 8045,
-        "bundle_exists": false
-      }
+      "outputs": "Per-nucleus contours and centroids"
     },
     "ClassificationNode": {
       "displayName": "Nuclei Classification (NuClass)",
@@ -149,16 +136,7 @@
       "source": "builtin",
       "h5_group": null,
       "inputs": "Per-nucleus contours and centroids",
-      "outputs": "Per-nucleus class probabilities",
-      "runtime": {
-        "env_name": "stardist_environment",
-        "service_path": "/home/tissuelab-admin/tissuelab/dev-env/Tissuelab-Model-Zoo/cell_classification/NuClass/classification_taskNode.py",
-        "dependency_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Ctrl-Service/storage/uploads",
-        "python_version": "3.9",
-        "log_path": "/home/tissuelab-admin/tissuelab/dev-env/TissueLab-Dev/app/service/storage/tasknode_logs/2025-10-12/ClassificationNode__stardist_environment__20251012_200138.log",
-        "port": 8046,
-        "bundle_exists": true
-      }
+      "outputs": "Per-nucleus class probabilities"
     },
     "CellCharter": {
       "displayName": "CellCharter",
@@ -195,6 +173,30 @@
       "h5_group": null,
       "inputs": null,
       "outputs": null
+    },
+    "BiomedParseNode": {
+      "displayName": "BiomedParse",
+      "description": "Pixel-accurate region segmentation for explicit boundary analysis when boundary precision is explicitly required; otherwise prefer embedding-backed classification (e.g., MUSK).",
+      "icon": "/images/icons/tissue_segmentation_biomedparse.png",
+      "factory": "TissueClassify",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "h5_group": null,
+      "inputs": null,
+      "outputs": "Region polygons/masks"
+    },
+    "Scripts": {
+      "displayName": "Code Calculation",
+      "description": "Custom Python analysis for counts/ratios/spatial queries; no visualization unless explicitly requested.",
+      "icon": "/images/icons/code_generator_tissuelab_code.png",
+      "factory": "Scripts",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "h5_group": null,
+      "inputs": null,
+      "outputs": null
     }
   },
   "category_display_names": {
@@ -204,6 +206,7 @@
     "NucleiClassify": "Nuclei Classification",
     "SpatialOmics": "Spatial Omics Analysis",
     "TaskSpecific": "Task Specific Analysis",
-    "CodeAgent": "Code Calculation"
+    "CodeAgent": "Code Calculation",
+    "Scripts": "Code Calculation"
   }
 }
