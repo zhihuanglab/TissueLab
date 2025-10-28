@@ -3,8 +3,7 @@
     "TissueClassify": [
       "BiomedParseClassification",
       "MuskClassification",
-      "TotalSegmentatorClassification",
-      "BiomedParseNode"
+      "TotalSegmentatorClassification"
     ],
     "TissueSeg": [
       "BiomedParseSegmentation",
@@ -173,18 +172,6 @@
       "h5_group": null,
       "inputs": null,
       "outputs": null
-    },
-    "BiomedParseNode": {
-      "displayName": "BiomedParse",
-      "description": "Pixel-accurate region segmentation for explicit boundary analysis when boundary precision is explicitly required; otherwise prefer embedding-backed classification (e.g., MUSK).",
-      "icon": "/images/icons/tissue_segmentation_biomedparse.png",
-      "factory": "TissueClassify",
-      "schema": null,
-      "version": null,
-      "source": "builtin",
-      "h5_group": null,
-      "inputs": null,
-      "outputs": "Region polygons/masks"
     },
     "Scripts": {
       "displayName": "Code Calculation",
