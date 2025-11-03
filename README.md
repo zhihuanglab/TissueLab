@@ -421,6 +421,12 @@ Reference implementation and examples:
 - **Purpose**: See how other models are integrated
 - **Examples**: Complete model integration examples
 
+⚠️ **Important**: Due to recent changes in local memory container storage format from **H5** to **Zarr**:
+- If running from **this source code**, please use the historical commit [https://github.com/zhihuanglab/Tissuelab-Model-Zoo/tree/754d9ff44c183428b8d0835f6d90ec2b832876c9](https://github.com/zhihuanglab/Tissuelab-Model-Zoo/tree/754d9ff44c183428b8d0835f6d90ec2b832876c9) as compatible source code.
+- If using our **latest software (Zarr version)**, you can use the latest Model Zoo.
+
+Note: The code logic remains consistent; only the storage format has been updated from H5 to Zarr.
+
 #### 2. **TissueLab SDK**
 Pre-built image processing utilities:
 - **GitHub**: [https://github.com/zhihuanglab/TissueLab-SDK](https://github.com/zhihuanglab/TissueLab-SDK)
