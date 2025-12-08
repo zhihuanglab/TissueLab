@@ -1,12 +1,17 @@
-import React, { useState, useEffect } from "react"
+import React, { useState, useEffect, useRef, useCallback } from "react"
 import Image from "next/image"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Button } from "@/components/ui/button"
-import { Plus } from "lucide-react"
+import { Plus, Loader2 } from "lucide-react"
 import { Label } from "@/components/ui/label"
 import { AI_SERVICE_API_ENDPOINT } from "@/constants/config"
 import http from '@/utils/http';
+
+type NodeStatus = {
+  running: boolean;
+  activating: boolean;
+};
 
 interface NodesExtendedPayload {
   nodes: Record<string, { displayName?: string; description?: string; icon?: string; factory?: string }>;
@@ -54,7 +59,8 @@ export const ImportModelDialog: React.FC<ImportModelDialogProps> = ({ onImport }
   const [factoryModels, setFactoryModels] = useState<Record<string, string[]>>({});
   const [categoryNames, setCategoryNames] = useState<Record<string, string>>({});
   const [nodesMeta, setNodesMeta] = useState<Record<string, any>>({});
-  const [runningNodes, setRunningNodes] = useState<Record<string, boolean>>({});
+  const [nodeStatus, setNodeStatus] = useState<Record<string, NodeStatus>>({});
+  const eventSourcesRef = useRef<Map<string, EventSource>>(new Map());
 
   useEffect(() => {
     const fetchFactoryModels = async () => {
@@ -75,11 +81,14 @@ export const ImportModelDialog: React.FC<ImportModelDialogProps> = ({ onImport }
         const resp = await http.get(`${AI_SERVICE_API_ENDPOINT}/tasks/v1/list_node_ports`);
         const portsData = resp.data;
         const nodes = portsData?.data?.nodes || {};
-        const runningMap: Record<string, boolean> = {};
+        const statusMap: Record<string, NodeStatus> = {};
         Object.keys(nodes).forEach((name) => {
-          runningMap[name] = !!nodes[name]?.running;
+          statusMap[name] = {
+            running: !!nodes[name]?.running,
+            activating: !!nodes[name]?.activating,
+          };
         });
-        setRunningNodes(runningMap);
+        setNodeStatus(statusMap);
       } catch (e) {
         console.error('Error fetching node ports:', e);
       }
@@ -87,6 +96,75 @@ export const ImportModelDialog: React.FC<ImportModelDialogProps> = ({ onImport }
 
     fetchFactoryModels();
     fetchNodePorts();
+  }, []);
+
+  // Subscribe to SSE activation events for nodes that are activating
+  const subscribeToActivationEvents = useCallback((nodeName: string) => {
+    // Don't create duplicate subscriptions
+    if (eventSourcesRef.current.has(nodeName)) {
+      return;
+    }
+
+    const eventSource = new EventSource(
+      `${AI_SERVICE_API_ENDPOINT}/tasks/v1/activation/events?model=${encodeURIComponent(nodeName)}`
+    );
+
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        const status = data.status;
+
+        if (status === "ready") {
+          // Node is now active
+          setNodeStatus((prev) => ({
+            ...prev,
+            [nodeName]: { running: true, activating: false },
+          }));
+          eventSource.close();
+          eventSourcesRef.current.delete(nodeName);
+        } else if (status === "failed") {
+          // Activation failed
+          setNodeStatus((prev) => ({
+            ...prev,
+            [nodeName]: { running: false, activating: false },
+          }));
+          eventSource.close();
+          eventSourcesRef.current.delete(nodeName);
+        } else if (status === "starting") {
+          // Still activating
+          setNodeStatus((prev) => ({
+            ...prev,
+            [nodeName]: { running: false, activating: true },
+          }));
+        }
+      } catch (error) {
+        console.error('Error parsing activation event:', error);
+      }
+    };
+
+    eventSource.onerror = () => {
+      eventSource.close();
+      eventSourcesRef.current.delete(nodeName);
+    };
+
+    eventSourcesRef.current.set(nodeName, eventSource);
+  }, []);
+
+  // Subscribe to activation events for all activating nodes
+  useEffect(() => {
+    Object.entries(nodeStatus).forEach(([name, status]) => {
+      if (status.activating && !eventSourcesRef.current.has(name)) {
+        subscribeToActivationEvents(name);
+      }
+    });
+  }, [nodeStatus, subscribeToActivationEvents]);
+
+  // Cleanup SSE connections on unmount
+  useEffect(() => {
+    return () => {
+      eventSourcesRef.current.forEach((es) => es.close());
+      eventSourcesRef.current.clear();
+    };
   }, []);
 
   useEffect(() => {
@@ -159,16 +237,36 @@ export const ImportModelDialog: React.FC<ImportModelDialogProps> = ({ onImport }
               <Label className="text-right">Model</Label>
               <div className="col-span-9 flex flex-col gap-[12px] h-[260px] overflow-y-auto overflow-x-hidden scrollbar-hide shadow-md border rounded-xl p-[12px] bg-neutral-50/50">
                 {getAvailableNodes().map((node: string) => {
-                  const exists = Object.prototype.hasOwnProperty.call(runningNodes, node);
-                  const isRunning = exists ? !!runningNodes[node] : false;
+                  const status = nodeStatus[node];
+                  const exists = status !== undefined;
+                  const isRunning = status?.running ?? false;
+                  const isActivating = status?.activating ?? false;
+
+                  // Determine badge text and styling
+                  let badgeText = 'Inactive';
+                  let badgeClass = 'bg-gray-100 text-gray-600';
+                  let titleText = 'Inactive. Activate in AI Model Zoo first.';
+
+                  if (isActivating) {
+                    badgeText = 'Activating';
+                    badgeClass = 'bg-amber-100 text-amber-700';
+                    titleText = 'Activation in progress...';
+                  } else if (isRunning) {
+                    badgeText = 'Active';
+                    badgeClass = 'bg-green-100 text-green-700';
+                    titleText = 'Running';
+                  } else if (exists) {
+                    titleText = 'Stopped (registered)';
+                  }
+
                   return (
                     <div
                       key={node}
                       className={`rounded-xl shadow-sm border transition-shadow bg-white ${
                         selectedNode === node ? 'outline outline-panelColor' : 'outline-border'
-                      } ${!exists ? 'opacity-50' : ''} cursor-pointer hover:shadow-lg`}
+                      } ${!exists && !isActivating ? 'opacity-50' : ''} cursor-pointer hover:shadow-lg`}
                       onClick={() => { setSelectedNode(node); }}
-                      title={!exists ? 'Inactive. Activate in AI Model Zoo first.' : (isRunning ? 'Running' : 'Stopped (registered)')}
+                      title={titleText}
                     >
                       <div className="flex items-start gap-3 p-3">
                         <div className="flex-shrink-0 h-16 w-16 items-center justify-center rounded-md bg-muted overflow-hidden">
@@ -177,8 +275,9 @@ export const ImportModelDialog: React.FC<ImportModelDialogProps> = ({ onImport }
                         <div className="min-w-0 flex-1">
                           <div className="text-normal font-medium break-words flex items-center gap-2">
                             <span>{nodesMeta?.[node]?.displayName || node}</span>
-                            <span className={`text-[10px] px-1.5 py-0.5 rounded ${!exists ? 'bg-gray-100 text-gray-600' : 'bg-green-100 text-green-700'}`}>
-                              {!exists ? 'Inactive' : 'Active'}
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded flex items-center gap-1 ${badgeClass}`}>
+                              {isActivating && <Loader2 className="h-3 w-3 animate-spin" />}
+                              {badgeText}
                             </span>
                           </div>
                           <div className="text-xs text-muted-foreground font-light break-words">{getNodeDescription(node, nodesMeta)}</div>

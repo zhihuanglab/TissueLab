@@ -2474,12 +2474,30 @@ def list_node_ports():
             except Exception:
                 pass
 
+        # Add activation state from activation_states dictionary
+        # This allows frontend to show "Activating" state when a node is being activated
+        for name in all_nodes:
+            act_state = activation_states.get(name)
+            if act_state and act_state.get("status") == "starting":
+                all_nodes[name]["activating"] = True
+            else:
+                all_nodes[name]["activating"] = False
+
+        # Also check nodes that are activating but not yet in all_nodes (not running yet)
+        for name, act_state in activation_states.items():
+            if name not in all_nodes and act_state.get("status") == "starting":
+                all_nodes[name] = {
+                    "running": False,
+                    "activating": True,
+                    "port": None,
+                }
+
         # Add helpful logging snapshot (debug level)
         try:
             logger.debug(f"[list_node_ports] nodes snapshot: {json.dumps(all_nodes, default=str)[:500]}")
         except Exception:
             pass
-        
+
         return {"success": True, "nodes": all_nodes}
 
     except Exception as e:
