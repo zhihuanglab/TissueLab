@@ -1,21 +1,23 @@
-MIT License
+PENN ACADEMIC SOFTWARE LICENSE AGREEMENT FOR 
+"TissueLab"
 
-Copyright (c) 2025 Zhi Huang Group
+1.	This is a legal agreement (“Agreement”) between __________[name and address]_________ (“RECIPIENT” or “you”), and THE TRUSTEES OF THE UNIVERSITY OF PENNSYLVANIA (“PENN”).  Penn controls “TissueLab” (“Software”) which was developed by Zhi Huang Lab at Penn. This Agreement shall be effective as of the date the Software is downloaded (“Effective Date”).
+2.	By accepting, receiving, and using Software, including any accompanying information, materials or manuals you are agreeing to be bound by the terms of this Agreement.  
+3.	PENN grants to RECIPIENT a royalty-free, nonexclusive, and nontransferable license to copy, reproduce, perform, display, and make derivative works of the Software furnished hereunder, upon the terms and conditions set out below. 
+4.	RECIPIENT agrees to use the Software solely for internal research or non-commercial purposes and shall not distribute or transfer the Software to another location or to any other person without prior written permission from PENN. Nothing in this license grants any rights for commercial use. 
+5.	RECIPIENT is encouraged to provide feedback on the Software or any updates or bug fixes back to the Zhi Huang lab at the University of Pennsylvania (email: zhihuang.ai@gmail.com).
+6.	RECIPIENT acknowledges that the Software is still in the development stage and that it is being supplied to Recipient as is, with all faults and without any accompanying documentation, services, support or improvements from PENN.  
+7.	PENN does not grant any licenses under any PENN patent or patent application by this Agreement. The rights and licenses granted in this Agreement are limited to the scope expressly granted.  Accordingly, except for the rights expressly granted under this Agreement, no right, title, or interest of any nature whatsoever is granted whether by implication, estoppel, reliance, or otherwise, by Penn to Recipient.  All rights with respect to any know-how, patent or other intellectual property rights that are not specifically granted herein are reserved to the owner thereof.
+8.	Title and copyright to the Software and any derivatives and any associated documentation shall at all times remain with PENN, and RECIPIENT agrees to preserve same.
+9.	RECIPIENT agrees not to reverse engineer, reverse assemble, reverse compile decompile, disassemble, or otherwise attempt to re-create the source code for the Software. RECIPIENT acknowledges that any programs created based on the Software will be considered a derivative of Software and owned by PENN.
+10.	RECIPIENT may not further distribute Software without express written permission of PENN; however, if permission to transfer the Software is given, RECIPIENT warrants that RECIPIENT will not remove or export any part of the Software from the United States except in full compliance with all United States export regulations and other applicable laws.
+11.	RECIPIENT will use the Software in compliance with all applicable laws, policies and regulations including, but not limited to, any approvals, informed consent and patient confidentiality principles.
+12.	PENN MAKES NO REPRESENTATIONS AND EXTENDS NO WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED OTHER THAN ARE SET OUT IN THIS AGREEMENT.
+13.	THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS, CONTRIBUTORS, AND THE TRUSTEES OF THE UNIVERSITY OF PENNSYLVANIA "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER, CONTRIBUTORS OR THE TRUSTEES OF THE UNIVERSITY OF PENNSYLVANIA BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+14.	RECIPIENT will indemnify, hold harmless, and defend PENN against any claim of any kind arising out of or related to the exercise of any rights granted under this Agreement or the breach of this Agreement by RECIPIENT.
+15.	This Agreement may be terminated by either party upon thirty (30) days written notice to the other party.  In the event of termination, RECIPIENT shall destroy or return immediately all Software and all copies thereof to PENN.
+16.	The parties further waive any right to challenge the admissibility or authenticity of this document in a court of law based solely on the absence of an original signature.
+17.	Any notice, request, approval or consent required or permitted to be given under this Agreement shall be in writing and directed to a party at its address shown below or such other address as such party shall have last given by notice to the other party.  A notice will be deemed received: if delivered personally, on the date of delivery; if mailed, five (5) days after deposit in the United States mail; if sent via courier, one (1) business day after deposit with the courier service.
+18.	Governing Law.  This Agreement shall be governed by and interpreted in accordance with the laws of the Commonwealth of Pennsylvania, excluding application of any conflict of laws principles that would require application of the law of a jurisdiction outside of the Commonwealth of Pennsylvania.
+19.	If a dispute arises between the parties concerning any right or duty under this Agreement, then the parties will confer, as soon as practicable, in an attempt to resolve the dispute. If the parties are unable to resolve the dispute amicably, then the parties will submit to the exclusive jurisdiction of, and venue in, the state and Federal courts located in the Eastern District of Pennsylvania with respect to all disputes arising under this Agreement.	
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
