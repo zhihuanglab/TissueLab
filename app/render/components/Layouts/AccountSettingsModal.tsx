@@ -1,22 +1,23 @@
 'use client'
 
-import React, { useState, useEffect, useLayoutEffect } from 'react'
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import AvatarCropper from '@/components/ui/AvatarCropper'
 import { Button } from '@/components/ui/button'
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Separator } from '@/components/ui/separator'
+import { deleteUserAvatarEndpoint, updateUserProfileEndpoint, uploadUserAvatarEndpoint } from '@/config/endpoints'
 import { useUserInfo } from '@/provider/UserInfoProvider'
-import { apiFetch } from '@/utils/apiFetch'
-import http from '@/utils/http'
-import { updateUserProfileEndpoint, uploadUserAvatarEndpoint, getUserAvatarEndpoint, deleteUserAvatarEndpoint } from '@/config/endpoints'
-import { useDispatch, useSelector } from 'react-redux'
 import { setUserAvatarUrl } from '@/store/slices/userSlice'
-import { doc, getFirestore, setDoc, serverTimestamp } from 'firebase/firestore'
-import { getStorage, ref, getDownloadURL } from 'firebase/storage'
-import AvatarCropper from '@/components/ui/AvatarCropper'
-import NotificationToast from '@/components/ui/NotificationToast'
+import { apiFetch } from '@/utils/common/apiFetch'
+import { getFirestoreDb } from '@/config/firebaseFirestore'
+import { doc, setDoc } from 'firebase/firestore'
+import { getDownloadURL, getStorage, ref } from 'firebase/storage'
+import { Copy } from 'lucide-react'
+import React, { useEffect, useState } from 'react'
+import { useDispatch } from 'react-redux'
+import { toast } from 'sonner'
 
 interface AccountSettingsModalProps {
   isOpen: boolean
@@ -113,13 +114,17 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
 
   // Use useLayoutEffect to ensure input readiness after state changes - reduce dependencies to prevent excessive re-runs
 
-  // Handle avatar file selection - now opens cropper
-  const [toast, setToast] = useState<{ visible: boolean; title: string; message: string, variant?: 'success' | 'warning' | 'error' }>(
-    { visible: false, title: '', message: '', variant: 'success' }
-  )
-
-  const showToast = (title: string, message: string, variant: 'success' | 'warning' | 'error' = 'success') => {
-    setToast({ visible: true, title, message, variant })
+  // Copy text to clipboard with success toast
+  const copyToClipboard = async (text: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      toast.success(`${label} copied!`)
+    } catch (error) {
+      console.error('Failed to copy to clipboard:', error)
+      toast.error('Copy failed', {
+        description: 'Failed to copy to clipboard'
+      })
+    }
   }
   const handleAvatarChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -128,14 +133,18 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
     // File type validation - supported formats
     const supportedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp']
     if (!supportedTypes.includes(file.type)) {
-      showToast('Unsupported file type', 'Please upload JPG, PNG, GIF, or WebP images.', 'warning')
+      toast.warning('Unsupported file type', {
+        description: 'Please upload JPG, PNG, GIF, or WebP images.'
+      })
       return
     }
 
     // File size validation - max 5MB
     const maxSize = 5 * 1024 * 1024 // 5MB in bytes
     if (file.size > maxSize) {
-      showToast('File size too large', 'Please upload an image smaller than 5MB.', 'warning')
+      toast.warning('File size too large', {
+        description: 'Please upload an image smaller than 5MB.'
+      })
       return
     }
 
@@ -170,15 +179,17 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
       localStorage.removeItem(`user_avatar_${userInfo.user_id}`)
       // Call backend to delete stored avatar
       try {
-        await http.delete(deleteUserAvatarEndpoint(userInfo.user_id), {
+        await apiFetch(deleteUserAvatarEndpoint(userInfo.user_id), {
+          method: 'DELETE',
           headers: {
             'Authorization': `Bearer ${await getAuthToken()}`,
           },
+          returnAxiosFormat: true,
         })
       } catch {}
       try {
         // Clear Firestore profile avatar to broadcast change across clients
-        const db = getFirestore()
+        const db = getFirestoreDb()
         const profileRef = doc(db, 'users', userInfo.user_id)
         const ts = Date.now()
         setDoc(profileRef, { avatar_url: '', avatarUpdatedAt: ts }, { merge: true })
@@ -208,7 +219,6 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
     setIsAvatarEditOpen(false)
   }
 
-  // Save all user preferences to localStorage AND backend following Kaze.ai pattern
   const saveUserPreferences = async () => {
     if (typeof window !== 'undefined' && userInfo?.user_id) {
       setIsLoading(true)
@@ -222,10 +232,13 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
           try {
             const form = new FormData()
             form.append('file', avatarFile)
-            const resp = await http.post(uploadUserAvatarEndpoint(userInfo.user_id), form, {
+            const resp = await apiFetch(uploadUserAvatarEndpoint(userInfo.user_id), {
+              method: 'POST',
+              body: form,
               headers: {
                 'Authorization': `Bearer ${await getAuthToken()}`,
-              }
+              },
+              returnAxiosFormat: true,
             })
             const data = resp.data
             const newUrl = data?.avatar_url || ''
@@ -240,7 +253,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
                 dispatch(setUserAvatarUrl(urlWithTs))
                 // write to Firestore profile to broadcast change
                 try {
-                  const db = getFirestore()
+                  const db = getFirestoreDb()
                   const profileRef = doc(db, 'users', userInfo.user_id)
                   await setDoc(profileRef, { avatar_url: newUrl, avatarUpdatedAt: ts }, { merge: true })
                 } catch (e) {
@@ -251,13 +264,18 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
               }
             }
           } catch (e) {
-            showToast('Avatar upload failed', 'Please try again.', 'error')
+            toast.error('Avatar upload failed', {
+              description: 'Please try again.'
+            })
           }
         } else if (avatarPreview && avatarPreview.startsWith('data:image')) {
           // Fallback: user changed avatar earlier (base64) but not picked a new file this time
           try {
-            const res = await http.get(avatarPreview, { responseType: 'blob' })
-            const blob = res.data
+            const res = await apiFetch(avatarPreview, {
+              method: 'GET',
+              isReturnResponse: true,
+            })
+            const blob = await res.blob()
             // Only accept JPEG/PNG
             const mime = blob.type
             if (!['image/jpeg','image/jpg','image/png'].includes(mime)) {
@@ -268,10 +286,13 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
             }
             const form = new FormData()
             form.append('file', new File([blob], `avatar.${mime.includes('png') ? 'png' : 'jpg'}`, { type: mime }))
-            const resp = await http.post(uploadUserAvatarEndpoint(userInfo.user_id), form, {
+            const resp = await apiFetch(uploadUserAvatarEndpoint(userInfo.user_id), {
+              method: 'POST',
+              body: form,
               headers: {
                 'Authorization': `Bearer ${await getAuthToken()}`,
-              }
+              },
+              returnAxiosFormat: true,
             })
             const data = resp.data
             const newUrl = data?.avatar_url || ''
@@ -285,7 +306,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
                 setAvatarPreview(urlWithTs)
                 dispatch(setUserAvatarUrl(urlWithTs))
                 try {
-                  const db = getFirestore()
+                  const db = getFirestoreDb()
                   const profileRef = doc(db, 'users', userInfo.user_id)
                   await setDoc(profileRef, { avatar_url: newUrl, avatarUpdatedAt: ts }, { merge: true })
                 } catch (e) {
@@ -337,7 +358,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
 
         // Step 2.5: Also write directly to Firestore to ensure cross-client sync
         try {
-          const db = getFirestore()
+          const db = getFirestoreDb()
           const profileRef = doc(db, 'users', userInfo.user_id)
           const updateData: any = {}
           
@@ -363,10 +384,11 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
           avatarPreview
         })
         
-        
+        toast.success('Settings saved', {
+          description: 'Your preferences have been saved successfully.'
+        })
         
         // Don't auto-close modal, let user decide
-        // Success feedback could be added here (toast, etc.)
       } catch (error) {
         console.error('Error saving user preferences:', error)
       } finally {
@@ -409,7 +431,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
         }
       }}>
       <DialogContent 
-        className="max-w-5xl w-[90vw] max-h-[90vh] overflow-y-auto bg-gray-50 border-gray-300 text-gray-900"
+        className="max-w-5xl w-[90vw] max-h-[90vh] overflow-y-auto bg-card border-border text-foreground"
         onPointerDownOutside={(e) => {
           // Prevent accidental closes when clicking inside
         }}
@@ -418,10 +440,10 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
         }}
       >
         <DialogHeader>
-          <DialogTitle className="text-xl font-semibold text-gray-800">
+          <DialogTitle className="text-xl font-semibold text-foreground">
             Account Settings
           </DialogTitle>
-          <DialogDescription className="text-gray-600">
+          <DialogDescription className="text-muted-foreground">
             manage your account settings and preferences
           </DialogDescription>
         </DialogHeader>
@@ -430,11 +452,11 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
         <div className="space-y-6 mt-6">
           {/* User Profile Section */}
           <div className="space-y-4">
-            <h3 className="text-base font-medium text-gray-700">Profile</h3>
+            <h3 className="text-base font-medium text-foreground">Profile</h3>
             
             <div className="flex items-center space-x-4">
               <div className="relative">
-                <Avatar key={avatarPreview || 'fallback'} className={`h-16 w-16 cursor-pointer hover:opacity-80 transition-opacity ${avatarPreview ? '' : 'bg-gray-200 text-gray-700'}`} onClick={() => setIsAvatarEditOpen(true)}>
+                <Avatar key={avatarPreview || 'fallback'} className={`h-16 w-16 cursor-pointer hover:opacity-80 transition-opacity ${avatarPreview ? '' : 'bg-muted text-muted-foreground'}`} onClick={() => setIsAvatarEditOpen(true)}>
                   {avatarPreview ? (
                     <AvatarImage 
                       src={avatarPreview} 
@@ -442,7 +464,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
                       onError={() => setAvatarPreview('')}
                     />
                   ) : null}
-                  <AvatarFallback delayMs={0} className="text-lg bg-gray-200 text-gray-700">
+                  <AvatarFallback delayMs={0} className="text-lg bg-muted text-muted-foreground">
                     {preferredName 
                       ? preferredName.charAt(0).toUpperCase() 
                       : userInfo?.email 
@@ -458,54 +480,60 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
                   onChange={handleAvatarChange}
                   className="hidden"
                 />
-                <button
+                <Button
                   onClick={() => setIsAvatarEditOpen(true)}
-                  className="absolute bottom-0 right-0 bg-blue-600 hover:bg-blue-700 text-white rounded-full p-1 cursor-pointer transition-colors"
+                  size="icon"
+                  className="absolute bottom-0 right-0 h-6 w-6 rounded-full"
                 >
                   <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
                   </svg>
-                </button>
+                </Button>
               </div>
               <div>
-                <div className="font-medium text-gray-800">{preferredName || userInfo?.email}</div>
-                <div className="text-sm text-gray-500">User ID: {userInfo.user_id}</div>
+                <div className="font-medium text-foreground">{preferredName || userInfo?.email}</div>
+                <div className="flex items-start gap-2 text-sm text-muted-foreground">
+                  <span 
+                    className="cursor-pointer hover:text-foreground transition-colors"
+                    onClick={() => copyToClipboard(userInfo.user_id, 'User ID')}
+                    title="Click to copy User ID"
+                  >
+                    User ID: {userInfo.user_id}
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => copyToClipboard(userInfo.user_id, 'User ID')}
+                    className="h-6 w-6 p-0 hover:bg-accent -mt-0.5"
+                  >
+                    <Copy className="h-3 w-3" />
+                  </Button>
+                </div>
               </div>
             </div>
           </div>
 
-          <Separator className="bg-gray-300" />
+          <Separator className="bg-border" />
 
           {/* Preferred Name Section */}
           <div className="space-y-4">
             <div className="flex justify-between items-center">
-              <h3 className="text-base font-medium text-gray-700">Personal Information</h3>
-              <div className="flex space-x-2">
-                <Button
-                  onClick={saveUserPreferences}
-                  disabled={isLoading}
-                  className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                  size="sm"
-                >
-                  {isLoading ? 'Saving...' : 'Save Changes'}
-                </Button>
-                <Button
-                  onClick={handleClose}
-                  variant="outline"
-                  className="border-gray-300 text-gray-700 hover:bg-white"
-                  size="sm"
-                >
-                  Close
-                </Button>
-              </div>
+              <h3 className="text-base font-medium text-foreground">Personal Information</h3>
+              <Button
+                onClick={saveUserPreferences}
+                disabled={isLoading}
+                size="sm"
+              >
+                {isLoading ? 'Saving...' : 'Save Changes'}
+              </Button>
             </div>
             
             <div className="space-y-4">
               <div>
-                <Label htmlFor="preferredName" className="text-sm font-medium text-gray-600">
+                <Label htmlFor="preferredName" className="text-sm font-medium text-muted-foreground">
                   Preferred Name
                 </Label>
-                <p className="text-xs text-gray-500 mt-1">
+                <p className="text-xs text-muted-foreground mt-1">
                   This will be displayed instead of your email in the profile
                 </p>
                 <Input
@@ -513,19 +541,19 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
                   value={preferredName}
                   onChange={(e) => setPreferredName(e.target.value)}
                   placeholder="Enter your preferred name"
-                  className="mt-2 bg-white border-gray-300 text-gray-800"
+                  className="mt-2 bg-background border-border text-foreground"
                   maxLength={50}
                 />
-                <div className="text-xs text-gray-500 mt-1">
+                <div className="text-xs text-muted-foreground mt-1">
                   Character count: {preferredName.length}/50
                 </div>
               </div>
 
               <div>
-                <Label htmlFor="organization" className="text-sm font-medium text-gray-600">
+                <Label htmlFor="organization" className="text-sm font-medium text-muted-foreground">
                   Organization
                 </Label>
-                <p className="text-xs text-gray-500 mt-1">
+                <p className="text-xs text-muted-foreground mt-1">
                   Your company or organization name
                 </p>
                 <Input
@@ -533,19 +561,19 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
                   value={organization}
                   onChange={(e) => setOrganization(e.target.value)}
                   placeholder="Enter your organization"
-                  className="mt-2 bg-white border-gray-300 text-gray-800"
+                  className="mt-2 bg-background border-border text-foreground"
                   maxLength={100}
                 />
-                <div className="text-xs text-gray-500 mt-1">
+                <div className="text-xs text-muted-foreground mt-1">
                   Character count: {organization.length}/100
                 </div>
               </div>
 
               <div>
-                <Label htmlFor="customTitle" className="text-sm font-medium text-gray-600">
+                <Label htmlFor="customTitle" className="text-sm font-medium text-muted-foreground">
                   Custom Title
                 </Label>
-                <p className="text-xs text-gray-500 mt-1">
+                <p className="text-xs text-muted-foreground mt-1">
                   This will be displayed in your profile dropdown
                 </p>
                 <Input
@@ -553,31 +581,41 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
                   value={customTitle}
                   onChange={(e) => setCustomTitle(e.target.value)}
                   placeholder="Enter your custom title"
-                  className="mt-2 bg-white border-gray-300 text-gray-800"
+                  className="mt-2 bg-background border-border text-foreground"
                   maxLength={50}
                 />
-                <div className="text-xs text-gray-500 mt-1">
+                <div className="text-xs text-muted-foreground mt-1">
                   Character count: {customTitle.length}/50
                 </div>
               </div>
             </div>
           </div>
 
-          <Separator className="bg-gray-300" />
+          <Separator className="bg-border" />
 
           {/* Account Management */}
           <div className="space-y-4">
-            <h3 className="text-base font-medium text-gray-700">Account Management</h3>
+            <h3 className="text-base font-medium text-foreground">Account Management</h3>
             
             <div className="space-y-3">
               <div>
-                <h4 className="text-sm font-medium text-gray-600">Email</h4>
-                <p className="text-sm text-gray-500">{userInfo?.email}</p>
+                <h4 className="text-sm font-medium text-muted-foreground">Email</h4>
+                <div className="flex items-start gap-2">
+                  <p className="text-sm text-muted-foreground">{userInfo?.email}</p>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => copyToClipboard(userInfo?.email || '', 'Email')}
+                    className="h-6 w-6 p-0 hover:bg-accent -mt-0.5"
+                  >
+                    <Copy className="h-3 w-3" />
+                  </Button>
+                </div>
               </div>
               
               <div>
-                <h4 className="text-sm font-medium text-gray-600">Account Created</h4>
-                <p className="text-sm text-gray-500">
+                <h4 className="text-sm font-medium text-muted-foreground">Account Created</h4>
+                <p className="text-sm text-muted-foreground">
                   {userInfo.registered_at 
                     ? (() => {
                         // Handle different timestamp formats
@@ -611,17 +649,17 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
             </div>
           </div>
 
-          <Separator className="bg-gray-300" />
+          <Separator className="bg-border" />
 
           {/* Danger Zone */}
           <div className="space-y-4">
-            <h3 className="text-base font-medium text-red-600">Danger Zone</h3>
+            <h3 className="text-base font-medium text-destructive">Danger Zone</h3>
             
-            <div className="bg-red-50 border border-red-300 rounded-lg p-4">
+            <div className="bg-destructive/10 border border-destructive/30 rounded-lg p-4">
               <div className="flex justify-between items-start">
                 <div>
-                  <h4 className="text-sm font-medium text-red-700">Delete Account</h4>
-                  <p className="text-xs text-red-600 mt-1">
+                  <h4 className="text-sm font-medium text-destructive">Delete Account</h4>
+                  <p className="text-xs text-destructive/80 mt-1">
                     Once you delete your account, there is no going back. Please be certain.
                   </p>
                 </div>
@@ -643,12 +681,12 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
 
       {/* Avatar Edit Modal */}
       <Dialog open={isAvatarEditOpen} onOpenChange={setIsAvatarEditOpen}>
-        <DialogContent className="max-w-md bg-gray-50 border-gray-300 text-gray-900">
+        <DialogContent className="max-w-md bg-card border-border text-foreground">
           <DialogHeader>
-            <DialogTitle className="text-lg font-semibold text-gray-800">
+            <DialogTitle className="text-lg font-semibold text-foreground">
               Edit Profile Photo
             </DialogTitle>
-            <DialogDescription className="text-gray-600">
+            <DialogDescription className="text-muted-foreground">
               Update or remove your profile photo
             </DialogDescription>
           </DialogHeader>
@@ -656,7 +694,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
           <div className="space-y-6 mt-6">
             {/* Current Avatar Preview */}
             <div className="flex justify-center">
-              <Avatar key={avatarPreview || 'fallback'} className={`h-24 w-24 ${avatarPreview ? '' : 'bg-gray-200 text-gray-700'}`}>
+              <Avatar key={avatarPreview || 'fallback'} className={`h-24 w-24 ${avatarPreview ? '' : 'bg-muted text-muted-foreground'}`}>
                 {avatarPreview ? (
                   <AvatarImage 
                     src={avatarPreview} 
@@ -664,7 +702,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
                     onError={() => setAvatarPreview('')}
                   />
                 ) : null}
-                <AvatarFallback delayMs={0} className="text-2xl bg-gray-200 text-gray-700">
+                <AvatarFallback delayMs={0} className="text-2xl bg-muted text-muted-foreground">
                   {preferredName 
                     ? preferredName.charAt(0).toUpperCase() 
                     : userInfo?.email 
@@ -679,7 +717,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
             <div className="space-y-3">
               <Button
                 asChild
-                className="w-full bg-blue-600 hover:bg-blue-700"
+                className="w-full"
               >
                 <label htmlFor="avatar-upload-modal" className="cursor-pointer">
                   <svg className="h-4 w-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -701,7 +739,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
                 <Button
                   onClick={handleAvatarDelete}
                   variant="outline"
-                  className="w-full border-red-300 text-red-600 hover:bg-red-50 hover:border-red-400"
+                  className="w-full border-destructive/30 text-destructive hover:bg-destructive/10 hover:border-destructive/40"
                 >
                   <svg className="h-4 w-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
@@ -712,18 +750,18 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
             </div>
 
             {/* Info Text */}
-            <div className="text-xs text-gray-500 text-center">
+            <div className="text-xs text-muted-foreground text-center">
               Supported formats: JPG, PNG, GIF, WebP<br />
               Maximum file size: 5MB<br />
-              <span className="text-blue-600">Crop and resize after upload</span>
+              <span className="text-primary">Crop and resize after upload</span>
             </div>
           </div>
 
-          <div className="flex justify-end mt-6 pt-4 border-t border-gray-300">
+          <div className="flex justify-end mt-6 pt-4 border-t border-border">
             <Button
               onClick={() => setIsAvatarEditOpen(false)}
               variant="outline"
-              className="border-gray-300 text-gray-700 hover:bg-white"
+              className="border-border text-foreground hover:bg-accent"
             >
               Close
             </Button>
@@ -740,13 +778,6 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
         fileName={originalFileName}
       />
 
-      <NotificationToast
-        isVisible={toast.visible}
-        title={toast.title}
-        message={toast.message}
-        onDismiss={() => setToast((t) => ({ ...t, visible: false }))}
-        variant={toast.variant}
-      />
     </div>
   )
 }

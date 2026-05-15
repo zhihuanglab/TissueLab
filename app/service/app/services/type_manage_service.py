@@ -3,12 +3,12 @@ from datetime import datetime
 
 class TypeManageHandler:
     def __init__(self):
-        # format：{idx: {"color": ..., "category": ..., "timestamp": ...}}
+        # format: {idx: {"color": ..., "category": ..., "timestamp": ...}}
         self.type_data = {}
 
     def update_type(self, idx, color, category):
         """
-        add or update based on idx (uid)。
+        add or update based on idx (uid).
         """
         self.type_data[idx] = {
             "color": color,

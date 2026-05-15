@@ -1,25 +1,128 @@
-const { app, BrowserWindow, ipcMain, dialog, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu, shell, safeStorage } = require('electron');
 const path = require('path');
-const express = require('express');
 const fs = require('fs').promises;
 const fssync = require('fs');
 const os = require('os');
+const http = require('http');
+const net = require('net');
+const { performGoogleOAuth, refreshGoogleToken } = require('./ipc/oauth-helpers');
+const { setupProtocolHandlers } = require('./ipc/protocol-helpers');
 // const ProjectBehaviorRecording = require('./services/recording/projectBehaviorRecording');
 
 let mainWindow;
-let expressApp;
-let expressServer;
+
+let currentTitleBarTheme = 'dark';
+
+let activeDownloads = new Map();
 
 const isWindows = process.platform === 'win32';
 const isMac = process.platform === 'darwin';
 
-// Enable GPU acceleration and monitor rendering
-app.commandLine.appendSwitch('enable-accelerated-2d-canvas');
-app.commandLine.appendSwitch('enable-webgl');
-app.commandLine.appendSwitch('ignore-gpu-blacklist');
-app.commandLine.appendSwitch('enable-gpu-rasterization');
-app.commandLine.appendSwitch('disable-software-rasterizer');
-app.commandLine.appendSwitch('disable-gpu-vsync');
+// Store backend port (default to 5001)
+let backendPort = 5001;
+const NEXTJS_URL = 'http://localhost:3000';
+
+// Function to get backend port
+function getBackendPort() {
+  return backendPort;
+}
+
+function checkNextjsServerReady(url, callback, maxAttempts = 120, retryIntervalMs = 200, initialDelayMs = 0) {
+  let attempts = 0;
+  let callbackInvoked = false;
+  const parsed = new URL(url);
+  const host = parsed.hostname || '127.0.0.1';
+  const port = Number(parsed.port) || (parsed.protocol === 'https:' ? 443 : 80);
+
+  const check = () => {
+    if (callbackInvoked) {
+      return;
+    }
+
+    attempts++;
+    console.log(`[ELECTRON] Checking Next.js server... (attempt ${attempts}/${maxAttempts})`);
+
+    const socket = net.createConnection({ host, port });
+    socket.setTimeout(800);
+    let retryScheduled = false;
+
+    socket.on('connect', () => {
+      socket.destroy();
+
+      // Verify the server is actually serving HTTP responses.
+      const req = http.get(url, { timeout: 2000 }, (res) => {
+        res.resume();
+        if (callbackInvoked || retryScheduled) {
+          return;
+        }
+
+        const statusCode = res.statusCode || 0;
+        if (statusCode >= 200 && statusCode < 500) {
+          console.log(`[ELECTRON] Next.js server is ready on ${host}:${port} (HTTP ${statusCode})`);
+          callbackInvoked = true;
+          callback(true);
+        } else {
+          scheduleRetry();
+        }
+      });
+
+      req.on('error', scheduleRetry);
+      req.on('timeout', () => {
+        req.destroy();
+        scheduleRetry();
+      });
+    });
+
+    const scheduleRetry = () => {
+      if (callbackInvoked || retryScheduled) {
+        return;
+      }
+      retryScheduled = true;
+      socket.destroy();
+      if (attempts >= maxAttempts) {
+        console.error(`[ELECTRON] Next.js server failed to start after ${maxAttempts} attempts`);
+        callbackInvoked = true;
+        callback(false);
+      } else {
+        setTimeout(check, retryIntervalMs);
+      }
+    };
+
+    socket.on('error', scheduleRetry);
+    socket.on('timeout', scheduleRetry);
+  };
+
+  if (initialDelayMs > 0) {
+    setTimeout(check, initialDelayMs);
+  } else {
+    check();
+  }
+}
+
+// Register custom deep link protocol handlers
+setupProtocolHandlers(app, () => mainWindow);
+
+// Configure GPU features for best compatibility and performance:
+// - Enable WebGL (required for image viewer)
+// - Allow WebGL even if GPU is blacklisted
+// - Enable 2D canvas acceleration for better performance
+app.commandLine.appendSwitch('enable-webgl'); // Keep WebGL enabled
+app.commandLine.appendSwitch('ignore-gpu-blacklist'); // Allow WebGL even if GPU is blacklisted
+app.commandLine.appendSwitch('enable-accelerated-2d-canvas'); // Enable 2D canvas acceleration
+
+// Disable GPU features that may cause rendering artifacts when window is resized/scaled:
+// - Disable GPU rasterization to prevent known artifacts
+// - Enable software rasterizer as fallback (won't affect WebGL)
+// app.commandLine.appendSwitch('disable-gpu-rasterization'); // Disable GPU rasterization
+app.commandLine.appendSwitch('enable-software-rasterizer'); // Enable software rasterizer as fallback
+
+// macOS Metal compositor occasionally tries to ProduceOverlay against a stale
+// SharedImage mailbox after window resize / focus change, spamming
+// "Invalid mailbox" / "non-existent mailbox" errors. Disabling CoreAnimation
+// layer overlays stops that path without affecting WebGL / 2D canvas.
+if (process.platform === 'darwin') {
+  app.commandLine.appendSwitch('disable-features', 'CALayerOverlays,VideoToolboxVideoDecoder');
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -29,19 +132,19 @@ function createWindow() {
     ...(isWindows ? {
       titleBarStyle: 'hidden',
       titleBarOverlay: {
-        color: '#0f172a',
-        symbolColor: '#e2e8f0',
-        height: 56
+        color: '#F9FAFB',
+        symbolColor: '#000000',
+        height: 40
       }
     } : {}),
-    backgroundColor: '#0f172a',
+    backgroundColor: '#F9FAFB',
     // For Mac, use hidden title bar like Slack for modern look
     ...(isMac ? {
       titleBarStyle: 'hidden',
       titleBarOverlay: {
         color: '#0f172a',
         symbolColor: '#e2e8f0',
-        height: 28
+        height: 22
       }
     } : {}),
     // trafficLightPosition: { x: 20, y: 20 }, // Position the traffic lights
@@ -61,7 +164,7 @@ function createWindow() {
 
   // Graphics Feature Status
   // mainWindow.loadURL('chrome://gpu');
-  mainWindow.loadURL('http://localhost:3000');
+  mainWindow.loadURL(NEXTJS_URL);
   // const GPUFeatureStatus = app.getGPUFeatureStatus()
   // console.log(GPUFeatureStatus)
 
@@ -77,7 +180,7 @@ function createWindow() {
           label: 'Reload',
           click: () => {
             if (mainWindow) {
-              mainWindow.loadURL('http://localhost:3000');
+              mainWindow.loadURL(NEXTJS_URL);
             }
           }
         }
@@ -87,31 +190,6 @@ function createWindow() {
 
   // Set new application menu
   Menu.setApplicationMenu(customMenuTemplate);
-
-  // Handle IPC messages from renderer
-  const { ipcMain } = require('electron');
-  
-  ipcMain.on('show-application-menu', (event, position) => {
-    // Get the menu and show it at the button position
-    const menu = Menu.getApplicationMenu();
-    if (menu) {
-      if (position && position.x !== undefined && position.y !== undefined) {
-        // Use the position sent from renderer
-        menu.popup({
-          window: mainWindow,
-          x: position.x,
-          y: position.y
-        });
-      } else {
-        // Fallback to default position
-        menu.popup({
-          window: mainWindow,
-          x: 10,
-          y: 30
-        });
-      }
-    }
-  });
 
   // Open dev tools for debugging in detached window to avoid docked close issues
   mainWindow.webContents.openDevTools({ mode: 'detach' });
@@ -130,15 +208,173 @@ function createWindow() {
   });
 }
 
-function startExpressServer() {
-  expressApp = express();
-  const frontEndPath = path.join(__dirname, '../render/out');
-  expressApp.use(express.static(frontEndPath));
+// Handle IPC messages from renderer
+// These handlers are registered once outside createWindow() to prevent duplicate listeners
 
-  expressServer = expressApp.listen(3000, () => {
-    console.log('Express server running on http://localhost:3000');
-  });
-}
+ipcMain.on('show-application-menu', (event, position) => {
+  // Get the menu and show it at the button position
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+  const menu = Menu.getApplicationMenu();
+  if (menu) {
+    if (position && position.x !== undefined && position.y !== undefined) {
+      // Use the position sent from renderer
+      menu.popup({
+        window: mainWindow,
+        x: position.x,
+        y: position.y
+      });
+    } else {
+      // Fallback to default position
+      menu.popup({
+        window: mainWindow,
+        x: 10,
+        y: 30
+      });
+    }
+  }
+});
+
+// Handle theme change to update title bar overlay colors
+ipcMain.on('update-titlebar-theme', (event, theme) => {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+
+  currentTitleBarTheme = theme || 'dark';
+
+  // Define colors for light and dark themes
+  const themeColors = {
+    light: {
+      color: '#F9FAFB',        // Light gray background (slate-50)
+      symbolColor: '#000000'   // Black symbols (buttons)
+    },
+    dark: {
+      color: '#0B111E',        // Dark background
+      symbolColor: '#E2E8F0'   // Light gray symbols on hover (slate-200)
+    }
+  };
+
+  const colors = themeColors[currentTitleBarTheme] || themeColors.dark;
+
+  // Update window background color
+  try {
+    const bgColor = colors.color;
+    mainWindow.setBackgroundColor(bgColor);
+    console.log(`[ELECTRON] Updated window background color for ${currentTitleBarTheme} theme: ${bgColor}`);
+  } catch (error) {
+    console.error('[ELECTRON] Failed to update window background color:', error);
+  }
+
+  // Update title bar overlay for Windows
+  if (isWindows && mainWindow.setTitleBarOverlay) {
+    try {
+      mainWindow.setTitleBarOverlay({
+        color: colors.color,
+        symbolColor: colors.symbolColor,
+        height: 40
+      });
+      console.log(`[ELECTRON] Updated Windows title bar overlay for ${currentTitleBarTheme} theme`);
+    } catch (error) {
+      console.error('[ELECTRON] Failed to update title bar overlay:', error);
+    }
+  }
+
+  // Update title bar overlay for macOS
+  if (isMac && mainWindow.setTitleBarOverlay) {
+    try {
+      mainWindow.setTitleBarOverlay({
+        color: colors.color,
+        symbolColor: colors.symbolColor,
+        height: 22
+      });
+      console.log(`[ELECTRON] Updated macOS title bar overlay for ${currentTitleBarTheme} theme`);
+    } catch (error) {
+      console.error('[ELECTRON] Failed to update title bar overlay:', error);
+    }
+  }
+});
+
+// Last applied modal titlebar state — skip duplicate IPC when nothing changed
+let lastTitlebarOverlaySignature = '';
+
+// Handle modal overlay state to update title bar overlay (for visual consistency)
+ipcMain.on('update-titlebar-overlay', (event, { isModalOpen, currentTheme }) => {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+
+  const theme = currentTheme || currentTitleBarTheme;
+
+  const themeColors = {
+    light: {
+      color: '#F9FAFB',
+      symbolColor: '#000000'
+    },
+    dark: {
+      color: '#0B111E',
+      symbolColor: '#E2E8F0'
+    }
+  };
+
+  let colors;
+  if (isModalOpen) {
+    if (theme === 'light') {
+      colors = {
+        color: '#323232',
+        symbolColor: '#E5E7EB'
+      };
+    } else {
+      colors = {
+        color: '#000000',
+        symbolColor: '#6B7280'
+      };
+    }
+  } else {
+    colors = themeColors[theme] || themeColors.dark;
+  }
+
+  const overlaySignature = `${isModalOpen}|${theme}|${colors.color}|${colors.symbolColor}`;
+  if (overlaySignature === lastTitlebarOverlaySignature) {
+    return;
+  }
+  lastTitlebarOverlaySignature = overlaySignature;
+
+  try {
+    const bgColor = colors.color;
+    mainWindow.setBackgroundColor(bgColor);
+    console.log(`[ELECTRON] Updated window background color for modal overlay (${isModalOpen ? 'open' : 'closed'}): ${bgColor}`);
+  } catch (error) {
+    console.error('[ELECTRON] Failed to update window background color:', error);
+  }
+
+  if (isWindows && mainWindow.setTitleBarOverlay) {
+    try {
+      mainWindow.setTitleBarOverlay({
+        color: colors.color,
+        symbolColor: colors.symbolColor,
+        height: 40
+      });
+      console.log(`[ELECTRON] Updated Windows title bar overlay for modal overlay (${isModalOpen ? 'open' : 'closed'})`);
+    } catch (error) {
+      console.error('[ELECTRON] Failed to update title bar overlay:', error);
+    }
+  }
+
+  if (isMac && mainWindow.setTitleBarOverlay) {
+    try {
+      mainWindow.setTitleBarOverlay({
+        color: colors.color,
+        symbolColor: colors.symbolColor,
+        height: 22
+      });
+      console.log(`[ELECTRON] Updated macOS title bar overlay for modal overlay (${isModalOpen ? 'open' : 'closed'})`);
+    } catch (error) {
+      console.error('[ELECTRON] Failed to update title bar overlay:', error);
+    }
+  }
+});
 
 ipcMain.handle('open-folder-dialog', async () => {
   const result = await dialog.showOpenDialog({
@@ -163,75 +399,43 @@ ipcMain.handle('save-file-dialog', async (event, options) => {
   return result;
 });
 
-// Download a remote URL via Chromium and prompt user to save in the current window
+const { downloadFile, extractAndPersist } = require('./ipc/tasknode-helpers');
+
+// Download a remote URL via Chromium
 ipcMain.handle('download-signed-url', async (event, payload) => {
-  try {
-    const { url, filename } = payload || {};
-    if (!url) return { ok: false, error: 'Missing URL' };
-    const win = BrowserWindow.fromWebContents(event.sender) || mainWindow;
-    const suggestion = filename && typeof filename === 'string' ? filename : 'download.bin';
-    const { canceled, filePath } = await dialog.showSaveDialog(win, { defaultPath: suggestion });
-    if (canceled || !filePath) return { ok: false, cancelled: true };
-    
-    const userDir = require('path').dirname(filePath);
-    const userBaseName = require('path').basename(filePath, require('path').extname(filePath));
+  const win = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+  return downloadFile({
+    url: payload?.url,
+    filename: payload?.filename,
+    showSaveDialog: payload?.showSaveDialog !== false,
+    window: win,
+    activeDownloads
+  });
+});
 
-    // Force the correct extension based on suggested filename
-    let correctedPath = filePath;
-    if (filename && filename.includes('.')) {
-      const suggestedExt = filename.substring(filename.lastIndexOf('.'));
-      const userExt = filePath.includes('.') ? filePath.substring(filePath.lastIndexOf('.')) : '';
-      
-      if (!userExt || userExt !== suggestedExt) {
-        const basePath = userExt ? filePath.substring(0, filePath.lastIndexOf('.')) : filePath;
-        correctedPath = basePath + suggestedExt;
-      }
-    }
+// Extract ZIP and persist to registry
+ipcMain.handle('extract-zip-and-persist', async (event, payload) => {
+  const win = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+  return extractAndPersist({
+    zipPath: payload?.zipPath,
+    modelName: payload?.modelName,
+    factory: payload?.factory,
+    window: win,
+    url: payload?.url
+  });
+});
 
-    const session = win.webContents.session;
-    const willDownload = (_evt, item) => {
-      session.removeListener('will-download', willDownload);
-      
-      console.log('🔍 [Main Process] Download Debug:');
-      console.log('- URL:', url);
-      console.log('- User selected path:', filePath);
-      console.log('- Suggested filename:', filename);
-      console.log('- Corrected path:', correctedPath);
-      
-      // Use the pre-corrected path
-      try {
-        item.setSavePath(correctedPath);
-        console.log('Set save path to:', correctedPath);
-      } catch (e) {
-        console.error('Failed to set save path:', e.message);
-        // Fallback to original path
-        try {
-          item.setSavePath(filePath);
-          console.log('🔄 Fallback to original path:', filePath);
-        } catch (e2) {
-          console.error('Fallback also failed:', e2.message);
-        }
-      }
-      
-      item.on('updated', (_e, state) => {
-        if (state === 'progressing' && !item.isPaused()) {
-          const receivedBytes = item.getReceivedBytes();
-          const totalBytes = item.getTotalBytes();
-          win.webContents.send('download-progress', { url, state, receivedBytes, totalBytes });
-        }
-      });
-      item.once('done', (_e, state) => {
-        const actualPath = item.getSavePath();
-        console.log('- Download completed, actual save path:', actualPath);
-        win.webContents.send('download-progress', { url, state: state === 'completed' ? 'completed' : state, filePath: actualPath });
-      });
-    };
-    session.once('will-download', willDownload);
-    win.webContents.downloadURL(url);
-    return { ok: true, started: true, target: filePath };
-  } catch (err) {
-    return { ok: false, error: String(err && err.message || err) };
+ipcMain.handle('cancel-download', async (event, downloadUrl) => {
+  const downloadItem = activeDownloads.get(downloadUrl);
+
+  if (downloadItem && !downloadItem.isDone()) {
+    downloadItem.cancel();
+    activeDownloads.delete(downloadUrl);
+    console.log('Download cancelled by user');
+    return { ok: true, cancelled: true };
   }
+
+  return { ok: false, error: 'No active download found' };
 });
 
 // list files in directory
@@ -270,6 +474,15 @@ ipcMain.handle('create-local-folder', async (event, folderPath) => {
 // rename file
 ipcMain.handle('rename-local-file', async (event, oldPath, newPath) => {
   await fs.rename(oldPath, newPath);
+  return true;
+});
+
+// Reveal file or folder in Explorer / Finder / file manager
+ipcMain.handle('show-item-in-folder', async (event, fullPath) => {
+  if (!fullPath || typeof fullPath !== 'string') {
+    throw new Error('Invalid path');
+  }
+  shell.showItemInFolder(fullPath);
   return true;
 });
 
@@ -335,12 +548,158 @@ ipcMain.handle('write-file', async (event, options) => {
   }
 });
 
-// Launch Django service
-app.on('ready', () => {
+// Google OAuth - PKCE-based browser authentication
+// Desktop client "secret" is bundled with the app — not truly confidential per Google's OAuth spec
+ipcMain.handle('google-oauth', async (event, { clientId, clientSecret }) => {
+  return await performGoogleOAuth({
+    clientId,
+    clientSecret,
+    openExternal: shell.openExternal.bind(shell)
+  });
+});
 
-  // start express server
-  // startExpressServer();
-  createWindow();
+// Refresh Google OAuth token using refresh_token
+ipcMain.handle('google-refresh-token', async (event, { refreshToken, clientId, clientSecret }) => {
+  return await refreshGoogleToken({
+    refreshToken,
+    clientId,
+    clientSecret
+  });
+});
+
+// Save refresh token securely using Electron's safeStorage
+ipcMain.handle('save-refresh-token', async (event, { token }) => {
+  try {
+    if (!token) {
+      throw new Error('Token is required');
+    }
+    
+    // Use safeStorage to encrypt the token
+    if (safeStorage.isEncryptionAvailable()) {
+      const encrypted = safeStorage.encryptString(token);
+      const tokenPath = path.join(app.getPath('userData'), 'refresh_token.enc');
+      await fs.writeFile(tokenPath, encrypted);
+      console.log('[Auth] Refresh token saved securely');
+      return { success: true };
+    } else {
+      console.warn('[Auth] Encryption not available, storing token in plain text (not recommended)');
+      const tokenPath = path.join(app.getPath('userData'), 'refresh_token.txt');
+      await fs.writeFile(tokenPath, token, 'utf8');
+      
+      // Set restrictive file permissions on Unix-like systems
+      if (process.platform !== 'win32') {
+        await fs.chmod(tokenPath, 0o600);
+        console.log('[Auth] Set file permissions to 0600 (owner read/write only)');
+      }
+      
+      return { success: true, warning: 'Stored in plain text' };
+    }
+  } catch (error) {
+    console.error('[Auth] Failed to save refresh token:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Get refresh token from secure storage
+ipcMain.handle('get-refresh-token', async () => {
+  try {
+    const encryptedPath = path.join(app.getPath('userData'), 'refresh_token.enc');
+    const plainPath = path.join(app.getPath('userData'), 'refresh_token.txt');
+    
+    // Try encrypted file first
+    try {
+      const encrypted = await fs.readFile(encryptedPath);
+      if (safeStorage.isEncryptionAvailable()) {
+        const token = safeStorage.decryptString(encrypted);
+        console.log('[Auth] Retrieved encrypted refresh token');
+        return { success: true, token };
+      } else {
+        console.error('[Auth] Cannot decrypt token - encryption not available');
+        return { success: false, error: 'Encryption not available' };
+      }
+    } catch (encryptedError) {
+      // Encrypted file doesn't exist or can't be read, try plain text
+      if (encryptedError.code !== 'ENOENT') {
+        // Real error, not just file missing
+        throw encryptedError;
+      }
+    }
+    
+    // Try plain text file
+    try {
+      const token = await fs.readFile(plainPath, 'utf8');
+      console.log('[Auth] Retrieved plain text refresh token');
+      return { success: true, token };
+    } catch (plainError) {
+      if (plainError.code === 'ENOENT') {
+        // No token found
+        return { success: false, error: 'No refresh token found' };
+      }
+      throw plainError;
+    }
+  } catch (error) {
+    console.error('[Auth] Failed to get refresh token:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Delete refresh token from storage
+ipcMain.handle('delete-refresh-token', async () => {
+  try {
+    const encryptedPath = path.join(app.getPath('userData'), 'refresh_token.enc');
+    const plainPath = path.join(app.getPath('userData'), 'refresh_token.txt');
+    
+    // Try to delete both files (ignore ENOENT errors if they don't exist)
+    try {
+      await fs.unlink(encryptedPath);
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error; // Re-throw if it's not a "file not found" error
+      }
+    }
+    
+    try {
+      await fs.unlink(plainPath);
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error; // Re-throw if it's not a "file not found" error
+      }
+    }
+    
+    console.log('[Auth] Refresh token deleted');
+    return { success: true };
+  } catch (error) {
+    console.error('[Auth] Failed to delete refresh token:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Get backend port
+ipcMain.handle('get-backend-port', () => {
+  return getBackendPort();
+});
+
+
+// Launch Django service
+app.whenReady().then(() => {
+
+  // Register as default protocol handler (tissuelab://)
+  try {
+    const registered = app.setAsDefaultProtocolClient('tissuelab');
+    console.log('[Protocol] setAsDefaultProtocolClient(tissuelab):', registered);
+  } catch (e) {
+    console.warn('[Protocol] Failed to register protocol handler:', e.message);
+  }
+
+  checkNextjsServerReady(NEXTJS_URL, (isReady) => {
+    if (isReady) {
+      createWindow();
+      return;
+    }
+
+    console.error('[ELECTRON] Next.js server failed to start after multiple attempts. Exiting application.');
+    app.quit();
+  });
   // registerReduxSyncHandlers();
 });
 
@@ -356,18 +715,14 @@ app.on('window-all-closed', () => {
 // Handle macOS dock icon click - reopen window when clicked
 app.on('activate', () => {
   if (mainWindow === null) {
-    createWindow();
+    checkNextjsServerReady(NEXTJS_URL, (isReady) => {
+      if (isReady) {
+        createWindow();
+      } else {
+        console.error('[ELECTRON] Next.js server is not ready yet, skip window creation on activate.');
+      }
+    }, 30);
   }
-});
-
-// close express server
-app.on('before-quit', () => {
-  if (expressServer) {
-    expressServer.close(() => {
-      console.log('Express server has been closed.');
-    });
-  }
-  // clearInterval(saveCoordinatesInterval);
 });
 
 // Handle quitting the app

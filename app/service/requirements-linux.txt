@@ -77,6 +77,7 @@ networkx==3.2.1
 ngff-zarr==0.8.7
 numcodecs==0.12.1
 numpy==1.26.4
+orjson
 ome-types==0.5.2
 ome-zarr==0.9.0
 packaging==24.2
@@ -125,13 +126,17 @@ yarl==1.17.1
 zarr==2.17.2
 zict==3.0.0
 zipp==3.21.0
+zstandard
 nibabel==5.3.2
 numba==0.61.2
 pylibCZIrw
 pyisyntax
 pyvips[binary]
 czifile
-tissuelab_sdk==0.1.8
+tissuelab_sdk==0.1.12
 # thumbnail-task-distributor dependencies
 celery
 zmq
+datasets
+fairscale
+einops

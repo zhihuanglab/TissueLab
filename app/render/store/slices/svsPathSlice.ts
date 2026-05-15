@@ -120,7 +120,10 @@ const svsPathSlice = createSlice({
     },
     updateTotalAnnotations: (state, action: PayloadAction<number>) => {
       state.slideInfo.totalAnnotations = action.payload;
-    }
+    },
+    resetSvsPath: () => {
+      return initialState;
+    },
   },
 });
 
@@ -135,7 +138,8 @@ export const {
   setSlideInfo,
   updateProcessingStatus,
   updateTotalCells,
-  updateTotalAnnotations
+  updateTotalAnnotations,
+  resetSvsPath
 } = svsPathSlice.actions;
 
 export default svsPathSlice.reducer; 

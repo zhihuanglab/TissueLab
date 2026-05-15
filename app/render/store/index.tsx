@@ -4,35 +4,34 @@ import { combineReducers } from 'redux'
 // Removed redux-persist - using localStorage directly for lightweight data like tissuelab.org
 
 import userReducer from './slices/userSlice'
-import sidebarReducer from './slices/sidebarSlice'
+import layoutReducer from './slices/layoutSlice'
 import themeReducer from './slices/themeSlice'
-import uploadedFilesReducer from './slices/uploadedFilesSlice'
-import annotationReducer from "@/store/slices/annotationSlice";
-import coPilotReducer from "@/store/slices/coPilotSlice";
+import fileManagerReducer from './slices/fileManagerSlice'
+import annotationReducer from "@/store/slices/viewer/annotationSlice";
+import coPilotReducer from "@/store/slices/chat/coPilotSlice";
 import svsPathReducer from './slices/svsPathSlice';
-import agentReducer from "@/store/slices/agentSlice";
-import shapeReducer from '@/store/slices/shapeSlice';
-import chatReducer from "@/store/slices/chatSlice";
-import modelTypeReducer from './slices/modelTypeSlice';
-import workflowReducer from './slices/workflowSlice';
-import viewerReducer from './slices/viewerSlice';
-import toolReducer from './slices/toolSlice';
-import panelReducer from './slices/panelSlice';
-import wsiReducer from './slices/wsiSlice';
-import webFileManagerReducer from './slices/webFileManagerSlice';
-import multiWindowReducer from './slices/multiWindowSlice';
-import activeLearningReducer from './slices/activeLearningSlice';
-import imageSettingsReducer from './slices/imageSettingsSlice';
-import viewerSettingsReducer from './slices/viewerSettingsSlice';
-import modelSelectionReducer from './slices/modelSelectionSlice';
-import shortcutsReducer from './slices/shortcutsSlice';
+import agentReducer from "@/store/slices/chat/agentSlice";
+import shapeReducer from '@/store/slices/viewer/shapeSlice';
+import chatReducer from "@/store/slices/chat/chatSlice";
+import modelTypeReducer from '@/store/slices/chat/modelTypeSlice';
+import workflowReducer from '@/store/slices/chat/workflowSlice';
+import viewerReducer from '@/store/slices/viewer/viewerSlice';
+import toolReducer from '@/store/slices/viewer/toolSlice';
+import wsiReducer from '@/store/slices/wsiSlice';
+import reviewReducer from '@/store/slices/reviewSlice';
+import imageSettingsReducer from '@/store/slices/viewer/imageSettingsSlice';
+import viewerSettingsReducer from '@/store/slices/viewer/viewerSettingsSlice';
+import gtHighlightReducer from '@/store/slices/viewer/gtHighlightSlice';
+import modelSelectionReducer from '@/store/slices/chat/modelSelectionSlice';
+import shortcutsReducer from '@/store/slices/viewer/shortcutsSlice';
+import recordingTranscriptReducer from '@/store/slices/viewer/recordingTranscriptSlice';
 
 // No more persist config - following tissuelab.org pattern
 const rootReducer = combineReducers({
   user: userReducer,
-  sidebar: sidebarReducer,
+  layout: layoutReducer,
   theme: themeReducer,
-  uploadedFiles: uploadedFilesReducer,
+  fileManager: fileManagerReducer,
   annotations: annotationReducer,
   coPilot: coPilotReducer,
   svsPath: svsPathReducer,
@@ -43,15 +42,14 @@ const rootReducer = combineReducers({
   workflow: workflowReducer,
   viewer: viewerReducer,
   tool: toolReducer,
-  panel: panelReducer,
   wsi: wsiReducer,
-  webFileManager: webFileManagerReducer,
-  multiWindow: multiWindowReducer,
-  activeLearning: activeLearningReducer,
+  review: reviewReducer,
   imageSettings: imageSettingsReducer,
   viewerSettings: viewerSettingsReducer,
+  gtHighlight: gtHighlightReducer,
   modelSelection: modelSelectionReducer,
   shortcuts: shortcutsReducer,
+  recordingTranscript: recordingTranscriptReducer,
 })
 
 // Generate a unique ID for this renderer instance
@@ -113,7 +111,6 @@ export const store = configureStore({
           'annotations/updateAnnotationById',
           'annotations/setNucleiClasses',
           'annotations/setPatchClassificationData',
-          'annotations/setAnnotationType',
           'annotations/clearAnnotationTypes',
           'annotations/setClassificationEnabled',
           'annotations/requestClassification',
@@ -124,7 +121,6 @@ export const store = configureStore({
         ignoredPaths: [
           'annotations.annotations',
           'annotations.nuclei_segmentation',
-          'annotations.annotationTypeMap',
           'annotations.patchClassificationData',
           'annotations.nucleiClasses',
           'annotations.regionClasses',

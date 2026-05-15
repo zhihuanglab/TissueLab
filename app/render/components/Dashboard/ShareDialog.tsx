@@ -1,11 +1,11 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter, DialogClose } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { getShareInfo, updateShareInfo } from '@/utils/fileManager.service';
-import { doc, getDoc, getFirestore } from 'firebase/firestore';
-import { app } from '@/config/firebaseConfig';
-import { lookupUserByEmail, searchUsersByEmail, getUsersBasicInfo } from '@/utils/fileManager.service';
+import { getFirestoreDb } from '@/config/firebaseFirestore';
+import { getErrorMessage } from '@/utils/common/apiResponse';
+import { getShareInfo, getUsersBasicInfo, lookupUserByEmail, searchUsersByEmail, updateShareInfo } from '@/utils/dashboard/fileManager.service';
+import { doc, getDoc } from 'firebase/firestore';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 
 interface ShareDialogProps {
   path: string;
@@ -71,7 +71,7 @@ export const ShareDialog: React.FC<ShareDialogProps> = ({ path, onClose }) => {
         try {
           const owner = data.ownerId || '';
           if (owner) {
-            const db = getFirestore(app);
+            const db = getFirestoreDb();
             const snap = await getDoc(doc(db, 'users', owner));
             const preferred = snap.exists() ? (snap.data() as any)?.preferred_name : null;
             setOwnerName(preferred || (owner ? owner.substring(0, 8) : 'Unknown'));
@@ -83,7 +83,7 @@ export const ShareDialog: React.FC<ShareDialogProps> = ({ path, onClose }) => {
           setOwnerName(owner ? owner.substring(0, 8) : 'Unknown');
         }
       } catch (e: any) {
-        setError(e?.message || 'Failed to load share info');
+        setError(getErrorMessage(e, 'Failed to load share info'));
       } finally {
         setLoading(false);
       }
@@ -188,7 +188,7 @@ export const ShareDialog: React.FC<ShareDialogProps> = ({ path, onClose }) => {
       await updateShareInfo(payload);
       onClose();
     } catch (e: any) {
-      setError(e?.message || 'Failed to save share settings');
+      setError(getErrorMessage(e, 'Failed to save share settings'));
     } finally {
       setSaving(false);
     }

@@ -1,5 +1,5 @@
-import React, { createContext, useContext, useState, ReactNode } from 'react';
-import OpenSeadragon from 'openseadragon';
+import React, { createContext, useContext, useMemo, useState, ReactNode } from 'react';
+import type OpenSeadragon from 'openseadragon';
 
 interface AnnotatorContextType {
   annotatorInstance: any;
@@ -39,16 +39,17 @@ export const AnnotatorProvider: React.FC<AnnotatorProviderProps> = ({ children }
     };
   }, []);
 
-  return (
-    <AnnotatorContext.Provider value={{ 
-      annotatorInstance, 
+  const contextValue = useMemo(
+    () => ({
+      annotatorInstance,
       setAnnotatorInstance,
       viewerInstance,
       setViewerInstance,
       instanceId,
-      setInstanceId
-    }}>
-      {children}
-    </AnnotatorContext.Provider>
+      setInstanceId,
+    }),
+    [annotatorInstance, viewerInstance, instanceId]
   );
+
+  return <AnnotatorContext.Provider value={contextValue}>{children}</AnnotatorContext.Provider>;
 }; 

@@ -2,16 +2,134 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-    --foreground-rgb: 255, 255, 255;
-    scrollbar-width: none; /* Firefox */
-    -ms-overflow-style: none; /* IE and Edge */
-}
+/* Transition for color changes */
+/* html,
+body,
+#__next {
+  @apply transition-colors duration-100;
+} */
 
-.app-container {
-  display: flex;
-  flex-direction: row;
-  height: 100vh;
+@layer base {
+  :root {
+    --background: 210 20% 98%;
+    --foreground: 222 47% 11%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+
+    --primary: 249 35% 48%;
+    --primary-foreground: 0 0% 98%;
+
+    --secondary: 210 16% 90%;
+    --secondary-foreground: 222 47% 11%;
+
+    --muted: 210 16% 92%;
+    --muted-foreground: 222 17% 45%;
+
+    --accent: 249 35% 94%;
+    --accent-foreground: 249 35% 28%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 216 20% 88%;
+    --button-outline-border:216 20% 88%;
+    --input: 216 20% 88%;
+    --ring: 249 35% 48%;
+
+    --radius: 0.75rem;
+
+    --chart-1: 12 76% 61%;
+    --chart-2: 173 58% 39%;
+    --chart-3: 197 37% 24%;
+    --chart-4: 43 74% 66%;
+    --chart-5: 27 87% 67%;
+
+    --foreground-rgb: 15, 23, 42;
+    --status-uploading: 217 91% 60%;
+    --status-paused: 42 100% 59%;
+    --status-error: 0 84% 60%;
+    --status-success: 142 72% 45%;
+    --status-cancelled: 220 9% 46%;
+
+    --success: 142 50% 47%;   
+    --warning: 45 100% 52%;   
+    --info: 197 41% 39%;      
+
+    --purple: 258 67% 62%;
+    --yellow: 45 90% 28%;
+    --green: 134 84% 33%;
+    --blue: 221 83% 53%;
+    --orange: 27 85% 60%;
+    --pink: 330 75% 65%;
+    --cyan: 197 65% 55%;
+
+    --dropdown-bg: 0 0% 100%;
+  }
+
+  .dark {
+    --background: 222 47% 8%;
+    --foreground: 210 40% 98%;
+
+    --card: 222 47% 12%;
+    --card-foreground: 210 40% 98%;
+
+    --popover: 222 47% 12%;
+    --popover-foreground: 210 40% 98%;
+
+    --primary: 252 65% 71%;
+    --primary-foreground: 255 53% 94%;
+
+    --secondary: 222 24% 18%;
+    --secondary-foreground: 210 40% 92%;
+
+    --muted: 222 24% 18%;
+    --muted-foreground: 220 12% 58%;
+
+    --accent: 249 27% 20%;
+    --accent-foreground: 210 40% 92%;
+
+    --destructive: 0 65% 55%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 222 24% 20%;
+    --button-outline-border: 0 0% 30%;
+    --input: 222 24% 20%;
+    --ring: 249 35% 62%;
+
+    --foreground-rgb: 226, 232, 240;
+    --status-uploading: 217 91% 70%;
+    --status-paused: 42 100% 65%;
+    --status-error: 0 84% 66%;
+    --status-success: 142 72% 55%;
+    --status-cancelled: 220 9% 60%;
+
+    --success: 142 40% 60%;   
+    --warning: 45 95% 60%;
+    --info: 197 40% 60%;
+
+    --purple: 276 75% 74%;
+    --yellow: 45 100% 68%;
+    --green: 124 43% 56%;
+    --blue: 211 48% 48%;
+    --orange: 27 85% 65%;
+    --pink: 330 75% 72%;
+    --cyan: 182 36% 57%;
+
+    --dropdown-bg: 225 15% 18%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans;
+    font-family: var(--font-inter), 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  }
 }
 
 /* Electron draggable regions for custom title bar */
@@ -35,10 +153,6 @@
   @apply h-fit w-fit rounded-xl bg-gradient-to-br from-blue-500 to-[#83a9ea] px-4 py-2 text-sm text-white hover:bg-gradient-to-br hover:from-blue-500 hover:to-[#739ee8];
 }
 
-.scrollbar-hide::-webkit-scrollbar {
-    display: none;  /* Chrome, Safari and Opera */
-}
-
 
 html, body {
     height: 100vh;
@@ -56,7 +170,7 @@ html, body {
 
 .app-sidebar {
   width: 250px;
-  background-color: #222;
+  background-color: hsl(var(--card));
 }
 
 .wrapper {
@@ -68,7 +182,8 @@ html, body {
 
 .body {
   flex-grow: 1;
-  background-color: #f8f9fa;
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
   padding: 20px;
 }
 
@@ -87,8 +202,8 @@ body::-webkit-scrollbar {
 }
 
 body {
-  color: rgb(var(--foreground-rgb));
-  background: #f8f9fa;
+  color: hsl(var(--foreground));
+  background: hsl(var(--background));
   user-select: none;
   scrollbar-width: none; /* Firefox */
   -ms-overflow-style: none; /* IE and Edge */
@@ -329,23 +444,9 @@ body {
   animation-timing-function: linear;
 }
 
-/* React simple image viewer */
-#ReactSimpleImageViewer{
-  z-index: 99999999;
-}
-
-.react-simple-image-viewer__close{
-  top: 70px !important;
-  right: 10px !important;
-  font-size: 50px !important;
-}
-
-.react-simple-image-viewer__next{
-  height: 60% !important;
-}
-
-.react-simple-image-viewer__previous{
-  height: 60% !important;
+/* Range input with shadcn primary color */
+.range-input-primary {
+  accent-color: hsl(var(--primary));
 }
 
 /* Input in waitlist join form */
@@ -402,66 +503,69 @@ body {
 .nav-ph:hover svg>path{
   fill: #ff6154;
 }
-@layer base {
-  :root {
-        --background: 0 0% 100%;
-        --foreground: 0 0% 3.9%;
-        --card: 0 0% 100%;
-        --card-foreground: 0 0% 3.9%;
-        --popover: 0 0% 100%;
-        --popover-foreground: 0 0% 3.9%;
-        --primary: 0 0% 9%;
-        --primary-foreground: 0 0% 98%;
-        --secondary: 0 0% 96.1%;
-        --secondary-foreground: 0 0% 9%;
-        --muted: 0 0% 96.1%;
-        --muted-foreground: 0 0% 45.1%;
-        --accent: 0 0% 96.1%;
-        --accent-foreground: 0 0% 9%;
-        --destructive: 0 84.2% 60.2%;
-        --destructive-foreground: 0 0% 98%;
-        --border: 0 0% 89.8%;
-        --input: 0 0% 89.8%;
-        --ring: 0 0% 3.9%;
-        --chart-1: 12 76% 61%;
-        --chart-2: 173 58% 39%;
-        --chart-3: 197 37% 24%;
-        --chart-4: 43 74% 66%;
-        --chart-5: 27 87% 67%;
-        --radius: 0.5rem;
-    }
-  .dark {
-        --background: 0 0% 3.9%;
-        --foreground: 0 0% 98%;
-        --card: 0 0% 3.9%;
-        --card-foreground: 0 0% 98%;
-        --popover: 0 0% 3.9%;
-        --popover-foreground: 0 0% 98%;
-        --primary: 0 0% 98%;
-        --primary-foreground: 0 0% 9%;
-        --secondary: 0 0% 14.9%;
-        --secondary-foreground: 0 0% 98%;
-        --muted: 0 0% 14.9%;
-        --muted-foreground: 0 0% 63.9%;
-        --accent: 0 0% 14.9%;
-        --accent-foreground: 0 0% 98%;
-        --destructive: 0 62.8% 30.6%;
-        --destructive-foreground: 0 0% 98%;
-        --border: 0 0% 14.9%;
-        --input: 0 0% 14.9%;
-        --ring: 0 0% 83.1%;
-        --chart-1: 220 70% 50%;
-        --chart-2: 160 60% 45%;
-        --chart-3: 30 80% 55%;
-        --chart-4: 280 65% 60%;
-        --chart-5: 340 75% 55%;
-    }
+
+/* Glowing container animation for CoPilot */
+@keyframes rotateGlow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
-@layer base {
-  * {
-    @apply border-border;
-    }
-  body {
-    @apply bg-background text-foreground;
-    }
+
+@keyframes changeBackground {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+.glowing-container {
+  position: relative;
+  overflow: hidden;
+  padding: 3px;
+  border-radius: 0;
+  background: linear-gradient(
+    45deg,
+    #000033,
+    #330033,
+    #003333,
+    #000033
+  );
+  background-size: 400% 400%;
+  animation: changeBackground 8s ease infinite;
+}
+
+.glowing-container::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    #00ffff 60deg,
+    #4666ff 120deg,
+    #9933ff 180deg,
+    #00ccff 240deg,
+    #33ffcc 300deg,
+    #0099ff 360deg
+  );
+  animation: rotateGlow 1s linear infinite;
+  pointer-events: none;
+  opacity: 1;
+  z-index: 0;
+}
+
+.glowing-container > * {
+  position: relative;
+  background: hsl(var(--card));
+  height: 100%;
+  border-radius: 0;
+  z-index: 1;
 }

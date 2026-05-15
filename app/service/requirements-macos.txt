@@ -1,5 +1,5 @@
 fastapi==0.115.4
-uvicorn==0.32.0
+uvicorn[standard]==0.32.0
 # Allow Pillow 11.0.0 for tissuelab_sdk compatibility
 Pillow>=8.3.2
 numpy
@@ -79,6 +79,7 @@ networkx==3.2.1
 ngff-zarr==0.8.7
 numcodecs==0.12.1
 numpy==1.26.4
+orjson
 ome-types==0.5.2
 ome-zarr==0.9.0
 packaging==24.2
@@ -128,6 +129,7 @@ xsdata==24.3.1
 yarl==1.17.1
 zarr==2.17.2
 zict==3.0.0
+zstandard
 pydantic_settings
 shapely
 # format support
@@ -137,10 +139,12 @@ pylibCZIrw
 pyisyntax
 pyvips[binary]
 czifile
-tissuelab_sdk==0.1.8
+tissuelab_sdk==0.1.12
 # thumbnail-task-distributor
 celery
 zmq
-firebase_admin
 openai
 python-multipart
+datasets
+fairscale
+einops

@@ -1,10 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
-import { 
-  UploadCloud, 
-  X, 
-  CheckCircle2, 
+import {
+  UploadCloud,
+  X,
+  CheckCircle2,
   AlertTriangle,
   Minimize2,
   Maximize2
@@ -26,13 +26,19 @@ interface FileUploadStatus {
   fileName?: string;
 }
 
+// Extended File type with relative path info for folder uploads
+export interface FileWithPath extends File {
+  _relativePath?: string;
+}
+
 // Upload dialog props
 interface UploadDialogProps {
   isOpen: boolean;
   onClose: () => void;
-  onUpload: (files: FileList) => void;
+  onUpload: (files: FileList, relativePaths?: string[]) => void;
   isUploading: boolean;
   uploadProgress: number;
+  uploadTotalFiles?: number;
   uploadStatus?: Map<string, FileUploadStatus>;
   onCancelChunkedUpload?: (fileId: string) => void;
   onPauseChunkedUpload?: (fileId: string) => void;
@@ -40,6 +46,10 @@ interface UploadDialogProps {
   onCancelAllUploads?: () => void;
   uploadInterrupted?: boolean;
   hideFileSelection?: boolean; // when true, do not show drag/select area
+  /** Called whenever the dialog's minimized state changes (true = minimized to widget). */
+  onMinimizedChange?: (isMinimized: boolean) => void;
+  /** When true, show a brief "upload complete" notice above the file-selection area. */
+  uploadJustCompleted?: boolean;
 }
 
 export const UploadDialog: React.FC<UploadDialogProps> = ({
@@ -48,14 +58,64 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
   onUpload,
   isUploading,
   uploadProgress,
+  uploadTotalFiles = 0,
   uploadStatus,
   onCancelChunkedUpload,
   onCancelAllUploads,
   uploadInterrupted,
-  hideFileSelection
+  hideFileSelection,
+  onMinimizedChange,
+  uploadJustCompleted,
 }) => {
   const [isDragging, setIsDragging] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
+  const [isProcessingDrop, setIsProcessingDrop] = useState(false);
+
+  // Reset minimized state whenever the dialog is closed so the next time it
+  // opens it starts in the normal (expanded) view, not still minimized.
+  // Also notify the parent so it can reset its isDialogMinimizedRef.
+  React.useEffect(() => {
+    if (!isOpen) {
+      setIsMinimized(false);
+      onMinimizedChange?.(false);
+    }
+  }, [isOpen]);
+
+  // Recursively read all files from a dropped directory entry
+  const readDirectoryEntries = useCallback(async (
+    dirEntry: FileSystemDirectoryEntry,
+    basePath: string
+  ): Promise<{ file: File; relativePath: string }[]> => {
+    const results: { file: File; relativePath: string }[] = [];
+    const reader = dirEntry.createReader();
+
+    // Must call readEntries in a loop — Chrome returns max 100 per call
+    const readBatch = (): Promise<FileSystemEntry[]> =>
+      new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+
+    let batch: FileSystemEntry[];
+    do {
+      batch = await readBatch();
+      for (const entry of batch) {
+        const entryPath = basePath ? `${basePath}/${entry.name}` : entry.name;
+        if (entry.isFile) {
+          const fileEntry = entry as FileSystemFileEntry;
+          const file = await new Promise<File>((resolve, reject) =>
+            fileEntry.file(resolve, reject)
+          );
+          results.push({ file, relativePath: entryPath });
+        } else if (entry.isDirectory) {
+          const subResults = await readDirectoryEntries(
+            entry as FileSystemDirectoryEntry,
+            entryPath
+          );
+          results.push(...subResults);
+        }
+      }
+    } while (batch.length > 0);
+
+    return results;
+  }, []);
 
   // Handle dialog close
   const handleClose = () => {
@@ -76,17 +136,36 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
   // Handle minimize
   const handleMinimize = () => {
     setIsMinimized(true);
+    onMinimizedChange?.(true);
   };
 
   // Handle maximize
   const handleMaximize = () => {
     setIsMinimized(false);
+    onMinimizedChange?.(false);
   };
 
   // File selection handlers
-  const handleFileSelect = (files: FileList | null) => {
+  const handleFileSelect = (files: FileList | null, relativePaths?: string[]) => {
     if (!files || files.length === 0) return;
-    onUpload(files);
+    onUpload(files, relativePaths);
+    // Reset input so the same files can be re-selected
+    const input = document.getElementById('file-upload-input') as HTMLInputElement;
+    if (input) input.value = '';
+  };
+
+  // Handle folder selection via webkitdirectory input
+  const handleFolderSelect = (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const relativePaths: string[] = [];
+    for (let i = 0; i < files.length; i++) {
+      // webkitRelativePath gives us the path like "folderName/sub/file.txt"
+      relativePaths.push(files[i].webkitRelativePath || files[i].name);
+    }
+    onUpload(files, relativePaths);
+    // Reset input so the same folder can be re-selected
+    const input = document.getElementById('folder-upload-input') as HTMLInputElement;
+    if (input) input.value = '';
   };
 
   const handleDragEnter = (e: React.DragEvent<HTMLDivElement>) => {
@@ -106,11 +185,76 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
     e.stopPropagation();
   };
 
-  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+  const handleDrop = async (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     e.stopPropagation();
     setIsDragging(false);
-    handleFileSelect(e.dataTransfer.files);
+
+    const items = e.dataTransfer.items;
+    if (!items || items.length === 0) {
+      handleFileSelect(e.dataTransfer.files);
+      return;
+    }
+
+    // Check if any dropped item is a directory
+    const entries: FileSystemEntry[] = [];
+    let hasDirectory = false;
+    for (let i = 0; i < items.length; i++) {
+      const entry = items[i].webkitGetAsEntry?.();
+      if (entry) {
+        entries.push(entry);
+        if (entry.isDirectory) hasDirectory = true;
+      }
+    }
+
+    if (!hasDirectory) {
+      // No directories — use simple file upload
+      handleFileSelect(e.dataTransfer.files);
+      return;
+    }
+
+    // Has directories — recursively enumerate all files
+    setIsProcessingDrop(true);
+    try {
+      const allFiles: { file: File; relativePath: string }[] = [];
+      for (const entry of entries) {
+        if (entry.isFile) {
+          const fileEntry = entry as FileSystemFileEntry;
+          const file = await new Promise<File>((resolve, reject) =>
+            fileEntry.file(resolve, reject)
+          );
+          allFiles.push({ file, relativePath: file.name });
+        } else if (entry.isDirectory) {
+          const dirFiles = await readDirectoryEntries(
+            entry as FileSystemDirectoryEntry,
+            entry.name
+          );
+          allFiles.push(...dirFiles);
+        }
+      }
+
+      if (allFiles.length === 0) return;
+
+      // Create a DataTransfer to build a FileList
+      const dt = new DataTransfer();
+      const relativePaths: string[] = [];
+      for (const { file, relativePath } of allFiles) {
+        // Skip zero-byte files (empty files / directory entries)
+        if (file.size === 0) continue;
+        dt.items.add(file);
+        relativePaths.push(relativePath);
+      }
+
+      if (dt.files.length > 0) {
+        onUpload(dt.files, relativePaths);
+      }
+    } catch (err) {
+      console.error('Error processing dropped folder:', err);
+      // Fallback to simple file upload
+      handleFileSelect(e.dataTransfer.files);
+    } finally {
+      setIsProcessingDrop(false);
+    }
   };
 
   // Format file size
@@ -123,28 +267,32 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
   };
 
   // Render minimized upload progress (bottom-right corner)
-  if (isMinimized && isUploading) {
+  // IMPORTANT: Do NOT return early - render minimized widget alongside the full dialog (hidden).
+  // Returning early unmounts the full dialog and can cause upload to pause (e.g. browser throttling
+  // when component tree changes). Keeping both in DOM ensures upload continues in background.
+  const renderMinimizedWidget = () => {
+    if (!isMinimized || !isOpen) return null;
     return (
-      <div className="fixed bottom-4 right-4 z-50 bg-white border border-gray-200 rounded-lg shadow-xl p-4 min-w-[320px] backdrop-blur-sm bg-white/95">
+      <div className="fixed bottom-4 right-4 z-[60] bg-card border border-border rounded-lg shadow-xl p-4 min-w-[320px] backdrop-blur-sm bg-card/95">
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">
-            <UploadCloud className="h-4 w-4 text-blue-500" />
-            <h3 className="text-sm font-medium text-gray-700">Upload Progress</h3>
+            <UploadCloud className="h-4 w-4 text-primary" />
+            <h3 className="text-sm font-medium text-foreground">Upload Progress</h3>
           </div>
           <div className="flex items-center gap-1">
             <button
               onClick={handleMaximize}
-              className="p-1.5 hover:bg-gray-100 rounded transition-colors"
+              className="p-1.5 hover:bg-muted rounded transition-colors"
               title="Maximize"
             >
-              <Maximize2 className="h-4 w-4 text-gray-600" />
+              <Maximize2 className="h-4 w-4 text-muted-foreground" />
             </button>
             <button
               onClick={onClose}
-              className="p-1.5 hover:bg-gray-100 rounded transition-colors"
+              className="p-1.5 hover:bg-muted rounded transition-colors"
               title="Close"
             >
-              <X className="h-4 w-4 text-gray-600" />
+              <X className="h-4 w-4 text-muted-foreground" />
             </button>
           </div>
         </div>
@@ -157,7 +305,7 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
             
             if (hasIncompleteUploads) {
               return (
-                <div className="flex items-center gap-2 text-yellow-600 bg-yellow-50 p-2 rounded">
+                <div className="flex items-center gap-2 text-foreground bg-muted p-2 rounded">
                   <AlertTriangle className="h-4 w-4" />
                   <span className="text-xs font-medium">Upload in progress</span>
                 </div>
@@ -165,7 +313,7 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
             }
             
             return (
-              <div className="flex items-center gap-2 text-green-600 bg-green-50 p-2 rounded">
+              <div className="flex items-center gap-2 text-foreground bg-muted p-2 rounded">
                 <CheckCircle2 className="h-4 w-4" />
                 <span className="text-xs font-medium">Upload complete!</span>
               </div>
@@ -175,76 +323,113 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
           <div className="space-y-2">
             <Progress value={uploadProgress} className="w-full h-2" />
             <div className="flex items-center justify-between">
-              <p className="text-xs text-gray-600">Uploading...</p>
-              <p className="text-xs font-medium text-gray-700">{uploadProgress.toFixed(0)}%</p>
+              <p className="text-xs text-muted-foreground">Uploading...</p>
+              <p className="text-xs font-medium text-foreground">{uploadProgress.toFixed(0)}%</p>
             </div>
           </div>
         )}
       </div>
     );
-  }
+  };
+
+ 
+  // isUploading=false (which takes a moment after the last cancel resolves).
+  const hasActiveItems = uploadStatus && uploadStatus.size > 0
+    ? Array.from(uploadStatus.values()).some(
+        s => s.status !== 'Cancelled' && s.status !== 'Error' && s.status !== 'Completed'
+      )
+    : isUploading; // no status entries yet → rely on isUploading flag
 
   // Render upload progress (Google Drive style)
   const renderUploadProgress = () => {
-    if (!isUploading) return null;
+    if (!isUploading || !hasActiveItems) return null;
+
+    // Compute counts directly from uploadStatus so the label updates in real-time
+    // when individual files are cancelled (uploadTotalFiles in Redux is fixed at
+    // upload-start and never decreases, so it can't be used as the denominator).
+    const completedCount = uploadStatus
+      ? Array.from(uploadStatus.values()).filter(s => s.status === 'Completed').length
+      : 0;
+    const activeCount = uploadStatus
+      ? Array.from(uploadStatus.values()).filter(s => s.status !== 'Cancelled').length
+      : (uploadTotalFiles > 0 ? uploadTotalFiles : 0);
 
     return (
       <div className="space-y-4">
-        {/* Simple Progress Bar */}
+        {/* Overall Progress Bar */}
         <div className="space-y-3">
           <div className="flex items-center justify-between text-sm">
-            <span className="text-gray-600">Uploading files...</span>
-            <span className="font-medium text-gray-900">{uploadProgress.toFixed(0)}%</span>
+            <span className="text-muted-foreground">
+              {activeCount > 0
+                ? `Uploading ${completedCount} of ${activeCount} files`
+                : 'Uploading files...'}
+            </span>
+            <span className="font-medium text-foreground">{uploadProgress.toFixed(0)}%</span>
           </div>
           <Progress value={uploadProgress} className="w-full h-2" />
         </div>
 
-        {/* Simple File List - Google Drive style */}
+        {/* Per-file list - Google Drive style, scrollable */}
         {uploadStatus && uploadStatus.size > 0 && (
-          <div className="space-y-2">
+          <div className="space-y-2 max-h-[360px] overflow-y-auto overflow-x-hidden pr-1">
             {Array.from(uploadStatus.entries())
-              .filter(([_, status]) => status.status !== 'Cancelled') // Filter out cancelled files
+              .filter(([_, status]) => status.status !== 'Cancelled')
               .map(([fileId, status]) => (
-                <div key={fileId} className="flex items-center gap-3 p-2 rounded-lg bg-gray-50">
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-gray-900 break-words leading-tight" style={{ wordBreak: 'break-word' }}>
+                <div key={fileId} className="flex items-center gap-3 p-2 rounded-lg bg-muted/50 flex-shrink-0">
+                  <div className="flex-1 min-w-0 overflow-hidden">
+                    <div className="flex items-center justify-between gap-2">
+                      <span
+                        className="text-sm text-foreground break-all leading-tight"
+                        title={status.fileName || 'Unknown file'}
+                      >
                         {status.fileName || 'Unknown file'}
                       </span>
-                      <span className="text-xs text-gray-500">
+                      <span className="text-xs text-muted-foreground">
                         {status.fileSize && formatFileSize(status.fileSize)}
                       </span>
                     </div>
-                    
+
+                    {/* Per-file progress bar (chunk-weighted, shown while uploading) */}
                     {status.status === 'Uploading' && (
-                      <div className="mt-1">
-                        <div className="flex items-center justify-between text-xs text-gray-500">
+                      <div className="mt-1.5 space-y-0.5">
+                        <Progress value={status.progress} className="w-full h-1.5" />
+                        <div className="flex items-center justify-between text-xs text-muted-foreground">
                           <span>{status.progress.toFixed(0)}%</span>
-                          <span>{status.status}</span>
+                          <span>Uploading</span>
+                        </div>
+                      </div>
+                    )}
+
+                    {status.status === 'Paused' && (
+                      <div className="mt-1.5 space-y-0.5">
+                        <Progress value={status.progress} className="w-full h-1.5" />
+                        <div className="flex items-center justify-between text-xs text-muted-foreground">
+                          <span>{status.progress.toFixed(0)}%</span>
+                          <span>Paused</span>
                         </div>
                       </div>
                     )}
                     
                     {status.status === 'Completed' && (
-                      <div className="mt-1 text-xs text-green-600">
+                      <div className="mt-1 text-xs text-foreground">
                         ✓ Completed
                       </div>
                     )}
                     
                     {status.status === 'Error' && (
-                      <div className="mt-1 text-xs text-red-600">
+                      <div className="mt-1 text-xs text-destructive">
                         ✗ {status.error || 'Upload failed'}
                       </div>
                     )}
                   </div>
                   
-                  {/* Minimal Action Buttons */}
-                  {status.status === 'Uploading' && (
+                  {/* Cancel button for active uploads */}
+                  {(status.status === 'Uploading' || status.status === 'Paused') && (
                     <Button
                       size="sm"
                       variant="ghost"
                       onClick={() => onCancelChunkedUpload?.(fileId)}
-                      className="h-6 w-6 p-0 text-gray-400 hover:text-red-600"
+                      className="h-6 w-6 p-0 text-muted-foreground hover:text-destructive flex-shrink-0"
                     >
                       <X className="w-3 h-3" />
                     </Button>
@@ -271,10 +456,10 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
     
     return (
       <div className="text-center py-8">
-        <CheckCircle2 className="mx-auto h-12 w-12 text-green-500 mb-3" />
-        <h3 className="text-lg font-medium text-gray-900 mb-2">Upload complete!</h3>
-        <p className="text-sm text-gray-600 mb-4">Your files have been uploaded successfully.</p>
-        <Button onClick={handleMinimize} className="bg-green-600 hover:bg-green-700">
+        <CheckCircle2 className="mx-auto h-12 w-12 text-foreground mb-3" />
+        <h3 className="text-lg font-medium text-foreground mb-2">Upload complete!</h3>
+        <p className="text-sm text-muted-foreground mb-4">Your files have been uploaded successfully.</p>
+        <Button onClick={handleMinimize}>
           Minimize
         </Button>
       </div>
@@ -283,15 +468,25 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
 
   // Render file selection area (Google Drive style)
   const renderFileSelection = () => {
-    if (isUploading) return null;
+    // Show immediately when all files have been cancelled/finished,
+    // even if isUploading is still true in the background.
+    if (isUploading && hasActiveItems) return null;
     if (hideFileSelection) return null;
 
     return (
+      <>
+        {/* Completion notice — only shown right after an upload finishes */}
+        {uploadJustCompleted && (
+          <div className="mb-4 flex items-center gap-2 px-4 py-3 rounded-lg bg-muted border border-border text-foreground text-sm">
+            <CheckCircle2 className="h-4 w-4 flex-shrink-0 text-primary" />
+            <span>Upload complete</span>
+          </div>
+        )}
       <div
         className={`relative border-2 border-dashed rounded-xl p-12 pb-16 text-center transition-all duration-200
           ${isDragging 
-            ? 'border-blue-500 bg-blue-50' 
-            : 'border-gray-300 hover:border-gray-400 hover:bg-gray-50'
+            ? 'border-primary bg-primary/10' 
+            : 'border-border hover:border-border hover:bg-muted/50'
           }`
         }
         onDragEnter={handleDragEnter}
@@ -300,20 +495,22 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
         onDrop={handleDrop}
       >
         <UploadCloud className={`mx-auto h-16 w-16 mb-4 transition-colors ${
-          isDragging ? 'text-blue-500' : 'text-gray-400'
+          isDragging ? 'text-primary' : 'text-muted-foreground'
         }`} />
         
-        <h3 className="text-xl font-medium text-gray-900 mb-2">
-          {isDragging ? 'Drop files here' : 'Upload files'}
+        <h3 className="text-xl font-medium text-foreground mb-2">
+          {isProcessingDrop ? 'Processing folder...' : isDragging ? 'Drop files or folders here' : 'Upload files or folders'}
         </h3>
-        
-        <p className="text-gray-600 mb-6">
-          {isDragging 
-            ? 'Release to upload your files'
-            : 'Drag and drop files here, or click to select files'
+
+        <p className="text-muted-foreground mb-6">
+          {isProcessingDrop
+            ? 'Reading folder contents...'
+            : isDragging
+            ? 'Release to upload your files or folders'
+            : 'Drag and drop files or folders here, or click to select'
           }
         </p>
-        
+
         <input
           id="file-upload-input"
           type="file"
@@ -321,31 +518,56 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
           className="hidden"
           onChange={(e) => handleFileSelect(e.target.files)}
         />
-        
-        <Button 
-          onClick={() => document.getElementById('file-upload-input')?.click()}
-          className="bg-blue-600 hover:bg-blue-700 px-6 py-2"
-        >
-          Select files
-        </Button>
+
+        {/* Hidden input for folder selection via webkitdirectory */}
+        <input
+          id="folder-upload-input"
+          type="file"
+          // @ts-ignore — webkitdirectory is not in React's type definitions
+          webkitdirectory=""
+          multiple
+          className="hidden"
+          onChange={(e) => handleFolderSelect(e.target.files)}
+        />
+
+        <div className="flex justify-center gap-3">
+          <Button
+            className="min-w-[120px]"
+            onClick={() => document.getElementById('file-upload-input')?.click()}
+          >
+            Select files
+          </Button>
+          <Button
+            className="min-w-[120px]"
+            variant="outline"
+            onClick={() => document.getElementById('folder-upload-input')?.click()}
+          >
+            Select folder
+          </Button>
+        </div>
       </div>
+      </>
     );
   };
 
   return (
     <>
-      {isOpen && (
+      {renderMinimizedWidget()}
+      {/* When minimized, NEVER render the full overlay regardless of isUploading state.
+          Previously !(isMinimized && isUploading) allowed the overlay to flash in for
+          one render when isUploading flipped to false before isOpen was closed. */}
+      {isOpen && !isMinimized && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
-          {/* Backdrop */}
+          {/* Backdrop — minimize (not cancel) when an upload is in progress */}
           <div 
-            className="absolute inset-0 bg-black/50 backdrop-blur-sm"
-            onClick={handleClose}
+            className="absolute inset-0 bg-background/80 backdrop-blur-sm"
+            onClick={isUploading ? handleMinimize : handleClose}
           />
           
-          {/* Dialog Content */}
-          <div className="relative bg-white rounded-lg shadow-xl max-w-md max-h-[85vh] overflow-hidden w-full mx-4">
+          {/* Dialog Content - flex layout for scrollable content */}
+          <div className="relative bg-card rounded-lg shadow-xl max-w-md max-h-[85vh] overflow-hidden w-full mx-4 border border-border flex flex-col">
             {/* Header */}
-            <div className="flex items-center justify-between p-6 pb-4">
+            <div className="flex-shrink-0 flex items-center justify-between p-6 pb-4">
               <h2 className="text-lg font-semibold">Upload files</h2>
               <Button
                 variant="ghost"
@@ -360,17 +582,16 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
 
             {/* Interruption Warning */}
             {uploadInterrupted && (
-              <div className="mx-6 mb-4 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
-                <div className="flex items-center gap-2 text-yellow-800">
+              <div className="flex-shrink-0 mx-6 mb-4 p-3 bg-muted border border-border rounded-lg">
+                <div className="flex items-center gap-2 text-foreground">
                   <AlertTriangle className="w-4 h-4" />
                   <span className="text-sm">Upload interrupted</span>
                 </div>
               </div>
             )}
 
-            {/* Content */}
-            <div className="px-6 pb-6 overflow-y-auto">
-              {renderUploadCompletion()}
+            {/* Content - flex-1 min-h-0 enables overflow scroll */}
+            <div className="flex-1 min-h-0 overflow-y-auto px-6 pb-6">
               {renderUploadProgress()}
               {renderFileSelection()}
             </div>

@@ -1,16 +1,18 @@
-import React, { useRef, useEffect, useMemo, useCallback, useState } from "react";
-import OpenSeadragon from "openseadragon";
-import { useSelector } from "react-redux";
 import { RootState } from "@/store";
-import { mat2d } from "gl-matrix";
-import { RectangleCoords, ShapeData } from "@/store/slices/shapeSlice";
+import { RectangleCoords } from "@/store/slices/viewer/shapeSlice";
+import { useAnnotationTypes } from '@/store/zustand/slice/annotationTypesStore';
 import { webglContextManager } from '@/utils/webglContextManager';
+import { mat2d } from "gl-matrix";
+import OpenSeadragon from "openseadragon";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSelector } from "react-redux";
+import { CentroidsArray } from './CentroidsArray';
 
-const ZOOM_SCALE = 16; // same constant as in viewer component
+const INV_255 = 1 / 255; // Pre-computed inverse for faster color normalization
 
 interface DrawingOverlayProps {
   viewer: OpenSeadragon.Viewer | null;
-  centroids: Array<[number, number, number, number]>; // [id, x, y, class_id]
+  centroids: CentroidsArray; // [id, x, y, class_id]
   threshold: number;
   classificationData?: {
     nuclei_class_id: number[];
@@ -19,20 +21,10 @@ interface DrawingOverlayProps {
   } | null;
   annotations: any[];
   nucleiClasses: { name: string, color: string, count: number }[];
+  /** When true (filter mode, cell overlay off): only draw highlighted cells (yellow), not the rest */
+  filterOnlyHighlight?: boolean;
 }
 
-interface AnnotationBody {
-  id: string;
-  annotation: string;
-  type: string;
-  purpose: string;
-  value: string;
-  created: string;
-  creator: {
-    id: string;
-    type: string;
-  };
-}
 
 // Centroid vertex shader
 const centroidVertexShaderSource = `#version 300 es
@@ -152,11 +144,10 @@ const createCircleVertices = (segments: number) => {
 const isPointInRectangle = (x: number, y: number, rect: RectangleCoords | null): boolean => {
   if (!rect) return false;
 
-  // Convert rectangle coordinates to image coordinates (same scale as centroids)
-  const rectX1 = rect.x1 * ZOOM_SCALE;
-  const rectY1 = rect.y1 * ZOOM_SCALE;
-  const rectX2 = rect.x2 * ZOOM_SCALE;
-  const rectY2 = rect.y2 * ZOOM_SCALE;
+  const rectX1 = rect.x1;
+  const rectY1 = rect.y1;
+  const rectX2 = rect.x2;
+  const rectY2 = rect.y2;
 
   // Check if point is inside rectangle
   return x >= Math.min(rectX1, rectX2) && x <= Math.max(rectX1, rectX2) &&
@@ -167,20 +158,14 @@ const isPointInRectangle = (x: number, y: number, rect: RectangleCoords | null):
 const isPointInPolygon = (x: number, y: number, polygonPoints: [number, number][] | null): boolean => {
   if (!polygonPoints || polygonPoints.length < 3) return false;
 
-  // Convert polygon points to image coordinates (same scale as centroids)
-  const scaledPolygonPoints = polygonPoints.map(point => [
-    point[0] * ZOOM_SCALE,
-    point[1] * ZOOM_SCALE
-  ]);
-
   let inside = false;
-  const n = scaledPolygonPoints.length;
+  const n = polygonPoints.length;
 
   for (let i = 0, j = n - 1; i < n; j = i++) {
-    const xi = scaledPolygonPoints[i][0];
-    const yi = scaledPolygonPoints[i][1];
-    const xj = scaledPolygonPoints[j][0];
-    const yj = scaledPolygonPoints[j][1];
+    const xi = polygonPoints[i][0];
+    const yi = polygonPoints[i][1];
+    const xj = polygonPoints[j][0];
+    const yj = polygonPoints[j][1];
 
     if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
       inside = !inside;
@@ -196,9 +181,11 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
   threshold,
   classificationData,
   annotations,
-  nucleiClasses
+  nucleiClasses,
+  filterOnlyHighlight = false,
 }) => {
   const centroidSize = useSelector((state: RootState) => state.viewerSettings.centroidSize) ?? 1.5;
+  const overlayAlpha = useSelector((state: RootState) => state.viewerSettings.overlayAlpha) ?? 0.4;
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const glRef = useRef<WebGLRenderingContext | WebGL2RenderingContext | null>(null);
 
@@ -227,9 +214,12 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
   } | null>(null);
   const polygonEdgeVaoRef = useRef<WebGLVertexArrayObject | null>(null);
 
-  const annotationTypes = useSelector((state: RootState) => state.annotations?.annotationTypeMap || {});
+  const { annotationTypes, version: annotationTypesVersion } = useAnnotationTypes();
   const slideInfo = useSelector((state: RootState) => state.svsPath.slideInfo);
   const shapeData = useSelector((state: RootState) => state.shape.shapeData); // Lastest shape data drawn by annotorious
+  const filterHighlightIndices = useSelector((state: RootState) => state.shape.filterHighlightIndices);
+  const highlightGtAnnotations = useSelector((state: RootState) => state.viewerSettings.highlightGtAnnotations);
+  const gtHighlightNucleiIndices = useSelector((state: RootState) => state.gtHighlight.nucleiIndices);
   const [liveRectangleCoords, setLiveRectangleCoords] = useState<RectangleCoords | null>(shapeData?.rectangleCoords || null);
 
   // Memoize rectangleCoords to avoid unnecessary re-renders
@@ -265,10 +255,10 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
       return;
     }
 
-    let imgX1 = liveRectangleCoords.x1 * ZOOM_SCALE;
-    let imgY1 = liveRectangleCoords.y1 * ZOOM_SCALE;
-    let imgX2 = liveRectangleCoords.x2 * ZOOM_SCALE;
-    let imgY2 = liveRectangleCoords.y2 * ZOOM_SCALE;
+    let imgX1 = liveRectangleCoords.x1;
+    let imgY1 = liveRectangleCoords.y1;
+    let imgX2 = liveRectangleCoords.x2;
+    let imgY2 = liveRectangleCoords.y2;
 
     const maxX = contentSize.x;
     const maxY = contentSize.y;
@@ -321,30 +311,112 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
     lastDataHash: ''
   });
 
-  const hexToRgb = (hex: string) => {
-    // remove prefix #
-    const sanitizedHex = hex.replace(/^#/, '');
-    // 3 bit HEX to 6 bit HEX
-    const fullHex = sanitizedHex.length === 3
-      ? sanitizedHex.split('').map(c => c + c).join('')
-      : sanitizedHex;
+  // Cache for hex color conversions
+  const hexToRgbCache = useRef<Map<string, [number, number, number]>>(new Map());
+  
+  const hexToRgb = useCallback((hex: string): [number, number, number] => {
+    // Check cache first
+    const cached = hexToRgbCache.current.get(hex);
+    if (cached !== undefined) {
+      return cached;
+    }
+    
+    // Remove prefix # (optimized: use slice instead of regex)
+    const sanitizedHex = hex[0] === '#' ? hex.slice(1) : hex;
+    
+    // 3-bit HEX to 6-bit HEX (optimized: avoid array creation)
+    let fullHex: string;
+    if (sanitizedHex.length === 3) {
+      // Manual expansion is faster than split/map/join
+      fullHex = sanitizedHex[0] + sanitizedHex[0] + 
+                sanitizedHex[1] + sanitizedHex[1] + 
+                sanitizedHex[2] + sanitizedHex[2];
+    } else {
+      fullHex = sanitizedHex;
+    }
+    
     const bigint = parseInt(fullHex, 16);
-    const r = (bigint >> 16) & 255;
-    const g = (bigint >> 8) & 255;
-    const b = bigint & 255;
-    return [r, g, b];
-  }
+    
+    // Convert to normalized [0.0-1.0] range for WebGL (use pre-computed inverse)
+    const result: [number, number, number] = [
+      ((bigint >> 16) & 255) * INV_255,
+      ((bigint >> 8) & 255) * INV_255,
+      (bigint & 255) * INV_255
+    ];
+    
+    // Cache the result
+    hexToRgbCache.current.set(hex, result);
+    return result;
+  }, []);
 
-  // Boundary check for centroid-in-ROI rule. Prefer polygon points when available.
-  const isPointInBoundary = useCallback((x: number, y: number, shapeData: ShapeData | null): boolean => {
-    if (!shapeData) return false;
-
+  // Pre-compute polygon AABB and rectangle bounds for boundary checking
+  const boundaryCheckCache = useMemo(() => {
+    if (!shapeData) return null;
+    
     if (shapeData.polygonPoints && shapeData.polygonPoints.length >= 3) {
-      return isPointInPolygon(x, y, shapeData.polygonPoints);
+      const points = shapeData.polygonPoints as [number, number][];
+      
+      // Pre-compute bounding box for fast rejection
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const point of points) {
+        if (point[0] < minX) minX = point[0];
+        if (point[0] > maxX) maxX = point[0];
+        if (point[1] < minY) minY = point[1];
+        if (point[1] > maxY) maxY = point[1];
+      }
+      
+      return { 
+        type: 'polygon' as const, 
+        points,
+        minX, maxX, minY, maxY // Bounding box for fast rejection
+      };
+    }
+    
+    if (shapeData.rectangleCoords) {
+      const rect = shapeData.rectangleCoords;
+      const rectX1 = rect.x1;
+      const rectY1 = rect.y1;
+      const rectX2 = rect.x2;
+      const rectY2 = rect.y2;
+      return {
+        type: 'rectangle' as const,
+        minX: Math.min(rectX1, rectX2),
+        maxX: Math.max(rectX1, rectX2),
+        minY: Math.min(rectY1, rectY2),
+        maxY: Math.max(rectY1, rectY2)
+      };
+    }
+    
+    return null;
+  }, [shapeData]);
+
+  // Optimized boundary check function with fast bounding box rejection
+  const checkPointInBoundary = useCallback((x: number, y: number, cache: NonNullable<typeof boundaryCheckCache>): boolean => {
+    // Fast bounding box check first (rejects most points quickly)
+    if (x < cache.minX || x > cache.maxX || y < cache.minY || y > cache.maxY) {
+      return false;
     }
 
-    if (shapeData.rectangleCoords) {
-      return isPointInRectangle(x, y, shapeData.rectangleCoords);
+    // Point is within bounding box, do detailed check
+    if (cache.type === 'rectangle') {
+      return true; // Already confirmed by bounding box
+    }
+
+    // Polygon ray casting
+    if (cache.type === 'polygon') {
+      const points = cache.points;
+      let inside = false;
+      const n = points.length;
+      for (let i = 0, j = n - 1; i < n; j = i++) {
+        const xi = points[i][0];
+        const yi = points[i][1];
+        const xj = points[j][0];
+        const yj = points[j][1];
+        if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
+          inside = !inside;
+        }
+      }
+      return inside;
     }
 
     return false;
@@ -352,61 +424,152 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
 
   // Process centroid data
   const processedCentroidData = useMemo(() => {
+    const versionMarker = annotationTypesVersion;
+    void versionMarker;
+    const start = performance.now();
+
     if (!centroids.length) return { imageCoords: new Float32Array(0), colors: new Float32Array(0), count: 0 };
 
-    const imageCoords = new Float32Array(centroids.length * 2);
-    const colors = new Float32Array(centroids.length * 4);
+    const count = centroids.length;
+    const bc = boundaryCheckCache;
+    const hasBoundary = bc !== null;
+    const filterSet = filterHighlightIndices != null ? new Set(filterHighlightIndices) : null;
+    const useFilterHighlight = filterHighlightIndices != null;
+    const gtSet = highlightGtAnnotations && gtHighlightNucleiIndices.length > 0 ? new Set(gtHighlightNucleiIndices) : null;
 
-    for (let i = 0; i < centroids.length; i++) {
-      const [idx, x, y, class_id] = centroids[i];
+    const defaultColorR = 128 / 255;
+    const defaultColorG = 128 / 255;
+    const defaultColorB = 128 / 255;
+    const yellowColorR = 255 / 255;
+    const yellowColorG = 255 / 255;
+    const yellowColorB = 0 / 255;
+    const data = centroids.getData();
 
-      // Store image coordinates
-      imageCoords[i * 2] = x;
-      imageCoords[i * 2 + 1] = y;
-
-      // Default color is gray
-      let finalColor = [128, 128, 128];
-
-      // First, check for a manual override. This takes highest priority.
-      if (idx in annotationTypes) {
-        finalColor = hexToRgb(annotationTypes[idx].color || '#808080');
+    // Filter-only mode (cell overlay off): only draw highlighted cells (yellow), skip the rest
+    if (filterOnlyHighlight && useFilterHighlight && filterSet) {
+      let n = 0;
+      for (let i = 0, j = 0; i < count; i++, j += 4) {
+        if (filterSet.has(data[j]) || (gtSet && gtSet.has(data[j]))) n++;
       }
-      // If no manual override, use the backend-provided class ID.
-      else if (class_id > -1 && nucleiClasses && class_id < nucleiClasses.length) {
-        finalColor = hexToRgb(nucleiClasses[class_id].color || '#808080');
+      const imageCoords = new Float32Array(n * 2);
+      const colors = new Float32Array(n * 4);
+      let out = 0;
+      for (let i = 0, j = 0; i < count; i++, j += 4) {
+        if (!filterSet.has(data[j]) && !(gtSet && gtSet.has(data[j]))) continue;
+        imageCoords[out * 2] = data[j + 1];
+        imageCoords[out * 2 + 1] = data[j + 2];
+        colors[out * 4] = yellowColorR;
+        colors[out * 4 + 1] = yellowColorG;
+        colors[out * 4 + 2] = yellowColorB;
+        colors[out * 4 + 3] = Math.min(overlayAlpha + 0.2, 1.0);
+        out++;
       }
-
-      // Check if this centroid is inside the boundary selection
-      const isHighlighted = isPointInBoundary(x, y, shapeData || null);
-
-      // If highlighted, use yellow color
-      if (isHighlighted) {
-        finalColor = [255, 255, 0]; // Yellow
-      }
-
-      colors[i * 4] = finalColor[0] / 255;
-      colors[i * 4 + 1] = finalColor[1] / 255;
-      colors[i * 4 + 2] = finalColor[2] / 255;
-      colors[i * 4 + 3] = isHighlighted ? 0.8 : 0.6; // Higher alpha for highlighted items
+      return { imageCoords, colors, count: n };
     }
 
-    return { imageCoords, colors, count: centroids.length };
-  }, [centroids, annotationTypes, nucleiClasses, shapeData, isPointInBoundary]);
+    const imageCoords = new Float32Array(count * 2);
+    const colors = new Float32Array(count * 4);
+
+    if (hasBoundary) {
+      // Path with boundary checking
+      for (let i = 0, j = 0; i < count; i++, j += 4) {
+        const idx = data[j];
+        const x = data[j + 1];
+        const y = data[j + 2];
+        const class_id = data[j + 3];
+
+        imageCoords[i * 2] = x;
+        imageCoords[i * 2 + 1] = y;
+
+        const inBoundary = checkPointInBoundary(x, y, bc!);
+        const gtHighlight = gtSet ? gtSet.has(idx) : false;
+        const isHighlighted = gtHighlight || (useFilterHighlight
+          ? (inBoundary && filterSet!.has(idx))
+          : inBoundary);
+
+        if (isHighlighted) {
+          colors[i * 4] = yellowColorR;
+          colors[i * 4 + 1] = yellowColorG;
+          colors[i * 4 + 2] = yellowColorB;
+          colors[i * 4 + 3] = Math.min(overlayAlpha + 0.2, 1.0);
+        } else {
+        // prob < threshold or not this class: no yellow highlight, normal class color
+        let r = defaultColorR, g = defaultColorG, b = defaultColorB;
+        const annotationOverride = annotationTypes.get(String(idx));
+        if (annotationOverride) {
+          const color = hexToRgb(annotationOverride.color || '#808080');
+            r = color[0];
+            g = color[1];
+            b = color[2];
+          } else if (class_id > -1 && nucleiClasses && class_id < nucleiClasses.length) {
+            const color = hexToRgb(nucleiClasses[class_id].color || '#808080');
+            r = color[0];
+            g = color[1];
+            b = color[2];
+          }
+          colors[i * 4] = r;
+          colors[i * 4 + 1] = g;
+          colors[i * 4 + 2] = b;
+          colors[i * 4 + 3] = overlayAlpha;
+        }
+      }
+    } else {
+      // Fast path: no boundary checking
+      for (let i = 0, j = 0; i < count; i++, j += 4) {
+        const idx = data[j];
+        const x = data[j + 1];
+        const y = data[j + 2];
+        const class_id = data[j + 3];
+
+        imageCoords[i * 2] = x;
+        imageCoords[i * 2 + 1] = y;
+
+        const gtHighlight = gtSet ? gtSet.has(idx) : false;
+        let r = defaultColorR, g = defaultColorG, b = defaultColorB;
+        if (gtHighlight) {
+          r = yellowColorR;
+          g = yellowColorG;
+          b = yellowColorB;
+        } else {
+        const annotationOverride = annotationTypes.get(String(idx));
+        if (annotationOverride) {
+          const color = hexToRgb(annotationOverride.color || '#808080');
+          r = color[0];
+          g = color[1];
+          b = color[2];
+        } else if (class_id > -1 && nucleiClasses && class_id < nucleiClasses.length) {
+          const color = hexToRgb(nucleiClasses[class_id].color || '#808080');
+          r = color[0];
+          g = color[1];
+          b = color[2];
+        }
+        }
+        colors[i * 4] = r;
+        colors[i * 4 + 1] = g;
+        colors[i * 4 + 2] = b;
+        colors[i * 4 + 3] = gtHighlight ? Math.min(overlayAlpha + 0.2, 1.0) : overlayAlpha;
+      }
+    }
+
+    const end = performance.now();
+    console.log(`processedCentroidData computation time: ${(end - start).toFixed(2)}ms for ${count} centroids`);
+
+    return { imageCoords, colors, count };
+  }, [centroids, annotationTypes, annotationTypesVersion, nucleiClasses, boundaryCheckCache, filterHighlightIndices, filterOnlyHighlight, highlightGtAnnotations, gtHighlightNucleiIndices, hexToRgb, checkPointInBoundary, overlayAlpha]);
 
   // Process polygon data (filled)
   const processedPolygonData = useMemo(() => {
+    const versionMarker = annotationTypesVersion;
+    void versionMarker;
 
+    if (filterOnlyHighlight) return { vertices: new Float32Array(0), colors: new Float32Array(0), indices: new Uint32Array(0), count: 0 };
     if (!annotations.length) return { vertices: new Float32Array(0), colors: new Float32Array(0), indices: new Uint32Array(0), count: 0 };
 
     let totalVertices = 0;
     let totalIndices = 0;
     annotations.forEach(annotation => {
-      const selectorRaw = annotation.target?.selector;
-      const selector = Array.isArray(selectorRaw)
-        ? selectorRaw.find((s: any) => s?.type === 'POLYGON' && s?.geometry?.points)
-        : selectorRaw;
-      if (selector?.type === 'POLYGON' && selector.geometry?.points) {
-        const points = selector.geometry.points;
+      const points = annotation.points;
+      if (points && Array.isArray(points) && points.length >= 3) {
         totalVertices += points.length;
         totalIndices += (points.length - 2) * 3;
       }
@@ -425,28 +588,36 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
     let baseVertex = 0;
 
     annotations.forEach(annotation => {
-      const selectorRaw = annotation.target?.selector;
-      const selector = Array.isArray(selectorRaw)
-        ? selectorRaw.find((s: any) => s?.type === 'POLYGON' && s?.geometry?.points)
-        : selectorRaw;
-      if (selector?.type === 'POLYGON' && selector.geometry?.points) {
-        const points = selector.geometry.points;
-        // Priority: optimistic Redux override -> existing style body -> fallback gray
-        const override = (annotationTypes && annotation?.id != null) ? annotationTypes[annotation.id] : undefined;
-        const color = override?.color || (annotation.bodies.find((b: AnnotationBody) => b.purpose === 'style')?.value) || '#808080';
-        const rgb = hexToRgb(color);
+      const points = annotation.points;
+
+      if (points && Array.isArray(points) && points.length >= 3) {
+        // Use same color logic as centroid mode
+        let finalColor = [128, 128, 128]; // Default gray #808080
+
+        // First, check for a manual override. This takes highest priority.
+        const override = annotation?.id != null ? annotationTypes.get(String(annotation.id)) : null;
+        if (override) {
+          finalColor = hexToRgb(override.color || '#808080');
+        }
+        // If no manual override, use the backend-provided class ID.
+        else if (annotation.class_id !== undefined && annotation.class_id > -1 && nucleiClasses && annotation.class_id < nucleiClasses.length) {
+          finalColor = hexToRgb(nucleiClasses[annotation.class_id].color || '#808080');
+        }
+        // Fallback to annotation color if available
+        else if (annotation.color) {
+          finalColor = hexToRgb(annotation.color);
+        }
 
         // For fill, always use base color; highlight handled by edge pass
-        const finalColor = rgb;
 
         points.forEach((point: number[], i: number) => {
           vertices[vertexIndex * 2] = point[0];
           vertices[vertexIndex * 2 + 1] = point[1];
 
-          colors[vertexIndex * 4] = finalColor[0] / 255;
-          colors[vertexIndex * 4 + 1] = finalColor[1] / 255;
-          colors[vertexIndex * 4 + 2] = finalColor[2] / 255;
-          colors[vertexIndex * 4 + 3] = 0.6;
+          colors[vertexIndex * 4] = finalColor[0];
+          colors[vertexIndex * 4 + 1] = finalColor[1];
+          colors[vertexIndex * 4 + 2] = finalColor[2];
+          colors[vertexIndex * 4 + 3] = overlayAlpha;
 
           vertexIndex++;
         });
@@ -467,30 +638,61 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
       indices,
       count: indexIndex
     };
-  }, [annotations, annotationTypes]);
+  }, [annotations, annotationTypes, annotationTypesVersion, hexToRgb, nucleiClasses, overlayAlpha, filterOnlyHighlight]);
 
-  // Process polygon edge data (contours)
+  // Find centroid id (index) nearest to (cx, cy); centroids are [id, x, y, classId] per row, same scale as boundary
+  const findNearestCentroidId = useCallback((cx: number, cy: number): number | null => {
+    if (!centroids.length) return null;
+    const data = centroids.getData();
+    const count = centroids.length;
+    let bestId: number | null = null;
+    let bestD2 = Infinity;
+    for (let i = 0, j = 0; i < count; i++, j += 4) {
+      const x = data[j + 1];
+      const y = data[j + 2];
+      const d2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      if (d2 < bestD2) {
+        bestD2 = d2;
+        bestId = data[j];
+      }
+    }
+    return bestId;
+  }, [centroids]);
+
+  // Process polygon edge data (contours) — WebGL highlight is the contour (yellow edges).
+  // With selection: when filterHighlightIndices set, only show contours for highlighted (prob >= threshold); else show all in region.
   const processedPolygonEdgeData = useMemo(() => {
     if (!annotations.length) return { vertices: new Float32Array(0), colors: new Float32Array(0), count: 0 };
 
+    const bc = boundaryCheckCache;
+    const hasBoundary = bc !== null;
+    const filterSet = filterHighlightIndices != null ? new Set(filterHighlightIndices) : null;
+    const useFilterHighlight = filterHighlightIndices != null;
+    const gtSet = highlightGtAnnotations && gtHighlightNucleiIndices.length > 0 ? new Set(gtHighlightNucleiIndices) : null;
+
     let totalEdgeVertices = 0;
-    // First pass: count edges for highlighted polygons
     annotations.forEach(annotation => {
-      const selectorRaw = annotation.target?.selector;
-      const selector = Array.isArray(selectorRaw)
-        ? selectorRaw.find((s: any) => s?.type === 'POLYGON' && s?.geometry?.points)
-        : selectorRaw;
-      if (selector?.type === 'POLYGON' && selector.geometry?.points) {
-        const points = selector.geometry.points as [number, number][];
-        if (!points || points.length < 2) return;
-        // Highlight check: centroid of polygon inside rectangle ROI only
+      const points = annotation.points;
+
+      if (points && Array.isArray(points) && points.length >= 2) {
+        const pointsArray = points as [number, number][];
+        if (!pointsArray || pointsArray.length < 2) return;
         let centerX = 0, centerY = 0;
-        for (const p of points) { centerX += p[0]; centerY += p[1]; }
-        centerX /= points.length; centerY /= points.length;
-        const isHighlighted = isPointInBoundary(centerX, centerY, shapeData || null);
+        for (const p of pointsArray) { centerX += p[0]; centerY += p[1]; }
+        centerX /= pointsArray.length; centerY /= pointsArray.length;
+        const inBoundary = hasBoundary ? checkPointInBoundary(centerX, centerY, bc!) : false;
+        const cellId = Number(annotation.id);
+        const nearestId = Number.isFinite(cellId) ? null : findNearestCentroidId(centerX, centerY);
+        const idInSet = useFilterHighlight
+          ? (Number.isFinite(cellId) ? filterSet!.has(cellId) : (nearestId !== null && filterSet!.has(nearestId)))
+          : true;
+        const gtHighlight = gtSet ? (Number.isFinite(cellId) ? gtSet.has(cellId) : (nearestId !== null && gtSet.has(nearestId))) : false;
+        // When filter highlight is active: show contour if id is in set (no boundary required).
+        // GT highlight: always show contour for user-annotated (GT) indices.
+        const isHighlighted = gtHighlight || (useFilterHighlight ? idInSet : (inBoundary && idInSet));
+
         if (isHighlighted) {
-          // Each edge contributes 2 vertices (start, end)
-          totalEdgeVertices += points.length * 2; // including closing edge
+          totalEdgeVertices += pointsArray.length * 2;
         }
       }
     });
@@ -502,32 +704,34 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
     const edgeVertices = new Float32Array(totalEdgeVertices * 2);
     const edgeColors = new Float32Array(totalEdgeVertices * 4);
     let edgeVertexIndex = 0;
+    const stroke = [1.0, 1.0, 0.0, Math.min(overlayAlpha + 0.5, 1.0)];
 
-    // Second pass: build edge vertices only for highlighted polygons
     annotations.forEach(annotation => {
-      const selectorRaw = annotation.target?.selector;
-      const selector = Array.isArray(selectorRaw)
-        ? selectorRaw.find((s: any) => s?.type === 'POLYGON' && s?.geometry?.points)
-        : selectorRaw;
-      if (selector?.type === 'POLYGON' && selector.geometry?.points) {
-        const points = selector.geometry.points as [number, number][];
-        if (!points || points.length < 2) return;
+      const points = annotation.points;
+
+      if (points && Array.isArray(points) && points.length >= 2) {
+        const pointsArray = points as [number, number][];
+        if (!pointsArray || pointsArray.length < 2) return;
 
         let centerX = 0, centerY = 0;
-        for (const p of points) { centerX += p[0]; centerY += p[1]; }
-        centerX /= points.length; centerY /= points.length;
-        const isHighlighted = isPointInBoundary(centerX, centerY, shapeData || null);
+        for (const p of pointsArray) { centerX += p[0]; centerY += p[1]; }
+        centerX /= pointsArray.length; centerY /= pointsArray.length;
+
+        const inBoundary = hasBoundary ? checkPointInBoundary(centerX, centerY, bc!) : false;
+        const cellId = Number(annotation.id);
+        const nearestId = Number.isFinite(cellId) ? null : findNearestCentroidId(centerX, centerY);
+        const idInSet = useFilterHighlight
+          ? (Number.isFinite(cellId) ? filterSet!.has(cellId) : (nearestId !== null && filterSet!.has(nearestId)))
+          : true;
+        const gtHighlight = gtSet ? (Number.isFinite(cellId) ? gtSet.has(cellId) : (nearestId !== null && gtSet.has(nearestId))) : false;
+        const isHighlighted = gtHighlight || (useFilterHighlight ? idInSet : (inBoundary && idInSet));
 
         if (!isHighlighted) return;
 
-        // Yellow color for highlighted edges
-        const stroke = [255 / 255, 255 / 255, 0 / 255, 0.9];
+        for (let i = 0; i < pointsArray.length; i++) {
+          const a = pointsArray[i];
+          const b = pointsArray[(i + 1) % pointsArray.length];
 
-        for (let i = 0; i < points.length; i++) {
-          const a = points[i];
-          const b = points[(i + 1) % points.length]; // closing edge
-
-          // push segment a -> b
           edgeVertices[edgeVertexIndex * 2] = a[0];
           edgeVertices[edgeVertexIndex * 2 + 1] = a[1];
           edgeColors[edgeVertexIndex * 4] = stroke[0];
@@ -552,7 +756,7 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
       colors: edgeColors,
       count: edgeVertexIndex
     };
-  }, [annotations, shapeData, isPointInBoundary]);
+  }, [annotations, boundaryCheckCache, checkPointInBoundary, overlayAlpha, filterHighlightIndices, highlightGtAnnotations, gtHighlightNucleiIndices, findNearestCentroidId]);
 
   const redraw = useCallback(() => {
     const gl = glRef.current;
@@ -627,7 +831,9 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
     }
 
     // Draw centroids if available
-    if (centroidDataCache.current.count > 0) {
+    if (centroidDataCache.current.count > 0 && 
+        centroidDataCache.current.imageCoords && 
+        centroidDataCache.current.imageCoords.length > 0) {
       gl.useProgram(centroidProgramRef.current);
       gl.bindVertexArray(centroidVaoRef.current);
 
@@ -647,12 +853,19 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
       gl.uniform2fv(uCanvasSizeLoc, [canvas.width, canvas.height]);
       gl.uniformMatrix3fv(uImageToViewerLoc, false, imageToViewerMat3);
 
-      // Draw centroids
-      gl.drawArraysInstanced(gl.TRIANGLES, 0, 48, centroidDataCache.current.count);
+      // Draw centroids - ensure count doesn't exceed buffer size
+      const centroidCount = centroidDataCache.current.count;
+      const maxCentroidInstances = centroidDataCache.current.imageCoords.length / 2;
+      const safeCentroidCount = Math.min(centroidCount, maxCentroidInstances);
+      if (safeCentroidCount > 0 && safeCentroidCount <= maxCentroidInstances) {
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, 48, safeCentroidCount);
+      }
     }
 
     // Draw polygons (filled) if available
-    if (polygonDataCache.current.count > 0) {
+    if (polygonDataCache.current.count > 0 && 
+        polygonDataCache.current.indices && 
+        polygonDataCache.current.indices.length > 0) {
       gl.useProgram(polygonProgramRef.current);
       gl.bindVertexArray(polygonVaoRef.current);
 
@@ -671,12 +884,21 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
 
       // Bind element array buffer
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, polygonBuffersRef.current.indices);
-      // Render filled triangles (using 32-bit indices)
-      gl.drawElements(gl.TRIANGLES, polygonDataCache.current.count, gl.UNSIGNED_INT, 0);
+      // Render filled triangles (using 32-bit indices) - ensure count doesn't exceed buffer size
+      const polygonIndexCount = polygonDataCache.current.count;
+      const maxPolygonIndices = polygonDataCache.current.indices.length;
+      const safePolygonIndexCount = Math.min(polygonIndexCount, maxPolygonIndices);
+      if (safePolygonIndexCount > 0 && safePolygonIndexCount <= maxPolygonIndices) {
+        gl.drawElements(gl.TRIANGLES, safePolygonIndexCount, gl.UNSIGNED_INT, 0);
+      }
     }
 
     // Draw highlighted polygon edges (contours) if available
-    if (polygonEdgeDataCache.current.count > 0 && polygonEdgeVaoRef.current && polygonEdgeBuffersRef.current) {
+    if (polygonEdgeDataCache.current.count > 0 && 
+        polygonEdgeVaoRef.current && 
+        polygonEdgeBuffersRef.current &&
+        polygonEdgeDataCache.current.vertices &&
+        polygonEdgeDataCache.current.vertices.length > 0) {
       gl.useProgram(polygonProgramRef.current);
       gl.bindVertexArray(polygonEdgeVaoRef.current);
 
@@ -688,11 +910,17 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
       }
 
       // Note: line width is implementation-defined; many browsers clamp to 1
-      gl.drawArrays(gl.LINES, 0, polygonEdgeDataCache.current.count);
+      // Ensure count doesn't exceed buffer size
+      const edgeVertexCount = polygonEdgeDataCache.current.count;
+      const maxEdgeVertices = polygonEdgeDataCache.current.vertices.length / 2;
+      const safeEdgeVertexCount = Math.min(edgeVertexCount, maxEdgeVertices);
+      if (safeEdgeVertexCount > 0 && safeEdgeVertexCount <= maxEdgeVertices) {
+        gl.drawArrays(gl.LINES, 0, safeEdgeVertexCount);
+      }
     }
 
     gl.bindVertexArray(null);
-  }, [viewer, centroidSize]);
+  }, [viewer, centroidSize, overlayAlpha]);
 
   // WebGL setup
   useEffect(() => {
@@ -920,6 +1148,22 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
     const gl = glRef.current;
     const currentHash = `${processedCentroidData.count}_${Array.from(processedCentroidData.imageCoords.slice(0, 4)).join(',')}`;
 
+    if (processedCentroidData.count === 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, centroidBuffersRef.current.imageCoords);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(0), gl.STATIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, centroidBuffersRef.current.color);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(0), gl.STATIC_DRAW);
+      // Update cache to reflect empty state
+      centroidDataCache.current = {
+        imageCoords: new Float32Array(0),
+        colors: new Float32Array(0),
+        count: 0,
+        lastDataHash: currentHash
+      };
+      redraw();
+      return;
+    }
+
     // Always update buffers when data changes
     gl.bindBuffer(gl.ARRAY_BUFFER, centroidBuffersRef.current.imageCoords);
     gl.bufferData(gl.ARRAY_BUFFER, processedCentroidData.imageCoords, gl.STATIC_DRAW);
@@ -934,6 +1178,7 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
       lastDataHash: currentHash
     };
 
+    // Force redraw immediately - this will clear the buffer if count is 0
     redraw();
   }, [processedCentroidData, redraw]);
 
@@ -943,6 +1188,25 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
 
     const gl = glRef.current;
     const currentHash = `${processedPolygonData.count}_${Array.from(processedPolygonData.vertices.slice(0, 4)).join(',')}`;
+
+    if (processedPolygonData.count === 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, polygonBuffersRef.current.position);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(0), gl.STATIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, polygonBuffersRef.current.color);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(0), gl.STATIC_DRAW);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, polygonBuffersRef.current.indices);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(0), gl.STATIC_DRAW);
+      // Update cache to reflect empty state
+      polygonDataCache.current = {
+        vertices: new Float32Array(0),
+        colors: new Float32Array(0),
+        indices: new Uint32Array(0),
+        count: 0,
+        lastDataHash: currentHash
+      };
+      redraw();
+      return;
+    }
 
     // Always update buffers when data changes
     gl.bindBuffer(gl.ARRAY_BUFFER, polygonBuffersRef.current.position);
@@ -971,6 +1235,22 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
 
     const gl = glRef.current;
     const currentHash = `${processedPolygonEdgeData.count}_${Array.from(processedPolygonEdgeData.vertices.slice(0, 4)).join(',')}`;
+
+    if (processedPolygonEdgeData.count === 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, polygonEdgeBuffersRef.current.position);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(0), gl.STATIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, polygonEdgeBuffersRef.current.color);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(0), gl.STATIC_DRAW);
+      // Update cache to reflect empty state
+      polygonEdgeDataCache.current = {
+        vertices: new Float32Array(0),
+        colors: new Float32Array(0),
+        count: 0,
+        lastDataHash: currentHash
+      };
+      redraw();
+      return;
+    }
 
     gl.bindBuffer(gl.ARRAY_BUFFER, polygonEdgeBuffersRef.current.position);
     gl.bufferData(gl.ARRAY_BUFFER, processedPolygonEdgeData.vertices, gl.STATIC_DRAW);

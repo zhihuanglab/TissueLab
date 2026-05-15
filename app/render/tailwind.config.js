@@ -1,14 +1,16 @@
 /** @type {import('tailwindcss').Config} */
-const {nextui} = require("@nextui-org/react");
 module.exports = {
   content: [
     './pages/**/*.{js,ts,jsx,tsx,mdx}',
     './components/**/*.{js,ts,jsx,tsx,mdx}',
     './app/**/*.{js,ts,jsx,tsx,mdx}',
-    "./node_modules/@nextui-org/theme/dist/**/*.{js,ts,jsx,tsx}",
+    './utils/**/*.{js,ts,jsx,tsx,mdx}',
   ],
   theme: {
   	extend: {
+  		fontFamily: {
+  			sans: ["var(--font-inter)"],
+  		},
   		screens: {
   			xl: '1100px'
   		},
@@ -21,6 +23,17 @@ module.exports = {
   			pink: '#DCBEE8',
   			'pink-btn': '#F4D8FF',
   			linear: '#F4D8FF',
+  			success: 'hsl(var(--success))',
+  			danger: 'hsl(var(--destructive))',
+  			warning: 'hsl(var(--warning))',
+  			info: 'hsl(var(--info))',
+  			status: {
+  				uploading: 'hsl(var(--status-uploading))',
+  				paused: 'hsl(var(--status-paused))',
+  				error: 'hsl(var(--status-error))',
+  				success: 'hsl(var(--status-success))',
+  				cancelled: 'hsl(var(--status-cancelled))'
+  			},
   			panelColor: '#8368F2',
   			background: 'hsl(var(--background))',
   			foreground: 'hsl(var(--foreground))',
@@ -48,11 +61,15 @@ module.exports = {
   				DEFAULT: 'hsl(var(--accent))',
   				foreground: 'hsl(var(--accent-foreground))'
   			},
-  			destructive: {
-  				DEFAULT: 'hsl(var(--destructive))',
-  				foreground: 'hsl(var(--destructive-foreground))'
-  			},
-  			border: 'hsl(var(--border))',
+			destructive: {
+				DEFAULT: 'hsl(var(--destructive))',
+				foreground: 'hsl(var(--destructive-foreground))'
+			},
+			success: 'hsl(var(--success))',
+			warning: 'hsl(var(--warning))',
+			info: 'hsl(var(--info))',
+			border: 'hsl(var(--border))',
+			'button-outline-border': 'hsl(var(--button-outline-border))',
   			input: 'hsl(var(--input))',
   			ring: 'hsl(var(--ring))',
   			chart: {
@@ -64,7 +81,7 @@ module.exports = {
   			}
   		},
   		container: {
-  			center: 'true',
+  			center: true,
   			padding: {
   				DEFAULT: '1rem',
   				sm: '0rem'
@@ -77,6 +94,6 @@ module.exports = {
   		}
   	}
   },
-  plugins: [nextui(), require("tailwindcss-animate")],
-  darkMode: ["class", 'class'],
+  plugins: [require("tailwindcss-animate")],
+  darkMode: 'class',
 }

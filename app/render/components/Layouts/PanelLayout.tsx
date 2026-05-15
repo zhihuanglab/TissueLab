@@ -6,8 +6,8 @@ interface PanelLayoutProps {
 
 export const PanelLayout: React.FC<PanelLayoutProps> = ({ children }) => {
   return (
-    <div className="h-screen w-screen bg-white p-4">
-      <div className="h-full overflow-auto">
+    <div className="h-screen w-screen bg-background p-4 transition-all transition-colors duration-300">
+      <div className="h-full flex flex-col overflow-hidden transition-all duration-300">
         {children}
       </div>
     </div>

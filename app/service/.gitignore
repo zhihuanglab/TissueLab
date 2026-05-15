@@ -141,7 +141,6 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-.env
 .venv
 env/
 venv/
@@ -185,4 +184,4 @@ cython_debug/
 !/storage/bundles/
 /storage/bundles/*
 !/storage/bundles/catalog.json
-!/storage/model_registry.json
+!/storage/model_registry_preset.json

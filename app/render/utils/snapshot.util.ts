@@ -1,4 +1,5 @@
-import { message } from 'antd';
+import { toast } from 'sonner';
+import { getErrorMessage } from './common/apiResponse';
 
 /**
  * Snapshot utility for capturing canvas views
@@ -269,7 +270,7 @@ export const captureSnapshot = async (
     console.error('Error capturing snapshot:', error);
     return {
       success: false,
-      error: `Error capturing snapshot: ${error instanceof Error ? error.message : 'Unknown error'}`
+      error: getErrorMessage(error, 'Error capturing snapshot')
     };
   }
 };
@@ -287,17 +288,17 @@ export const takeSnapshot = async (
   const result = await captureSnapshot(viewerInstance, options);
   
   if (!result.success) {
-    message.error(result.error || 'Failed to capture snapshot');
+    toast.error(result.error || 'Failed to capture snapshot');
     return false;
   }
 
   if (result.blob && result.filename) {
     downloadFile(result.blob, result.filename);
-    message.success('Snapshot captured successfully!');
+    toast.success('Snapshot captured successfully!');
     return true;
   }
 
-  message.error('Failed to create snapshot');
+  toast.error('Failed to create snapshot');
   return false;
 };
 
@@ -321,13 +322,13 @@ export const takeSnapshotRegion = async (
 
   try {
     if (!viewerInstance) {
-      message.error('Viewer instance not available');
+      toast.error('Viewer instance not available');
       return false;
     }
 
     const canvasEl = viewerInstance?.container?.querySelector?.('.openseadragon-canvas') as HTMLCanvasElement | null;
     if (!canvasEl) {
-      message.error('No OpenSeadragon canvas found');
+      toast.error('No OpenSeadragon canvas found');
       return false;
     }
 
@@ -348,7 +349,7 @@ export const takeSnapshotRegion = async (
     const sh = Math.floor(clamp(region.height, 0, baseCanvas.height - sy));
 
     if (sw <= 0 || sh <= 0) {
-      message.error('Invalid crop region');
+      toast.error('Invalid crop region');
       return false;
     }
 
@@ -357,7 +358,7 @@ export const takeSnapshotRegion = async (
     cropCanvas.height = sh;
     const cropCtx = cropCanvas.getContext('2d');
     if (!cropCtx) {
-      message.error('Failed to create crop context');
+      toast.error('Failed to create crop context');
       return false;
     }
 
@@ -388,7 +389,7 @@ export const takeSnapshotRegion = async (
     });
 
     if (!blob) {
-      message.error('Failed to create JPEG blob');
+      toast.error('Failed to create JPEG blob');
       return false;
     }
 
@@ -400,11 +401,11 @@ export const takeSnapshotRegion = async (
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 100);
 
-    message.success('Region snapshot saved');
+    toast.success('Region snapshot saved');
     return true;
   } catch (error) {
     console.error('Error capturing region snapshot:', error);
-    message.error('Error capturing region snapshot');
+    toast.error('Error capturing region snapshot');
     return false;
   }
 };
@@ -426,7 +427,7 @@ export const takeSnapshotRegionFromCanvas = async (
       || (viewerInstance?.drawer?.canvas as HTMLCanvasElement | null)
       || null;
     if (!hostEl || !baseCanvas) {
-      message.error('No OpenSeadragon canvas found');
+      toast.error('No OpenSeadragon canvas found');
       return false;
     }
 
@@ -456,7 +457,7 @@ export const takeSnapshotRegionFromCanvas = async (
     out.height = Math.max(1, shBase);
     const ctx = out.getContext('2d');
     if (!ctx) {
-      message.error('Failed to create canvas context');
+      toast.error('Failed to create canvas context');
       return false;
     }
 
@@ -542,7 +543,7 @@ export const takeSnapshotRegionFromCanvas = async (
     });
 
     if (!blob) {
-      message.error('Failed to create JPEG blob');
+      toast.error('Failed to create JPEG blob');
       return false;
     }
 
@@ -554,11 +555,11 @@ export const takeSnapshotRegionFromCanvas = async (
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 100);
 
-    message.success('Region snapshot saved');
+    toast.success('Region snapshot saved');
     return true;
   } catch (e) {
     console.error('Region crop failed:', e);
-    message.error('Region crop failed');
+    toast.error('Region crop failed');
     return false;
   }
 };
@@ -584,7 +585,7 @@ export const takeSnapshotPolygon = async (
 
   try {
     if (!viewerInstance) {
-      message.error('Viewer instance not available');
+      toast.error('Viewer instance not available');
       return false;
     }
     const hostEl = viewerInstance?.container?.querySelector?.('.openseadragon-canvas') as HTMLElement | null;
@@ -592,12 +593,12 @@ export const takeSnapshotPolygon = async (
       || (viewerInstance?.drawer?.canvas as HTMLCanvasElement | null)
       || null;
     if (!hostEl || !baseCanvas) {
-      message.error('No OpenSeadragon canvas found');
+      toast.error('No OpenSeadragon canvas found');
       return false;
     }
 
     if (!polygonCssPoints || polygonCssPoints.length < 3) {
-      message.error('Invalid polygon');
+      toast.error('Invalid polygon');
       return false;
     }
 
@@ -621,7 +622,7 @@ export const takeSnapshotPolygon = async (
     const bh = Math.floor(clamp(maxY - minY, 0, baseCanvas.height - by));
 
     if (bw <= 0 || bh <= 0) {
-      message.error('Invalid polygon bounds');
+      toast.error('Invalid polygon bounds');
       return false;
     }
 
@@ -631,7 +632,7 @@ export const takeSnapshotPolygon = async (
     out.height = bh;
     const ctx = out.getContext('2d');
     if (!ctx) {
-      message.error('Failed to create canvas context');
+      toast.error('Failed to create canvas context');
       return false;
     }
 
@@ -763,7 +764,7 @@ export const takeSnapshotPolygon = async (
 
     const blob = await toBlobAsync();
     if (!blob) {
-      message.error('Failed to create image blob');
+      toast.error('Failed to create image blob');
       return false;
     }
 
@@ -774,11 +775,11 @@ export const takeSnapshotPolygon = async (
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 100);
 
-    message.success('Polygon snapshot saved');
+    toast.success('Polygon snapshot saved');
     return true;
   } catch (e) {
     console.error('Polygon snapshot failed:', e);
-    message.error('Polygon snapshot failed');
+    toast.error('Polygon snapshot failed');
     return false;
   }
 };
@@ -790,7 +791,7 @@ export const takeSnapshotPolygon = async (
 export const savePNGFromCurrentSelection = async (
   viewerInstance: any,
   shapeCoords: { x1: number; y1: number; x2: number; y2: number } | null | undefined,
-  options: { scaleFactor?: number; backgroundColor?: string; quality?: number; filenameSuffix?: string } = {}
+  options: { backgroundColor?: string; quality?: number; filenameSuffix?: string } = {}
 ): Promise<boolean> => {
   try {
     if (!viewerInstance) {
@@ -798,7 +799,7 @@ export const savePNGFromCurrentSelection = async (
       return false;
     }
 
-    const { scaleFactor = 16, backgroundColor = '#ffffff', quality = 0.95, filenameSuffix = 'annotation' } = options;
+    const { backgroundColor = '#ffffff', quality = 0.95, filenameSuffix = 'annotation' } = options;
 
     const viewer = viewerInstance as any;
     const world = viewer.world;
@@ -911,11 +912,10 @@ export const savePNGFromCurrentSelection = async (
       return false;
     }
 
-    const scale = scaleFactor;
-    const x1Raw = shapeCoords.x1 * scale;
-    const y1Raw = shapeCoords.y1 * scale;
-    const x2Raw = shapeCoords.x2 * scale;
-    const y2Raw = shapeCoords.y2 * scale;
+    const x1Raw = shapeCoords.x1;
+    const y1Raw = shapeCoords.y1;
+    const x2Raw = shapeCoords.x2;
+    const y2Raw = shapeCoords.y2;
 
     const OSD: any = (window as any).OpenSeadragon;
     const pImage1 = OSD ? new OSD.Point(x1Raw, y1Raw) : { x: x1Raw, y: y1Raw };

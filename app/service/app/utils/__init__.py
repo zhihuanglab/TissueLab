@@ -25,5 +25,21 @@ def resolve_path(path: str) -> str:
     return os.path.realpath(full_path)
 
 from app.utils.decorator import async_retry
+from app.utils.h5_to_zarr import (
+    ConversionConfig,
+    convert_h5_to_zarr,
+    test_zarr_file,
+)
 
-__all__ = ["async_retry", "resolve_path"]
+
+def register_zarr_store(uid: str, zarr_abs_path: str) -> None:
+    """No-op in the local desktop build.
+
+    Previously wrote a metadata entry to Firestore; the local backend no longer
+    talks to remote services for file indexing. Kept as a stub so existing
+    fire-and-forget call sites stay valid.
+    """
+    return
+
+
+__all__ = ["async_retry", "resolve_path", "register_zarr_store", "ConversionConfig", "convert_h5_to_zarr", "test_zarr_file"]

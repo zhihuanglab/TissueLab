@@ -1,36 +1,22 @@
 'use client';
 
+import { AnimatePresence } from 'framer-motion';
+import { X } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { toast } from 'sonner';
+import * as z from 'zod';
+import { getApiResponseErrorMessage, getErrorMessage } from '@/utils/common/apiResponse';
+import { initUserAssetsEndpoint, sendCodeEndpoint, verifyCodeEndpoint } from '../../../config/endpoints';
+import useGlobalSignup from '../../../hooks/useGlobalSignup';
+import { useSignupModal } from '../../../store/zustand/store';
+import ImageComparisonSlider from '../../assets/ImageComparisonSlider';
 import {
   Dialog,
-  DialogTrigger,
   DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
+  DialogTrigger
 } from '../../ui/dialog';
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from '../../ui/form';
-import React, { useState, useEffect } from 'react';
-import { Button } from '../../ui/button';
-import Image from 'next/image';
-import { zodResolver } from '@hookform/resolvers/zod';
-import { Input } from '../../ui/input';
-import useGlobalSignup from '../../../hooks/useGlobalSignup';
-import { useForm } from 'react-hook-form';
-import * as z from 'zod';
-import { ChevronLeft, Loader2, X } from 'lucide-react';
-import { toast } from 'sonner';
-import { useInterval } from 'react-use';
-import ImageComparisonSlider from '../../assets/ImageComparisonSlider';
-import { motion, AnimatePresence } from 'framer-motion';
-import { useSignupModal } from '../../../store/zustand/store';
-import Link from 'next/link';
+import LeftPaneEmail from './LeftPaneEmail';
+import LeftPaneVerify from './LeftPaneVerify';
 let curEmail: string;
 
 interface GlobalSignLoginModalProps {
@@ -94,87 +80,178 @@ const GlobalSignupModal = ({
     signupSuccess: signupModalContext?.signupSuccess,
   });
   const [isGooglePending, setIsGooglePending] = useState(false);
+  const [isEmailPending, setIsEmailPending] = useState(false);
+  const [emailStep, setEmailStep] = useState<'email' | 'verify'>('email');
+  const [email, setEmail] = useState('');
+  const [verificationCode, setVerificationCode] = useState<string[]>(Array(6).fill(''));
+  
   const handleGoogleClick = async () => {
     if (isGooglePending) return;
     try {
       setIsGooglePending(true);
       await loginViaGoogle();
-      // If successful, keep the button disabled until modal closes (onAuthStateChanged handles this)
-      // Don't reset the state here on success to prevent multiple login attempts
-    } catch (error: any) {
-      // Reset immediately on error/cancellation to allow retry
-      console.log('Google login error:', error?.code || error);
+      // loginViaGoogle handles modal closing and signupSuccess callback internally
+      // onAuthStateChanged will also trigger to update global user state
+      // Reset pending state to allow UI to update immediately
       setIsGooglePending(false);
-      
-      // Handle specific error cases
-      if (error?.code === 'auth/popup-closed-by-user' || 
-          error?.code === 'auth/cancelled-popup-request' ||
-          error?.code === 'auth/popup-blocked') {
-        console.log('User cancelled or blocked Google login popup');
-        // Allow immediate retry for user cancellation
+      // Modal will be closed by loginViaGoogle or onAuthStateChanged
+    } catch (error: any) {
+      console.log('Google login error:', error?.code || error);
+
+      // recover pending on popup errors
+      if (
+        error?.code === 'auth/popup-closed-by-user' ||
+        error?.code === 'auth/cancelled-popup-request' ||
+        error?.code === 'auth/popup-blocked'
+      ) {
+        setIsGooglePending(false);
         return;
       }
-      
-      // For other errors, show error message if needed
-      console.warn('Google login failed:', error);
+
+      // reset pending for all other errors
+      setIsGooglePending(false);
     }
-    // Note: We don't use finally block anymore to have precise control over state reset
   };
 
-  const [errorTip, setErrorTip] = useState('');
-  const [step, setStep] = useState<'email'>('email');
+  const handleSendCode = async () => {
+    if (isEmailPending) return;
+    try {
+      setIsEmailPending(true);
+      
+      const response = await fetch(sendCodeEndpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ email }),
+      });
+      
+      const result = await response.json();
+      
+      const backendMessage = getApiResponseErrorMessage(result);
+      if (result.success) {
+        toast.success('Verification code sent to your email');
+        setEmailStep('verify');
+      } else {
+        toast.error(backendMessage || result.message || 'Failed to send verification code');
+      }
+    } catch (error) {
+      console.error('Send code error:', error);
+      toast.error(getErrorMessage(error, 'Failed to send verification code'));
+    } finally {
+      setIsEmailPending(false);
+    }
+  };
 
-  // Reset Google pending state when modal closes
+  const handleVerifyCode = async () => {
+    if (isEmailPending) return;
+    const codeString = verificationCode.join('');
+    if (codeString.length !== 6) return;
+    
+    try {
+      setIsEmailPending(true);
+      
+      const response = await fetch(verifyCodeEndpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ 
+          email, 
+          code: codeString 
+        }),
+      });
+      
+      const result = await response.json();
+      
+      const backendMessage = getApiResponseErrorMessage(result);
+      if (result.success && result.user?.custom_token) {
+        // Use Firebase custom token to sign in
+        const { getAuth, signInWithCustomToken } = await import('firebase/auth');
+        const { app } = await import('../../../config/firebaseConfig');
+        
+        const auth = getAuth(app);
+        const userCredential = await signInWithCustomToken(auth, result.user.custom_token);
+        
+        // Get ID token for backend API calls
+        const idToken = await userCredential.user.getIdToken();
+        
+        // Call /v1/me to create user data
+        const meResponse = await fetch(initUserAssetsEndpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${idToken}`,
+          },
+        });
+        
+        if (meResponse.ok) {
+          toast.success('Email verification successful');
+          setSignupModalOpen(false);
+        } else {
+          console.error('Failed to create user data');
+          toast.error('Login successful but failed to initialize user data');
+        }
+      } else {
+        toast.error(backendMessage || result.message || 'Invalid verification code');
+      }
+    } catch (error) {
+      console.error('Verify code error:', error);
+      toast.error(getErrorMessage(error, 'Failed to verify code'));
+    } finally {
+      setIsEmailPending(false);
+    }
+  };
+
+  const handleResendCode = async () => {
+    if (isEmailPending) return;
+    try {
+      setIsEmailPending(true);
+      
+      const response = await fetch(sendCodeEndpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ email }),
+      });
+      
+      const result = await response.json();
+      
+      const backendMessage = getApiResponseErrorMessage(result);
+      if (result.success) {
+        toast.success('New verification code sent to your email');
+      } else {
+        toast.error(backendMessage || result.message || 'Failed to resend verification code');
+      }
+    } catch (error) {
+      console.error('Resend code error:', error);
+      toast.error(getErrorMessage(error, 'Failed to resend verification code'));
+    } finally {
+      setIsEmailPending(false);
+    }
+  };
+  
+  const [errorTip, setErrorTip] = useState('');
+
+  // Reset states when modal closes
   useEffect(() => {
     if (!isSignupModalOpen) {
       setIsGooglePending(false);
+      setIsEmailPending(false);
+      setEmailStep('email');
+      setEmail('');
+      setVerificationCode(Array(6).fill(''));
       setErrorTip('');
-      setStep('email');
     }
   }, [isSignupModalOpen]);
-
-  const getSchemaForStep = () => EmailSchema;
-
-  const getDefaultValuesForStep = () => ({ email: '' });
-
-  const form = useForm<any>({
-    resolver: zodResolver(getSchemaForStep() as any),
-    defaultValues: getDefaultValuesForStep(),
-  });
-
-
-  // Email flow removed; keep stub for potential future use
-  const handleSubmit = async (
-    values: z.infer<typeof EmailSchema>
-  ) => {
-    setErrorTip('');
-    // No-op: email flow disabled
-  };
-
-  // countdown logic
-  // Countdown removed with email flow
-
-  useEffect(() => {
-    form.reset({ ...form.getValues() });
-    form.clearErrors();
-    setErrorTip('');
-  }, [step, form]);
-
-  useEffect(() => {
-    if (!isSignupModalOpen) {
-      form.reset({ email: '' });
-      form.clearErrors();
-      setStep('email');
-      setErrorTip('');
-    }
-  }, [form, isSignupModalOpen]);
 
   return (
     <Dialog open={isSignupModalOpen} onOpenChange={setSignupModalOpen}>
       {children && <DialogTrigger asChild={asChild}>{children}</DialogTrigger>}
       {isSignupModalOpen && (
         <DialogContent
-          className={`flex w-[21.25rem] max-w-full flex-row gap-x-0 gap-y-4 overflow-hidden rounded-lg border-none p-0 lg:w-[48rem] ${customClassName}`}
+          className={`flex w-[21.25rem] max-w-full flex-row gap-x-0 gap-y-4 overflow-hidden rounded-lg border-text-foreground/50 p-0 lg:w-[48rem]  ${customClassName}`}
           /* TODO: Centered version without side image - for future use */
           /* className={`flex w-[21.25rem] max-w-full flex-col gap-x-0 gap-y-4 overflow-hidden rounded-lg border-none p-0 items-center justify-center ${customClassName}`} */
           onInteractOutside={(e) => {
@@ -182,112 +259,39 @@ const GlobalSignupModal = ({
           }}
           onCloseAutoFocus={(e) => e.preventDefault()}
         >
-          <AnimatePresence initial={false} mode='wait'>
-            <motion.div
-              key={step}
-              initial={{
-                x: step === 'email' ? -30 : 30,
-                opacity: 0,
-              }}
-              animate={{
-                x: 0,
-                opacity: 1,
-                transition: {
-                  duration: 0.25,
-                  ease: [0.4, 0, 0.2, 1],
-                },
-              }}
-              exit={{
-                x: step === 'email' ? -30 : 30,
-                opacity: 0,
-                transition: {
-                  duration: 0.25,
-                  ease: [0.4, 0, 1, 1],
-                },
-              }}
-              transition={{ type: 'tween', duration: 0.2 }}
-              className='flex w-[21.25rem] flex-col gap-4 overflow-hidden p-6 justify-center items-center'
-              /* TODO: Original positioning - for later adjustment */
-              /* className='flex w-[21.25rem] flex-col gap-4 overflow-hidden p-6' */
-            >
-              {/* Close button in top right */}
-              <button
-                className='absolute top-2 right-2 h-8 w-8 rounded-full p-0 z-10 bg-white shadow-sm hover:bg-gray-100 hover:shadow-md transition-all flex items-center justify-center border-0 cursor-pointer'
-                onClick={() => setSignupModalOpen(false)}
-              >
-                <X className='h-4 w-4 text-gray-500 hover:text-gray-800' />
-              </button>
+          {/* Close button in top right - always visible */}
+          <button
+            className="absolute top-2 right-2 h-8 w-8 rounded-full p-0 z-10 bg-card/20 shadow-sm hover:bg-card/20 hover:shadow-md transition-all flex items-center justify-center border-0 cursor-pointer"
+            onClick={() => setSignupModalOpen(false)}
+          >
+            <X className="h-4 w-4 text-foreground/80 hover:text-foreground" />
+          </button>
 
-              <DialogHeader>
-                <DialogTitle className='flex flex-row items-center'>
-                  {/* Back button removed with email-only step */}
-                  <span className='text-2xl font-semibold'>Continue to TissueLab</span>
-                </DialogTitle>
-              </DialogHeader>
-              {step === 'email' ? (
-                <DialogDescription className='text-sm leading-5 text-gray-600'>
-                  {signupModalContext?.description ||
-                    'Sign up or log in to continue.'}
-                </DialogDescription>
-              ) : null}
-              {step === 'email' ? (
-                <div className='flex flex-col gap-3'>
-                  {errorTip && step === 'email' ? (
-                    <div className='rounded-lg bg-[#f8d8d9] px-3 py-1 text-xs'>
-                      {errorTip}
-                    </div>
-                  ) : null}
-
-                  <Button
-                    onClick={handleGoogleClick}
-                    variant='outline'
-                    className={`flex h-11 w-full items-center justify-center gap-3 rounded-xl border-2 text-sm font-bold hover:shadow ${isGooglePending ? 'pointer-events-none opacity-70' : ''}`}
-                    disabled={isGooglePending}
-                  >
-                    <Image
-                      src='https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg'
-                      width={24}
-                      height={24}
-                      alt='Google'
-                      className='h-6 w-6 pr-2'
-                    />
-                    {isGooglePending ? (
-                      <>
-                        <Loader2 className='animate-spin' size={16} />
-                        Processing...
-                      </>
-                    ) : (
-                      'Continue with Google'
-                    )}
-                  </Button>
-
-                  {/* Email login removed */}
-
-                  {/* Terms */}
-                  <p className='mt-6 text-xs text-neutral-500'>
-                    By continuing up, you agree to our{' '}
-                    <a 
-                      href='https://tissuelab.org/' 
-                      target='_blank' 
-                      rel='noopener noreferrer'
-                      className='underline hover:text-blue-600'
-                    >
-                      Terms of Service
-                    </a>{' '}
-                    and our{' '}
-                    <a 
-                      href='https://tissuelab.org/' 
-                      target='_blank' 
-                      rel='noopener noreferrer'
-                      className='underline hover:text-blue-600'
-                    >
-                      Privacy Policy
-                    </a>
-                    .
-                  </p>
-                </div>
-              ) : null}
-            </motion.div>
+          <AnimatePresence initial={false} mode="wait">
+            {emailStep === 'email' ? (
+              <LeftPaneEmail
+                key="email-pane"
+                email={email}
+                setEmail={setEmail}
+                isGooglePending={isGooglePending}
+                isEmailPending={isEmailPending}
+                onGoogleClick={handleGoogleClick}
+                onSendCode={handleSendCode}
+                signupModalContext={signupModalContext}
+                errorTip={errorTip}
+              />
+            ) : (
+              <LeftPaneVerify
+                key="verify-pane"
+                email={email}
+                verificationCode={verificationCode}
+                setVerificationCode={setVerificationCode}
+                isEmailPending={isEmailPending}
+                onVerifyCode={handleVerifyCode}
+                onResendCode={handleResendCode}
+                onBack={() => setEmailStep('email')}
+              />
+            )}
           </AnimatePresence>
           <div className='hidden flex-1 lg:block'>
             {/* TODO: replace with Cloudflare image to support CDN (https://imagedelivery.net) */}

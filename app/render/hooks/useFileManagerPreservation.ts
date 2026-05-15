@@ -11,9 +11,9 @@ import {
   setSearchTerm,
   addExpandedFolder,
   removeExpandedFolder
-} from '@/store/slices/webFileManagerSlice';
+} from '@/store/slices/fileManagerSlice';
 
-export const useFileManagerPreservation = () => {
+export const useFileManagerPreservation = (storageKey: string = 'fileManagerState') => {
   const dispatch = useDispatch();
   const {
     currentDirectory,
@@ -25,7 +25,7 @@ export const useFileManagerPreservation = () => {
     searchTerm,
     expandedFolders,
     lastVisitedPath
-  } = useSelector((state: RootState) => state.webFileManager);
+  } = useSelector((state: RootState) => state.fileManager);
 
   // Save state to localStorage when it changes
   useEffect(() => {
@@ -45,8 +45,9 @@ export const useFileManagerPreservation = () => {
       lastVisitedPath
     };
     
-    localStorage.setItem('fileManagerState', JSON.stringify(stateToSave));
+    localStorage.setItem(storageKey, JSON.stringify(stateToSave));
   }, [
+    storageKey,
     currentDirectory,
     selectedFiles,
     sortConfig,
@@ -64,7 +65,7 @@ export const useFileManagerPreservation = () => {
       return;
     }
     
-    const savedState = localStorage.getItem('fileManagerState');
+    const savedState = localStorage.getItem(storageKey);
     if (savedState) {
       try {
         const parsedState = JSON.parse(savedState);
@@ -97,7 +98,7 @@ export const useFileManagerPreservation = () => {
         console.error('Failed to restore file manager state:', error);
       }
     }
-  }, [dispatch]);
+  }, [dispatch, storageKey]);
 
   return {
     currentDirectory,

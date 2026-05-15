@@ -76,11 +76,11 @@ class FeedbackService:
             self._cache[self._doc_id(user_id)] = copy.deepcopy(data)
 
     @staticmethod
-    def _context_key_from_path(h5_path: Optional[str]) -> Optional[str]:
+    def _context_key_from_path(zarr_path: Optional[str]) -> Optional[str]:
         try:
-            if not h5_path:
+            if not zarr_path:
                 return None
-            base = h5_path.replace("\\", "/").split("/")[-1]
+            base = zarr_path.replace("\\", "/").split("/")[-1]
             if not base:
                 return None
             return base.rsplit(".", 1)[0] if "." in base else base
@@ -132,14 +132,14 @@ class FeedbackService:
         self,
         nodes: List[Dict[str, str]],
         rating: str,
-        h5_path: Optional[str] = None,
+        zarr_path: Optional[str] = None,
         context: Optional[Dict] = None,
         user_id: Optional[str] = None,
     ) -> Dict:
         if not isinstance(nodes, list):
             return {"success": False, "error": "nodes must be a list"}
         delta = 1 if str(rating).lower() == "up" else -1
-        ctx_key = self._context_key_from_path(h5_path)
+        ctx_key = self._context_key_from_path(zarr_path)
         data = self._load_data(user_id)
         data = self._apply_feedback(data, nodes, delta, ctx_key, self._doc_id(user_id))
         self._save_data(user_id, data)
