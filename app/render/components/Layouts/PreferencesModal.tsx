@@ -1,13 +1,16 @@
 'use client'
 
 import React, { useState, useEffect } from 'react'
+import { useTheme } from 'next-themes'
+import { useDispatch, useSelector } from 'react-redux'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { useUserInfo } from '@/provider/UserInfoProvider'
+import { RootState } from '@/store'
+import { setHighlightGtAnnotations } from '@/store/slices/viewer/viewerSettingsSlice'
 
 interface PreferencesModalProps {
   isOpen: boolean
@@ -19,6 +22,10 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
   onClose,
 }) => {
   const { userInfo } = useUserInfo()
+  const { theme, setTheme, systemTheme } = useTheme()
+  const dispatch = useDispatch()
+  const highlightGtAnnotations = useSelector((state: RootState) => state.viewerSettings.highlightGtAnnotations)
+  const [mounted, setMounted] = useState(false)
   const [preferences, setPreferences] = useState({
     theme: 'dark',
     notifications: true,
@@ -26,6 +33,41 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
     showAdvancedOptions: false,
   })
   const [isLoading, setIsLoading] = useState(false)
+
+  // Get current theme (resolve system theme if needed)
+  const currentTheme = React.useMemo(() => {
+    if (theme === 'system') {
+      return systemTheme
+    }
+    return theme
+  }, [theme, systemTheme])
+
+  const updatePreference = (key: string, value: any) => {
+    setPreferences(prev => ({ ...prev, [key]: value }))
+  }
+
+  // Handle theme toggle
+  const handleThemeToggle = (checked: boolean) => {
+    const nextTheme = checked ? 'dark' : 'light'
+    setTheme(nextTheme)
+    
+    // Notify Electron to update title bar overlay colors
+    if (typeof window !== 'undefined' && window.electron) {
+      try {
+        window.electron.send('update-titlebar-theme', nextTheme)
+      } catch (error) {
+        console.error('Failed to update title bar theme:', error)
+      }
+    }
+    
+    // Update local preferences state
+    updatePreference('theme', nextTheme)
+  }
+
+  // Mount check for theme
+  useEffect(() => {
+    setMounted(true)
+  }, [])
 
   // Load preferences from localStorage
   useEffect(() => {
@@ -58,18 +100,14 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
     }
   }
 
-  const updatePreference = (key: string, value: any) => {
-    setPreferences(prev => ({ ...prev, [key]: value }))
-  }
-
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-5xl w-[90vw] max-h-[90vh] overflow-y-auto bg-gray-50 border-gray-300 text-gray-900">
+      <DialogContent className="max-w-5xl w-[90vw] max-h-[90vh] overflow-y-auto bg-card border-border text-foreground">
         <DialogHeader>
-          <DialogTitle className="text-xl font-semibold text-gray-800">
+          <DialogTitle className="text-xl font-semibold text-foreground">
             Preferences
           </DialogTitle>
-          <DialogDescription className="text-gray-600">
+          <DialogDescription className="text-muted-foreground">
             Customize your application settings and preferences
           </DialogDescription>
         </DialogHeader>
@@ -77,43 +115,53 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
         <div className="space-y-6 mt-6">
           {/* Appearance */}
           <div className="space-y-4">
-            <h3 className="text-lg font-medium text-gray-700">Appearance</h3>
+            <h3 className="text-lg font-medium text-foreground">Appearance</h3>
             
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <div className="space-y-1">
-                  <Label className="text-sm font-medium text-gray-600">Theme</Label>
-                  <p className="text-xs text-gray-500">Choose your interface theme (Coming soon)</p>
+                  <Label className="text-sm font-medium text-muted-foreground">Theme</Label>
+                  <p className="text-xs text-muted-foreground">Choose your interface theme</p>
                 </div>
-                <Select
-                  value={preferences.theme}
-                  disabled={true}
-                >
-                  <SelectTrigger className="w-32 bg-gray-100 border-gray-300 cursor-not-allowed opacity-60">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent className="bg-white border-gray-300">
-                    <SelectItem value="dark">Dark</SelectItem>
-                    <SelectItem value="light">Light</SelectItem>
-                    <SelectItem value="auto">Auto</SelectItem>
-                  </SelectContent>
-                </Select>
+                <Switch
+                  checked={mounted && currentTheme === 'dark'}
+                  onCheckedChange={handleThemeToggle}
+                />
               </div>
 
             </div>
           </div>
 
-          <Separator className="bg-gray-300" />
+          <Separator className="bg-border" />
+
+          {/* Viewer / Annotations */}
+          <div className="space-y-4">
+            <h3 className="text-lg font-medium text-foreground">Viewer</h3>
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="space-y-1">
+                  <Label className="text-sm font-medium text-muted-foreground">Highlight user annotations (GT)</Label>
+                  <p className="text-xs text-muted-foreground">Always highlight nuclei and tissue marked as ground truth</p>
+                </div>
+                <Switch
+                  checked={highlightGtAnnotations}
+                  onCheckedChange={(checked) => dispatch(setHighlightGtAnnotations(checked))}
+                />
+              </div>
+            </div>
+          </div>
+
+          <Separator className="bg-border" />
 
           {/* Application Settings */}
           <div className="space-y-4">
-            <h3 className="text-lg font-medium text-gray-700">Application</h3>
+            <h3 className="text-lg font-medium text-foreground">Application</h3>
             
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <div className="space-y-1">
-                  <Label className="text-sm font-medium text-gray-400">Notifications</Label>
-                  <p className="text-xs text-gray-400">Receive app notifications</p>
+                  <Label className="text-sm font-medium text-muted-foreground">Notifications</Label>
+                  <p className="text-xs text-muted-foreground">Receive app notifications</p>
                 </div>
                 <Switch
                   checked={preferences.notifications}
@@ -125,8 +173,8 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
 
               <div className="flex items-center justify-between">
                 <div className="space-y-1">
-                  <Label className="text-sm font-medium text-gray-400">Auto Save</Label>
-                  <p className="text-xs text-gray-400">Automatically save your work</p>
+                  <Label className="text-sm font-medium text-muted-foreground">Auto Save</Label>
+                  <p className="text-xs text-muted-foreground">Automatically save your work</p>
                 </div>
                 <Switch
                   checked={preferences.autoSave}
@@ -138,8 +186,8 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
 
               <div className="flex items-center justify-between">
                 <div className="space-y-1">
-                  <Label className="text-sm font-medium text-gray-400">Show Advanced Options</Label>
-                  <p className="text-xs text-gray-400">Display advanced features in the interface</p>
+                  <Label className="text-sm font-medium text-muted-foreground">Show Advanced Options</Label>
+                  <p className="text-xs text-muted-foreground">Display advanced features in the interface</p>
                 </div>
                 <Switch
                   checked={preferences.showAdvancedOptions}
@@ -153,7 +201,7 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
 
         </div>
 
-        <div className="flex justify-between items-center space-x-2 mt-6 pt-4 border-t border-gray-300">
+        <div className="flex justify-between items-center space-x-2 mt-6 pt-4 border-t border-border">
           <Button
             onClick={() => setPreferences({
               theme: 'dark',
@@ -162,7 +210,7 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
               showAdvancedOptions: false,
             })}
             variant="outline"
-            className="border-gray-300 text-gray-700 hover:bg-white"
+            className="border-border text-foreground hover:bg-accent"
           >
             Reset to Defaults
           </Button>
@@ -171,14 +219,13 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
             <Button
               onClick={onClose}
               variant="outline"
-              className="border-gray-300 text-gray-700 hover:bg-white"
+              className="border-border text-foreground hover:bg-accent"
             >
               Cancel
             </Button>
             <Button
               onClick={savePreferences}
               disabled={isLoading}
-              className="bg-blue-600 hover:bg-blue-700"
             >
               {isLoading ? 'Saving...' : 'Save Changes'}
             </Button>

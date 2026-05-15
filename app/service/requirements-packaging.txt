@@ -1,0 +1,41 @@
+# Packaging requirements - minimal runtime dependencies
+# Core frameworks
+fastapi==0.115.4
+uvicorn==0.32.0
+pydantic==2.9.2
+pydantic-settings==2.0.3
+
+# Image processing core
+Pillow>=8.3.2
+numpy==1.26.4
+opencv-python
+scipy==1.13.1
+scikit-image==0.22.0
+
+# Medical image format support
+h5py==3.12.1
+pyisyntax
+pyvips[binary]
+
+# Network and API
+requests==2.32.3
+aiohttp==3.10.10
+websockets>=11.0.3
+
+# Authentication and security
+PyJWT>=2.8.0
+
+# Task queue
+celery
+pyzmq
+
+# AI/ML core
+tissuelab_sdk==0.1.12
+openai
+
+# Data processing
+tqdm==4.67.0
+orjson
+
+# System tools
+psutil==6.1.0

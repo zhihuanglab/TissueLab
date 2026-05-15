@@ -1,4 +1,4 @@
-import { apiFetch } from "@/utils/apiFetch";
+import { apiFetch } from "@/utils/common/apiFetch";
 import { CTRL_SERVICE_API_ENDPOINT } from "@/constants/config";
 
 export interface ClassifierData {
@@ -87,15 +87,16 @@ export class ClassifiersService {
    */
   async deleteClassifier(classifierId: string): Promise<any> {
     try {
-      return await apiFetch(`${this.baseUrl}/v1/classifiers/${classifierId}`, {
+      const result = await apiFetch(`${this.baseUrl}/v1/classifiers/${classifierId}`, {
         method: 'DELETE',
       });
+      return result;
     } catch (error) {
       const status = (error as any)?.status;
       // If classifier is already deleted (404), treat as success
       if (status === 404) {
-        console.log(`Classifier ${classifierId} was already deleted`);
-        return { success: true, message: 'Classifier was already deleted' };
+        console.warn(`Classifier ${classifierId} not found - may have been deleted or does not exist`);
+        return { success: true, message: 'Classifier not found or already deleted' };
       }
       console.error('Failed to delete classifier:', error);
       throw error;
@@ -142,15 +143,14 @@ export class ClassifiersService {
    * Get classifier author display
    */
   getAuthorDisplay(classifier: ClassifierData): string {
-    // Try to get preferred_name from localStorage first
-    if (classifier.ownerId && classifier.ownerId !== 'anonymous') {
+    if (typeof window !== 'undefined' && classifier.ownerId && classifier.ownerId !== 'anonymous') {
       try {
-        const preferredName = localStorage.getItem(`preferred_name_${classifier.ownerId}`);
+        const preferredName = window.localStorage.getItem(`preferred_name_${classifier.ownerId}`)
         if (preferredName && preferredName !== 'null' && preferredName !== '') {
-          return preferredName;
+          return preferredName
         }
       } catch (error) {
-        console.warn('Failed to get preferred_name from localStorage:', error);
+        console.warn('Failed to get preferred_name from localStorage:', error)
       }
     }
     

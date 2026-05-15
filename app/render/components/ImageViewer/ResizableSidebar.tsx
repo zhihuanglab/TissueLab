@@ -1,26 +1,26 @@
 'use client'
 
-import React, { useState, useEffect, useCallback } from 'react'
-import SidebarMain from "@/components/ImageViewer/Sidebar/SidebarMain";
-import SidebarAnnotation from "@/components/ImageViewer/Sidebar/SidebarAnnotaion";
-// import SidebarPythonScripts from "@/components/ImageViewer/Sidebar/SidebarPythonScripts";
-// Original SidebarChat kept for reference (contains tabs)
-// import SidebarChat from "@/components/ImageViewer/Sidebar/SidebarChat";
-import SidebarBotOnly from "@/components/ImageViewer/Sidebar/SidebarBotOnly";
-import SidebarWorkflowOnly from "@/components/ImageViewer/Sidebar/SidebarWorkflowOnly";
-import SidebarPrefs from "@/components/ImageViewer/Sidebar/SidebarViewerSetting";
-// TODO: Comment out for future use
-// import SidebarAITabs from "@/components/ImageViewer/Sidebar/SidebarAITabs/index";
-import SidebarH5DataViewer from "@/components/ImageViewer/Sidebar/SidebarH5DataViewer";
+import dynamic from 'next/dynamic';
+import React, { useCallback, useEffect, useState } from 'react';
+
+// Dynamically import sidebar components to avoid SSR issues with openseadragon
+const SidebarAnnotation = dynamic(() => import("@/components/imageViewer/RightSidebar/SidebarAnnotaion"), { ssr: false });
+const SidebarBotOnly = dynamic(() => import("@/components/imageViewer/RightSidebar/SidebarBotOnly"), { ssr: false });
+const SidebarMain = dynamic(() => import("@/components/imageViewer/RightSidebar/SidebarMain"), { ssr: false });
+const SidebarPrefs = dynamic(() => import("@/components/imageViewer/RightSidebar/SidebarViewerSetting"), { ssr: false });
+const SidebarWorkflowOnly = dynamic(() => import("@/components/imageViewer/RightSidebar/SidebarWorkflowOnly"), { ssr: false });
+const SidebarWorkflowGraphOnly = dynamic(() => import("@/components/imageViewer/RightSidebar/SidebarWorkflowGraphOnly"), { ssr: false });
+const SidebarDataViewer = dynamic(() => import("@/components/imageViewer/RightSidebar/SidebarDataViewer"), { ssr: false });
 
 interface ResizableComponentProps {
   children: React.ReactNode;
   minWidth?: number;
   maxWidth?: number;
   sidebarContent: string | null;
+  fullScreen?: boolean;
 }
 
-const ResizableComponent: React.FC<ResizableComponentProps> = ({ children, minWidth = 400, maxWidth = 800, sidebarContent }) => {
+const ResizableComponent: React.FC<ResizableComponentProps> = ({ children, minWidth = 400, maxWidth = 800, sidebarContent, fullScreen = false }) => {
   const [isResizing, setIsResizing] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(minWidth)
 
@@ -56,12 +56,20 @@ const ResizableComponent: React.FC<ResizableComponentProps> = ({ children, minWi
     }
   }, [resize, stopResizing])
 
+  if (fullScreen) {
+    return (
+      <aside className="relative flex-1 overflow-x-hidden bg-background overflow-hidden h-full w-full flex flex-col">
+        <div className="flex-1 overflow-y-auto scrollbar-hide min-h-0">{children}</div>
+      </aside>
+    );
+  }
+
   return (
     <aside
       style={{ width: sidebarWidth }}
-      className="relative pl-1 flex-shrink-0 overflow-x-hidden bg-background overflow-hidden"
+      className="relative pl-1 flex-shrink-0 overflow-x-hidden bg-background overflow-hidden border-l border-border h-full flex flex-col"
     >
-      <div className="h-[calc(100vh-64px)] overflow-y-auto scrollbar-hide">{children}</div>
+      <div className="flex-1 overflow-y-auto scrollbar-hide min-h-0">{children}</div>
       <button
         tabIndex={0}
         onMouseDown={startResizing}
@@ -74,10 +82,20 @@ const ResizableComponent: React.FC<ResizableComponentProps> = ({ children, minWi
 
 interface ResizableSidebarProps {
   sidebarContent: string | null;
+  isElectron?: boolean;
+  fullScreen?: boolean;
+  /**
+   * Once the user opens Workflow or Agentic AI at least once, keep those roots mounted even when
+   * `sidebarContent` is null (sidebar closed) so graph/list state survives toggle — mirrors SidebarChat TabsContent forceMount.
+   */
+  keepWorkflowRailsAlive?: boolean;
 }
 
 const ResizableSidebar: React.FC<ResizableSidebarProps> = ({
-  sidebarContent
+  sidebarContent,
+  isElectron = false,
+  fullScreen = false,
+  keepWorkflowRailsAlive = false,
 }) => {
   const getMinWidth = () => {
     if (sidebarContent === 'WebFileManager') {
@@ -87,17 +105,41 @@ const ResizableSidebar: React.FC<ResizableSidebarProps> = ({
   };
 
   return (
-    <div className="h-[calc(100vh-64px)] flex flex-row-reverse">
-      {/* Careful with the height, right now it is full screen - 64px (header) */}
+    <div className="h-full flex flex-row-reverse">
       <ResizableComponent
         minWidth={getMinWidth()}
         sidebarContent={sidebarContent}
+        fullScreen={fullScreen}
       >
         {sidebarContent === 'SidebarMain' && <SidebarMain />}
         {sidebarContent === 'SidebarAnnotation' && <SidebarAnnotation />}
         {sidebarContent === 'SidebarChat' && <SidebarBotOnly />}
-        {sidebarContent === 'SidebarWorkflow' && <SidebarWorkflowOnly />}
-        {sidebarContent === 'SidebarH5Data' && <SidebarH5DataViewer />}
+        {/* Align with SidebarChat TabsContent forceMount: Workflow + Graph stay mounted once visited (`keepWorkflowRailsAlive`) even when sidebar closed (`sidebarContent` null). */}
+        {(sidebarContent != null || keepWorkflowRailsAlive) && (
+          <>
+            <div
+              className={
+                sidebarContent === 'SidebarWorkflow'
+                  ? 'h-full min-h-0 overflow-hidden'
+                  : 'hidden'
+              }
+              aria-hidden={sidebarContent !== 'SidebarWorkflow'}
+            >
+              <SidebarWorkflowOnly />
+            </div>
+            <div
+              className={
+                sidebarContent === 'SidebarWorkflowGraph'
+                  ? 'h-full min-h-0 overflow-hidden'
+                  : 'hidden'
+              }
+              aria-hidden={sidebarContent !== 'SidebarWorkflowGraph'}
+            >
+              <SidebarWorkflowGraphOnly />
+            </div>
+          </>
+        )}
+        {sidebarContent === 'SidebarData' && <SidebarDataViewer />}
         {sidebarContent === 'SidebarViewerSetting' && <SidebarPrefs />}
 
       </ResizableComponent>

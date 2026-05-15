@@ -1,0 +1,144 @@
+[
+  {
+    "id": "comm-tumor-pipeline",
+    "name": "Tumor Detection Pipeline",
+    "description": "Tissue segmentation followed by per-region classification on H&E pathology slides.",
+    "author": "TissueLab Team",
+    "savedAt": "2026-04-28T12:00:00.000Z",
+    "nodes": [
+      { "id": "__start__", "kind": "start", "x": 140, "y": 24 },
+      { "id": "tdp-seg", "kind": "model", "modelId": "BiomedParseSegmentation", "x": 140, "y": 120 },
+      { "id": "tdp-clf", "kind": "model", "modelId": "BiomedParseClassification", "x": 140, "y": 220 },
+      { "id": "__end__", "kind": "end", "x": 140, "y": 320 }
+    ],
+    "connections": [
+      { "id": "seed-conn-1", "fromId": "__start__", "toId": "tdp-seg", "fromPort": "bottom", "toPort": "top" },
+      { "id": "seed-conn-2", "fromId": "tdp-seg", "toId": "tdp-clf", "fromPort": "bottom", "toPort": "top" },
+      { "id": "seed-conn-3", "fromId": "tdp-clf", "toId": "__end__", "fromPort": "bottom", "toPort": "top" }
+    ],
+    "panelStates": {},
+    "chatMessages": [
+      {
+        "id": 1438152543,
+        "sender": "bot",
+        "type": "welcome",
+        "content": "Welcome to TissueLab! I'm TissueLab Agent — here to help you navigate and use this platform. I can answer questions, design research workflows, and analyze results. Let me know what you need help with!"
+      }
+    ],
+    "selectedId": null
+  },
+  {
+    "id": "comm-nuclei-quant",
+    "name": "Nuclei Quantification",
+    "description": "Per-nucleus segmentation + classification, ready for downstream cell-density analysis.",
+    "author": "Demo User",
+    "savedAt": "2026-04-23T12:00:00.000Z",
+    "nodes": [
+      { "id": "__start__", "kind": "start", "x": 140, "y": 24 },
+      { "id": "nq-seg", "kind": "model", "modelId": "SegmentationNode", "x": 140, "y": 120 },
+      { "id": "nq-clf", "kind": "model", "modelId": "ClassificationNode", "x": 140, "y": 220 },
+      { "id": "nq-code", "kind": "model", "modelId": "GPT-4o Agent", "x": 140, "y": 320 },
+      { "id": "__end__", "kind": "end", "x": 140, "y": 420 }
+    ],
+    "connections": [
+      { "id": "seed-conn-4", "fromId": "__start__", "toId": "nq-seg", "fromPort": "bottom", "toPort": "top" },
+      { "id": "seed-conn-5", "fromId": "nq-seg", "toId": "nq-clf", "fromPort": "bottom", "toPort": "top" },
+      { "id": "seed-conn-6", "fromId": "nq-clf", "toId": "nq-code", "fromPort": "bottom", "toPort": "top" },
+      { "id": "seed-conn-7", "fromId": "nq-code", "toId": "__end__", "fromPort": "bottom", "toPort": "top" }
+    ],
+    "panelStates": {},
+    "chatMessages": [
+      {
+        "id": 1233396885,
+        "sender": "bot",
+        "type": "welcome",
+        "content": "Welcome to TissueLab! I'm TissueLab Agent — here to help you navigate and use this platform. I can answer questions, design research workflows, and analyze results. Let me know what you need help with!"
+      }
+    ],
+    "selectedId": null
+  },
+  {
+    "id": "comm-musk-embed",
+    "name": "MUSK Patch Embeddings + Classifier",
+    "description": "Generate MUSK patch embeddings on a WSI, then run patch-level classification.",
+    "author": "TissueLab Team",
+    "savedAt": "2026-04-16T12:00:00.000Z",
+    "nodes": [
+      { "id": "__start__", "kind": "start", "x": 140, "y": 24 },
+      { "id": "musk-emb", "kind": "model", "modelId": "MuskEmbedding", "x": 140, "y": 120 },
+      { "id": "musk-clf", "kind": "model", "modelId": "MuskClassification", "x": 140, "y": 220 },
+      { "id": "__end__", "kind": "end", "x": 140, "y": 320 }
+    ],
+    "connections": [
+      { "id": "seed-conn-8", "fromId": "__start__", "toId": "musk-emb", "fromPort": "bottom", "toPort": "top" },
+      { "id": "seed-conn-9", "fromId": "musk-emb", "toId": "musk-clf", "fromPort": "bottom", "toPort": "top" },
+      { "id": "seed-conn-10", "fromId": "musk-clf", "toId": "__end__", "fromPort": "bottom", "toPort": "top" }
+    ],
+    "panelStates": {},
+    "chatMessages": [
+      {
+        "id": 1093772755,
+        "sender": "bot",
+        "type": "welcome",
+        "content": "Welcome to TissueLab! I'm TissueLab Agent — here to help you navigate and use this platform. I can answer questions, design research workflows, and analyze results. Let me know what you need help with!"
+      }
+    ],
+    "selectedId": null
+  },
+  {
+    "id": "comm-organ-seg",
+    "name": "Multi-organ CT Segmentation",
+    "description": "TotalSegmentator-driven organ segmentation followed by organ classification.",
+    "author": "Radiology Group",
+    "savedAt": "2026-03-31T12:00:00.000Z",
+    "nodes": [
+      { "id": "__start__", "kind": "start", "x": 140, "y": 24 },
+      { "id": "ts-seg", "kind": "model", "modelId": "TotalSegmentatorSegmentation", "x": 140, "y": 120 },
+      { "id": "ts-clf", "kind": "model", "modelId": "TotalSegmentatorClassification", "x": 140, "y": 220 },
+      { "id": "__end__", "kind": "end", "x": 140, "y": 320 }
+    ],
+    "connections": [
+      { "id": "seed-conn-11", "fromId": "__start__", "toId": "ts-seg", "fromPort": "bottom", "toPort": "top" },
+      { "id": "seed-conn-12", "fromId": "ts-seg", "toId": "ts-clf", "fromPort": "bottom", "toPort": "top" },
+      { "id": "seed-conn-13", "fromId": "ts-clf", "toId": "__end__", "fromPort": "bottom", "toPort": "top" }
+    ],
+    "panelStates": {},
+    "chatMessages": [
+      {
+        "id": 1524319464,
+        "sender": "bot",
+        "type": "welcome",
+        "content": "Welcome to TissueLab! I'm TissueLab Agent — here to help you navigate and use this platform. I can answer questions, design research workflows, and analyze results. Let me know what you need help with!"
+      }
+    ],
+    "selectedId": null
+  },
+  {
+    "id": "comm-cardiac-mr",
+    "name": "Cardiac MR Hypertrophy",
+    "description": "Cardiac MRI segmentation focused on myocardium / LV / RV for hypertrophy analysis.",
+    "author": "Cardio Demo",
+    "savedAt": "2026-03-16T12:00:00.000Z",
+    "nodes": [
+      { "id": "__start__", "kind": "start", "x": 140, "y": 24 },
+      { "id": "card-seg", "kind": "model", "modelId": "CardiacMRSegmentation", "x": 140, "y": 120 },
+      { "id": "card-code", "kind": "model", "modelId": "GPT-4o Agent", "x": 140, "y": 220 },
+      { "id": "__end__", "kind": "end", "x": 140, "y": 320 }
+    ],
+    "connections": [
+      { "id": "seed-conn-14", "fromId": "__start__", "toId": "card-seg", "fromPort": "bottom", "toPort": "top" },
+      { "id": "seed-conn-15", "fromId": "card-seg", "toId": "card-code", "fromPort": "bottom", "toPort": "top" },
+      { "id": "seed-conn-16", "fromId": "card-code", "toId": "__end__", "fromPort": "bottom", "toPort": "top" }
+    ],
+    "panelStates": {},
+    "chatMessages": [
+      {
+        "id": 1085949224,
+        "sender": "bot",
+        "type": "welcome",
+        "content": "Welcome to TissueLab! I'm TissueLab Agent — here to help you navigate and use this platform. I can answer questions, design research workflows, and analyze results. Let me know what you need help with!"
+      }
+    ],
+    "selectedId": null
+  }
+]

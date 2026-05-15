@@ -16,19 +16,20 @@ import {
   setPersistence,
   browserLocalPersistence,
 } from 'firebase/auth';
-import { doc, getDoc, getFirestore, onSnapshot, setDoc } from 'firebase/firestore';
+import { doc, getDoc, onSnapshot } from 'firebase/firestore';
 import { getStorage, ref, getDownloadURL } from 'firebase/storage';
 import { initUserAssetsEndpoint, initUserEndpoint, getUserAvatarEndpoint } from '../config/endpoints';
 import { useDispatch } from 'react-redux';
 import { setUserAvatarUrl, setPreferredName, setCustomTitle, setOrganization } from '@/store/slices/userSlice';
 import { useGoogleOneTapLogin } from '@react-oauth/google';
 import { app } from '../config/firebaseConfig';
-import { apiFetch } from '../utils/apiFetch';
+import { getFirestoreDb } from '../config/firebaseFirestore';
+import { apiFetch } from '@/utils/common/apiFetch';
 import { useInterval } from 'react-use';
-import tryCatchPromise from '../utils/tryCatchPromise';
+import tryCatchPromise from '@/utils/tryCatchPromise';
 import Cookies from 'js-cookie';
-import { handleLogout } from '../utils/authUtils';
-
+import { handleLogout } from '@/utils/common/authUtils';
+import { forceRefreshAuthToken } from '@/utils/common/authToken';
 
 declare global {
   interface Window {
@@ -138,6 +139,8 @@ export function UserInfoProvider({ children }: { children: React.ReactNode }) {
   }> | null>(null);
   // execute to stop listening to user change onSnapshot
   const offSnapshot = useRef<() => void>(() => {});
+  /** Invalidates deferred profile listeners (logout / rapid updateUserInfo). */
+  const profileListenSeqRef = useRef(0);
 
   const resetTokenCache = useCallback(() => {
     tokenCache.status = 'pending';
@@ -145,12 +148,138 @@ export function UserInfoProvider({ children }: { children: React.ReactNode }) {
     tokenCache.error = undefined;
   }, []);
 
+  // Helper to check if running in Electron environment
+  const isElectron = useCallback(() => {
+    if (typeof window === 'undefined') return false;
+    return !!(window as any).electron && typeof (window as any).electron?.invoke === 'function';
+  }, []);
+
+  // Refresh Firebase token using stored Google refresh_token (Electron only)
+  const refreshFirebaseToken = useCallback(async (): Promise<string | null> => {
+    if (!isElectron()) {
+      console.log('[Auth] Token refresh only available in Electron');
+      return null;
+    }
+
+    try {
+      console.log('[Auth] Attempting to refresh Firebase token using stored refresh_token...');
+      
+      // Get stored refresh token
+      const refreshTokenResult = await (window as any).electron.getRefreshToken();
+      if (!refreshTokenResult.success || !refreshTokenResult.token) {
+        console.log('[Auth] No refresh token available');
+        return null;
+      }
+
+      // Get client ID
+      const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
+      if (!clientId) {
+        console.error('[Auth] Google Client ID not configured');
+        return null;
+      }
+
+      // Request new tokens from Google
+      const result = await (window as any).electron.googleRefreshToken({
+        refreshToken: refreshTokenResult.token,
+        clientId
+      });
+
+      if (!result.success || !result.tokens?.id_token) {
+        console.error('[Auth] Token refresh failed:', result.error);
+        
+        // Delete invalid refresh token if it's permanently invalid
+        // Common error codes that indicate token should be deleted:
+        // - invalid_grant: token expired, revoked, or malformed
+        // - unauthorized_client: client not authorized
+        if (result.error && typeof result.error === 'string') {
+          const errorLower = result.error.toLowerCase();
+          if (errorLower.includes('invalid_grant') || 
+              errorLower.includes('invalid_token') ||
+              errorLower.includes('token expired') ||
+              errorLower.includes('token revoked')) {
+            console.warn('[Auth] Refresh token is invalid, deleting it...');
+            try {
+              await (window as any).electron.deleteRefreshToken();
+              console.log('[Auth] Invalid refresh token deleted');
+            } catch (deleteError) {
+              console.error('[Auth] Failed to delete invalid token:', deleteError);
+            }
+          }
+        }
+        
+        return null;
+      }
+
+      console.log('[Auth] Successfully refreshed tokens from Google');
+
+      // Update Firebase token WITHOUT triggering re-authentication
+      // Just force refresh the existing user's token to keep session alive
+      const auth = getAuth(app);
+      const currentUser = auth.currentUser;
+      
+      if (!currentUser || currentUser.isAnonymous) {
+        console.warn('[Auth] No valid user to refresh token for');
+        return null;
+      }
+
+      // Force refresh the Firebase token (this updates the token internally without triggering onAuthStateChanged)
+      const newToken = await currentUser.getIdToken(true);
+      
+      if (newToken) {
+        // Update cookie with the refreshed token
+        Cookies.set('tissuelab_token', newToken, { expires: 30 });
+        console.log('[Auth] Firebase token refreshed successfully');
+      }
+
+      return newToken || null;
+    } catch (error) {
+      console.error('[Auth] Error during token refresh:', error);
+      return null;
+    }
+  }, [isElectron]);
+
+  // Use refs to access current values in interval callbacks (avoiding stale closures)
+  const userIdentityRef = useRef(userIdentity);
+  const userInfoRef = useRef(userInfo);
+  
+  useEffect(() => {
+    userIdentityRef.current = userIdentity;
+  }, [userIdentity]);
+  
+  useEffect(() => {
+    userInfoRef.current = userInfo;
+  }, [userInfo]);
+
   // reset tokenCache every 10 minutes
   useInterval(resetTokenCache, 10 * 60 * 1000);
 
+  // Auto-refresh token every 50 minutes (Firebase tokens expire in 1 hour)
+  useInterval(async () => {
+    if (userIdentityRef.current !== 3) return;
+
+    console.log('[Auth] Automatic token refresh check...');
+    try {
+      const newToken = isElectron()
+        ? await refreshFirebaseToken()
+        : await forceRefreshAuthToken();
+
+      resetTokenCache();
+
+      if (newToken && typeof window !== 'undefined') {
+        console.log('[Auth] Dispatching tokenRefreshed event to WebSocket');
+        window.dispatchEvent(new CustomEvent('tokenRefreshed', { 
+          detail: { token: newToken } 
+        }));
+      }
+    } catch (error) {
+      console.warn('[Auth] Auto-refresh failed:', error);
+    }
+  }, 50 * 60 * 1000); // 50 minutes
+
   // auto refresh user info - check every 5 minutes
   useInterval(() => {
-    if (userIdentity === 3 && userInfo) {
+    // Use refs to get current values, avoiding stale closure
+    if (userIdentityRef.current === 3 && userInfoRef.current) {
       updateUserInfoAssets().catch(error => {
         console.warn('Auto-refresh user info failed:', error);
       });
@@ -232,6 +361,7 @@ export function UserInfoProvider({ children }: { children: React.ReactNode }) {
     // create new login Promise
     anonymousLoginPromise.current = (async () => {
       anonymousLoginLock.current = true;
+      profileListenSeqRef.current += 1;
       offSnapshot.current?.();
 
       setIsLoading(true);
@@ -250,6 +380,17 @@ export function UserInfoProvider({ children }: { children: React.ReactNode }) {
       // check existing login state first
       await nowAuth.authStateReady();
       const currentUser = nowAuth.currentUser;
+
+      // If there is already a real (non-anonymous) user, don't create anonymous user
+      if (currentUser && !currentUser.isAnonymous) {
+        console.log('[signInAnonymous] Real user already exists, skipping anonymous login');
+        const authToken = await currentUser.getIdToken();
+        setAuthToken(authToken);
+        anonymousLoginLock.current = false;
+        anonymousLoginPromise.current = null;
+        await updateUserInfo();
+        return { authToken };
+      }
 
       // if there is an anonymous user and the token is not expired, use it directly
       if (currentUser?.isAnonymous) {
@@ -288,21 +429,22 @@ export function UserInfoProvider({ children }: { children: React.ReactNode }) {
    */
   const updateUserInfo = useCallback(async () => {
     const nowAuth = getAuth(app);
-    const db = getFirestore();
+    const db = getFirestoreDb();
 
     try {
       await nowAuth.authStateReady();
       const currentUser = nowAuth.currentUser;
       if (currentUser) {
         setUserIdentity(currentUser.isAnonymous ? 2 : 3);
-        const userDbIndex = doc(db, 'users', currentUser.uid);
-        const { data: docSnap, error } = await tryCatchPromise(
-          getDoc(userDbIndex)
-        );
-        if (error) {
-          console.error(`updateUserInfo Firestore error:`, error);
-          // If Firestore fails, still try to call the backend API
-          
+        if (!currentUser.isAnonymous) {
+          const userDbIndex = doc(db, 'users', currentUser.uid);
+          const { data: docSnap, error } = await tryCatchPromise(
+            getDoc(userDbIndex)
+          );
+          if (error) {
+            console.error(`updateUserInfo Firestore error:`, error);
+            // If Firestore fails, still try to call the backend API
+          }
         }
         
         // Try to call backend API regardless of Firestore status
@@ -318,102 +460,143 @@ export function UserInfoProvider({ children }: { children: React.ReactNode }) {
           setUserInfo(userInfo);
           // write current user ID to localStorage, for logout cleanup
           try { localStorage.setItem('last_user_id', userInfo.user_id); } catch {}
+          
+          // Load cached data from localStorage immediately to prevent showing email on first login
+          try {
+            const cachedPreferredName = localStorage.getItem(`preferred_name_${userInfo.user_id}`);
+            const cachedCustomTitle = localStorage.getItem(`custom_title_${userInfo.user_id}`);
+            const cachedOrganization = localStorage.getItem(`organization_${userInfo.user_id}`);
+            const cachedAvatar = localStorage.getItem(`user_avatar_${userInfo.user_id}`);
+            
+            if (cachedPreferredName) {
+              dispatch(setPreferredName(cachedPreferredName));
+            }
+            if (cachedCustomTitle) {
+              dispatch(setCustomTitle(cachedCustomTitle));
+            }
+            if (cachedOrganization) {
+              dispatch(setOrganization(cachedOrganization));
+            }
+            if (cachedAvatar) {
+              dispatch(setUserAvatarUrl(cachedAvatar));
+            }
+          } catch (error) {
+            console.warn('[UserInfoProvider] Failed to load cached user data from localStorage:', error);
+          }
+          
           // Start Firestore realtime subscription for avatar/profile
           try {
-            // cleanup previous subscription if any
+            profileListenSeqRef.current += 1;
+            const listenId = profileListenSeqRef.current;
             offSnapshot.current?.();
-            const profileRef = doc(db, 'users', userInfo.user_id);
-            const unsubscribe = onSnapshot(profileRef, async (snap) => {
-              const data = snap.data() as { 
-                avatar_url?: string; 
-                avatarUpdatedAt?: number;
-                preferred_name?: string;
-                custom_title?: string;
-                organization?: string;
-                profileUpdatedAt?: number;
-              } | undefined;
-              if (!data) return;
-              
-              // handle avatar update
-              const url = data.avatar_url || '';
-              const ts = data.avatarUpdatedAt || Date.now();
-              if (url) {
+            offSnapshot.current = () => {};
+            if (!currentUser.isAnonymous) {
+              const userId = userInfo.user_id;
+              const profileRef = doc(db, 'users', userId);
+              queueMicrotask(() => {
+                if (listenId !== profileListenSeqRef.current) return;
                 try {
-                  // Get authenticated URL for Firebase Storage
-                  const authenticatedUrl = await getAuthenticatedStorageUrl(url);
-                  if (!authenticatedUrl) {
-                    // If object is gone, clear locally
-                    dispatch(setUserAvatarUrl(null));
-                    if (typeof window !== 'undefined') {
-                      localStorage.removeItem(`user_avatar_${userInfo.user_id}`);
-                      window.dispatchEvent(new Event('localStorageChanged'));
+                  const unsubscribe = onSnapshot(
+                    profileRef,
+                    async (snap) => {
+                      const data = snap.data() as {
+                        avatar_url?: string;
+                        avatarUpdatedAt?: number;
+                        preferred_name?: string;
+                        custom_title?: string;
+                        organization?: string;
+                        profileUpdatedAt?: number;
+                      } | undefined;
+                      if (!data) return;
+
+                      // handle avatar update
+                      const url = data.avatar_url || '';
+                      const ts = data.avatarUpdatedAt || Date.now();
+                      if (url) {
+                        try {
+                          const authenticatedUrl = await getAuthenticatedStorageUrl(url);
+                          if (!authenticatedUrl) {
+                            dispatch(setUserAvatarUrl(null));
+                            if (typeof window !== 'undefined') {
+                              localStorage.removeItem(`user_avatar_${userId}`);
+                              window.dispatchEvent(new Event('localStorageChanged'));
+                            }
+                          } else {
+                            const urlWithTs = `${authenticatedUrl}${authenticatedUrl.includes('?') ? '&' : '?'}t=${ts}`;
+                            dispatch(setUserAvatarUrl(urlWithTs));
+                            if (typeof window !== 'undefined') {
+                              localStorage.setItem(`user_avatar_${userId}`, urlWithTs);
+                              window.dispatchEvent(new Event('localStorageChanged'));
+                            }
+                          }
+                        } catch (error) {
+                          console.warn('Failed to process avatar URL from Firestore:', error);
+                        }
+                      } else {
+                        try {
+                          dispatch(setUserAvatarUrl(null));
+                          if (typeof window !== 'undefined') {
+                            localStorage.removeItem(`user_avatar_${userId}`);
+                            window.dispatchEvent(new Event('localStorageChanged'));
+                          }
+                        } catch {}
+                      }
+
+                      if (typeof window !== 'undefined') {
+                        try {
+                          {
+                            const val = (data.preferred_name ?? null) as string | null;
+                            if (val === null || val === '') {
+                              localStorage.removeItem(`preferred_name_${userId}`);
+                              dispatch(setPreferredName(null));
+                            } else {
+                              localStorage.setItem(`preferred_name_${userId}`, val);
+                              dispatch(setPreferredName(val));
+                            }
+                          }
+
+                          {
+                            const val = (data.custom_title ?? null) as string | null;
+                            if (val === null || val === '') {
+                              localStorage.removeItem(`custom_title_${userId}`);
+                              dispatch(setCustomTitle(null));
+                            } else {
+                              localStorage.setItem(`custom_title_${userId}`, val);
+                              dispatch(setCustomTitle(val));
+                            }
+                          }
+
+                          {
+                            const val = (data.organization ?? null) as string | null;
+                            if (val === null || val === '') {
+                              localStorage.removeItem(`organization_${userId}`);
+                              dispatch(setOrganization(null));
+                            } else {
+                              localStorage.setItem(`organization_${userId}`, val);
+                              dispatch(setOrganization(val));
+                            }
+                          }
+
+                          window.dispatchEvent(new Event('localStorageChanged'));
+                        } catch (error) {
+                          console.warn('Failed to update user preferences from Firestore:', error);
+                        }
+                      }
+                    },
+                    (err) => {
+                      console.warn('[UserInfoProvider] Firestore profile listener error:', err);
                     }
-                  } else {
-                    const urlWithTs = `${authenticatedUrl}${authenticatedUrl.includes('?') ? '&' : '?'}t=${ts}`;
-                    dispatch(setUserAvatarUrl(urlWithTs));
-                    if (typeof window !== 'undefined') {
-                      localStorage.setItem(`user_avatar_${userInfo.user_id}`, urlWithTs);
-                      window.dispatchEvent(new Event('localStorageChanged'));
-                    }
+                  );
+                  if (listenId !== profileListenSeqRef.current) {
+                    unsubscribe();
+                    return;
                   }
-                } catch (error) {
-                  console.warn('Failed to process avatar URL from Firestore:', error);
+                  offSnapshot.current = unsubscribe;
+                } catch (e) {
+                  console.warn('Failed to subscribe user profile snapshot:', e);
                 }
-              } else {
-                // Avatar cleared remotely -> clear redux and local cache
-                try {
-                  dispatch(setUserAvatarUrl(null));
-                  if (typeof window !== 'undefined') {
-                    localStorage.removeItem(`user_avatar_${userInfo.user_id}`);
-                    window.dispatchEvent(new Event('localStorageChanged'));
-                  }
-                } catch {}
-              }
-
-              // handle user preferences update
-              if (typeof window !== 'undefined') {
-                try {
-                  {
-                    const val = (data.preferred_name ?? null) as string | null;
-                    if (val === null || val === '') {
-                      localStorage.removeItem(`preferred_name_${userInfo.user_id}`);
-                      dispatch(setPreferredName(null));
-                    } else {
-                      localStorage.setItem(`preferred_name_${userInfo.user_id}`, val);
-                      dispatch(setPreferredName(val));
-                    }
-                  }
-
-                  {
-                    const val = (data.custom_title ?? null) as string | null;
-                    if (val === null || val === '') {
-                      localStorage.removeItem(`custom_title_${userInfo.user_id}`);
-                      dispatch(setCustomTitle(null));
-                    } else {
-                      localStorage.setItem(`custom_title_${userInfo.user_id}`, val);
-                      dispatch(setCustomTitle(val));
-                    }
-                  }
-
-                  {
-                    const val = (data.organization ?? null) as string | null;
-                    if (val === null || val === '') {
-                      localStorage.removeItem(`organization_${userInfo.user_id}`);
-                      dispatch(setOrganization(null));
-                    } else {
-                      localStorage.setItem(`organization_${userInfo.user_id}`, val);
-                      dispatch(setOrganization(val));
-                    }
-                  }
-
-                  // trigger local storage update event, notify UI components to refresh
-                  window.dispatchEvent(new Event('localStorageChanged'));
-                } catch (error) {
-                  console.warn('Failed to update user preferences from Firestore:', error);
-                }
-              }
-            });
-            offSnapshot.current = unsubscribe;
+              });
+            }
           } catch (e) {
             console.warn('Failed to subscribe user profile snapshot:', e);
           }
@@ -430,7 +613,7 @@ export function UserInfoProvider({ children }: { children: React.ReactNode }) {
         setUserInfo(null);
         setUserIdentity(1);
         setIsLoading(false);
-        // cleanup subscription on logout
+        profileListenSeqRef.current += 1;
         try { offSnapshot.current?.(); } catch {}
         // Note: localStorage cleanup is now handled in onAuthStateChanged
       }
@@ -475,8 +658,17 @@ export function UserInfoProvider({ children }: { children: React.ReactNode }) {
   );
 
   const logout = useCallback(async () => {
+    // Delete stored refresh token in Electron
+    if (isElectron()) {
+      try {
+        await (window as any).electron.deleteRefreshToken();
+        console.log('[Auth] Refresh token deleted on logout');
+      } catch (error) {
+        console.warn('[Auth] Failed to delete refresh token:', error);
+      }
+    }
     await handleLogout([]);
-  }, []);
+  }, [isElectron]);
 
   useEffect(() => {
     // check persisted auth state when init
@@ -495,13 +687,17 @@ export function UserInfoProvider({ children }: { children: React.ReactNode }) {
       if (anonymousLoginLock.current) {
         return;
       }
-      
+
       // Handle logout (user is null)
       if (!user) {
         setUserInfo(null);
         setUserIdentity(1);
         setAuthToken(undefined);
         setIsLoading(false);
+        profileListenSeqRef.current += 1;
+        try {
+          offSnapshot.current?.();
+        } catch {}
         // Clear token from cookies
         Cookies.remove('tissuelab_token');
         
@@ -521,7 +717,9 @@ export function UserInfoProvider({ children }: { children: React.ReactNode }) {
       }
       
       // Handle login - update user info when auth state changes, but avoid duplicate calls
-      if (!userInfo || userInfo.user_id !== user.uid) {
+      // Use userInfoRef (not userInfo state) so this effect does not re-subscribe on every userInfo update
+      const latest = userInfoRef.current;
+      if (!latest || latest.user_id !== user.uid) {
         await updateUserInfo();
       }
     });
@@ -529,8 +727,12 @@ export function UserInfoProvider({ children }: { children: React.ReactNode }) {
     // Cleanup
     return () => {
       unsubscribeAuth();
+      profileListenSeqRef.current += 1;
+      try {
+        offSnapshot.current?.();
+      } catch {}
     };
-  }, [resetTokenCache, updateUserInfo, userInfo]);
+  }, [resetTokenCache, updateUserInfo]);
 
   const [shouldShowOneTap, setShouldShowOneTap] = useState(false);
 

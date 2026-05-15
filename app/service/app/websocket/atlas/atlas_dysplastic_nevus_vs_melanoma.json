@@ -1,0 +1,119 @@
+{
+  "title": "Dysplastic Nevus vs Low-CSD Melanoma",
+  "description": "Diagnostic criteria atlas for evidence matching. category_id aligns with melanoma.json categories.",
+  "criteria": [
+    {
+      "category_id": 1,
+      "name": "Symmetry",
+      "dysplastic_nevus": "Roughly symmetric — bilateral silhouette, nest distribution, and pigmentation are approximately mirror images",
+      "melanoma_ssm": "Asymmetric — architecture, cell density, and pigmentation differ between the two halves",
+      "explanation": "First step at low power. Asymmetry is the most classic low-power clue for melanoma. Some melanomas can be symmetric (nevoid melanoma), so symmetry ≠ safe, but asymmetry always warrants concern.",
+      "computational_quantification": "①Extract patch features from each half.  ②Compute mean similarity of corresponding patches across midline."
+    },
+    {
+      "category_id": 2,
+      "name": "Overall Growth Orientation",
+      "dysplastic_nevus": "\"East-west\" orientation — thin and flat, extending horizontally along surface, shallow dermal component",
+      "melanoma_ssm": "Horizontal + vertical — RGP (Radial Growth Phase) expands horizontally + VGP (Vertical Growth Phase) grows vertically into deep dermis",
+      "explanation": "Dysplastic nevi go \"east-west\" (horizontal), congenital nevi go \"north-south\" (vertical). Both horizontal features AND deep atypical cell clusters → unlikely simple dysplastic nevus.",
+      "computational_quantification": "①Tissue segmentation → lesion extent   ②Cell segmentation → all melanocytes  ③Compute bounding box: width (W) and depth (D)  ④Aspect ratio = D / W. Dysplastic nevus: low ratio (wide, shallow). SSM with VGP: increased ratio. ⑤Compute melanocyte density distribution across depth layers: dysplastic nevus density drops rapidly with depth; SSM maintains high density at depth."
+    },
+    {
+      "category_id": 3,
+      "name": "Pagetoid Spread",
+      "dysplastic_nevus": "[+] Minimal or absent — may have \"limited suprabasal scatter,\" only occasional cells centrally",
+      "melanoma_ssm": "[-] Extensive, prominent — \"buckshot\" pattern: numerous single atypical melanocytes scattered throughout all epidermal layers, including the periphery",
+      "explanation": "THE SINGLE MOST IMPORTANT FEATURE. Carefully search entire lesion for pagetoid spread. Pay special attention to the periphery — peripheral pagetoid spread is more alarming than central. Exception: Spitz/Reed nevi may show central pagetoid (stops abruptly at edges).",
+      "computational_quantification": "①Tissue segmentation → epidermal layers (basal, spinous, granular)  ②Cell segmentation + classification → all intraepidermal melanocytes  ③Divide into basal and suprabasal ④Pagetoid Index = suprabasal melanocyte count / total intraepidermal melanocyte count. ⑤Spatial analysis: Divide lesion into central 1/3 and peripheral 1/3 → calculate pagetoid index per zone → high peripheral index → strongly suggests malignancy. ⑥Depth distribution: melanocytes reaching granular layer → extremely alarming."
+    },
+    {
+      "category_id": 4,
+      "name": "Confluent Growth",
+      "dysplastic_nevus": "[-] Nests separated by normal keratinocytes; bridging nests are not solid continuous lines",
+      "melanoma_ssm": "[+] Atypical melanocytes form continuous solid line replacing basal layer. \"Like a child drawing a solid line with a crayon\"",
+      "explanation": "Continuous replacement of basal layer. Ben Wood technique: draw line connecting dermal papillae tops; melanocytes filling inter-rete space above = confluence. \"Unzipped zipper\" sign: severe confluence → epidermal-dermal clefting.",
+      "computational_quantification": "①Tissue segmentation → basal layer / DEJ (Dermo-Epidermal Junction)  ②Cell segmentation → melanocytes along DEJ  ③Linearize DEJ into 1D sequence ④DEJ melanocyte coverage = melanocyte-occupied DEJ length / total DEJ length. ⑤Longest continuous melanocyte segment: dysplastic nevi have gaps; SSM has long continuous stretches. ⑥Melanocyte density above vs. below papillae tip line → high ratio → favors malignancy."
+    },
+    {
+      "category_id": 5,
+      "name": "Nest Location and Distribution",
+      "dysplastic_nevus": "Nests at rete ridge tips or sides, bridging tip to tip. Nests relatively uniform in size.",
+      "melanoma_ssm": "Nests of varying sizes, not confined to rete tips, any location, may coalesce",
+      "explanation": "Normal nevi nest at rete tips. Dysplastic nevi have bridging but follow rules. Melanoma nests are everywhere, variable size, coalescing.",
+      "computational_quantification": "①Tissue segmentation → rete ridges and dermal papillae ②Cell segmentation → melanocyte nests  ③Label each nest: rete tip / rete side / inter-rete space / suprabasal  ④Rete tip nest proportion = rete tip nests / total nests. High → favors benign. ⑤Nest area Coefficient of Variation: low → uniform (dysplastic nevus); high → variable (melanoma). ⑥Nest coalescence detection: no keratinocyte gap between adjacent nests → coalesced. Calculate coalescence proportion."
+    },
+    {
+      "category_id": 6,
+      "name": "Bridging & Lamellar Fibroplasia",
+      "dysplastic_nevus": "[+] HALLMARK FEATURES — Nests bridge rete tip to rete tip forming \"bridges,\" surrounded by dense lamellar/concentric fibroplasia (\"onion skin\" wrapping)",
+      "melanoma_ssm": "[-] Not characteristic of melanoma — bridging + fibroplasia without pagetoid/confluence favors dysplastic nevus",
+      "explanation": "[!] BEGINNER'S TRAP: Bridging and fibroplasia distinguish dysplastic nevus from ORDINARY NEVUS, NOT from melanoma!",
+      "computational_quantification": "①Tissue segmentation → rete ridges → ②Cell segmentation → nests spanning two rete tips → label as bridging nest → count/proportion. ③Fibroplasia detection: Extract patches around bridging nests → patch similarity retrieval vs. known fibroplasia templates. Or train a classifier. ④Bridging + fibroplasia co-occurring → supports dysplastic nevus."
+    },
+    {
+      "category_id": 7,
+      "name": "Shouldering",
+      "dysplastic_nevus": "[+] Junctional component extends beyond dermal component by ≥ 3 rete ridges",
+      "melanoma_ssm": "[+] Also seen — in situ component extends beyond invasive component, not a diagnostic focus",
+      "explanation": "CANNOT distinguish between the two — both can show it. Also common in congenital nevi. Quantitative threshold: ≥ 3 rete ridges.",
+      "computational_quantification": "①Cell segmentation → distinguish junctional vs. dermal melanocytes ②Calculate horizontal span of each ③Shoulder distance = junctional span − dermal span (each side)  ④Tissue segmentation → count rete ridges within this distance → ≥ 3 = positive. Note: cannot independently differentiate."
+    },
+    {
+      "category_id": 8,
+      "name": "Dermal Maturation",
+      "dysplastic_nevus": "[+] Maturation present — Type A (large epithelioid) → Type B (small round) → Type C (spindle). Nests shrink large → small → single cells.",
+      "melanoma_ssm": "[-] Lack of maturation — Deep cells remain large with prominent nucleoli; large nests persist or enlarge (VGP (Vertical Growth Phase) expansile nests larger than intraepidermal)",
+      "explanation": "MOST IMPORTANT criterion for dermal component malignancy. Look directly at deepest cells — large nuclei with prominent nucleoli at depth → no maturation → suspect melanoma.",
+      "computational_quantification": "①Tissue segmentation → dermis into superficial/mid/deep layers according to distance ②Cell segmentation per layer → extract morphological features (nuclear area, cytoplasmic area, N:C ratio, roundness, aspect ratio) ③Mean nuclear area and mean nest area per layer ④Nuclear area vs. depth curve → Maturation gradient = (superficial mean − deep mean) / superficial mean. Positive & large → maturation (benign); near 0 or negative → no maturation (malignant). ⑤Nest area vs. depth + cell density vs. depth → multi-metric. ⑥Morphological type transitions: large/round → small/spindle with depth → supports maturation."
+    },
+    {
+      "category_id": 9,
+      "name": "Degree & Uniformity of Cytologic Atypia",
+      "dysplastic_nevus": "Atypia present but limited and heterogeneous — nuclear enlargement, chromatin condensation, small-medium nucleoli. Uneven: some cells atypical, some normal.",
+      "melanoma_ssm": "Severe and more uniform atypia — large nuclei, prominent nucleoli, coarse chromatin, irregular nuclear membranes, marked pleomorphism. More uniform.",
+      "explanation": "\"Atypia is subjective\" — architectural features more reliable than cytology. Do not diagnose malignancy from a few large cells. Key: diffuse vs. focal, uniform vs. heterogeneous.",
+      "computational_quantification": "①Cell segmentation → nuclear morphological features: area, perimeter, roundness, eccentricity, chromatin texture, nucleolar area ②Compare with basal keratinocyte nuclear area → Nuclear size ratio = melanocyte mean / keratinocyte mean. ③Uniformity: CV of all melanocyte nuclear areas → low CV = uniform (melanoma); high CV = heterogeneous (dysplastic nevus). ④Patch-level retrieval vs. severe/mild atypia templates."
+    },
+    {
+      "category_id": 10,
+      "name": "Dermal Mitoses",
+      "dysplastic_nevus": "Rare — occasional single mitosis. WHO: when present, melanoma should enter the differential.",
+      "melanoma_ssm": "Common — especially in VGP (Vertical Growth Phase). Atypical mitoses even more concerning.",
+      "explanation": "BEST SINGLE DIFFERENTIATING FEATURE (PathologyOutlines exam answer). Focus on dermis. Gardner: mitoses are often \"the last straw.\"",
+      "computational_quantification": "①Tissue segmentation → dermal region (exclude epidermis)   ②Run mitosis detection ③Dermal mitotic density = count / dermal area (per mm²). Density > 0 → concern; high → strongly suggests melanoma. ④Depth-stratified: deep mitoses more alarming → annotate depth of each. ⑤Atypical mitoses (tripolar, asymmetric) → additional weighting."
+    },
+    {
+      "category_id": 11,
+      "name": "Epidermal Changes",
+      "dysplastic_nevus": "Acanthosis — epidermal thickening, elongated rete ridges, basic architecture preserved",
+      "melanoma_ssm": "Rete ridge effacement / epidermal attenuation — normal undulations disappear, epidermis flattens. WHO: NOT features of dysplastic nevi.",
+      "explanation": "Easily overlooked but useful. Dysplastic nevi have normal rete ridge-papilla undulations; melanoma destroys this. SSM may show regression.",
+      "computational_quantification": "①Tissue segmentation → epidermis ②Sample epidermal thickness (stratum corneum to basal layer) ③Mean thickness + thickness CV → thin + low CV = effacement → melanoma. ④Rete ridge depth + spacing → Undulation index = rete ridge depth SD / mean epidermal thickness → low = effacement → melanoma. ⑤Regression detection: focal \"no melanocytes + dermal fibrosis + melanophages\" → patch retrieval with regression templates."
+    },
+    {
+      "category_id": 12,
+      "name": "Extension Along Adnexal Structures",
+      "dysplastic_nevus": "[-] Dysplastic nevi do not track down sweat ducts or follicular epithelium",
+      "melanoma_ssm": "[+] In situ melanoma can extend down sweat duct and follicular epithelium",
+      "explanation": "Very practical but easily overlooked. Melanocytes tracking down sweat duct epithelium in a \"dysplastic nevus-like\" lesion → strongly suspect melanoma.",
+      "computational_quantification": "①Tissue segmentation → adnexal structures (follicles, sweat ducts)  ②Cell segmentation → melanocytes within adnexal epithelium  ③Adnexal melanocyte density → markedly > 0 → adnexal extension → supports melanoma. ④Distinguish from congenital nevi: congenital = melanocytes around (outside) adnexa; melanoma = melanocytes infiltrate (inside) adnexal epithelium."
+    },
+    {
+      "category_id": 13,
+      "name": "Anatomic Site & Clinical Context",
+      "dysplastic_nevus": "Back, trunk, extremities. Young patients. Rarely face/scalp. Low-CSD skin.",
+      "melanoma_ssm": "Male: back/shoulders. Female: legs. Low-CSD skin.",
+      "explanation": "Gardner's RULE: Sun-damaged face/scalp in elderly → NEVER casually diagnose dysplastic nevus. Those lesions are almost always lentigo maligna.",
+      "computational_quantification": "①Clinical metadata: biopsy site, age, sex → direct features into classification model."
+    },
+    {
+      "category_id": 14,
+      "name": "Pattern of Invasion",
+      "dysplastic_nevus": "Gentle small-cell infiltration into collagen — deep type B/C cells, no inflammation/desmoplasia. Dermis \"doesn't care.\"",
+      "melanoma_ssm": "Expansile pushing nests — VGP (Vertical Growth Phase) nests larger than intraepidermal nests, with mitoses. Deep cells remain large and atypical. May have inflammation/fibrosis.",
+      "explanation": "Benign = \"quiet infiltration\" (small cells slip between collagen). Malignant = \"aggressive pushing\" (large atypical clusters displace normal tissue). Deep solid nodules > epidermal nests = VGP = melanoma.",
+      "computational_quantification": "①Tissue segmentation → dermal layers  ②Cell segmentation → deepest melanocyte nests  ③Deep largest nest area vs. superficial/intraepidermal largest nest area ratio → ratio > 1 → VGP → melanoma. ④Stromal reaction: patches around deep nests → detect lymphocytic infiltration (cell classifier) → reaction = dermis \"cares\" → malignant invasion. ⑤Deep vs. superficial morphology → refer to #8 maturation."
+    }
+  ],
+  "usage_notes": "Symmetry, pagetoid, confluent growth, maturation carry most weight. Prioritize architectural features over cytologic. Dermal mitoses (#10) is the most important in difficult cases."
+}

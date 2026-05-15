@@ -3,7 +3,8 @@ import asyncio
 from typing import Dict, Any
 from fastapi import WebSocket, WebSocketDisconnect
 from app.core import logger
-# Auth removed for open source
+from app.middlewares.websocket_auth_middleware import websocket_auth_required
+from app.core.auth import AuthUser
 from typing import Optional
 
 class ThumbnailConnectionManager:
@@ -46,9 +47,13 @@ thumbnail_manager = ThumbnailConnectionManager()
 
 async def thumbnail_endpoint(websocket: WebSocket, task_id: str):
     """WebSocket endpoint for thumbnail task updates"""
-    # Auth removed for open source - direct connection without authentication
+    # Authenticate WebSocket connection
     try:
-        logger.info(f"WebSocket connected for task: {task_id}")
+        user: Optional[AuthUser] = await websocket_auth_required(websocket)
+        if user:
+            logger.info(f"WebSocket connected for user: {user.uid} ({user.email}) for task: {task_id}")
+        else:
+            logger.info(f"WebSocket connected (authentication skipped for excluded path) for task: {task_id}")
     except WebSocketDisconnect:
         return  # Connection closed due to auth failure
     

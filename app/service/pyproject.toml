@@ -15,10 +15,8 @@ dependencies = [
     "certifi==2024.8.30",
     "charset-normalizer==3.4.0",
     "fastapi==0.109.1",
-    # "firebase-admin",  # Removed for open source
     "frozenlist==1.5.0",
-    # "google-cloud-firestore",  # Removed for open source
-    # "google-cloud-storage",  # Removed for open source
+    "google-cloud-storage",
     "h5py==3.12.1",
     "idna==3.10",
     "importlib_metadata==8.5.0",
@@ -56,7 +54,7 @@ dependencies = [
     "pyvips[binary]",
     "openai",
     "czifile",
-    "tissuelab_sdk==0.1.8",
+    "tissuelab_sdk==0.1.12",
     "celery",
     "pyzmq",
 ]

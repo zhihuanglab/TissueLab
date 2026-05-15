@@ -10,7 +10,7 @@ from app.core.errors import AppError, AppErrors
 class CustomizedModelFactory(BaseModelFactory):
     """
     recognize user model script
-    eg:  script_path，.py script
+    eg:  script_path, .py script
     """
 
     def __init__(self, script_path: str, class_name: str = "UserModelAgent"):

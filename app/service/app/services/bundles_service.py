@@ -10,7 +10,6 @@ import urllib.request
 import shutil
 import threading
 import uuid
-import requests
 from typing import Dict, Any, List, Optional
 
 try:
@@ -139,46 +138,6 @@ def _get_gcs_client():
         except Exception:
             pass
         return None
-
-
-def get_download_url_from_api(model_name: str = "ClassificationNode", platform: str = "darwin") -> Dict[str, Any]:
-    """
-    Get download URL from the new API endpoint.
-    Returns the response from https://ctrl.vlm.ai/api/community/v1/tasknodes/signed-url
-    """
-    try:
-        # Hardcode values for now
-        model_name = "ClassificationNode"
-        platform = "darwin"  # or "win", "linux" based on your needs
-        
-        api_url = "https://ctrl.vlm.ai/api/community/v1/tasknodes/signed-url"
-        
-        # Make request to get signed URL
-        response = requests.post(api_url, json={
-            "model_name": model_name,
-            "platform": platform
-        }, timeout=30)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("success"):
-                return {
-                    "status": "success",
-                    "download_url": data.get("download_url"),
-                    "model_name": data.get("model_name"),
-                    "platform": data.get("platform"),
-                    "filename": data.get("filename"),
-                    "expires_in": data.get("expires_in")
-                }
-            else:
-                return {"status": "fail", "message": "API returned success=false"}
-        else:
-            return {"status": "fail", "message": f"API request failed with status {response.status_code}"}
-            
-    except requests.exceptions.RequestException as e:
-        return {"status": "fail", "message": f"Request failed: {str(e)}"}
-    except Exception as e:
-        return {"status": "fail", "message": f"Unexpected error: {str(e)}"}
 
 
 def generate_signed_url(gs_uri: str, minutes: int = 30, filename: Optional[str] = None) -> Dict[str, Any]:
@@ -364,7 +323,7 @@ def _activate_node(model_name: str, service_path: str) -> Dict[str, Any]:
     except Exception as e:
         return {"code": 1, "message": str(e)}
 
-def start_bundle_install(model_name: str = "ClassificationNode", gcs_uri: str = None, filename: Optional[str] = None, entry_relative_path: str = "main",
+def start_bundle_install(model_name: str, gcs_uri: str, filename: Optional[str], entry_relative_path: str,
                          expected_size: Optional[int] = None, expected_sha256: Optional[str] = None) -> str:
     """Start install in a background thread and return install_id."""
     install_id = str(uuid.uuid4())
@@ -375,16 +334,13 @@ def start_bundle_install(model_name: str = "ClassificationNode", gcs_uri: str = 
         lg = logging.getLogger(__name__)
         try:
             _ensure_dirs()
-            # Get download URL from new API
+            # Resolve signed URL (disposition set to suggest filename)
             _set_install_state(install_id, status="signing", step="sign")
-            api_res = get_download_url_from_api()
-            if api_res.get("status") != "success":
-                _set_install_state(install_id, status="failed", step="sign", message=api_res.get("message", "Failed to get download URL"))
+            sign_res = generate_signed_url(gcs_uri, minutes=60, filename=filename)
+            if sign_res.get("status") != "success":
+                _set_install_state(install_id, status="failed", step="sign", message=sign_res.get("message", "Failed to sign URL"))
                 return
-            url = api_res.get("download_url")
-            # Update filename from API response if available
-            if api_res.get("filename"):
-                filename = api_res.get("filename")
+            url = sign_res.get("signed_url")
 
             # Download to tmp path
             tmp_name = f"{model_name}__{int(time.time())}.tar.gz"

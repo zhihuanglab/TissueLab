@@ -1,5 +1,5 @@
 import { CTRL_SERVICE_API_ENDPOINT } from '@/constants/config'
-import { apiFetch } from '@/utils/apiFetch'
+import { apiFetch } from '@/utils/common/apiFetch'
 
 export interface UserProfile {
   user_id: string

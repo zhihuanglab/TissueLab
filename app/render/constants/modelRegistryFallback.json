@@ -1,0 +1,174 @@
+{
+  "category_map": {
+    "TissueClassify": [
+      "BiomedParseClassification",
+      "MuskClassification",
+      "TotalSegmentatorClassification",
+      "PatchClassifier"
+    ],
+    "TissueSeg": [
+      "BiomedParseSegmentation",
+      "MuskEmbedding",
+      "TotalSegmentatorSegmentation",
+      "VISTA"
+    ],
+    "NucleiSeg": [
+      "SegmentationNode",
+      "InstanSegNode"
+    ],
+    "NucleiClassify": [
+      "ClassificationNode"
+    ],
+    "SpatialOmics": [
+      "CellCharter"
+    ],
+    "TaskSpecific": [
+      "Ark",
+      "CardiacMRSegmentation"
+    ],
+    "CodingAgent": [
+      "GPT-4o Agent"
+    ]
+  },
+  "nodes": {
+    "BiomedParseSegmentation": {
+      "displayName": "BiomedParse Segmentation",
+      "description": "Tissue segmentation for radiology images with pixel-accurate region boundaries. Require BiomedParseClassification to follow it.",
+      "icon": "/images/icons/tissue_segmentation_biomedparse.png",
+      "factory": "TissueSeg",
+      "source": "builtin",
+      "outputs": "Region polygons/masks"
+    },
+    "BiomedParseClassification": {
+      "displayName": "BiomedParse Classification",
+      "description": "Tissue classification for radiology images. Must follow BiomedParseSegmentation.",
+      "icon": "/images/icons/tissue_segmentation_biomedparse.png",
+      "factory": "TissueClassify",
+      "source": "builtin",
+      "outputs": "Region classifications"
+    },
+    "TotalSegmentatorSegmentation": {
+      "displayName": "TotalSegmentator Segmentation",
+      "description": "Organ segmentation for radiology images. When segmenting brain, brain structure, liver, spleen, prioritize this node over BiomedParse.",
+      "icon": "/images/icons/totalsegmentator.png",
+      "factory": "TissueSeg",
+      "source": "builtin",
+      "inputs": "Radiology images (CT/MRI)",
+      "outputs": "Organ masks (brain, brain structure, liver, spleen)"
+    },
+    "TotalSegmentatorClassification": {
+      "displayName": "TotalSegmentator Classification",
+      "description": "Organ classification for radiology images. When classifying brain, brain structure, liver, spleen, prioritize this node over BiomedParse.",
+      "icon": "/images/icons/totalsegmentator.png",
+      "factory": "TissueClassify",
+      "source": "builtin",
+      "inputs": "Radiology images (CT/MRI)",
+      "outputs": "Organ classifications (brain, brain structure, liver, spleen)"
+    },
+    "MuskEmbedding": {
+      "displayName": "Patch Embedding (MUSK)",
+      "description": "Generates patch embeddings for pathology whole slides used downstream by patch classification.",
+      "icon": "/images/icons/musk_embedding.svg",
+      "factory": "TissueSeg",
+      "source": "builtin",
+      "outputs": "Patch embeddings [N,D]"
+    },
+    "MuskClassification": {
+      "displayName": "MUSK Classification",
+      "description": "Patch-based classification model for pathology whole slides. You must use MuskEmbedding node to generate patch embeddings first.",
+      "icon": "/images/icons/musk_classification.svg",
+      "factory": "TissueClassify",
+      "source": "builtin"
+    },
+    "SegmentationNode": {
+      "displayName": "Cell/Nuclei Segmentation",
+      "description": "Instance segmentation of nuclei/cells on WSI with per-nucleus polygons/centroids; prerequisite for per-cell metrics and classification.",
+      "icon": "/images/icons/nuclei_segmentation_stardist.png",
+      "factory": "NucleiSeg",
+      "source": "builtin",
+      "outputs": "Per-nucleus contours and centroids"
+    },
+    "InstanSegNode": {
+      "displayName": "InstanSeg Nuclei Segmentation",
+      "description": "Fast nuclei segmentation using InstanSeg's lightweight transformer architecture. Produces per-nucleus contours, centroids, and PLIP embeddings. Alternative to StarDist with improved speed.",
+      "icon": "/images/icons/nuclei_segmentation_stardist.png",
+      "factory": "NucleiSeg",
+      "source": "builtin",
+      "inputs": "WSI path, pixel_size, model_type",
+      "outputs": "Per-nucleus contours, centroids, probability, embeddings"
+    },
+    "VISTA": {
+      "displayName": "VISTA Tissue Segmentation",
+      "description": "An interactive foundation model for histopathology image segmentation.",
+      "icon": "/images/icons/vista.svg",
+      "factory": "TissueSeg",
+      "source": "builtin",
+      "inputs": "WSI path, bbox, model_type",
+      "outputs": "coordinates of tissue regions",
+      "panel": [
+        { "key": "tissue_class", "type": "input", "value": "" }
+      ]
+    },
+    "ClassificationNode": {
+      "displayName": "Nuclei Classification (NuClass)",
+      "description": "Per-nucleus classifier assigning classes (e.g., tumor_cell, lymphocyte); consumes nuclei segmentation results.",
+      "icon": "/images/icons/nuclei_classification_tissuelab_nuclass.png",
+      "factory": "NucleiClassify",
+      "source": "builtin",
+      "inputs": "Per-nucleus contours and centroids",
+      "outputs": "Per-nucleus class probabilities"
+    },
+    "CellCharter": {
+      "displayName": "CellCharter",
+      "description": "Spatial transcriptomics clustering for identifying tissue domains and cellular neighborhoods. We need nuclei segmentation to precede this tasknode and also nuclei classification to tell us what is the name of the cell clusters.",
+      "icon": "/images/icons/cellcharter.png",
+      "factory": "SpatialOmics",
+      "source": "builtin",
+      "inputs": "Spatial transcriptomics data",
+      "outputs": "Cluster assignments and spatial domains"
+    },
+    "Ark": {
+      "displayName": "Ark",
+      "description": "Task-specific model for specifically ONLY chest X-ray analysis with direct prediction scores; standalone model that does not require other nodes.",
+      "icon": "/images/icons/ark.png",
+      "factory": "TaskSpecific",
+      "source": "builtin",
+      "inputs": "Chest X-ray images",
+      "outputs": "Prediction scores"
+    },
+    "CardiacMRSegmentation": {
+      "displayName": "Cardiac MR Segmentation",
+      "description": "Task-specific model for cardiac MRI segmentation to identify myocardium (MYO), left ventricle (LV), and right ventricle (RV); specialized for myocardial hypertrophy analysis; standalone model that does not require other nodes.",
+      "icon": "/images/icons/cardiac_mr_segmentation.png",
+      "factory": "TaskSpecific",
+      "source": "builtin",
+      "inputs": "Cardiac MRI images",
+      "outputs": "Cardiac structure segmentations (MYO, LV, RV)"
+    },
+    "GPT-4o Agent": {
+      "displayName": "Code Calculation",
+      "description": "Read the result from result files. Custom Python analysis for counts/ratios/spatial queries if needed; no visualization unless explicitly requested.",
+      "icon": "/images/icons/code_generator_tissuelab_code.png",
+      "factory": "CodingAgent",
+      "source": "builtin"
+    },
+    "PatchClassifier": {
+      "displayName": "Patch Classifier",
+      "description": "Per-patch classifier driven by an active-learning loop. Same class-management UI as NuClass but operates on patches — no nuclei segmentation step.",
+      "icon": "/images/icons/musk_classification.svg",
+      "factory": "TissueClassify",
+      "source": "builtin",
+      "inputs": "Patch embeddings",
+      "outputs": "Per-patch class probabilities"
+    }
+  },
+  "category_display_names": {
+    "TissueClassify": "Tissue Classification",
+    "TissueSeg": "Tissue Segmentation",
+    "NucleiSeg": "Cell Segmentation + Embedding",
+    "NucleiClassify": "Nuclei Classification",
+    "SpatialOmics": "Spatial Omics Analysis",
+    "TaskSpecific": "Task Specific Analysis",
+    "CodingAgent": "Coding Agent"
+  }
+}

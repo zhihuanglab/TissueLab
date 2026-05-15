@@ -49,32 +49,34 @@ export const Breadcrumbs: React.FC<BreadcrumbsProps> = ({
       baseClickPath = SHARED_ROOT;
       baseParts = [SHARED_ROOT];
     }
+  } else if (currentDirectory === VIRTUAL_ROOT) {
+    baseName = null;
+    baseParts = [];
+    baseClickPath = null;
   }
 
   const relativeParts = isLoggedIn
     ? (baseName ? allParts.slice(baseParts.length) : (currentDirectory === VIRTUAL_ROOT ? [] : allParts))
-    : allParts.slice(allParts[0] === 'samples' ? 1 : 0);
+    : (currentDirectory === VIRTUAL_ROOT ? [] : allParts.slice(allParts[0] === 'samples' ? 1 : 0));
 
   return (
-    <div className="flex items-center text-sm text-gray-500">
-      <span 
-        className="cursor-pointer hover:underline p-1 rounded flex items-center gap-2"
-        onClick={() => {
-          if (isLoggedIn) {
-            onNavigate(VIRTUAL_ROOT);
-          } else {
-            onNavigate('samples');
-          }
-        }}
-      >
-        <Folder className="h-4 w-4" />
-        {isLoggedIn ? ROOT_DISPLAY.root : ROOT_DISPLAY.samples}
-      </span>
+    <div className="flex items-center text-xs sm:text-sm text-gray-500 overflow-x-auto scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent py-1">
+      {!isLoggedIn && (
+        <span
+          className="cursor-pointer hover:underline p-1 rounded flex items-center gap-1 sm:gap-2 flex-shrink-0"
+          aria-label={ROOT_DISPLAY.samples}
+          onClick={() => onNavigate('samples')}
+        >
+          <Folder className="h-3 w-3 sm:h-4 sm:w-4" />
+          <span className="hidden sm:inline">{ROOT_DISPLAY.samples}</span>
+          <span className="sm:hidden">{ROOT_DISPLAY.samples.charAt(0)}</span>
+        </span>
+      )}
 
-      {isLoggedIn && baseName && <ChevronRight className="h-4 w-4 mx-1" />}
       {isLoggedIn && baseName && (
         <span
-          className="cursor-pointer hover:underline p-1 rounded"
+          className="cursor-pointer hover:underline p-1 rounded truncate max-w-[80px] sm:max-w-none flex-shrink-0"
+          title={baseName}
           onClick={() => {
             if (baseClickPath) {
               onNavigate(baseClickPath);
@@ -87,7 +89,9 @@ export const Breadcrumbs: React.FC<BreadcrumbsProps> = ({
         </span>
       )}
 
-      {relativeParts.length > 0 && <ChevronRight className="h-4 w-4 mx-1" />}
+      {relativeParts.length > 0 && (!isLoggedIn || baseName) && (
+        <ChevronRight className="h-3 w-3 sm:h-4 sm:w-4 mx-0.5 sm:mx-1 flex-shrink-0" />
+      )}
       {relativeParts.map((part, index) => {
         const fullParts = baseName
           ? baseParts.concat(relativeParts.slice(0, index + 1))
@@ -96,12 +100,13 @@ export const Breadcrumbs: React.FC<BreadcrumbsProps> = ({
         return (
           <React.Fragment key={`${pathUntilThisPart}:${index}`}>
             <span
-              className="cursor-pointer hover:underline p-1 rounded"
+              className="cursor-pointer hover:underline p-1 rounded truncate max-w-[100px] sm:max-w-[150px] md:max-w-none flex-shrink-0"
+              title={part}
               onClick={() => onNavigate(pathUntilThisPart)}
             >
               {part}
             </span>
-            {index < relativeParts.length - 1 && <ChevronRight className="h-4 w-4 mx-1" />}
+            {index < relativeParts.length - 1 && <ChevronRight className="h-3 w-3 sm:h-4 sm:w-4 mx-0.5 sm:mx-1 flex-shrink-0" />}
           </React.Fragment>
         );
       })}
@@ -110,5 +115,4 @@ export const Breadcrumbs: React.FC<BreadcrumbsProps> = ({
 };
 
 export default Breadcrumbs;
-
 

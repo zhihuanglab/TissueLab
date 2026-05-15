@@ -1,9 +1,9 @@
 import os
+import asyncio
 import logging
 import math
 import numpy as np
 from PIL import Image, ImageOps, ImageDraw
-import tiffslide
 from functools import lru_cache
 from typing import Tuple, List, Dict, Optional
 from io import BytesIO
@@ -11,35 +11,49 @@ import time
 import threading
 import traceback
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import base64
 import pyvips
 import re
+import uuid
+import tempfile
+
+from tissuelab_sdk.wrapper import (TiffSlideWrapper, TiffFileWrapper,
+                    SimpleImageWrapper, DicomImageWrapper,
+                    NiftiImageWrapper)
+
+from app.wrapper import PyvipsSlideWrapper
+
+import tiffslide
 try:
     import tifffile as _tifffile
 except Exception:
     _tifffile = None
-
-from tissuelab_sdk.wrapper import (TiffSlideWrapper, TiffFileWrapper, 
-                    SimpleImageWrapper, DicomImageWrapper, 
-                    NiftiImageWrapper)
 try:
     from tissuelab_sdk.wrapper import ISyntaxImageWrapper
 except:
     ISyntaxImageWrapper = None
+from isyntax import ISyntax
+
 try:
     from tissuelab_sdk.wrapper import CziImageWrapper
 except:
     CziImageWrapper = None
 from app.utils import resolve_path
+from app.config.path_config import resolve_virtual_path, STORAGE_ROOT
 
 # set logging level to WARNING
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.WARNING)
 
+# Logger for z-stack specific logging
+logger = logging.getLogger(__name__)
+
 # constants
-TILE_SIZE = 1024
-ALLOWED_EXTENSIONS = {'svs', 'tif', 'tiff', 'czi', 'qptiff', 'ndpi', 'jpeg', 'png', 'jpg', 'bmp', 'nii', 'btf', 'isyntax'}
+TILE_SIZE = 512
+ALLOWED_EXTENSIONS = {'svs', 'tif', 'tiff', 'czi', 'qptiff', 'ndpi', 'jpeg', 'png', 'jpg', 'bmp', 'nii', 'nii.gz', 'btf', 'isyntax', 'dcm'}
+
+# Configuration for skipping NII parsing
+SKIP_NII_PARSING = True  # Set to True to skip NII file parsing and use direct loading
 
 # global variables for multi-session support
 sessions = {}  # key: session_id, value: session_data dict
@@ -59,11 +73,28 @@ def get_session_data(session_id: str) -> Dict:
                 'current_file_path': None,
                 'tiff_slide_wrapper': False,
                 'isyntax_slide': None,
-                'last_isyntax_file_path': None
+                'last_isyntax_file_path': None,
+                'isyntax_lock': threading.Lock(),
+                'zstack_info': {
+                    'has_zstack': False,
+                    'layer_count': 1,
+                    'layer_indices': [0]
+                },
+                'current_z_layer': 0
             }
         return sessions[session_id]
 
-def clear_session(session_id: str):
+def _cleanup_instance_data(instance_id: str):
+    """Clean up review/AL data associated with an instance."""
+    try:
+        from app.services.review import cleanup_instance_data
+        return cleanup_instance_data(instance_id)
+    except Exception as e:
+        logger.warning(f"Failed to cleanup AL data for session {instance_id}: {e}")
+        return None
+
+
+def clear_session(session_id: str, cleanup_review: bool = True):
     """Clear session data for a given session ID"""
     with session_lock:
         if session_id in sessions:
@@ -81,6 +112,868 @@ def clear_session(session_id: str):
                 except:
                     pass
             del sessions[session_id]
+
+    if cleanup_review:
+        return _cleanup_instance_data(session_id)
+
+    return None
+
+
+def create_instance_from_path(file_path: str) -> Dict:
+    """Create a new instance/session from a file path."""
+    if not file_path:
+        return {"status": "error", "message": "file_path is required"}
+
+    resolved_file_path = resolve_virtual_path(file_path)
+    if not resolved_file_path:
+        return {"status": "error", "message": "Unrecognized or invalid path"}
+
+    absolute_file_path = resolve_path(resolved_file_path)
+    instance_id = str(uuid.uuid4())
+
+    logger.info(
+        "Creating instance %s for file path %s -> %s",
+        instance_id,
+        resolved_file_path,
+        absolute_file_path,
+    )
+
+    result = load_slide_from_file_with_session(absolute_file_path, instance_id)
+    if result["status"] == "error":
+        return result
+
+    return {
+        "status": "success",
+        "instanceId": instance_id,
+        "message": "Instance created successfully",
+        "file_format": result["file_format"],
+        "dimensions": result["dimensions"],
+        "level_count": result["level_count"],
+        "total_tiles": result["total_tiles"],
+        "total_channels": result.get("total_channels", 3),
+        "image_type": result.get("image_type", "Brightfield H&E"),
+    }
+
+
+def delete_instance_and_cleanup(instance_id: str) -> Dict:
+    """Delete an instance/session and clean up related state."""
+    if not instance_id:
+        return {"status": "error", "message": "instance_id is required"}
+
+    cleanup_result = clear_session(instance_id)
+    return {
+        "status": "success",
+        "message": f"Instance {instance_id} deleted successfully",
+        "al_cleanup": cleanup_result,
+    }
+
+
+def _normalize_dimensions(dimensions) -> List[int]:
+    """Normalize dimensions into a JSON-friendly two-item list."""
+    if isinstance(dimensions, (tuple, list)):
+        return list(dimensions)
+    return [0, 0]
+
+
+def _normalize_mpp(file_format: str, skip_parsing: bool, mpp_value):
+    """Normalize MPP for API responses."""
+    if file_format in ["nii", "nii.gz"] and skip_parsing:
+        return None
+    if mpp_value == 0.0:
+        return None
+    return mpp_value if mpp_value is not None else None
+
+
+def _normalize_magnification(file_format: str, skip_parsing: bool, magnification_value):
+    """Normalize magnification for API responses."""
+    if file_format in ["nii", "nii.gz"] and skip_parsing:
+        return None
+    if magnification_value is None:
+        return None
+    if isinstance(magnification_value, dict) and not magnification_value:
+        return None
+    return magnification_value
+
+
+def _clean_response_data(obj):
+    """Recursively preserve JSON-null while normalizing nested containers."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return {key: _clean_response_data(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_clean_response_data(item) for item in obj]
+    return obj
+
+
+def build_upload_path_response(response_file_path: str, full_file_path: str, load_result: Dict) -> Dict:
+    """Build the upload_path API payload from a service-layer load result."""
+    file_name = os.path.basename(full_file_path)
+    file_size = os.path.getsize(full_file_path) if os.path.exists(full_file_path) else 0
+
+    slide_pyramid_info = load_result.get("pyramid_info", [])
+    if slide_pyramid_info:
+        slide_dimensions = slide_pyramid_info[0].get(
+            "dimensions",
+            load_result.get("dimensions", [0, 0]),
+        )
+    else:
+        slide_dimensions = load_result.get("dimensions", [0, 0])
+
+    slide_file_format = load_result.get("file_format", "")
+    response = {
+        "message": "Slide loaded successfully from path",
+        "status": "success",
+        "success": True,
+        "filePath": response_file_path,
+        "fileName": file_name,
+        "fileFormat": slide_file_format,
+        "fileSize": load_result.get("file_size", file_size),
+        "directory": os.path.dirname(response_file_path),
+        "slideInfo": {
+            "fileFormat": slide_file_format,
+            "dimensions": _normalize_dimensions(slide_dimensions),
+            "levelCount": load_result.get("level_count", 0),
+            "totalTiles": load_result.get("total_tiles", 0),
+            "totalChannels": load_result.get("total_channels", 3),
+            "mpp": _normalize_mpp(
+                slide_file_format,
+                load_result.get("skip_parsing", False),
+                load_result.get("mpp"),
+            ),
+            "magnification": _normalize_magnification(
+                slide_file_format,
+                load_result.get("skip_parsing", False),
+                load_result.get("magnification"),
+            ),
+            "imageType": load_result.get("image_type", "Brightfield H&E"),
+            "processingStatus": load_result.get("processing_status", "Pending"),
+            "pyramidInfo": slide_pyramid_info,
+            "properties": load_result.get("properties", {}),
+        },
+    }
+    return _clean_response_data(response)
+
+
+def build_upload_file_response(load_result: Dict) -> Dict:
+    """Build the upload API payload from a slide load result."""
+    return {
+        "message": "File uploaded and slide loaded successfully",
+        "file_format": load_result["file_format"],
+        "dimensions": load_result["dimensions"],
+        "level_count": load_result["level_count"],
+        "total_tiles": load_result["total_tiles"],
+    }
+
+
+def load_uploaded_file_for_api(filename: str, file_bytes: bytes, session_id: str = "default") -> Dict:
+    """Persist an uploaded file temporarily, load it into a session, and clean up."""
+    if not allowed_file(filename):
+        return {"status": "error", "message": "File format not supported"}
+
+    suffix = os.path.splitext(filename)[1]
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, prefix="load_upload_") as tmp:
+            tmp.write(file_bytes)
+            temp_path = tmp.name
+
+        result = load_slide_from_file_with_session(temp_path, session_id)
+        if result["status"] == "error":
+            return result
+
+        response = build_upload_file_response(result)
+        response["status"] = "success"
+        return response
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception as e:
+                logger.warning("Failed to delete temporary upload file %s: %s", temp_path, e)
+
+
+def load_slide_from_path_for_api(file_path: str, session_id: str = "default") -> Dict:
+    """Resolve a request path, load the slide, and build the upload_path API payload."""
+    if not file_path:
+        return {"status": "error", "message": "No file path provided (tried all extraction methods)"}
+
+    requested_file_path = file_path
+    resolved_file_path = resolve_virtual_path(file_path)
+    if not resolved_file_path:
+        return {"status": "error", "message": "Unrecognized or invalid path"}
+
+    full_file_path = resolve_path(resolved_file_path)
+    result = upload_file_path(full_file_path, session_id)
+    if result["status"] == "error":
+        return result
+
+    return build_upload_path_response(requested_file_path, full_file_path, result)
+
+
+def build_upload_folder_response(relative_folder_path: str, result: Dict) -> Dict:
+    """Build the upload_folder API payload from folder scan results."""
+    relative_wsi_files = []
+    for wsi_file in result.get("wsi_files", []):
+        if wsi_file.startswith(STORAGE_ROOT):
+            relative_wsi_file = os.path.relpath(wsi_file, STORAGE_ROOT).replace("\\", "/")
+            relative_wsi_files.append(relative_wsi_file)
+        else:
+            relative_wsi_files.append(wsi_file)
+
+    relative_wsi_file = ""
+    if result.get("wsi_file", ""):
+        wsi_file = result.get("wsi_file", "")
+        if wsi_file.startswith(STORAGE_ROOT):
+            relative_wsi_file = os.path.relpath(wsi_file, STORAGE_ROOT).replace("\\", "/")
+        else:
+            relative_wsi_file = wsi_file
+
+    response_data = {
+        "status": "success",
+        "message": "Folder structure retrieved successfully",
+        "folder_path": relative_folder_path,
+        "folderPath": relative_folder_path,
+        "wsi_file": relative_wsi_file,
+        "wsi_files": relative_wsi_files,
+        "file_tree_dict": result.get("file_tree_dict", {}),
+        "file_tree": result.get("file_tree_dict", {}),
+        "tree_structure": result.get("tree_structure", {}),
+        "fileTree": result.get("file_tree_dict", {}),
+        "files": relative_wsi_files,
+        "tlproj_dict": result.get("tlproj_dict", {}),
+    }
+
+    def replace_none_with_default(obj, default_dict=None, default_list=None):
+        if default_dict is None:
+            default_dict = {}
+        if default_list is None:
+            default_list = []
+        if obj is None:
+            return default_dict
+        if isinstance(obj, dict):
+            return {k: replace_none_with_default(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            if not obj:
+                return default_list
+            return [replace_none_with_default(item) for item in obj]
+        return obj if obj is not None else ""
+
+    return replace_none_with_default(response_data)
+
+
+def get_folder_structure_for_api(folder_path: Optional[str]) -> Dict:
+    """Resolve a folder path, scan it, and build the upload_folder API payload."""
+    folder_path = folder_path or ""
+    full_folder_path = resolve_path(folder_path)
+    result = generate_tlproj_from_folder(full_folder_path)
+    if result["status"] == "error":
+        return result
+    return build_upload_folder_response(folder_path, result)
+
+
+def get_loaded_slide_info(session_id: str = "default") -> Dict:
+    """Return the currently loaded slide metadata for a session."""
+    session_data = get_session_data(session_id)
+    session_slide = session_data["slide"]
+    session_current_file_format = session_data["current_file_format"]
+
+    if session_slide is None:
+        if session_data.get("skip_parsing", False) and session_current_file_format in ["nii", "nii.gz"]:
+            dimensions = _normalize_dimensions(session_data.get("dimensions", [512, 512]))
+            return {
+                "status": "success",
+                "message": "Slide loaded successfully",
+                "slideInfo": {
+                    "fileFormat": session_current_file_format,
+                    "dimensions": dimensions,
+                    "levelCount": session_data.get("level_count", 1),
+                    "totalTiles": session_data.get("total_tiles", 1),
+                    "mpp": None,
+                    "magnification": None,
+                    "pyramidInfo": [{
+                        "level": 0,
+                        "dimensions": dimensions,
+                        "downsample": 1.0,
+                    }],
+                },
+            }
+        return {"status": "error", "message": f"No slide loaded for session {session_id}"}
+
+    return {
+        "status": "success",
+        "message": "Slide loaded successfully",
+        "slideInfo": {
+            "fileFormat": session_current_file_format,
+            "dimensions": session_slide.dimensions,
+            "levelCount": len(session_slide.level_dimensions) if hasattr(session_slide, "level_dimensions") else 0,
+            "totalTiles": calculate_total_tiles(session_slide),
+            "pyramidInfo": get_pyramid_info(session_slide),
+        },
+    }
+
+
+def get_session_pyramid_info(session_id: str = "default") -> Dict:
+    """Return pyramid metadata for the current session slide."""
+    session_data = get_session_data(session_id)
+    session_slide = session_data["slide"]
+
+    if session_slide is None:
+        return {"status": "error", "message": f"No slide loaded for session {session_id}"}
+
+    result = {
+        "level_count": len(session_slide.level_dimensions),
+        "dimensions": session_slide.dimensions,
+    }
+
+    pyramid_levels = []
+    for level in range(len(session_slide.level_dimensions)):
+        width, height = session_slide.level_dimensions[level]
+        downsample = session_slide.dimensions[0] / width
+        pyramid_levels.append({
+            "level": level,
+            "dimensions": [width, height],
+            "size": {"width": width, "height": height},
+            "downsample": downsample,
+            "cols": math.ceil(width / TILE_SIZE),
+            "rows": math.ceil(height / TILE_SIZE),
+        })
+
+    result["levels"] = pyramid_levels
+
+    if pyramid_levels:
+        thumbnail_level = len(pyramid_levels) - 1
+        result["thumbnail_level"] = thumbnail_level
+        result["thumbnail_dimensions"] = pyramid_levels[thumbnail_level]["dimensions"]
+
+        best_level = 0
+        best_size_diff = float("inf")
+        target_width = 1000
+
+        for level_info in pyramid_levels:
+            width = level_info["dimensions"][0]
+            diff = abs(width - target_width)
+            if diff < best_size_diff:
+                best_size_diff = diff
+                best_level = level_info["level"]
+
+        result["best_level"] = best_level
+
+    return {"status": "success", "data": result}
+
+
+def get_session_properties_response(session_id: str = "default") -> Dict:
+    """Return frontend-friendly slide properties for the current session."""
+    session_data = get_session_data(session_id)
+    session_slide = session_data["slide"]
+
+    if session_slide is None:
+        return {"status": "error", "message": f"No slide loaded for session {session_id}"}
+
+    result = get_slide_properties(session_slide)
+    if "error" in result:
+        return {"status": "error", "message": result["error"]}
+
+    if "dimensions" not in result:
+        result["dimensions"] = session_slide.dimensions
+
+    result["level_count"] = len(session_slide.level_dimensions)
+    result["mpp"] = result.get("mpp", 0.25)
+    result["magnification"] = result.get("magnification", "20x")
+
+    if "pyramid_info" in result:
+        for level_info in result["pyramid_info"]:
+            level = level_info["level"]
+            width, height = session_slide.level_dimensions[level]
+            level_info["cols"] = math.ceil(width / TILE_SIZE)
+            level_info["rows"] = math.ceil(height / TILE_SIZE)
+
+    if result["level_count"] > 0:
+        result["best_level"] = 0
+        result["thumbnail_level"] = result["level_count"] - 1
+
+    result["status"] = "success"
+    return {"status": "success", "data": result}
+
+
+def _parse_tile_request_inputs(col_row: str, query_params) -> Dict:
+    """Parse tile request inputs into service-friendly values."""
+    channels_list = []
+    colors_list = []
+
+    for param_name in query_params:
+        if param_name.startswith("channels["):
+            for value in query_params.getlist(param_name):
+                try:
+                    channels_list.append(int(value))
+                except ValueError:
+                    logger.warning("Unable to convert channel value '%s' to integer", value)
+        elif param_name.startswith("colors["):
+            for value in query_params.getlist(param_name):
+                colors_list.append(value)
+
+    col_row_clean = col_row.replace(".jpeg", "")
+    parts = col_row_clean.split("_")
+    if len(parts) != 2:
+        return {
+            "status": "error",
+            "message": f"Invalid tile format: {col_row_clean}. Expected format: col_row",
+        }
+
+    try:
+        col = int(parts[0])
+        row = int(parts[1])
+    except ValueError:
+        return {
+            "status": "error",
+            "message": f"Invalid tile values: {col_row_clean}. Col and row must be integers",
+        }
+
+    return {
+        "status": "success",
+        "col": col,
+        "row": row,
+        "channels": channels_list,
+        "colors": colors_list,
+    }
+
+
+def _get_isyntax_tile(
+    session_data: Dict,
+    session_id: str,
+    level: int,
+    col: int,
+    row: int,
+    scale_factor: float,
+    color_mode: Optional[str],
+    channels_list: List[int],
+    colors_list: List[str],
+) -> Dict:
+    """Serve an ISyntax tile with session-level locking and cache support."""
+    session_current_file_path = session_data["current_file_path"]
+
+    from app.services.tile_cache_service import get_tile_cache
+    tile_cache = get_tile_cache()
+
+    if session_current_file_path:
+        cached_tile = tile_cache.get_cached_tile(
+            session_current_file_path,
+            level,
+            col,
+            row,
+            scale_factor,
+            color_mode,
+            channels_list,
+            colors_list,
+        )
+        if cached_tile:
+            logger.debug(
+                "Cache hit for ISyntax tile: level=%s col=%s row=%s",
+                level,
+                col,
+                row,
+            )
+            return {
+                "status": "success",
+                "image_data": cached_tile,
+                "format": "JPEG",
+                "width": TILE_SIZE,
+                "height": TILE_SIZE,
+            }
+
+    isyntax_lock = session_data["isyntax_lock"]
+    with isyntax_lock:
+        if session_data["last_isyntax_file_path"] != session_current_file_path:
+            session_data["last_isyntax_file_path"] = session_current_file_path
+            if session_data["isyntax_slide"] is not None:
+                session_data["isyntax_slide"].close()
+            session_data["isyntax_slide"] = ISyntax.open(session_current_file_path)
+
+        if session_data["isyntax_slide"] is None:
+            return {
+                "status": "error",
+                "message": f"No ISyntax slide loaded for session {session_id}",
+            }
+
+        size = TILE_SIZE
+        isyntax_slide = session_data["isyntax_slide"]
+        dzi_level = int(level)
+        W = (
+            isyntax_slide.level_dimensions[0][0]
+            if hasattr(isyntax_slide, "level_dimensions")
+            else isyntax_slide.dimensions[0]
+        )
+        H = (
+            isyntax_slide.level_dimensions[0][1]
+            if hasattr(isyntax_slide, "level_dimensions")
+            else isyntax_slide.dimensions[1]
+        )
+        max_dzi_level = max(0, math.ceil(math.log2(max(W, H) / size)))
+        tile_span = size * (2 ** (max_dzi_level - dzi_level))
+        x = int(col) * tile_span
+        y = int(row) * tile_span
+        x = min(x, W)
+        y = min(y, H)
+        w = min(tile_span, W - x)
+        h = min(tile_span, H - y)
+        out_w = max(1, math.ceil(w * size / tile_span))
+        out_h = max(1, math.ceil(h * size / tile_span))
+        w, h = max(1, math.ceil(w)), max(1, math.ceil(h))
+
+        target_downsample = max(1.0, tile_span / size)
+        if hasattr(isyntax_slide, "get_best_level_for_downsample"):
+            svs_level = isyntax_slide.get_best_level_for_downsample(target_downsample)
+        else:
+            svs_level = 0
+            n_levels = isyntax_slide.level_count if hasattr(isyntax_slide, "level_count") else 1
+            for lvl in range(n_levels):
+                try:
+                    lvl_w = isyntax_slide.level_dimensions[lvl][0]
+                    if (W / lvl_w) <= target_downsample:
+                        svs_level = lvl
+                except Exception:
+                    break
+        svs_level = max(0, svs_level)
+
+        actual_svs_ds = isyntax_slide.level_dimensions[0][0] / isyntax_slide.level_dimensions[svs_level][0]
+        sx = max(0, int(round(x / actual_svs_ds)))
+        sy = max(0, int(round(y / actual_svs_ds)))
+        sw = max(1, int(round(w / actual_svs_ds)))
+        sh = max(1, int(round(h / actual_svs_ds)))
+        img_arr = session_data["isyntax_slide"].read_region(sx, sy, sw, sh, svs_level)
+
+    img = Image.fromarray(img_arr)
+    img = img.resize((out_w, out_h), Image.Resampling.LANCZOS)
+    buffer = BytesIO()
+    img.convert("RGB").save(buffer, format="JPEG", quality=75, optimize=False)
+    jpeg_data = buffer.getvalue()
+
+    if session_current_file_path:
+        tile_cache.cache_tile(
+            session_current_file_path,
+            level,
+            col,
+            row,
+            scale_factor,
+            color_mode,
+            channels_list,
+            colors_list,
+            jpeg_data,
+        )
+
+    return {
+        "status": "success",
+        "image_data": jpeg_data,
+        "format": "JPEG",
+        "width": out_w,
+        "height": out_h,
+    }
+
+
+async def get_tile_for_api(
+    level: int,
+    col_row: str,
+    scale_factor: float = 1.0,
+    color_mode: Optional[str] = None,
+    query_params=None,
+    session_id: str = "default",
+) -> Dict:
+    """Resolve a tile request into JPEG bytes and metadata."""
+    parse_result = _parse_tile_request_inputs(col_row, query_params)
+    if parse_result["status"] == "error":
+        return parse_result
+
+    col = parse_result["col"]
+    row = parse_result["row"]
+    channels_list = parse_result["channels"]
+    colors_list = parse_result["colors"]
+
+    session_data = get_session_data(session_id)
+    session_current_file_format = session_data["current_file_format"]
+
+    if session_current_file_format == "isyntax":
+        return _get_isyntax_tile(
+            session_data=session_data,
+            session_id=session_id,
+            level=level,
+            col=col,
+            row=row,
+            scale_factor=scale_factor,
+            color_mode=color_mode,
+            channels_list=channels_list,
+            colors_list=colors_list,
+        )
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: get_tile(
+            level=level,
+            col=col,
+            row=row,
+            scale_factor=scale_factor,
+            color_mode=color_mode,
+            channels=channels_list,
+            colors=colors_list,
+            session_id=session_id,
+        ),
+    )
+
+
+def get_preprocess_result_for_api() -> Dict:
+    """Normalize preprocess result payload for the API."""
+    result = get_process_result()
+    if result["status"] == "processing":
+        return {
+            "status": "success",
+            "data": {
+                "message": result["message"],
+                "progress": result["progress"],
+            },
+        }
+    return {"status": "success", "data": result}
+
+
+def get_cache_stats_response() -> Dict:
+    """Return tile cache stats for API responses."""
+    from app.services.tile_cache_service import get_tile_cache
+
+    tile_cache = get_tile_cache()
+    return {
+        "status": "success",
+        "cache_stats": tile_cache.get_cache_stats(),
+    }
+
+
+def clear_tile_cache_response() -> Dict:
+    """Clear the tile cache and return API response data."""
+    from app.services.tile_cache_service import get_tile_cache
+
+    tile_cache = get_tile_cache()
+    tile_cache.clear_cache()
+    return {
+        "status": "success",
+        "message": "All cache cleared",
+    }
+
+
+def get_zstack_info_response(session_id: str) -> Dict:
+    """Return z-stack info in API payload shape."""
+    result = get_z_layer_info(session_id)
+    if result["status"] == "error":
+        return result
+    return {
+        "status": "success",
+        "data": {
+            "zstack_info": result["zstack_info"],
+            "current_layer": result["current_layer"],
+        },
+    }
+
+
+def set_z_layer_for_api(session_id: str, z_layer: int) -> Dict:
+    """Set z-layer and return API payload shape."""
+    result = set_z_layer(session_id, int(z_layer))
+    if result["status"] == "error":
+        return result
+    return {
+        "status": "success",
+        "data": {
+            "message": result["message"],
+            "current_layer": result["current_layer"],
+            "layer_count": result["layer_count"],
+        },
+    }
+
+
+# ============================================================================
+# Z-Stack Related Functions
+# ============================================================================
+
+def detect_zstack_layers(file_path: str) -> Dict:
+    """
+    Detect z-stack layers in NDPI file
+    Returns: dict with z_stack info (layer_count, layer_indices, has_zstack)
+    """
+    try:
+        if not file_path.lower().endswith('.ndpi'):
+            return {"has_zstack": False, "layer_count": 1, "layer_indices": [0]}
+        
+        # Try to detect z-stack using tifffile
+        if _tifffile is None:
+            logger.warning("[Z-Stack] tifffile not available, cannot detect z-stack layers")
+            return {"has_zstack": False, "layer_count": 1, "layer_indices": [0]}
+        
+        try:
+            with _tifffile.TiffFile(file_path) as tif:
+                num_series = len(tif.series)
+                logger.info(f"[Z-Stack] File has {num_series} series")
+                
+                # Check if first series has ZYXS or ZCYX axes (direct z-stack indicator)
+                if num_series > 0:
+                    first_series = tif.series[0]
+                    if hasattr(first_series, 'axes'):
+                        axes = first_series.axes
+                        logger.info(f"[Z-Stack] First series axes: {axes}, shape: {first_series.shape}")
+                        
+                        if axes and axes[0] == 'Z':
+                            z_count = first_series.shape[0]  # First dimension is z
+                            logger.info(f"[Z-Stack] Detected Z-axis in series, z_count={z_count}")
+                            return {
+                                "has_zstack": True,
+                                "layer_count": z_count,
+                                "layer_indices": list(range(z_count)),
+                                "current_layer": 0
+                            }
+                
+                # Fallback: Check for z-stack metadata in NDPI tags
+                z_layers = []
+                for series_idx, series in enumerate(tif.series):
+                    # Look for z-position metadata
+                    if len(series.pages) > 0:
+                        page = series.pages[0]
+                        
+                        # Check NDPI-specific tags for z-stack info
+                        # NDPI stores z-position in custom tags
+                        if hasattr(page, 'tags'):
+                            # Look for focal plane or z-position tags
+                            for tag in page.tags.values():
+                                if 'focal' in str(tag.name).lower() or 'z' in str(tag.name).lower():
+                                    z_layers.append(series_idx)
+                                    break
+                
+                # If we found z-stack layers
+                if len(z_layers) > 1:
+                    logger.info(f"[Z-Stack] Detected {len(z_layers)} z-stack layers in NDPI file")
+                    return {
+                        "has_zstack": True,
+                        "layer_count": len(z_layers),
+                        "layer_indices": z_layers,
+                        "current_layer": 0
+                    }
+                
+                # Fallback: check if multiple pages at same resolution (common z-stack pattern)
+                if num_series == 1 and len(tif.series[0].pages) > 1:
+                    pages = tif.series[0].pages
+                    # Check if pages have same dimensions (indicates z-stack)
+                    if all(p.shape == pages[0].shape for p in pages[:10]):  # Check first 10
+                        layer_count = len(pages)
+                        logger.info(f"[Z-Stack] Detected {layer_count} z-stack layers (page-based)")
+                        return {
+                            "has_zstack": True,
+                            "layer_count": layer_count,
+                            "layer_indices": list(range(layer_count)),
+                            "current_layer": 0
+                        }
+                
+                # No z-stack detected
+                logger.info("[Z-Stack] No z-stack detected")
+                return {"has_zstack": False, "layer_count": 1, "layer_indices": [0]}
+                
+        except Exception as e:
+            logger.warning(f"[Z-Stack] Error detecting z-stack layers: {e}")
+            return {"has_zstack": False, "layer_count": 1, "layer_indices": [0]}
+            
+    except Exception as e:
+        logger.error(f"[Z-Stack] Unexpected error in detect_zstack_layers: {e}")
+        return {"has_zstack": False, "layer_count": 1, "layer_indices": [0]}
+
+
+def set_z_layer(session_id: str, z_layer: int) -> Dict:
+    """
+    Set the current z-layer for viewing
+    Args:
+        session_id: Session identifier
+        z_layer: Z-layer index to switch to
+    Returns:
+        Dict with status and current layer info
+    """
+    try:
+        logger.info(f"[Z-Stack] Setting z-layer to {z_layer} for session {session_id}")
+        session_data = get_session_data(session_id)
+        zstack_info = session_data.get('zstack_info', {})
+        
+        if not zstack_info.get('has_zstack', False):
+            return {
+                "status": "error",
+                "message": "Current file does not have z-stack layers"
+            }
+        
+        layer_indices = zstack_info.get('layer_indices', [0])
+        if z_layer not in layer_indices:
+            return {
+                "status": "error",
+                "message": f"Invalid z-layer {z_layer}. Available layers: {layer_indices}"
+            }
+        
+        # Update current z-layer in session
+        session_data['current_z_layer'] = z_layer
+        zstack_info['current_layer'] = z_layer
+        
+        logger.info(f"[Z-Stack] Successfully switched to z-layer {z_layer} for session {session_id}")
+        
+        return {
+            "status": "success",
+            "message": f"Switched to z-layer {z_layer}",
+            "current_layer": z_layer,
+            "layer_count": zstack_info.get('layer_count', 1)
+        }
+        
+    except Exception as e:
+        logger.error(f"[Z-Stack] Error setting z-layer: {e}")
+        return {
+            "status": "error",
+            "message": f"Error setting z-layer: {str(e)}"
+        }
+
+
+def get_z_layer_info(session_id: str) -> Dict:
+    """
+    Get current z-layer information for a session
+    Args:
+        session_id: Session identifier
+    Returns:
+        Dict with z-stack info
+    """
+    try:
+        logger.info(f"[Z-Stack] Getting z-layer info for session: {session_id}")
+        session_data = get_session_data(session_id)
+        zstack_info = session_data.get('zstack_info', {
+            'has_zstack': False,
+            'layer_count': 1,
+            'layer_indices': [0]
+        })
+        
+        # If no z-stack info in this session and session_id is not "default",
+        # try to get from "default" session as fallback
+        if not zstack_info.get('has_zstack', False) and session_id != "default":
+            logger.info(f"[Z-Stack] No z-stack in session {session_id}, trying default session")
+            try:
+                default_session = get_session_data("default")
+                default_zstack = default_session.get('zstack_info', {})
+                if default_zstack.get('has_zstack', False):
+                    logger.info(f"[Z-Stack] Found z-stack in default session, using that")
+                    zstack_info = default_zstack
+                    session_data['zstack_info'] = zstack_info  # Copy to current session
+                    session_data['current_z_layer'] = default_session.get('current_z_layer', 0)
+            except Exception as fallback_error:
+                logger.warning(f"[Z-Stack] Failed to get from default session: {fallback_error}")
+        
+        logger.info(f"[Z-Stack] Returning info for session {session_id}: {zstack_info}")
+        
+        return {
+            "status": "success",
+            "zstack_info": zstack_info,
+            "current_layer": session_data.get('current_z_layer', 0)
+        }
+        
+    except Exception as e:
+        logger.error(f"[Z-Stack] Error getting z-layer info: {e}")
+        return {
+            "status": "error",
+            "message": f"Error getting z-layer info: {str(e)}"
+        }
+
 
 # Legacy global variables for backward compatibility
 slide = None
@@ -191,12 +1084,63 @@ def get_process_result() -> Dict:
         "message": "No result available"
     }
 
+def get_file_extension(filename: str) -> str:
+    """Get file extension, handling special cases like .nii.gz"""
+    if filename.endswith('.nii.gz'):
+        return 'nii.gz'
+    elif '.' in filename:
+        return filename.rsplit('.', 1)[1].lower()
+    else:
+        return ''
+
+def smart_load_ndpi_wrapper(file_path: str):
+    """
+    Smart wrapper selection for NDPI files based on metadata
+    
+    Uses tifffile to read metadata first:
+    - If file has z-stack (multi-layer): use TiffFileWrapper (supports z_layer)
+    - If file is single-layer: use TiffSlideWrapper (faster performance)
+    
+    Args:
+        file_path: Path to NDPI file
+        
+    Returns:
+        Tuple of (wrapper_object, is_tiff_file_wrapper: bool)
+    """
+    is_zstack = False
+    try:
+        if _tifffile is not None:
+            with _tifffile.TiffFile(file_path) as tf:
+                if hasattr(tf, 'series') and len(tf.series) > 0:
+                    series = tf.series[0]
+                    if hasattr(series, 'shape') and len(series.shape) == 4:
+                        is_zstack = True
+                        logger.info(f"[NDPI Smart Load] Detected z-stack (4D shape), using TiffFileWrapper")
+    except Exception as e:
+        logger.warning(f"[NDPI Smart Load] Failed to check metadata: {e}, defaulting to TiffSlideWrapper")
+    
+    # Choose wrapper based on file structure
+    if is_zstack:
+        # Z-stack file: use TiffFileWrapper with zarr optimization
+        wrapper = TiffFileWrapper(file_path)
+        logger.info(f"[NDPI Smart Load] Using TiffFileWrapper for z-stack file: {file_path}")
+        return wrapper, True
+    else:
+        # Standard NDPI: use TiffSlideWrapper
+        wrapper = TiffSlideWrapper(file_path)
+        logger.info(f"[NDPI Smart Load] Using TiffSlideWrapper for standard file: {file_path}")
+        return wrapper, False
+
 def allowed_file(filename: str) -> bool:
     """Check if file is allowed format"""
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    return get_file_extension(filename) in ALLOWED_EXTENSIONS
 
 def calculate_total_tiles(slide_obj) -> int:
     """Calculate total tiles of slide"""
+    if slide_obj is None:
+        # For NII files with parsing skipped, return a default value
+        return 1
+    
     tile_size = TILE_SIZE  # standard tile size
     min_tiles = float('inf')
 
@@ -239,10 +1183,10 @@ def tree_to_string(tree_structure: Dict, indent: str = '') -> str:
     result = []
     for name, content in tree_structure.items():
         if isinstance(content, dict):
-            result.append(f"{indent}📂 {name}")
+            result.append(f"{indent}  {name}")
             result.append(tree_to_string(content, indent + '   '))
         else:
-            result.append(f"{indent}📄 {name}")
+            result.append(f"{indent}  {name}")
     return '\n'.join(result)
 
 def find_wsi_file(folder_path: str) -> Optional[str]:
@@ -311,7 +1255,12 @@ def process_channel(args: Tuple[np.ndarray, np.ndarray, int]) -> np.ndarray:
 def get_pyramid_info(slide_obj) -> Dict:
     """Get pyramid information"""
     if slide_obj is None:
-        return {"error": "No slide loaded"}
+        # For NII files with parsing skipped, return minimal pyramid info
+        return [{
+            "level": 0,
+            "dimensions": (512, 512),  # Default dimensions
+            "downsample": 1.0
+        }]
     
     result = []
     for level in range(len(slide_obj.level_dimensions)):
@@ -328,6 +1277,15 @@ def get_pyramid_info(slide_obj) -> Dict:
 
 def get_slide_properties(slide_obj) -> Dict:
     """Get slide properties"""
+    if slide_obj is None:
+        # For NII files with parsing skipped, return minimal properties
+        return {
+            'pyramid_info': [{'downsample': 1.0}],
+            'max_level': 1,
+            'greatest_downsample': 1.0,
+            'zoom_ratios': [1.0]
+        }
+    
     local_dict = {}
     local_dict['pyramid_info'] = get_pyramid_info(slide_obj)
     print(f"pyramid_info: {local_dict['pyramid_info']}", '!'*50)
@@ -340,45 +1298,21 @@ def get_slide_properties(slide_obj) -> Dict:
         zoom_ratios.append(slide_obj.level_dimensions[0][0] / slide_obj.level_dimensions[i][0])
     local_dict['zoom_ratios'] = zoom_ratios
     print(f"zoom_ratios: {local_dict['zoom_ratios']}", '!'*50)
-    walker = 16/local_dict['greatest_downsample']
-    adjust_ratios = [walker]
-    for i in range(1, local_dict['max_level']):
-        local_ratio = (local_dict['pyramid_info'][local_dict['max_level']-i]['downsample'] /
-                             local_dict['pyramid_info'][local_dict['max_level']-i-1]['downsample'])/2
-        walker *= local_ratio
-        adjust_ratios.append(walker)
-    adjust_ratios = adjust_ratios[::-1]
-    local_dict['adjust_ratios'] = adjust_ratios
     return local_dict
 
 @lru_cache(maxsize=2000)
 def process_tile_with_colors(img_np_bytes: bytes, shape: Tuple, channel_indices: Tuple, colors: Tuple) -> np.ndarray:
-    """Process tile with colors"""
+    """Process tile with colors using vectorised numpy (no thread pool overhead)."""
     try:
         img_np = np.frombuffer(img_np_bytes, dtype=np.uint8).reshape(shape)
         height, width = img_np.shape[:2]
         combined_img = np.zeros((height, width, 3), dtype=np.float32)
 
-        # channel prepare
-        channel_data = {
-            idx: img_np[..., idx]
-            for idx in channel_indices
-        }
-
-        # batch process all channels
-        with ThreadPoolExecutor(max_workers=4) as local_pool:
-            futures = [
-                local_pool.submit(
-                    process_channel,
-                    (channel_data[channel_idx], np.array(color), channel_idx)
-                )
-                for channel_idx, color in zip(channel_indices, colors)
-            ]
-
-            # wait all tasks done
-            for future in as_completed(futures):
-                result = future.result()
-                combined_img += result
+        for channel_idx, color in zip(channel_indices, colors):
+            # color is a 3-tuple of uint8 values
+            channel = img_np[..., channel_idx].astype(np.float32)          # (H, W)
+            color_arr = np.array(color, dtype=np.float32) / 255.0          # (3,)
+            combined_img += channel[..., np.newaxis] * color_arr           # broadcast (H,W,3)
 
         return np.clip(combined_img, 0, 255).astype(np.uint8)
 
@@ -458,34 +1392,34 @@ def load_slide_from_file_with_session(filename: str, session_id: str = "default"
         return {"status": "error", "message": f"File {filename} not found"}
     
     try:
-        file_ext = filename.rsplit('.', 1)[1].lower()
+        file_ext = get_file_extension(filename)
         
         # Store current file path in session
         session_data['current_file_path'] = filename
+        print(f"Debug - load_slide_from_file_with_session: file_ext={file_ext}, session_id={session_id}")
         
-        if file_ext in ['tif', 'tiff', 'btf']:
+        if file_ext in ['tif', 'tiff', 'btf', 'svs']:
+            # pyvips-native path for all TIFF/SVS variants.
+            # PyvipsSlideWrapper uses tifffile series[0].levels to correctly identify
+            # pyramid pages, filtering out SVS associated images (thumbnail/label/macro).
+            print(f"Debug - Using PyvipsSlideWrapper for {file_ext}")
+            session_data['slide'] = PyvipsSlideWrapper(filename)
+            session_data['current_file_format'] = file_ext
+            session_data['tiff_slide_wrapper'] = True
+        elif file_ext in ['qptiff']:
             try:
-                # First try tiffslide
                 session_data['slide'] = TiffSlideWrapper(filename)
-                session_data['current_file_format'] = 'svs'  # tiffslide format
+                session_data['current_file_format'] = 'qptiff'
                 session_data['tiff_slide_wrapper'] = False
             except Exception as e:
-                # If tiffslide fails, try our wrapper
-                session_data['slide'] = TiffFileWrapper(filename)
-                session_data['current_file_format'] = 'tif'
+                print(f"Debug - TiffSlideWrapper failed for QPTIFF: {e}, falling back to PyvipsSlideWrapper")
+                session_data['slide'] = PyvipsSlideWrapper(filename)
+                session_data['current_file_format'] = 'qptiff'
                 session_data['tiff_slide_wrapper'] = True
-        elif file_ext in ['svs']:
-            session_data['slide'] = TiffSlideWrapper(filename)
-            session_data['current_file_format'] = 'svs'
-            session_data['tiff_slide_wrapper'] = False
-        elif file_ext in ['qptiff']:
-            session_data['slide'] = TiffSlideWrapper(filename)
-            session_data['current_file_format'] = 'qptiff'
-            session_data['tiff_slide_wrapper'] = False
         elif file_ext in ['ndpi']:
-            session_data['slide'] = TiffSlideWrapper(filename)
+            # Smart wrapper selection for NDPI files using centralized logic
+            session_data['slide'], session_data['tiff_slide_wrapper'] = smart_load_ndpi_wrapper(filename)
             session_data['current_file_format'] = 'ndpi'
-            session_data['tiff_slide_wrapper'] = False
         elif file_ext in ['jpeg', 'jpg', 'png', 'bmp']:
             session_data['slide'] = SimpleImageWrapper(filename)
             session_data['current_file_format'] = 'image'
@@ -502,10 +1436,17 @@ def load_slide_from_file_with_session(filename: str, session_id: str = "default"
             session_data['slide'] = DicomImageWrapper(filename)
             session_data['current_file_format'] = 'dcm'
             session_data['tiff_slide_wrapper'] = False
-        elif file_ext in ['nii']:
-            session_data['slide'] = NiftiImageWrapper(filename)
-            session_data['current_file_format'] = 'nii'
-            session_data['tiff_slide_wrapper'] = False
+        elif file_ext in ['nii', 'nii.gz']:
+            if SKIP_NII_PARSING:
+                # Skip NII parsing - create a minimal wrapper for compatibility
+                session_data['slide'] = None
+                session_data['current_file_format'] = 'nii'
+                session_data['tiff_slide_wrapper'] = False
+                session_data['skip_parsing'] = True
+            else:
+                session_data['slide'] = NiftiImageWrapper(filename)
+                session_data['current_file_format'] = 'nii'
+                session_data['tiff_slide_wrapper'] = False
         else:
             return {"status": "error", "message": f"Unsupported file format: {file_ext}"}
         
@@ -549,23 +1490,109 @@ def load_slide_from_file_with_session(filename: str, session_id: str = "default"
         else:
             image_type = 'Brightfield H&E'
 
-        return {
-            "status": "success",
-            "message": "Slide loaded successfully",
-            "file_format": session_data['current_file_format'],
-            "dimensions": session_data['slide'].dimensions,
-            "level_count": len(session_data['slide'].level_dimensions),
-            "total_tiles": total_tiles,
-            "total_channels": total_channels,
-            "image_type": image_type
-        }
+        # Check for z-stack support
+        is_zstack = False
+        z_layer_count = 1
+        if hasattr(session_data['slide'], 'is_zstack'):
+            is_zstack = session_data['slide'].is_zstack
+            if is_zstack and hasattr(session_data['slide'], 'z_layer_count'):
+                z_layer_count = session_data['slide'].z_layer_count
+                # Initialize z-stack info in session (use 'has_zstack' key for frontend compatibility)
+                session_data['zstack_info'] = {
+                    'has_zstack': True,
+                    'layer_count': z_layer_count,
+                    'layer_indices': list(range(z_layer_count)),
+                    'current_layer': 0
+                }
+                session_data['current_z_layer'] = 0
+                logger.info(f"[Z-Stack] Initialized {z_layer_count} layers for session {session_id}")
+            else:
+                # No z-stack, use default info
+                session_data['zstack_info'] = {
+                    'has_zstack': False,
+                    'layer_count': 1,
+                    'layer_indices': [0],
+                    'current_layer': 0
+                }
+        else:
+            # Slide doesn't have is_zstack attribute, use default info
+            session_data['zstack_info'] = {
+                'has_zstack': False,
+                'layer_count': 1,
+                'layer_indices': [0],
+                'current_layer': 0
+            }
+
+        # Handle NII files with parsing skipped
+        if session_data.get('skip_parsing', False):
+            # Store dimensions and other info in session_data for later retrieval
+            dimensions = (512, 512)  # Default dimensions for NII
+            session_data['dimensions'] = dimensions
+            session_data['level_count'] = 1
+            session_data['total_tiles'] = total_tiles
+            session_data['total_channels'] = total_channels
+            
+            return {
+                "status": "success",
+                "message": "Slide loaded successfully (parsing skipped)",
+                "file_format": session_data['current_file_format'],
+                "dimensions": dimensions,
+                "level_count": 1,
+                "total_tiles": total_tiles,
+                "total_channels": total_channels,
+                "image_type": image_type,
+                "skip_parsing": True,
+                "zstack_info": session_data['zstack_info']
+            }
+        else:
+            return {
+                "status": "success",
+                "message": "Slide loaded successfully",
+                "file_format": session_data['current_file_format'],
+                "dimensions": session_data['slide'].dimensions,
+                "level_count": len(session_data['slide'].level_dimensions),
+                "total_tiles": total_tiles,
+                "total_channels": total_channels,
+                "image_type": image_type,
+                "zstack_info": session_data['zstack_info']
+            }
     except Exception as e:
         return {"status": "error", "message": f"Error loading slide: {str(e)}"}
 
 
+def _resize_vips_tile_to_exact(img: pyvips.Image, out_w: int, out_h: int) -> pyvips.Image:
+    """Scale to exact (out_w, out_h) so JPEG size matches OSD-reported tile geometry.
+
+    Uses independent horizontal/vertical scale so read_region rounding cannot leave a
+    height/width mismatch vs independently ceiled out_w/out_h (edge tiles).
+    """
+    if img.width == out_w and img.height == out_h:
+        return img
+    sx = out_w / img.width
+    sy = out_h / img.height
+    out = img.resize(sx, vscale=sy)
+    if out.width > out_w:
+        out = out.crop(0, 0, out_w, out.height)
+    if out.height > out_h:
+        out = out.crop(0, 0, out.width, out_h)
+    if out.width < out_w or out.height < out_h:
+        out = out.embed(0, 0, out_w, out_h, extend="background", background=[255, 255, 255])
+    return out
+
+
+def _encode_tile_vips(img: pyvips.Image, quality: int = 85) -> bytes:
+    """Encode a pyvips image to JPEG bytes for tile serving."""
+    if img.bands == 4:
+        img = img.extract_band(0, n=3)
+    elif img.bands == 1:
+        img = img.colourspace("srgb")
+    return img.jpegsave_buffer(Q=quality, keep="none")
+
+
 def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
              color_mode: str = None, channels: List[int] = None,
-             colors: List[List[int]] = None, session_id: str = "default") -> Dict:
+             colors: List[List[int]] = None, session_id: str = "default",
+             z_layer: Optional[int] = None) -> Dict:
     """
     Get tile from slide
     """
@@ -579,9 +1606,21 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
     session_tiff_slide_wrapper = session_data['tiff_slide_wrapper']
     session_current_file_path = session_data['current_file_path']
     
+    # Get z-layer: use provided value or current session z-layer
+    if z_layer is None:
+        z_layer = session_data.get('current_z_layer', 0)
+
+    # Match get_cached_tile: only non-zero z layers need a distinct cache namespace
+    cache_key_suffix = f"_z{z_layer}" if z_layer > 0 else ""
+
+    logger.debug(f"[Tile] Using z-layer: {z_layer} for session {session_id}")
+    
     try:
-        print(f"Debug - get_tile called: level={level}, col={col}, row={row}, scale={scale_factor}, session={session_id}")
+        print(f"Debug - get_tile called: level={level}, col={col}, row={row}, scale={scale_factor}, z_layer={z_layer}, session={session_id}")
         if session_slide is None:
+            # Check if this is a NII file with parsing skipped
+            if session_data.get('skip_parsing', False):
+                return {"status": "error", "message": "NII file parsing is skipped - use direct loading instead"}
             return {"status": "error", "message": f"No slide is loaded for session {session_id}"}
 
         # Check cache first
@@ -590,11 +1629,11 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
         
         if session_current_file_path:
             cached_tile = tile_cache.get_cached_tile(
-                session_current_file_path, level, col, row, 
+                session_current_file_path + cache_key_suffix, level, col, row, 
                 scale_factor, color_mode, channels, colors
             )
             if cached_tile:
-                print(f"Debug - Cache hit for tile: level={level}, col={col}, row={row}")
+                print(f"Debug - Cache hit for tile: level={level}, col={col}, row={row}, z_layer={z_layer}")
                 return {
                     "status": "success",
                     "image_data": cached_tile,
@@ -605,59 +1644,96 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
 
         # basic parameters
         size = TILE_SIZE
-        max_svs_level = len(session_slide.level_dimensions)
-
         dzi_level = int(level)
-        
-        # file format detection
         file_format = session_current_file_format
-        # Calculate the appropriate level to use
-        if session_tiff_slide_wrapper:
-            svs_level = int(session_slide.fit_page - dzi_level - 2*(max_svs_level-7))
+
+        # PathView-style tile coordinate computation (matches frontend maxLevel; clamp >= 0 for OSD)
+        W, H = session_slide.level_dimensions[0]
+        max_dzi_level = max(0, math.ceil(math.log2(max(W, H) / size)))
+        tile_span = size * (2 ** (max_dzi_level - dzi_level))
+
+        x1 = int(col) * tile_span
+        y1 = int(row) * tile_span
+
+        # Clamp to image bounds
+        x1 = min(x1, W)
+        y1 = min(y1, H)
+        w = min(tile_span, W - x1)
+        h = min(tile_span, H - y1)
+
+        # Output tile dimensions: proportional to coverage (edge tiles are smaller).
+        # Use ceil to match OSD's own edge-tile size computation: ceil(image_dim / scale).
+        out_w = max(1, math.ceil(w * size / tile_span))
+        out_h = max(1, math.ceil(h * size / tile_span))
+
+        if w <= 0 or h <= 0:
+            buf = BytesIO()
+            Image.new('RGB', (size, size), (255, 255, 255)).save(buf, format="JPEG", quality=85)
+            return {"status": "success", "image_data": buf.getvalue(), "format": "JPEG", "width": size, "height": size}
+
+        # Find best SVS pyramid level for the requested downsample
+        target_downsample = max(1.0, tile_span / size)
+        if hasattr(session_slide, 'get_best_level_for_downsample'):
+            svs_level = session_slide.get_best_level_for_downsample(target_downsample)
         else:
-            svs_level = max(0, max_svs_level-dzi_level-1)
-            
-        if svs_level <= 0:
             svs_level = 0
-            adjust_ratio = session_slide_levels['adjust_ratios'][svs_level]
-            adjust_ratio = adjust_ratio*(2**(max_svs_level-dzi_level-1))
-        else:
-            adjust_ratio = session_slide_levels['adjust_ratios'][svs_level]
-            
-        zoom_ratio = session_slide.level_dimensions[0][0] / session_slide.level_dimensions[svs_level][0]
-        
-        # Calculate coordinates
-        x = int(col) * size * zoom_ratio * adjust_ratio
-        y = int(row) * size * zoom_ratio * adjust_ratio
-        x1, y1,  = x, y
-        w = h = size * adjust_ratio
+            for lvl in range(len(session_slide.level_dimensions)):
+                lvl_ds = session_slide.level_dimensions[0][0] / session_slide.level_dimensions[lvl][0]
+                if lvl_ds <= target_downsample:
+                    svs_level = lvl
+        svs_level = max(0, svs_level)
 
-        svs_level = max(0,svs_level) # Ensure svs_level is not negative
-        
-        # Simple strategy to adjust to higher res layer: 05/20/2025, Yuxuan Liu
-        # Tile with compensation should have larger size than standard tile
-        # Only occurs when max_svs_level >= 8
-        if max_svs_level >= 8:
-            # To ensure tile is clear, keep adjusting adjusting layer size until largest level
-            while w < size and svs_level > 0:
-                w = w * 2
-                h = h * 2
-                svs_level = svs_level - 1
-            if svs_level > 0:
-            # If didn't pass assertion after adjusting, tile will be blurry
-                assert w >= size, f"tile too small: {w}"
+        x2, y2 = x1 + w, y1 + h
 
-        # re-calc bounds
-        x2, y2 = x + w, y + h
+        # Compute read size in svs_level pixel coordinates
+        # read_region(location, level, size) expects size at the given level, not at level-0
+        actual_svs_downsample = session_slide.level_dimensions[0][0] / session_slide.level_dimensions[svs_level][0]
+        read_w = max(1, int(round(w / actual_svs_downsample)))
+        read_h = max(1, int(round(h / actual_svs_downsample)))
 
-        print(f'Debug - Reading region: ({x1}, {y1}), ({int(w)}, {int(h)}), level={svs_level}')
-        
+        print(f'Debug - Reading region: ({x1}, {y1}), read=({read_w}, {read_h}) at svs_level={svs_level} (ds={actual_svs_downsample:.1f}), tile_span={tile_span}')
+
+        # --- Fast path: pure pyvips pipeline (no PIL/numpy) ---
+        if isinstance(session_slide, PyvipsSlideWrapper):
+            sx = int(x1 / actual_svs_downsample)
+            sy = int(y1 / actual_svs_downsample)
+            region = session_slide.read_region_vips(svs_level, sx, sy, read_w, read_h)
+
+            if region.width > 0 and (region.width != out_w or region.height != out_h):
+                region = _resize_vips_tile_to_exact(region, out_w, out_h)
+
+            vips_quality = 75 if session_current_file_format == 'btf' else 85
+            jpeg_data = _encode_tile_vips(region, vips_quality)
+
+            if session_current_file_path:
+                tile_cache.cache_tile(
+                    session_current_file_path + cache_key_suffix, level, col, row,
+                    scale_factor, color_mode, channels, colors, jpeg_data
+                )
+            return {
+                "status": "success",
+                "image_data": jpeg_data,
+                "format": "JPEG",
+                "width": out_w,
+                "height": out_h,
+            }
+
         # Read the region - optimize for BTF files
         img = None
         if session_tiff_slide_wrapper:
-            # For files using TiffSlideWrapper (BTF, some TIF), always use as_array
+            # For files using TiffFileWrapper (BTF, some TIF, NDPI), always use as_array
+            # Check if read_region supports z_layer parameter
             try:
-                img_np = session_slide.read_region((x1, y1), svs_level, (int(w), int(h)), as_array=True)         
+                import inspect
+                sig = inspect.signature(session_slide.read_region)
+                supports_z_layer = 'z_layer' in sig.parameters
+
+                if supports_z_layer:
+                    img_np = session_slide.read_region((x1, y1), svs_level, (read_w, read_h), as_array=True, z_layer=z_layer)
+                else:
+                    logger.warning(f"[Z-Stack] TiffFileWrapper does not support z_layer parameter, using default layer")
+                    img_np = session_slide.read_region((x1, y1), svs_level, (read_w, read_h), as_array=True)
+                    
                 total_channels = img_np.shape[2] if len(img_np.shape) > 2 else 1
                 
                 # Convert to PIL Image
@@ -675,12 +1751,33 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
                 traceback.print_exc()
                 raise
         else:
-            # Original code for non-wrapper files
+            # Original code for non-wrapper files (TiffSlideWrapper)
+            # Check if read_region supports z_layer parameter
             try:
-                img = session_slide.read_region((x1, y1), svs_level, (int(w), int(h)))
+                import inspect
+                sig = inspect.signature(session_slide.read_region)
+                supports_z_layer = 'z_layer' in sig.parameters
+                
+                if supports_z_layer:
+                    img = session_slide.read_region((x1, y1), svs_level, (read_w, read_h), z_layer=z_layer)
+                else:
+                    logger.warning(f"[Z-Stack] TiffSlideWrapper does not support z_layer parameter, using default layer")
+                    img = session_slide.read_region((x1, y1), svs_level, (read_w, read_h))
             except Exception as e:
                 print(f"Debug - Error with read_region, trying as_array: {str(e)}")
-                img_np = session_slide.read_region((x1, y1), svs_level, (int(w), int(h)), as_array=True)
+                try:
+                    import inspect
+                    sig = inspect.signature(session_slide.read_region)
+                    supports_z_layer = 'z_layer' in sig.parameters
+
+                    if supports_z_layer:
+                        img_np = session_slide.read_region((x1, y1), svs_level, (read_w, read_h), as_array=True, z_layer=z_layer)
+                    else:
+                        img_np = session_slide.read_region((x1, y1), svs_level, (read_w, read_h), as_array=True)
+                except Exception as e2:
+                    # Fallback without z_layer if it causes issues
+                    print(f"Debug - Error with z_layer, trying without: {str(e2)}")
+                    img_np = session_slide.read_region((x1, y1), svs_level, (read_w, read_h), as_array=True)
                 total_channels = img_np.shape[2] if len(img_np.shape) > 2 else 1
                 print(f"Debug - Total available channels: {total_channels}")
                 print(f"Debug - Array dtype: {img_np.dtype}, shape: {img_np.shape}")
@@ -736,41 +1833,25 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
                         padded[..., :total_channels] = img_np
                         img = Image.fromarray(padded)
         
-        # Resize to standard tile size
+        # Exact (out_w, out_h) before pyvips encode so JPEG dimensions match OSD placement
         resize_start = time.time()
-        img = img.resize((size, size), Image.Resampling.LANCZOS)
-        print(f"Debug - Resize took {time.time() - resize_start:.2f}s")
-        
-        # Skip post-processing for BTF files to save time
-        is_btf_file = (session_current_file_format == 'btf')
+        if img.size != (out_w, out_h):
+            img = img.resize((out_w, out_h), Image.Resampling.LANCZOS)
+        img_np_out = np.array(img.convert('RGB'))
+        bands = img_np_out.shape[2] if img_np_out.ndim == 3 else 1
+        vips_img = pyvips.Image.new_from_memory(
+            img_np_out.tobytes(), img_np_out.shape[1], img_np_out.shape[0], bands, "uchar"
+        )
+        print(f"Debug - Resize to ({out_w},{out_h}) took {time.time() - resize_start:.2f}s")
 
-        if not is_btf_file: # Apply if NOT BTF
-            # Apply post-processing
-            from app.utils.tile_post_process import PostProcess
-            post_processor = PostProcess(img, svs_level, x1, y1, x2, y2, None)
-            post_processor.run()
-            img = post_processor.img
-        
-        # Skip dynamic script processing for BTF files
-        if not is_btf_file: # Apply if NOT BTF
-            # Apply dynamic script processing if available
-            try:
-                load_script()
-                if 'process_tile' in script_locals:
-                    img = script_locals['process_tile'](img)
-            except Exception as e:
-                print(f"Debug - Error in process_tile script: {str(e)}")
-        
-        # Convert to JPEG for response - use quality=75 for BTF files for faster encoding
-        buffer = BytesIO()
+        is_btf_file = (session_current_file_format == 'btf')
         quality = 75 if is_btf_file else 85
-        img.convert('RGB').save(buffer, format="JPEG", quality=quality, optimize=False)
-        jpeg_data = buffer.getvalue()
+        jpeg_data = _encode_tile_vips(vips_img, quality)
         
         # Cache the tile if file path is available
         if session_current_file_path:
             tile_cache.cache_tile(
-                session_current_file_path, level, col, row,
+                session_current_file_path + cache_key_suffix, level, col, row,
                 scale_factor, color_mode, channels, colors, jpeg_data
             )
             print(f"Debug - Cached tile: level={level}, col={col}, row={row}")
@@ -779,8 +1860,8 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
             "status": "success",
             "image_data": jpeg_data,
             "format": "JPEG",
-            "width": size,
-            "height": size
+            "width": out_w,
+            "height": out_h
         }
     except Exception as e:
         print(f"Debug - get_tile exception: {str(e)}")
@@ -846,7 +1927,7 @@ def upload_file_path(file_path: str, session_id: str = "default") -> Dict:
     try:
         # set current_file_format (similar to Django version)
         file_name = os.path.basename(file_path)
-        session_data['current_file_format'] = file_name.rsplit('.', 1)[1].lower()
+        session_data['current_file_format'] = get_file_extension(file_name)
         print(f"Debug - Current file format: {session_data['current_file_format']}")
         
         # Handle simple image formats
@@ -863,52 +1944,44 @@ def upload_file_path(file_path: str, session_id: str = "default") -> Dict:
             total_channels = 3  # RGB images always have 3 channels
             session_data['tiff_slide_wrapper'] = False
         elif session_data['current_file_format'] in ['isyntax']:
-            # Note: Only for info use below
-            # ISyntaxImageWrapper is not supported for multi-threading (not thread safe)
-            # Server will crash in using thread pool executor
-            # Error message: access violation or segmentation fault
-            # This slide obj can not import in other files (e.g. get_tile)
-            # get_tile function for ISyntax is implemented in load.py
-            # Please use with caution
+            # Note: Only for info use (dimensions, level info).
+            # Tile serving for ISyntax is handled in api/load.py via ISyntax.open()
             session_data['slide'] = ISyntaxImageWrapper(file_path)
             total_channels = 3  # RGB images always have 3 channels
             session_data['tiff_slide_wrapper'] = False
-        elif session_data['current_file_format'] in ['nii']:
-            session_data['slide'] = NiftiImageWrapper(file_path)
-            total_channels = 3  # convert nii to rgb
-            session_data['tiff_slide_wrapper'] = False
+        elif session_data['current_file_format'] in ['nii', 'nii.gz']:
+            if SKIP_NII_PARSING:
+                # Skip NII parsing - create a minimal wrapper for compatibility
+                session_data['slide'] = None
+                total_channels = 3  # convert nii to rgb
+                session_data['tiff_slide_wrapper'] = False
+                session_data['skip_parsing'] = True
+            else:
+                session_data['slide'] = NiftiImageWrapper(file_path)
+                total_channels = 3  # convert nii to rgb
+                session_data['tiff_slide_wrapper'] = False
         elif session_data['current_file_format'] in ['ndpi']:
-            session_data['slide'] = TiffFileWrapper(file_path)
+            # Smart wrapper selection for NDPI files using centralized logic
+            session_data['slide'], session_data['tiff_slide_wrapper'] = smart_load_ndpi_wrapper(file_path)
+            
+            # Get total channels
+            try:
+                img_np = session_data['slide'].read_region((0, 0), 0, (1, 1), as_array=True)
+                total_channels = img_np.shape[-1] if len(img_np.shape) > 2 else 3
+            except:
+                total_channels = 3
+        elif session_data['current_file_format'] in ['tif', 'tiff', 'btf', 'svs']:
+            # pyvips-native path for all TIFF/SVS/BTF variants
+            print(f"Debug - Using PyvipsSlideWrapper for {session_data['current_file_format']}")
+            session_data['slide'] = PyvipsSlideWrapper(file_path)
             total_channels = int(session_data['slide'].properties.get('channels', 3))
             session_data['tiff_slide_wrapper'] = True
-        elif session_data['current_file_format'] in ['btf']:
-            # Handle BTF files explicitly to ensure they use the right loader
-            print(f"Debug - Loading BTF file: {file_path}")
-            try:
-                # Try tiffslide first for BTF
-                session_data['slide'] = TiffSlideWrapper(file_path)
-                img_np = session_data['slide'].read_region((0, 0), 0, (1, 1), as_array=True)
-                total_channels = img_np.shape[2] if len(img_np.shape) > 2 else 3
-                session_data['tiff_slide_wrapper'] = False
-                print(f"Debug - BTF loaded with tiffslide, channels: {total_channels}")
-            except Exception as e:
-                print(f"Debug - tiffslide failed for BTF, trying TiffFileWrapper: {e}")
-                session_data['slide'] = TiffFileWrapper(file_path)
-                total_channels = int(session_data['slide'].properties.get('channels', 3))
-                session_data['tiff_slide_wrapper'] = True
-                print(f"Debug - BTF loaded with TiffFileWrapper, channels: {total_channels}")
+            print(f"Debug - PyvipsSlideWrapper loaded, channels: {total_channels}")
         else:
-            # Original WSI handling code
-            try:
-                session_data['slide'] = TiffSlideWrapper(file_path)
-                img_np = session_data['slide'].read_region((0, 0), 0, (1, 1), as_array=True)
-                total_channels = img_np.shape[2] if len(img_np.shape) > 2 else 1
-                session_data['tiff_slide_wrapper'] = False
-            except Exception as e:
-                session_data['slide'] = TiffFileWrapper(file_path)
-                total_channels = int(session_data['slide'].properties.get('channels', 3))
-                session_data['tiff_slide_wrapper'] = True
-                print(f"read_region failed, use tifffile to read")
+            print(f"Debug - Unknown format falling through: {session_data['current_file_format']}")
+            session_data['slide'] = PyvipsSlideWrapper(file_path)
+            total_channels = int(session_data['slide'].properties.get('channels', 3))
+            session_data['tiff_slide_wrapper'] = True
 
         if session_data['current_file_format'] == 'qptiff' and total_channels <= 3:
             try:
@@ -927,17 +2000,23 @@ def upload_file_path(file_path: str, session_id: str = "default") -> Dict:
         print(f"Debug - Got slide_levels keys: {list(session_data['slide_levels'].keys() if session_data['slide_levels'] else {})}")
         
         # Get additional slide properties with safe fallbacks
-        slide_properties = session_data['slide'].properties
+        if session_data.get('skip_parsing', False):
+            slide_properties = {}  # Empty properties for NII with parsing skipped
+        else:
+            slide_properties = session_data['slide'].properties
         print(f"All slide properties: {slide_properties}")
 
         # MPP
         try:
             if session_data['current_file_format'] == 'nii':
-                print(f"Debug - NiftiImageWrapper: {session_data['slide'].zooms}")
-                try:
-                    mpp = float(session_data['slide'].zooms[0])
-                except:
-                    mpp = None
+                if session_data.get('skip_parsing', False):
+                    mpp = None  # No MPP for skipped NII parsing
+                else:
+                    print(f"Debug - NiftiImageWrapper: {session_data['slide'].zooms}")
+                    try:
+                        mpp = float(session_data['slide'].zooms[0])
+                    except:
+                        mpp = None
             else:
                 # TiffSlide (compatible properties)
                 mpp_x = float(slide_properties.get('openslide.mpp-x', 0))
@@ -968,6 +2047,9 @@ def upload_file_path(file_path: str, session_id: str = "default") -> Dict:
                             mpp_x = mpp_y = (25400 / x_resolution)
 
                 mpp = mpp_x if mpp_x > 0 else mpp_y
+                # If mpp is still 0, it means it wasn't found - set to None
+                if mpp == 0:
+                    mpp = None
 
         except (ValueError, TypeError):
             mpp = None
@@ -1006,7 +2088,13 @@ def upload_file_path(file_path: str, session_id: str = "default") -> Dict:
         except (ValueError, TypeError):
             magnification = None
 
-        dimensions = session_data['slide'].dimensions
+        # Handle NII files with parsing skipped
+        if session_data.get('skip_parsing', False):
+            dimensions = (512, 512)  # Default dimensions for NII
+            slide_properties = {}  # Empty properties for NII
+        else:
+            dimensions = session_data['slide'].dimensions
+            slide_properties = session_data['slide'].properties
 
         # Get file size in MB with 2 decimal places
         file_size = round(os.path.getsize(file_path) / (1024 * 1024), 2)
@@ -1017,12 +2105,45 @@ def upload_file_path(file_path: str, session_id: str = "default") -> Dict:
         else:
             image_type = 'Brightfield H&E'
 
+        # Read z-stack info from slide object (avoid redundant file reading)
+        is_zstack = False
+        z_layer_count = 1
+        if hasattr(session_data['slide'], 'is_zstack'):
+            is_zstack = session_data['slide'].is_zstack
+            if is_zstack and hasattr(session_data['slide'], 'z_layer_count'):
+                z_layer_count = session_data['slide'].z_layer_count
+                session_data['zstack_info'] = {
+                    'has_zstack': True,
+                    'layer_count': z_layer_count,
+                    'layer_indices': list(range(z_layer_count)),
+                    'current_layer': 0
+                }
+                session_data['current_z_layer'] = 0
+                logger.info(f"[Z-Stack] Initialized {z_layer_count} layers for file: {file_path}")
+            else:
+                session_data['zstack_info'] = {
+                    'has_zstack': False,
+                    'layer_count': 1,
+                    'layer_indices': [0],
+                    'current_layer': 0
+                }
+        else:
+            session_data['zstack_info'] = {
+                'has_zstack': False,
+                'layer_count': 1,
+                'layer_indices': [0],
+                'current_layer': 0
+            }
+        zstack_info = session_data['zstack_info']
+
         # build the response
         result = {
             "status": "success",
             "message": "Slide loaded successfully",
             'filename': file_name,
             'dimensions': dimensions,
+            'level_count': len(session_data['slide'].level_dimensions if hasattr(session_data['slide'], 'level_dimensions') else []),
+            'pyramid_info': session_data['slide_levels'].get('pyramid_info', []),
             'total_channels': total_channels,
             'mpp': mpp,
             'magnification': magnification,
@@ -1030,7 +2151,8 @@ def upload_file_path(file_path: str, session_id: str = "default") -> Dict:
             'file_format': session_data['current_file_format'],
             'properties': slide_properties,
             'total_tiles': calculate_total_tiles(session_data['slide']),
-            'image_type': image_type
+            'image_type': image_type,
+            'zstack_info': zstack_info
         }
         
         session_data['current_file_path'] = file_path

@@ -7,7 +7,11 @@ import Image from 'next/image'
 import { communityService } from '@/services/community.service'
 import { classifiersService } from '@/services/classifiers.service'
 import { usersService, UserProfile as APIUserProfile } from '@/services/users.service'
-import { apiFetch } from '@/utils/apiFetch'
+import { apiFetch } from '@/utils/common/apiFetch'
+import { getErrorMessage } from '@/utils/common/apiResponse'
+import { InlineSpinner } from '@/components/assets/PageLoading'
+import { ClassifiersHeader } from '@/components/community/Classifiers-Header'
+import { ColorTag, getTagColor } from '@/components/ui/color-tag'
 import { CTRL_SERVICE_API_ENDPOINT } from '@/constants/config'
 import { useUserInfo } from '@/provider/UserInfoProvider'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -18,32 +22,28 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Separator } from "@/components/ui/separator"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog"
-import { downloadCommunityClassifier } from '@/utils/fileManager.service'
+import { downloadCommunityClassifier, downloadCommunityModel } from '@/utils/dashboard/fileManager.service'
 import { toast } from 'sonner'
 import {
-  User,
+  ArrowLeft,
+  Award,
+  Building2,
   Calendar,
-  MapPin,
-  Link as LinkIcon,
-  Mail,
-  Star,
+  ChevronLeft,
+  ChevronRight,
+  Clock,
   Download,
   Eye,
-  Settings,
-  Share2,
-  Clock,
-  Award,
-  TrendingUp,
-  Heart,
-  Bookmark,
-  ArrowLeft,
-  Users,
-  Trash2,
-  ChevronRight,
-  ChevronLeft,
-  Building2,
+  Link as LinkIcon,
+  Mail,
+  MapPin,
   Search,
-  ArrowUpDown
+  ArrowUpDown,
+  Package,
+  Share2,
+  Star,
+  Trash2,
+  User
 } from "lucide-react"
 
 interface UserProfile {
@@ -59,6 +59,7 @@ interface UserProfile {
   bio: string
   stats: {
     totalClassifiers: number
+    totalModels: number
     totalStars: number
     totalDownloads: number
     followers: number
@@ -72,6 +73,23 @@ interface UserClassifier {
   description: string
   stats: {
     classes: number | null
+    size: string
+    stars: number
+    downloads: number
+    updatedAt: string
+  }
+  tags: string[]
+  thumbnail: string
+  factory?: string
+  model?: string
+  node?: string
+}
+
+interface UserModel {
+  id: string
+  title: string
+  description: string
+  stats: {
     size: string
     stars: number
     downloads: number
@@ -116,6 +134,7 @@ const convertAPIProfileToUserProfile = (apiProfile: APIUserProfile, username: st
     bio: apiProfile.custom_title || `Community member with email ${apiProfile.email}. This user has uploaded classifiers to share with the TissueLab community.`,
     stats: {
       totalClassifiers: cachedStats.totalClassifiers ?? 1,
+      totalModels: cachedStats.totalModels ?? 0,
       totalStars: cachedStats.totalStars ?? 0,
       totalDownloads: cachedStats.totalDownloads ?? 0,
       followers: cachedStats.followers ?? 0,
@@ -152,7 +171,7 @@ const fetchUserClassifiersFromAPI = async (username: string): Promise<UserClassi
         'tissue_segmentation': 'Tissue Segmentation',
         'cell_segmentation': 'Cell Segmentation + Embedding',
         'nuclei_classification': 'Nuclei Classification',
-        'code_calculation': 'Code Calculation',
+        'code_calculation': 'Coding Agent',
         'tissue_classification': 'Tissue Classification',
       };
 
@@ -161,6 +180,11 @@ const fetchUserClassifiersFromAPI = async (username: string): Promise<UserClassi
       if (factoryDisplay) tags.push(factoryDisplay);
       if (nodeId && (!factoryDisplay || !factoryDisplay.toLowerCase().includes(String(nodeId).toLowerCase()))) tags.push(nodeId);
       for (const t of modalityTags) if (typeof t === 'string') tags.push(t);
+      
+      // Remove duplicates (case-insensitive)
+      const uniqueTags = tags.filter((tag, index, self) => 
+        index === self.findIndex((t) => t.toLowerCase() === tag.toLowerCase())
+      );
 
       const fileSize = fc.fileSize || fc.stats?.size || 0;
       const downloads = fc.stats?.downloads || 0;
@@ -177,7 +201,7 @@ const fetchUserClassifiersFromAPI = async (username: string): Promise<UserClassi
           downloads,
           updatedAt: toIso(fc.updatedAt || fc.stats?.updatedAt),
         },
-        tags,
+        tags: uniqueTags,
         thumbnail: '/thumbnails/default.jpg',
         factory: factoryId,
         model: fc.model || '',
@@ -189,6 +213,370 @@ const fetchUserClassifiersFromAPI = async (username: string): Promise<UserClassi
     return [];
   }
 }
+
+// Helper function to format file size to MB
+const formatSizeToMB = (size: any): string => {
+  if (typeof size === 'string') {
+    // If already formatted (contains MB/GB), return as-is
+    if (size.toLowerCase().includes('mb') || size.toLowerCase().includes('gb')) {
+      return size;
+    }
+    // Try to parse as number (bytes)
+    const numSize = parseFloat(size);
+    if (!isNaN(numSize) && numSize > 0) {
+      return `${(numSize / (1024 * 1024)).toFixed(2)} MB`;
+    }
+  } else if (typeof size === 'number' && size > 0) {
+    return `${(size / (1024 * 1024)).toFixed(2)} MB`;
+  }
+  return 'Unknown';
+};
+
+const fetchUserModelsFromAPI = async (username: string): Promise<UserModel[]> => {
+  try {
+    // Fetch from Firebase models public list
+    const response = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/models/public`, {
+      method: 'GET'
+    });
+    const baseList = response?.models || [];
+
+    const userModels = baseList.filter((m: any) => m.ownerId === username);
+
+    const toIso = (v: any) => {
+      try {
+        if (!v) return new Date().toISOString();
+        if (typeof v === 'object' && typeof v.seconds === 'number') return new Date(v.seconds * 1000).toISOString();
+        const d = new Date(v);
+        return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+      } catch { return new Date().toISOString(); }
+    };
+
+    // Convert to UserModel format with modality + factory/model tags
+    return userModels.map((fm: any) => {
+      const factoryId = fm.factory;
+      const nodeId = fm.model || fm.node;
+      const modalityTags = Array.isArray(fm.tags) ? fm.tags : [];
+
+      const categoryDisplay: Record<string, string> = {
+        'tissue_segmentation': 'Tissue Segmentation',
+        'cell_segmentation': 'Cell Segmentation + Embedding',
+        'nuclei_classification': 'Nuclei Classification',
+        'code_calculation': 'Coding Agent',
+        'tissue_classification': 'Tissue Classification',
+      };
+
+      const tags: string[] = [];
+      const factoryDisplay = factoryId ? (categoryDisplay[factoryId] || factoryId) : '';
+      if (factoryDisplay) tags.push(factoryDisplay);
+      if (nodeId && (!factoryDisplay || !factoryDisplay.toLowerCase().includes(String(nodeId).toLowerCase()))) tags.push(nodeId);
+      for (const t of modalityTags) if (typeof t === 'string') tags.push(t);
+      
+      // Remove duplicates (case-insensitive)
+      const uniqueTags = tags.filter((tag, index, self) => 
+        index === self.findIndex((t) => t.toLowerCase() === tag.toLowerCase())
+      );
+
+      // Try multiple possible size field names
+      const fileSize = fm.fileSize || fm.file_size || fm.size || fm.stats?.size || fm.stats?.fileSize || 0;
+      const downloads = fm.stats?.downloads || 0;
+      const stars = fm.stats?.stars || 0;
+
+      return {
+        id: fm.id,
+        title: fm.title,
+        description: fm.description || 'User uploaded model',
+        stats: {
+          size: formatSizeToMB(fileSize),
+          stars,
+          downloads,
+          updatedAt: toIso(fm.updatedAt || fm.stats?.updatedAt),
+        },
+        tags: uniqueTags,
+        thumbnail: '/thumbnails/default.jpg',
+        factory: factoryId,
+        model: fm.model || '',
+        node: fm.model || ''
+      } as UserModel;
+    });
+  } catch (error) {
+    console.error('Failed to fetch user models from API:', error);
+    return [];
+  }
+}
+
+const UserModelCard = React.memo(function UserModelCard({ model, isCurrentUser, onTagClick, userProfile }: { model: UserModel, isCurrentUser: boolean, onTagClick?: (tag: string) => void, userProfile?: UserProfile }) {
+  const [isDownloading, setIsDownloading] = useState(false)
+  const [showAllTags, setShowAllTags] = useState(false)
+  const [isStarred, setIsStarred] = useState(false)
+  const [starCount, setStarCount] = useState(model.stats.stars || 0)
+  const [downloadCount, setDownloadCount] = useState(model.stats.downloads || 0)
+  const [isStarring, setIsStarring] = useState(false)
+
+  // Initialize star status
+  useEffect(() => {
+    const initializeStarStatus = async () => {
+      try {
+        const userStars = JSON.parse(localStorage.getItem('user_model_stars') || '{}')
+        if (userStars[model.id] !== undefined) {
+          setIsStarred(userStars[model.id])
+        }
+      } catch (error) {
+        console.warn('Failed to load star status from localStorage:', error)
+      }
+
+      try {
+        const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/models/${model.id}`, {
+          method: 'GET'
+        })
+
+        if (result) {
+          const apiIsStarred = result.is_starred || false
+          const apiStarCount = result.model?.stats?.stars || model.stats.stars || 0
+
+          setIsStarred(apiIsStarred)
+          setStarCount(apiStarCount)
+
+          try {
+            const userStars = JSON.parse(localStorage.getItem('user_model_stars') || '{}')
+            userStars[model.id] = apiIsStarred
+            localStorage.setItem('user_model_stars', JSON.stringify(userStars))
+          } catch (error) {
+            console.warn('Failed to save star status to localStorage:', error)
+          }
+        }
+      } catch (error) {
+        console.warn('Failed to fetch star status from API:', error)
+      }
+    }
+
+    initializeStarStatus()
+  }, [model.id, model.stats.stars])
+
+  const handleDownload = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    try {
+      setIsDownloading(true)
+
+      const filename = `${model.title.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.zip`
+      await downloadCommunityModel(model.id, filename)
+      
+      try {
+        const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/models/${model.id}`, {
+          method: 'GET',
+        });
+        
+        if (result && result.model?.stats?.downloads !== undefined) {
+          const newDownloadCount = result.model.stats.downloads;
+          setDownloadCount(newDownloadCount);
+        }
+      } catch (error) {
+        console.warn('Failed to fetch updated download count:', error);
+      }
+
+      toast.success('Model downloaded', { description: `${model.title} → ${filename}` } as any)
+    } catch (error) {
+      console.error('Download error:', error)
+      toast.error(getErrorMessage(error, 'Download failed'))
+    } finally {
+      setIsDownloading(false)
+    }
+  }
+  
+  const handleDelete = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (confirm(`Are you sure you want to delete "${model.title}"?`)) {
+      try {
+        // Always try to delete from backend (for both Firebase and localStorage)
+        try {
+          const deleteUrl = `${CTRL_SERVICE_API_ENDPOINT}/community/v1/models/${model.id}`
+          const deleteResponse = await apiFetch(deleteUrl, {
+            method: 'DELETE'
+          })
+
+          if (deleteResponse?.success) {
+            console.log('Model deleted from backend and Firebase successfully')
+          } else {
+            console.warn('Backend deletion returned success=false')
+            throw new Error('Backend deletion failed')
+          }
+        } catch (error) {
+          console.error('Backend delete error:', error)
+          toast.error(getErrorMessage(error, 'Failed to delete from server'))
+          return // Don't proceed if backend deletion failed
+        }
+
+        // Remove from localStorage
+        const savedModels = JSON.parse(localStorage.getItem('userUploadedModels') || '[]')
+        const updatedModels = savedModels.filter((m: any) => m.id !== model.id)
+        localStorage.setItem('userUploadedModels', JSON.stringify(updatedModels))
+        
+        // Trigger localStorage change event for other pages/tabs
+        window.dispatchEvent(new CustomEvent('localStorageChanged', { detail: { key: 'userUploadedModels' } }))
+        
+        toast.success('Model deleted successfully')
+        
+        // Reload the page to refresh data
+        window.location.reload()
+      } catch (error) {
+        console.error('Error in handleDelete:', error)
+        toast.error(getErrorMessage(error, 'Error occurred while deleting model'))
+      }
+    }
+  }
+
+  const handleStarToggle = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (isStarring) return
+
+    try {
+      setIsStarring(true)
+      const newIsStarred = !isStarred
+      const newStarCount = newIsStarred ? starCount + 1 : starCount - 1
+
+      setIsStarred(newIsStarred)
+      setStarCount(newStarCount)
+
+      const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/models/${model.id}/star`, {
+        method: newIsStarred ? 'POST' : 'DELETE',
+        headers: { 'Content-Type': 'application/json' }
+      })
+
+      if (result.starCount !== undefined) {
+        setStarCount(result.starCount)
+
+        try {
+          const savedModels = JSON.parse(localStorage.getItem('userUploadedModels') || '[]')
+          const updatedModels = savedModels.map((m: any) =>
+            m.id === model.id
+              ? { ...m, stats: { ...m.stats, stars: result.starCount } }
+              : m
+          )
+          localStorage.setItem('userUploadedModels', JSON.stringify(updatedModels))
+          window.dispatchEvent(new CustomEvent('localStorageChanged', { detail: { key: 'userUploadedModels' } }))
+        } catch (error) {
+          console.warn('Failed to sync star count to localStorage:', error)
+        }
+      }
+
+      const userStars = JSON.parse(localStorage.getItem('user_model_stars') || '{}')
+      userStars[model.id] = newIsStarred
+      localStorage.setItem('user_model_stars', JSON.stringify(userStars))
+    } catch (error) {
+      console.error('Star toggle failed:', error)
+      setIsStarred(isStarred)
+      setStarCount(starCount)
+    } finally {
+      setIsStarring(false)
+    }
+  }
+  
+  return (
+    <Card className="group hover:shadow-lg transition-all duration-200 cursor-pointer">
+      <CardHeader className="p-4">
+        <CardTitle className="text-lg font-semibold line-clamp-2">
+          {model.title}
+        </CardTitle>
+        <p className="text-sm text-gray-600 line-clamp-2">
+          {model.description}
+        </p>
+      </CardHeader>
+      <CardContent className="p-4 pt-0">
+        <div className="flex items-center justify-between text-xs text-gray-500 mb-3">
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1">
+              <span>Size:</span>
+              <span>{model.stats.size}</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-between text-xs text-gray-500 mb-3">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={handleStarToggle}
+              disabled={isStarring}
+              className="flex items-center gap-1 hover:bg-yellow-50 rounded-md p-1 -ml-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              title={isStarred ? 'Remove star' : 'Add star'}
+            >
+              <Star
+                className={`w-3 h-3 transition-colors ${
+                  isStarred
+                    ? 'text-yellow-400 fill-yellow-400'
+                    : 'text-gray-400 hover:text-yellow-400'
+                } ${isStarring ? 'animate-pulse' : ''}`}
+              />
+              <span>{starCount}</span>
+            </button>
+            <div className="flex items-center gap-1">
+              <Download className="w-3 h-3" />
+              <span>{downloadCount}</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-1">
+            <Calendar className="w-3 h-3" />
+            <span>{new Date(model.stats.updatedAt).toLocaleDateString()}</span>
+          </div>
+        </div>
+        
+        <div className="flex flex-wrap gap-1 mb-3">
+          {model.tags.slice(0, showAllTags ? model.tags.length : 2).map((tag, index) => (
+            <Badge
+              key={index}
+              className="text-xs px-2 py-1 cursor-pointer hover:opacity-80 transition-opacity bg-gray-100 text-gray-600"
+              onClick={onTagClick ? () => onTagClick(tag) : undefined}
+            >
+              {tag}
+            </Badge>
+          ))}
+          {model.tags.length > 2 && (
+            <Badge
+              variant="outline"
+              className="text-xs cursor-pointer hover:bg-gray-100 transition-colors"
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowAllTags(!showAllTags);
+              }}
+            >
+              {showAllTags ? 'Show Less' : `+${model.tags.length - 2}`}
+            </Badge>
+          )}
+        </div>
+        
+        <div className="flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleDownload}
+            disabled={isDownloading}
+            className="flex-1"
+          >
+            {isDownloading ? (
+              <>
+                <InlineSpinner size={12} color="#6352a3" className="mr-1" />
+                Downloading...
+              </>
+            ) : (
+              <>
+                <Download className="w-3 h-3 mr-1" />
+                Download
+              </>
+            )}
+          </Button>
+          {isCurrentUser && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleDelete}
+              className="border-red-200 text-red-600 hover:bg-red-50"
+            >
+              <Trash2 className="w-3 h-3" />
+            </Button>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  )
+})
 
 const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, isCurrentUser, onTagClick, userProfile }: { classifier: UserClassifier, isCurrentUser: boolean, onTagClick?: (tag: string) => void, userProfile?: UserProfile }) {
   const [isDownloading, setIsDownloading] = useState(false)
@@ -269,7 +657,7 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
       toast.success('Classifier downloaded', { description: `${classifier.title} → ${filename}` } as any)
     } catch (error) {
       console.error('Download error:', error)
-      toast.error(`Download failed: ${error instanceof Error ? error.message : 'Unknown error'}`)
+      toast.error(getErrorMessage(error, 'Download failed'))
     } finally {
       setIsDownloading(false)
     }
@@ -298,7 +686,7 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
             }
           } catch (error) {
             console.error('Backend delete error:', error)
-            toast.warning(`Backend deletion failed: ${error instanceof Error ? error.message : 'Unknown error'}`)
+            toast.warning(getErrorMessage(error, 'Backend deletion failed'))
           }
         } else {
         }
@@ -313,7 +701,7 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
         window.location.reload()
       } catch (error) {
         console.error('Error in handleDelete:', error)
-        toast.error('Error occurred while deleting classifier')
+        toast.error(getErrorMessage(error, 'Error occurred while deleting classifier'))
       }
     }
   }
@@ -382,12 +770,12 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
         >
           {classifier.title}
         </CardTitle>
-        <p className="text-sm text-gray-600 line-clamp-2">
+        <p className="text-sm text-muted-foreground line-clamp-2">
           {classifier.description}
         </p>
       </CardHeader>
       <CardContent className="p-4 pt-0">
-        <div className="flex items-center justify-between text-xs text-gray-500 mb-3">
+        <div className="flex items-center justify-between text-xs text-muted-foreground mb-3">
           <div className="flex items-center gap-3">
             {classifier.stats.classes && (
               <div className="flex items-center gap-1">
@@ -402,19 +790,19 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
           </div>
         </div>
 
-        <div className="flex items-center justify-between text-xs text-gray-500 mb-3">
+        <div className="flex items-center justify-between text-xs text-muted-foreground mb-3">
           <div className="flex items-center gap-3">
             <button
               onClick={handleStarToggle}
               disabled={isStarring}
-              className="flex items-center gap-1 hover:bg-yellow-50 rounded-md p-1 -ml-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="flex items-center gap-1 hover:bg-yellow-50 dark:hover:bg-yellow-900/20 rounded-md p-1 -ml-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               title={isStarred ? 'Remove star' : 'Add star'}
             >
               <Star
                 className={`w-3 h-3 transition-colors ${
                   isStarred
                     ? 'text-yellow-400 fill-yellow-400'
-                    : 'text-gray-400 hover:text-yellow-400'
+                    : 'text-muted-foreground hover:text-yellow-400'
                 } ${isStarring ? 'animate-pulse' : ''}`}
               />
               <span>{starCount}</span>
@@ -437,7 +825,7 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
               { id: 'tissue_segmentation', name: 'Tissue Segmentation' },
               { id: 'cell_segmentation', name: 'Cell Segmentation + Embedding' },
               { id: 'nuclei_classification', name: 'Nuclei Classification' },
-              { id: 'code_calculation', name: 'Code Calculation' },
+              { id: 'code_calculation', name: 'Coding Agent' },
               { id: 'tissue_classification', name: 'Tissue Classification' }
             ];
 
@@ -483,85 +871,19 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
               }
             });
 
-            // Function to get hierarchical colors
-            const getHierarchicalColor = (displayTag: string, isFactory: boolean, factoryName: string) => {
-              // Modality tags - brand purple family with different intensities
-              if (displayTag.toLowerCase() === 'pathology') {
-                return 'bg-[#6352a3]/10 text-[#594a93]';
-              }
-              if (displayTag.toLowerCase() === 'radiology') {
-                return 'bg-[#6352a3]/15 text-[#594a93]';
-              }
-              if (displayTag.toLowerCase() === 'spatial transcriptomics') {
-                return 'bg-[#6352a3]/5 text-[#594a93]';
-              }
-
-              // Factory categories (main classes) - use exact same colors as community page
-              if (isFactory) {
-                if (displayTag.toLowerCase().includes('tissue segmentation')) {
-                  return 'bg-blue-100 text-blue-700';
-                }
-                if (displayTag.toLowerCase().includes('cell segmentation')) {
-                  return 'bg-yellow-100 text-yellow-700';
-                }
-                if (displayTag.toLowerCase().includes('nuclei classification')) {
-                  return 'bg-green-100 text-green-700';
-                }
-                if (displayTag.toLowerCase().includes('code calculation')) {
-                  return 'bg-orange-100 text-orange-700';
-                }
-                if (displayTag.toLowerCase().includes('tissue classification')) {
-                  return 'bg-teal-100 text-teal-700';
-                }
-              } else {
-                // Node-level (sub-class) colors based on factory context
-                // Tissue Segmentation nodes - base color #dbe9fe
-                if (factoryName.toLowerCase().includes('tissue segmentation')) {
-                  if (displayTag === 'MuskEmbedding') return 'bg-[#dbe9fe]/30 text-[#1e40af]';
-                  if (displayTag === 'BiomedParseNode') return 'bg-[#dbe9fe]/60 text-[#1e40af]';
-                  return 'bg-[#dbe9fe]/90 text-[#1e40af]'; // fallback for other nodes
-                }
-
-                // Cell Segmentation nodes - base color #fef9c3
-                if (factoryName.toLowerCase().includes('cell segmentation')) {
-                  if (displayTag === 'SegmentationNode') return 'bg-[#fef9c3]/40 text-[#a16207]';
-                  return 'bg-[#fef9c3]/70 text-[#a16207]'; // fallback for other nodes
-                }
-
-                // Nuclei Classification nodes - base color #d9f9e4
-                if (factoryName.toLowerCase().includes('nuclei classification')) {
-                  if (displayTag === 'ClassificationNode') return 'bg-[#d9f9e4]/40 text-[#166534]';
-                  return 'bg-[#d9f9e4]/70 text-[#166534]'; // fallback for other nodes
-                }
-
-                // Code Calculation nodes - base color #f5e4cd
-                if (factoryName.toLowerCase().includes('code calculation')) {
-                  return 'bg-[#f5e4cd]/40 text-[#c2410c]'; // fallback for nodes
-                }
-
-                // Tissue Classification nodes - base color #cbfbf1
-                if (factoryName.toLowerCase().includes('tissue classification')) {
-                  return 'bg-[#cbfbf1]/40 text-[#0f766e]'; // fallback for nodes
-                }
-              }
-
-              // Default for other tags
-              return 'bg-gray-100 text-gray-600';
-            };
-
             const tagsToShow = showAllTags ? displayTags : displayTags.slice(0, 2);
 
             return tagsToShow.map((displayTag, displayIndex) => {
-              const colorClass = getHierarchicalColor(displayTag.text, displayTag.isFactory, factoryDisplayName || '');
+              const tagColor = getTagColor(displayTag.text, displayTag.isFactory, factoryDisplayName || '');
 
               return (
-                <Badge
+                <ColorTag
                   key={`classifier-${displayIndex}`}
-                  className={`text-xs px-2 py-1 cursor-pointer hover:opacity-80 transition-opacity ${colorClass}`}
+                  color={tagColor}
                   onClick={onTagClick ? () => onTagClick(displayTag.text) : undefined}
                 >
                   {displayTag.text}
-                </Badge>
+                </ColorTag>
               );
             });
           })()}
@@ -577,27 +899,27 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
             totalTags += classifier.tags.filter(t => modalityTags.includes(t.toLowerCase())).length;
 
             return totalTags > 2 && !showAllTags ? (
-              <Badge
-                variant="outline"
-                className="text-xs cursor-pointer hover:bg-gray-100 transition-colors"
+              <ColorTag
+                color="default"
+                className="text-xs cursor-pointer"
                 onClick={(e) => {
                   e.stopPropagation();
                   setShowAllTags(true);
                 }}
               >
                 +{totalTags - 2}
-              </Badge>
+              </ColorTag>
             ) : showAllTags && totalTags > 2 ? (
-              <Badge
-                variant="outline"
-                className="text-xs cursor-pointer hover:bg-gray-100 transition-colors"
+              <ColorTag
+                color="default"
+                className="text-xs cursor-pointer"
                 onClick={(e) => {
                   e.stopPropagation();
                   setShowAllTags(false);
                 }}
               >
                 Show Less
-              </Badge>
+              </ColorTag>
             ) : null;
           })()}
         </div>
@@ -612,7 +934,7 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
           >
             {isDownloading ? (
               <>
-                <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-gray-600 mr-1"></div>
+                <InlineSpinner size={12} color="#6352a3" className="mr-1" />
                 Downloading...
               </>
             ) : (
@@ -639,7 +961,7 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
       <Dialog open={showClassifierDetail} onOpenChange={setShowClassifierDetail}>
         <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle className="text-2xl font-bold text-[#6352a3]">
+            <DialogTitle className="text-2xl font-bold text-purple-600 dark:text-purple-400">
               {classifier.title}
             </DialogTitle>
             <DialogDescription className="sr-only">
@@ -648,19 +970,19 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
           </DialogHeader>
           <div className="space-y-4 mt-2">
             <div>
-              <h3 className="text-base font-semibold text-gray-800 mb-2">About Classifier</h3>
-              <div className="text-sm text-gray-600 leading-relaxed break-words overflow-wrap-anywhere">
+              <h3 className="text-base font-semibold text-foreground mb-2">About Classifier</h3>
+              <div className="text-sm text-muted-foreground leading-relaxed break-words overflow-wrap-anywhere">
                 {classifier.description}
               </div>
             </div>
-            <div className="flex flex-wrap items-center gap-4 pt-4 border-t">
-              <div className="text-sm text-gray-500">
+            <div className="flex flex-wrap items-center gap-4 pt-4 border-t border-border">
+              <div className="text-sm text-muted-foreground">
                 <span className="font-medium">Classes:</span> {classifier.stats.classes ?? 'null'}
               </div>
-              <div className="text-sm text-gray-500">
+              <div className="text-sm text-muted-foreground">
                 <span className="font-medium">Size:</span> {classifier.stats.size}
               </div>
-              <div className="text-sm text-gray-500">
+              <div className="text-sm text-muted-foreground">
                 <span className="font-medium">Author:</span> {userProfile?.displayName || 'Unknown'}
               </div>
             </div>
@@ -680,18 +1002,18 @@ function StatCard({ icon: Icon, label, value, onClick, loading }: {
 }) {
   return (
     <div
-      className={`text-center p-3 ${onClick ? 'cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors' : ''}`}
+      className={`text-center p-3 ${onClick ? 'cursor-pointer hover:bg-accent rounded-lg transition-colors' : ''}`}
       onClick={onClick}
     >
       <Icon className="w-6 h-6 mx-auto mb-2 text-blue-600" />
       {loading ? (
-        <div className="text-2xl font-bold text-gray-900 dark:text-white">
-          <div className="w-8 h-8 bg-gray-200 dark:bg-gray-700 rounded animate-pulse mx-auto"></div>
+        <div className="text-2xl font-bold text-foreground">
+          <div className="w-8 h-8 bg-muted rounded animate-pulse mx-auto"></div>
         </div>
       ) : (
-        <div className="text-2xl font-bold text-gray-900 dark:text-white">{value}</div>
+        <div className="text-2xl font-bold text-foreground">{value}</div>
       )}
-      <div className="text-sm text-gray-600 dark:text-gray-400">{label}</div>
+      <div className="text-sm text-muted-foreground">{label}</div>
     </div>
   )
 }
@@ -703,6 +1025,7 @@ export default function UserProfile() {
   const globalAvatarUrl = useSelector((state: RootState) => state.user.avatarUrl)
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null)
   const [classifiers, setClassifiers] = useState<UserClassifier[]>([])
+  const [models, setModels] = useState<UserModel[]>([])
   const [activeTab, setActiveTab] = useState('classifiers')
 
   // Handle tab changes to load data
@@ -724,13 +1047,19 @@ export default function UserProfile() {
   const [loadingFollowing, setLoadingFollowing] = useState(false)
   const [loadingFollowStats, setLoadingFollowStats] = useState(true)
 
-  // Search, filter, and sort states
+  // Search, filter, and sort states for classifiers
   const [classifierSearch, setClassifierSearch] = useState('')
   const [selectedTags, setSelectedTags] = useState<string[]>([])
   const [classifierSort, setClassifierSort] = useState<'most_likes' | 'most_downloads' | 'recently_upload'>('most_likes')
 
+  // Search, filter, and sort states for models
+  const [modelSearch, setModelSearch] = useState('')
+  const [selectedModelTags, setSelectedModelTags] = useState<string[]>([])
+  const [modelSort, setModelSort] = useState<'most_likes' | 'most_downloads' | 'recently_upload'>('most_likes')
+
   // Pagination states
   const [currentPage, setCurrentPage] = useState(1)
+  const [modelCurrentPage, setModelCurrentPage] = useState(1)
   const [itemsPerPage] = useState(8) // Show 8 per page
 
   // Tag handling functions
@@ -741,6 +1070,16 @@ export default function UserProfile() {
         : [...prev, tag]
     )
     setCurrentPage(1) // Reset to first page when tags change
+  }, [])
+
+  // Tag handling function for models
+  const handleModelTagClick = useCallback((tag: string) => {
+    setSelectedModelTags(prev =>
+      prev.includes(tag)
+        ? prev.filter(t => t !== tag)
+        : [...prev, tag]
+    )
+    setModelCurrentPage(1) // Reset to first page when tags change
   }, [])
 
   // Get filtered and sorted classifiers
@@ -764,7 +1103,7 @@ export default function UserProfile() {
           { id: 'tissue_segmentation', name: 'Tissue Segmentation' },
           { id: 'cell_segmentation', name: 'Cell Segmentation + Embedding' },
           { id: 'nuclei_classification', name: 'Nuclei Classification' },
-          { id: 'code_calculation', name: 'Code Calculation' },
+          { id: 'code_calculation', name: 'Coding Agent' },
           { id: 'tissue_classification', name: 'Tissue Classification' }
         ]
 
@@ -821,6 +1160,81 @@ export default function UserProfile() {
   // Calculate total pages
   const getTotalPages = () => {
     const filtered = getFilteredAndSortedClassifiers()
+    return Math.ceil(filtered.length / itemsPerPage)
+  }
+
+  // Get filtered and sorted models
+  const getFilteredAndSortedModels = useCallback(() => {
+    let filtered = [...models]
+
+    // Apply search filter
+    if (modelSearch.trim()) {
+      const searchTerm = modelSearch.toLowerCase()
+      filtered = filtered.filter(model =>
+        model.title.toLowerCase().includes(searchTerm) ||
+        model.description.toLowerCase().includes(searchTerm) ||
+        model.tags.some(tag => tag.toLowerCase().includes(searchTerm))
+      )
+    }
+
+    // Apply tag filters
+    if (selectedModelTags.length > 0) {
+      filtered = filtered.filter(model => {
+        const factoryCategories = [
+          { id: 'tissue_segmentation', name: 'Tissue Segmentation' },
+          { id: 'cell_segmentation', name: 'Cell Segmentation + Embedding' },
+          { id: 'nuclei_classification', name: 'Nuclei Classification' },
+          { id: 'code_calculation', name: 'Coding Agent' },
+          { id: 'tissue_classification', name: 'Tissue Classification' }
+        ]
+
+        const factoryCategory = factoryCategories.find(f => f.id === (model as any).factory)
+        const factoryDisplayName = factoryCategory?.name || (model as any).factory
+        const nodeId = (model as any).node
+
+        return selectedModelTags.every(selectedTag => {
+          if (factoryDisplayName && factoryDisplayName.toLowerCase() === selectedTag.toLowerCase()) {
+            return true
+          }
+          if (nodeId && nodeId.toLowerCase() === selectedTag.toLowerCase()) {
+            return true
+          }
+          if (model.tags.some(tag => tag.toLowerCase() === selectedTag.toLowerCase())) {
+            return true
+          }
+          return false
+        })
+      })
+    }
+
+    // Apply sorting
+    filtered.sort((a, b) => {
+      switch (modelSort) {
+        case 'most_likes':
+          return (b.stats.stars || 0) - (a.stats.stars || 0)
+        case 'most_downloads':
+          return (b.stats.downloads || 0) - (a.stats.downloads || 0)
+        case 'recently_upload':
+          return new Date(b.stats.updatedAt).getTime() - new Date(a.stats.updatedAt).getTime()
+        default:
+          return 0
+      }
+    })
+
+    return filtered
+  }, [models, modelSearch, selectedModelTags, modelSort])
+
+  // Get paginated models
+  const getPaginatedModels = () => {
+    const filtered = getFilteredAndSortedModels()
+    const startIndex = (modelCurrentPage - 1) * itemsPerPage
+    const endIndex = startIndex + itemsPerPage
+    return filtered.slice(startIndex, endIndex)
+  }
+
+  // Calculate total model pages
+  const getModelTotalPages = () => {
+    const filtered = getFilteredAndSortedModels()
     return Math.ceil(filtered.length / itemsPerPage)
   }
 
@@ -1077,6 +1491,7 @@ export default function UserProfile() {
                   bio: publicProfile.custom_title || `Community Member ${displayName}. This User Has Uploaded Classifiers To Share With The TissueLab Community.`,
                   stats: {
                     totalClassifiers: 0,
+                    totalModels: 0,
                     totalStars: 0,
                     totalDownloads: 0,
                     followers: 0,
@@ -1114,6 +1529,7 @@ export default function UserProfile() {
               bio: `Community member ${preferredName || (username as string).substring(0, 8)}. This user has uploaded classifiers to share with the TissueLab community.`,
               stats: {
                 totalClassifiers: cachedStats.totalClassifiers ?? 0,
+                totalModels: cachedStats.totalModels ?? 0,
                 totalStars: cachedStats.totalStars ?? 0,
                 totalDownloads: cachedStats.totalDownloads ?? 0,
                 followers: cachedStats.followers ?? 0,
@@ -1173,16 +1589,56 @@ export default function UserProfile() {
           const allClassifiers = uniqueClassifiers
           setClassifiers(allClassifiers)
           
-          // Calculate classifier stats but don't update profile yet
+          // Fetch user's models from API
+          const apiModels = await fetchUserModelsFromAPI(username as string)
+
+          // Get user's uploaded models from localStorage
+          const localStorageModels: UserModel[] = []
+          if (typeof window !== 'undefined') {
+            try {
+              const uploadedModels = JSON.parse(localStorage.getItem('userUploadedModels') || '[]')
+              const userLocalModels = uploadedModels
+                .filter((m: any) => m.author?.user_id === username)
+                .map((m: any) => ({
+                  id: m.id,
+                  title: m.title,
+                  description: m.description,
+                  stats: {
+                    size: formatSizeToMB(m.stats?.size),
+                    stars: m.stats?.stars || 0,
+                    downloads: m.stats?.downloads || 0,
+                    updatedAt: m.stats?.updatedAt || new Date().toISOString()
+                  },
+                  tags: m.tags || [],
+                  thumbnail: m.thumbnail || '/thumbnails/default.jpg',
+                  factory: m.factory,
+                  model: m.model,
+                  node: m.node
+                }))
+              localStorageModels.push(...userLocalModels)
+            } catch (error) {
+              console.warn('Failed to parse userUploadedModels:', error)
+            }
+          }
+
+          // Combine all models and remove duplicates
+          const combinedModels = [...localStorageModels, ...apiModels]
+          const uniqueModels = combinedModels.filter((model, index, arr) =>
+            arr.findIndex(m => m.id === model.id) === index
+          )
+          setModels(uniqueModels)
+          
+          // Calculate classifier and model stats
           let updatedProfileData = profileData
-          if (profileData && allClassifiers.length > 0) {
+          if (profileData && (allClassifiers.length > 0 || uniqueModels.length > 0)) {
             updatedProfileData = {
               ...profileData,
               stats: {
                 ...profileData.stats,
                 totalClassifiers: allClassifiers.length,
-                totalStars: allClassifiers.reduce((sum, c) => sum + (c.stats.stars || 0), 0),
-                totalDownloads: allClassifiers.reduce((sum, c) => sum + (c.stats.downloads || 0), 0)
+                totalModels: uniqueModels.length,
+                totalStars: allClassifiers.reduce((sum, c) => sum + (c.stats.stars || 0), 0) + uniqueModels.reduce((sum, m) => sum + (m.stats.stars || 0), 0),
+                totalDownloads: allClassifiers.reduce((sum, c) => sum + (c.stats.downloads || 0), 0) + uniqueModels.reduce((sum, m) => sum + (m.stats.downloads || 0), 0)
               }
             }
           }
@@ -1214,6 +1670,7 @@ export default function UserProfile() {
               if (typeof window !== 'undefined') {
                 const statsToCache = {
                   totalClassifiers: updatedProfileData.stats.totalClassifiers,
+                  totalModels: updatedProfileData.stats.totalModels,
                   totalStars: updatedProfileData.stats.totalStars,
                   totalDownloads: updatedProfileData.stats.totalDownloads,
                   followers: updatedProfileData.stats.followers,
@@ -1316,42 +1773,35 @@ export default function UserProfile() {
 
   if (!userProfile) {
     return (
-      <div className="min-h-screen bg-gray-50 dark:bg-gray-900 flex items-center justify-center">
+      <div className="min-h-screen bg-background flex items-center justify-center">
         <div className="text-center">
           <div className="w-8 h-8 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-          <p className="text-gray-600 dark:text-gray-400">Loading profile...</p>
+          <p className="text-muted-foreground">Loading profile...</p>
         </div>
       </div>
     )
   }
 
   return (
-    <div className="bg-gray-50 dark:bg-gray-900 min-h-screen">
-      <div className="container mx-auto px-4 py-6 max-w-7xl">
-        {/* Back to Community Button */}
-        <div className="mb-6">
+    <div className="bg-background">
+      <div className="container mx-auto px-2 sm:px-4 py-4 sm:py-6 max-w-7xl">
+        {/* Back Button */}
+        <div className="mb-4 sm:mb-6 sticky top-0 z-10 bg-background pt-2 -mt-2 pb-2">
           <button
             onClick={() => router.push('/community')}
-            className="px-4 py-1.5 rounded-lg hover:opacity-90 transition-all duration-200 flex items-center text-sm"
-            style={{
-              backgroundColor: '#6352a3',
-              borderColor: '#6352a3',
-              color: 'white',
-              border: '1px solid #6352a3',
-              cursor: 'pointer'
-            }}
+            className="flex items-center text-sm text-muted-foreground hover:text-foreground transition-colors"
           >
-            <ArrowLeft className="w-4 h-4 mr-2" />
-            Back to Community
+            <ArrowLeft className="w-4 h-4 mr-1.5" />
+            <span>Back</span>
           </button>
         </div>
         {/* Profile Header */}
-        <Card className="mb-6">
-          <CardContent className="p-6">
-            <div className="flex flex-col md:flex-row gap-6">
+        <Card className="mb-4 sm:mb-6">
+          <CardContent className="p-4 sm:p-6">
+            <div className="flex flex-col md:flex-row gap-4 sm:gap-6">
               {/* Left: Avatar and basic info */}
               <div className="flex flex-col items-center md:items-start">
-                <Avatar className="w-24 h-24 mb-4">
+                <Avatar className="w-20 h-20 sm:w-24 sm:h-24 mb-4">
                   {userProfile.avatar && userProfile.avatar !== '/avatars/default.jpg' ? (
                     <Image
                       src={userProfile.avatar}
@@ -1366,10 +1816,10 @@ export default function UserProfile() {
                     </div>
                   )}
                 </Avatar>
-                <h1 className="text-2xl font-bold text-gray-900 dark:text-white mb-1">
+                <h1 className="text-xl sm:text-2xl font-bold text-foreground mb-1">
                   {userProfile.displayName}
                 </h1>
-                <p className="text-gray-600 dark:text-gray-400 mb-4">@{userProfile.username}</p>
+                <p className="text-sm sm:text-base text-muted-foreground mb-4">@{userProfile.username}</p>
                 
                 <div className="flex gap-2 mb-4">
                   {/* Follow button temporarily commented out */}
@@ -1410,7 +1860,7 @@ export default function UserProfile() {
 
               {/* Center: Details */}
               <div className="flex-1">
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm text-gray-600 dark:text-gray-400 mb-6">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm text-muted-foreground mb-6">
                   <div className="flex items-center gap-2">
                     <Calendar className="w-4 h-4" />
                     <span>Joined {new Date(userProfile.joinDate).toLocaleDateString()}</span>
@@ -1455,7 +1905,7 @@ export default function UserProfile() {
                 {/* Email with privacy toggle */}
                 {userProfile.email && (
                   <div className="flex items-center justify-between mb-4">
-                    <div className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
                       <Mail className="w-4 h-4" />
                       {showEmail ? (
                         <a
@@ -1465,13 +1915,13 @@ export default function UserProfile() {
                           {userProfile.email}
                         </a>
                       ) : (
-                        <span className="text-gray-500">Email hidden from public</span>
+                        <span className="text-muted-foreground">Email hidden from public</span>
                       )}
                     </div>
                     {isCurrentUser && (
                       <button
                         onClick={() => setShowEmail(!showEmail)}
-                        className="text-xs text-gray-500 hover:text-gray-700 flex items-center gap-1 px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+                        className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1 px-2 py-1 rounded hover:bg-accent"
                         title={showEmail ? 'Make email private' : 'Make email public'}
                       >
                         {showEmail ? 'Make Private' : 'Make Public'}
@@ -1481,12 +1931,18 @@ export default function UserProfile() {
                 )}
 
                 {/* Stats */}
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 bg-gray-50 dark:bg-gray-800 rounded-lg p-4">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3 md:gap-4 bg-gray-50 dark:bg-gray-800 rounded-lg p-3 sm:p-4">
                   <StatCard
                     icon={Eye}
                     label="Classifiers"
                     value={userProfile.stats.totalClassifiers}
                     onClick={() => setActiveTab('classifiers')}
+                  />
+                  <StatCard
+                    icon={Package}
+                    label="Models"
+                    value={userProfile.stats.totalModels}
+                    onClick={() => setActiveTab('models')}
                   />
                   <StatCard
                     icon={Star}
@@ -1523,114 +1979,38 @@ export default function UserProfile() {
 
         {/* Content Tabs */}
         <Tabs value={activeTab} onValueChange={handleTabChange} className="w-full">
-          <TabsList className="grid w-full grid-cols-1 mb-6">
+          <TabsList className="grid w-full grid-cols-2 mb-4 sm:mb-6">
             <TabsTrigger value="classifiers">Classifiers</TabsTrigger>
+            <TabsTrigger value="models">Models</TabsTrigger>
             {/* Followers and Following tabs temporarily commented out */}
             {/* <TabsTrigger value="followers">Followers</TabsTrigger>
             <TabsTrigger value="following">Following</TabsTrigger> */}
           </TabsList>
 
           <TabsContent value="classifiers" className="space-y-4">
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex items-center gap-2">
-                <Star className="w-5 h-5 text-[#6352a3]" />
-                <h2 className="text-xl font-semibold">
+            <ClassifiersHeader
+              title={
+                <h2 className="text-xl font-semibold text-foreground">
                   Classifiers ({getFilteredAndSortedClassifiers().length})
                 </h2>
-              </div>
-              <div className="flex items-center gap-3">
-                {/* Search */}
-                <div className="flex items-center w-48 bg-white border border-gray-200 rounded-lg px-3 py-2">
-                  <Search className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
-                  <input
-                    className="flex-1 border-none outline-none bg-transparent text-sm text-gray-900 placeholder-gray-400 min-w-0"
-                    placeholder="Full-text search"
-                    value={classifierSearch}
-                    onChange={(e) => {
-                      setClassifierSearch(e.target.value)
-                      setCurrentPage(1) // Reset to first page when searching
-                    }}
-                  />
-                </div>
-                {/* Selected Tags Display */}
-                {selectedTags.length > 0 && (
-                  <div className="flex items-center gap-2 overflow-x-auto pb-1">
-                    <span className="text-sm text-[#594a93] font-medium whitespace-nowrap">Tags:</span>
-                    <div className="flex items-center gap-2 min-w-0">
-                      {selectedTags.map((tag) => {
-                        // Function to get tag color for filter display
-                        const getFilterTagColor = (tagText: string) => {
-                          // Factory categories (main classes)
-                          if (tagText.toLowerCase().includes('tissue segmentation')) {
-                            return 'bg-blue-100 text-blue-700 border-blue-200';
-                          }
-                          if (tagText.toLowerCase().includes('cell segmentation')) {
-                            return 'bg-yellow-100 text-yellow-700 border-yellow-200';
-                          }
-                          if (tagText.toLowerCase().includes('nuclei classification')) {
-                            return 'bg-green-100 text-green-700 border-green-200';
-                          }
-                          if (tagText.toLowerCase().includes('code calculation')) {
-                            return 'bg-orange-100 text-orange-700 border-orange-200';
-                          }
-                          if (tagText.toLowerCase().includes('tissue classification')) {
-                            return 'bg-teal-100 text-teal-700 border-teal-200';
-                          }
+              }
+              titleIcon={<Star className="w-5 h-5 text-purple-600 dark:text-purple-400" />}
+              search={classifierSearch}
+              onSearchChange={(value) => {
+                setClassifierSearch(value)
+                setCurrentPage(1) // Reset to first page when searching
+              }}
+              selectedTags={selectedTags}
+              onTagClick={handleTagClick}
+              useSimpleTagColor={true}
+              sort={classifierSort as any}
+              onSortChange={(value: any) => {
+                setClassifierSort(value === 'most_stars' ? 'most_likes' : value as any)
+                setCurrentPage(1) // Reset to first page when sorting changes
+              }}
+            />
 
-                          // Modality tags
-                          if (tagText.toLowerCase() === 'pathology') {
-                            return 'bg-[#6352a3]/10 text-[#594a93] border-[#6352a3]/30';
-                          }
-                          if (tagText.toLowerCase() === 'radiology') {
-                            return 'bg-[#6352a3]/15 text-[#594a93] border-[#6352a3]/30';
-                          }
-                          if (tagText.toLowerCase() === 'spatial transcriptomics') {
-                            return 'bg-[#6352a3]/5 text-[#594a93] border-[#6352a3]/20';
-                          }
-
-                          // Default for other tags
-                          return 'bg-gray-100 text-gray-600 border-gray-300';
-                        };
-
-                        const colorClass = getFilterTagColor(tag);
-
-                        return (
-                          <div key={tag} className={`flex items-center gap-1 rounded-lg px-2 py-1 whitespace-nowrap flex-shrink-0 border ${colorClass}`}>
-                            <span className="text-xs">{tag}</span>
-                            <button
-                              onClick={() => handleTagClick(tag)}
-                              className="hover:opacity-70 transition-opacity ml-1"
-                              title="Remove tag filter"
-                            >
-                              ✕
-                            </button>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-                {/* Sort */}
-                <Select value={classifierSort} onValueChange={(value: any) => {
-                  setClassifierSort(value)
-                  setCurrentPage(1) // Reset to first page when sorting changes
-                }}>
-                  <SelectTrigger className="w-48 bg-white border border-gray-200 rounded-lg shadow-none">
-                    <div className="flex items-center gap-2">
-                      <ArrowUpDown className="w-4 h-4" />
-                      <SelectValue />
-                    </div>
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="most_likes">Most Stars</SelectItem>
-                    <SelectItem value="most_downloads">Most Downloads</SelectItem>
-                    <SelectItem value="recently_upload">Recently Upload</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-4">
               {getPaginatedClassifiers().map((classifier) => (
                 <UserClassifierCard
                   key={classifier.id}
@@ -1644,15 +2024,15 @@ export default function UserProfile() {
 
             {/* Pagination */}
             {getTotalPages() > 1 && (
-              <div className="flex items-center justify-center mt-8 gap-1">
+              <div className="flex flex-wrap items-center justify-center mt-8 gap-1">
                 {/* Previous Button */}
                 <button
                   onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
                   disabled={currentPage === 1}
-                  className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-sm text-gray-600 hover:bg-gray-50 disabled:text-gray-300 disabled:cursor-not-allowed"
+                  className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-sm text-muted-foreground hover:bg-accent disabled:text-muted-foreground/50 disabled:cursor-not-allowed"
                 >
                   <ChevronLeft className="w-4 h-4" />
-                  Prev
+                  <span className="hidden sm:inline">Prev</span>
                 </button>
 
                 {/* Page 1 */}
@@ -1660,8 +2040,8 @@ export default function UserProfile() {
                   onClick={() => setCurrentPage(1)}
                   className={`rounded-lg px-2.5 py-1 text-sm ${
                     currentPage === 1
-                      ? 'bg-gray-50 font-semibold ring-1 ring-inset ring-gray-200'
-                      : 'text-gray-600 hover:bg-gray-50'
+                      ? 'bg-accent font-semibold ring-1 ring-inset ring-border'
+                      : 'text-muted-foreground hover:bg-accent'
                   }`}
                 >
                   1
@@ -1669,7 +2049,7 @@ export default function UserProfile() {
 
                 {/* Early ellipsis */}
                 {currentPage > 4 && getTotalPages() > 6 && (
-                  <span className="rounded-lg px-2.5 py-1 text-sm text-gray-400 pointer-events-none cursor-default">
+                  <span className="rounded-lg px-2.5 py-1 text-sm text-muted-foreground/50 pointer-events-none cursor-default">
                     ...
                   </span>
                 )}
@@ -1686,8 +2066,8 @@ export default function UserProfile() {
                       onClick={() => setCurrentPage(pageNum)}
                       className={`rounded-lg px-2.5 py-1 text-sm ${
                         currentPage === pageNum
-                          ? 'bg-gray-50 font-semibold ring-1 ring-inset ring-gray-200'
-                          : 'text-gray-600 hover:bg-gray-50'
+                          ? 'bg-accent font-semibold ring-1 ring-inset ring-border'
+                          : 'text-muted-foreground hover:bg-accent'
                       }`}
                     >
                       {pageNum}
@@ -1696,7 +2076,7 @@ export default function UserProfile() {
 
                 {/* Late ellipsis */}
                 {currentPage < getTotalPages() - 3 && getTotalPages() > 6 && (
-                  <span className="rounded-lg px-2.5 py-1 text-sm text-gray-400 pointer-events-none cursor-default">
+                  <span className="rounded-lg px-2.5 py-1 text-sm text-muted-foreground/50 pointer-events-none cursor-default">
                     ...
                   </span>
                 )}
@@ -1707,8 +2087,8 @@ export default function UserProfile() {
                     onClick={() => setCurrentPage(getTotalPages())}
                     className={`rounded-lg px-2.5 py-1 text-sm ${
                       currentPage === getTotalPages()
-                        ? 'bg-gray-50 font-semibold ring-1 ring-inset ring-gray-200'
-                        : 'text-gray-600 hover:bg-gray-50'
+                        ? 'bg-accent font-semibold ring-1 ring-inset ring-border'
+                        : 'text-muted-foreground hover:bg-accent'
                     }`}
                   >
                     {getTotalPages()}
@@ -1719,9 +2099,177 @@ export default function UserProfile() {
                 <button
                   onClick={() => setCurrentPage(Math.min(getTotalPages(), currentPage + 1))}
                   disabled={currentPage === getTotalPages()}
+                  className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-sm text-muted-foreground hover:bg-accent disabled:text-muted-foreground/50 disabled:cursor-not-allowed"
+                >
+                  <span className="hidden sm:inline">Next</span>
+                  <ChevronRight className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+          </TabsContent>
+
+          <TabsContent value="models" className="space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 mb-4">
+              <div className="flex items-center gap-2">
+                <Package className="w-5 h-5 text-[#6352a3]" />
+                <h2 className="text-xl font-semibold">
+                  Models ({getFilteredAndSortedModels().length})
+                </h2>
+              </div>
+              <div className="flex flex-col lg:flex-row items-stretch lg:items-center gap-2 lg:gap-3">
+                {/* Search */}
+                <div className="flex items-center w-full lg:w-48 bg-white border border-gray-200 rounded-lg px-3 py-2">
+                  <Search className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
+                  <input
+                    className="flex-1 border-none outline-none bg-transparent text-sm text-gray-900 placeholder-gray-400 min-w-0"
+                    placeholder="Full-text search"
+                    value={modelSearch}
+                    onChange={(e) => {
+                      setModelSearch(e.target.value)
+                      setModelCurrentPage(1)
+                    }}
+                  />
+                </div>
+                {/* Selected Tags Display */}
+                {selectedModelTags.length > 0 && (
+                  <div className="flex items-center gap-2 overflow-x-auto pb-1 w-full lg:w-auto lg:max-w-[400px]">
+                    <span className="text-sm text-[#594a93] font-medium whitespace-nowrap flex-shrink-0">Tags:</span>
+                    <div className="flex items-center gap-2 min-w-0 overflow-x-auto">
+                      {selectedModelTags.map((tag) => (
+                        <div key={tag} className="flex items-center gap-1 rounded-lg px-2 py-1 whitespace-nowrap flex-shrink-0 border bg-gray-100 text-gray-600 border-gray-300">
+                          <span className="text-xs">{tag}</span>
+                          <button
+                            onClick={() => handleModelTagClick(tag)}
+                            className="hover:opacity-70 transition-opacity ml-1"
+                            title="Remove tag filter"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {/* Sort */}
+                <Select value={modelSort} onValueChange={(value: any) => {
+                  setModelSort(value)
+                  setModelCurrentPage(1)
+                }}>
+                  <SelectTrigger className="w-full lg:w-48 bg-white border border-gray-200 rounded-lg shadow-none">
+                    <div className="flex items-center gap-2">
+                      <ArrowUpDown className="w-4 h-4" />
+                      <SelectValue />
+                    </div>
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="most_likes">Most Stars</SelectItem>
+                    <SelectItem value="most_downloads">Most Downloads</SelectItem>
+                    <SelectItem value="recently_upload">Recently Upload</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-4">
+              {getPaginatedModels().length > 0 ? (
+                getPaginatedModels().map((model) => (
+                  <UserModelCard
+                    key={model.id}
+                    model={model}
+                    isCurrentUser={isCurrentUser}
+                    onTagClick={handleModelTagClick}
+                    userProfile={userProfile}
+                  />
+                ))
+              ) : (
+                <div className="col-span-full text-center py-16">
+                  <Package className="w-16 h-16 mx-auto mb-4 text-gray-300" />
+                  <p className="text-gray-500 mb-2">No models found</p>
+                  <p className="text-sm text-gray-400">Try adjusting your search or filters</p>
+                </div>
+              )}
+            </div>
+
+            {/* Pagination */}
+            {getModelTotalPages() > 1 && (
+              <div className="flex flex-wrap items-center justify-center mt-8 gap-1">
+                {/* Previous Button */}
+                <button
+                  onClick={() => setModelCurrentPage(Math.max(1, modelCurrentPage - 1))}
+                  disabled={modelCurrentPage === 1}
                   className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-sm text-gray-600 hover:bg-gray-50 disabled:text-gray-300 disabled:cursor-not-allowed"
                 >
-                  Next
+                  <ChevronLeft className="w-4 h-4" />
+                  <span className="hidden sm:inline">Prev</span>
+                </button>
+
+                {/* Page 1 */}
+                <button
+                  onClick={() => setModelCurrentPage(1)}
+                  className={`rounded-lg px-2.5 py-1 text-sm ${
+                    modelCurrentPage === 1
+                      ? 'bg-gray-50 font-semibold ring-1 ring-inset ring-gray-200'
+                      : 'text-gray-600 hover:bg-gray-50'
+                  }`}
+                >
+                  1
+                </button>
+
+                {/* Early ellipsis */}
+                {modelCurrentPage > 4 && getModelTotalPages() > 6 && (
+                  <span className="rounded-lg px-2.5 py-1 text-sm text-gray-400 pointer-events-none cursor-default">
+                    ...
+                  </span>
+                )}
+
+                {/* Middle pages */}
+                {Array.from({ length: getModelTotalPages() }, (_, i) => i + 1)
+                  .filter(pageNum => {
+                    if (pageNum === 1 || pageNum === getModelTotalPages()) return false;
+                    return Math.abs(pageNum - modelCurrentPage) <= 1;
+                  })
+                  .map(pageNum => (
+                    <button
+                      key={pageNum}
+                      onClick={() => setModelCurrentPage(pageNum)}
+                      className={`rounded-lg px-2.5 py-1 text-sm ${
+                        modelCurrentPage === pageNum
+                          ? 'bg-gray-50 font-semibold ring-1 ring-inset ring-gray-200'
+                          : 'text-gray-600 hover:bg-gray-50'
+                      }`}
+                    >
+                      {pageNum}
+                    </button>
+                  ))}
+
+                {/* Late ellipsis */}
+                {modelCurrentPage < getModelTotalPages() - 3 && getModelTotalPages() > 6 && (
+                  <span className="rounded-lg px-2.5 py-1 text-sm text-gray-400 pointer-events-none cursor-default">
+                    ...
+                  </span>
+                )}
+
+                {/* Last page */}
+                {getModelTotalPages() > 1 && (
+                  <button
+                    onClick={() => setModelCurrentPage(getModelTotalPages())}
+                    className={`rounded-lg px-2.5 py-1 text-sm ${
+                      modelCurrentPage === getModelTotalPages()
+                        ? 'bg-gray-50 font-semibold ring-1 ring-inset ring-gray-200'
+                        : 'text-gray-600 hover:bg-gray-50'
+                    }`}
+                  >
+                    {getModelTotalPages()}
+                  </button>
+                )}
+
+                {/* Next Button */}
+                <button
+                  onClick={() => setModelCurrentPage(Math.min(getModelTotalPages(), modelCurrentPage + 1))}
+                  disabled={modelCurrentPage === getModelTotalPages()}
+                  className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-sm text-gray-600 hover:bg-gray-50 disabled:text-gray-300 disabled:cursor-not-allowed"
+                >
+                  <span className="hidden sm:inline">Next</span>
                   <ChevronRight className="w-4 h-4" />
                 </button>
               </div>
@@ -1741,17 +2289,17 @@ export default function UserProfile() {
                 {loadingFollowers ? (
                   <div className="text-center py-8">
                     <div className="w-8 h-8 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-                    <p className="text-gray-500">Loading followers...</p>
+                    <p className="text-muted-foreground">Loading followers...</p>
                   </div>
                 ) : followers.length === 0 ? (
-                  <div className="text-center py-8 text-gray-500">
+                  <div className="text-center py-8 text-muted-foreground">
                     <Users className="w-12 h-12 mx-auto mb-2 opacity-50" />
                     <p>No followers yet</p>
                   </div>
                 ) : (
                   <div className="space-y-3">
                     {followers.map((follower) => (
-                      <div key={follower.user_id} className="flex items-center gap-3 p-3 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800">
+                      <div key={follower.user_id} className="flex items-center gap-3 p-3 rounded-lg hover:bg-accent">
                         <Avatar className="w-10 h-10">
                           {follower.avatar_url ? (
                             <Image
@@ -1799,17 +2347,17 @@ export default function UserProfile() {
                 {loadingFollowing ? (
                   <div className="text-center py-8">
                     <div className="w-8 h-8 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-                    <p className="text-gray-500">Loading following...</p>
+                    <p className="text-muted-foreground">Loading following...</p>
                   </div>
                 ) : following.length === 0 ? (
-                  <div className="text-center py-8 text-gray-500">
+                  <div className="text-center py-8 text-muted-foreground">
                     <Heart className="w-12 h-12 mx-auto mb-2 opacity-50" />
                     <p>Not following anyone yet</p>
                   </div>
                 ) : (
                   <div className="space-y-3">
                     {following.map((followingUser) => (
-                      <div key={followingUser.user_id} className="flex items-center gap-3 p-3 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800">
+                      <div key={followingUser.user_id} className="flex items-center gap-3 p-3 rounded-lg hover:bg-accent">
                         <Avatar className="w-10 h-10">
                           {followingUser.avatar_url ? (
                             <Image

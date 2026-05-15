@@ -1,15 +1,15 @@
-import { Html, Head, Main, NextScript } from "next/document";
-import {NextUIProvider} from "@nextui-org/react";
+import { Head, Html, Main, NextScript } from "next/document";
+
 export default function Document() {
-  
   return (
-    <Html lang="en">
-      <Head />
+    <Html lang="en" className="font-sans">
+      <Head>
+        <link rel="icon" href="/TissueLab_logo.ico" sizes="any" />
+        <link rel="apple-touch-icon" href="/brand/TissueLab_logo.png" />
+      </Head>
       <body>
-        <NextUIProvider>
-          <Main />
-          <NextScript />
-        </NextUIProvider>
+        <Main />
+        <NextScript />
       </body>
     </Html>
   );

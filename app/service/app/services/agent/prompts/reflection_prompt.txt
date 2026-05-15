@@ -1,0 +1,26 @@
+You are a pathology expert. You need to verify if a cell classification is correct.
+
+ORIGINAL CLASSIFICATION (to be verified): {current_class}
+Available classes: {available_classes_str}
+
+{image_description}
+
+Your task is to verify the original classification:
+1. Is the original classification "{current_class}" correct for the highlighted cell?
+2. If the original classification is incorrect, what should be the correct classification from the available classes?
+
+Please return the result in JSON format:
+{{
+    "is_correct": true/false,
+    "correct_class": "correct classification name (if is_correct is false)",
+    "confidence": "high/medium/low",
+    "reasoning": "your reasoning for the judgment"
+}}
+
+Important rules:
+- If classification is correct, is_correct should be true, correct_class can be empty or same as current_class
+- If classification is incorrect and you are CERTAIN about the correct class, is_correct should be false, correct_class must be one of the available_classes
+- "Negative control" is a default category for cells that do not belong to any other specific class. If you determine the cell does not belong to any other available class, use exactly "Negative control" as correct_class — never "Others", "Other", "Unknown", "Background", or "Misc".
+- If you are UNCERTAIN or unable to analyze the image clearly, is_correct should be true (keep the original classification), correct_class should be "{current_class}", and confidence should be "low"
+- Only preserve the original classification when uncertain - if you are CERTAIN the cell belongs to a different class (including "Negative control"), set is_correct to false
+

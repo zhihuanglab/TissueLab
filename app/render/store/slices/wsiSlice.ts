@@ -140,6 +140,10 @@ const wsiSlice = createSlice({
       };
       state.activeInstanceId = instanceId;
     },
+
+    resetWSIState: () => {
+      return initialState;
+    },
   },
 });
 
@@ -151,7 +155,8 @@ export const {
   syncAllViewports,
   setSyncCoordinates,
   updateInstanceWSIInfo,
-  replaceCurrentInstance
+  replaceCurrentInstance,
+  resetWSIState,
 } = wsiSlice.actions;
 
 export default wsiSlice.reducer; 

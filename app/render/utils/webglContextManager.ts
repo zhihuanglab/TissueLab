@@ -2,7 +2,39 @@
  * WebGL Context Manager
  * 
  * Manages the creation and release of WebGL contexts to prevent context leaks
+ * Also ensures all WebGL contexts are created with preserveDrawingBuffer: true
+ * for proper screenshot functionality
  */
+
+// ============================================================================
+// WebGL Preserve Drawing Buffer Hook
+// ============================================================================
+// Override getContext to automatically set preserveDrawingBuffer: true for WebGL contexts
+// This is needed for screenshot functionality to work properly with Annotorious's WebGL contexts
+if (typeof window !== 'undefined' && typeof HTMLCanvasElement !== 'undefined') {
+  const originalGetContext = HTMLCanvasElement.prototype.getContext;
+
+  HTMLCanvasElement.prototype.getContext = function(
+    contextType: string,
+    contextAttributes?: WebGLContextAttributes
+  ): any {
+    // If it's a WebGL context and preserveDrawingBuffer is not explicitly set
+    if ((contextType === 'webgl' || contextType === 'webgl2') && contextAttributes) {
+      // Ensure preserveDrawingBuffer is set to true
+      contextAttributes.preserveDrawingBuffer = true;
+    } else if ((contextType === 'webgl' || contextType === 'webgl2') && !contextAttributes) {
+      // If no contextAttributes provided, create with preserveDrawingBuffer: true
+      contextAttributes = { preserveDrawingBuffer: true };
+    }
+    
+    // Call the original getContext method
+    return originalGetContext.call(this, contextType, contextAttributes);
+  };
+}
+
+// ============================================================================
+// WebGL Context Manager
+// ============================================================================
 
 interface WebGLContextInfo {
   canvas: HTMLCanvasElement;

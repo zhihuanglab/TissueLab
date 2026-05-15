@@ -17,7 +17,7 @@ const LoadingProgress = ({ label, status, ErrMsg }: LoadingProgressProps) => {
   const [percent, setPercent] = useState<number>(0);
 
   useEffect(() => {
-    let interval: NodeJS.Timer | null = null;
+    let interval: NodeJS.Timeout | null = null;
     if (status === Status.Progress) {
       interval = setInterval(() => {
         setPercent((prevPercent) => {

@@ -1,9 +1,85 @@
+'use client'
+
 import * as React from "react"
 import * as DialogPrimitive from "@radix-ui/react-dialog"
-import { cn } from "@/utils/twMerge"
 import { Cross2Icon } from "@radix-ui/react-icons"
+import { useTheme } from "next-themes"
 
-const Dialog = DialogPrimitive.Root
+import { cn } from "@/utils/twMerge"
+import {
+  subscribeElectronModalOverlay,
+  syncElectronModalOverlayTheme,
+} from "@/utils/electronModalTitlebarSync"
+
+type DialogProps = React.ComponentPropsWithoutRef<typeof DialogPrimitive.Root> & {
+  electronOverlay?: boolean
+}
+
+const Dialog = ({
+  electronOverlay = true,
+  open,
+  defaultOpen,
+  onOpenChange,
+  ...props
+}: DialogProps) => {
+  const { theme, systemTheme } = useTheme()
+  const [mounted, setMounted] = React.useState(false)
+  const [internalOpen, setInternalOpen] = React.useState(defaultOpen ?? false)
+  const isControlled = open !== undefined
+  const resolvedOpen = isControlled ? !!open : internalOpen
+  const resolvedTheme =
+    theme === "system" ? systemTheme ?? undefined : theme ?? undefined
+
+  React.useEffect(() => {
+    setMounted(true)
+  }, [])
+
+  React.useEffect(() => {
+    if (isControlled) {
+      setInternalOpen(!!open)
+    }
+  }, [isControlled, open])
+
+  const themeRef = React.useRef(resolvedTheme)
+  themeRef.current = resolvedTheme
+  const themeReady = !!resolvedTheme
+
+  // Ref-count modals at module level so nested dialogs and route churn stay correct.
+  React.useEffect(() => {
+    if (!electronOverlay || !mounted || !resolvedOpen || !themeReady) {
+      return
+    }
+    return subscribeElectronModalOverlay(() => themeRef.current)
+  }, [electronOverlay, mounted, resolvedOpen, themeReady])
+
+  React.useEffect(() => {
+    if (!electronOverlay || !mounted || !resolvedOpen || !resolvedTheme) {
+      return
+    }
+    syncElectronModalOverlayTheme(resolvedTheme)
+  }, [electronOverlay, mounted, resolvedOpen, resolvedTheme])
+
+  const handleOpenChange = React.useCallback(
+    (nextOpen: boolean) => {
+      if (!isControlled) {
+        setInternalOpen(nextOpen)
+      }
+      if (onOpenChange) {
+        onOpenChange(nextOpen)
+      }
+    },
+    [isControlled, onOpenChange]
+  )
+
+  return (
+    <DialogPrimitive.Root
+      open={open}
+      defaultOpen={defaultOpen}
+      onOpenChange={handleOpenChange}
+      {...props}
+    />
+  )
+}
 
 const DialogTrigger = DialogPrimitive.Trigger
 
@@ -118,3 +194,4 @@ export {
   DialogTitle,
   DialogDescription,
 }
+
