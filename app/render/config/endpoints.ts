@@ -15,6 +15,10 @@ export const getUserAvatarEndpoint = (userId: string) => `${apiUrl}/users/${user
 export const uploadUserAvatarEndpoint = (userId: string) => `${apiUrl}/users/${userId}/avatar`;
 export const deleteUserAvatarEndpoint = (userId: string) => `${apiUrl}/users/${userId}/avatar`;
 
+// email authentication endpoints
+export const sendCodeEndpoint = `${apiUrl}/users/v1/send_code`;
+export const verifyCodeEndpoint = `${apiUrl}/users/v1/verify_code`;
+
 
 /**
  * @proprocessing

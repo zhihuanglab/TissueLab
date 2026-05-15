@@ -6,6 +6,7 @@ import {
   GoogleAuthProvider,
   getAuth,
   signInWithCustomToken,
+  signInWithCredential,
   User,
   onAuthStateChanged,
 } from 'firebase/auth';
@@ -15,9 +16,10 @@ import { useCallback, useEffect, useState } from 'react';
 import {
   initUserEndpoint,
   updateUserProfileEndpoint,
+  initUserAssetsEndpoint,
 } from '../config/endpoints';
 import { toast } from 'sonner';
-import { apiFetch } from '../utils/apiFetch';
+import { apiFetch } from '../utils/common/apiFetch';
 
 
 type LoginWay = 'google-login' | 'email-login';
@@ -142,8 +144,18 @@ const useGlobalSignup = ({
       .catch(handleAuthError);
   };
 
+  // Check if running in Electron environment
+  const isElectron = () => {
+    return typeof window !== 'undefined' && window.electron !== undefined;
+  };
+
   // one-tap login
   const oneClickLogin = async () => {
+    // In Electron, one-tap doesn't make sense, just use normal login
+    if (isElectron()) {
+      return loginViaGoogle();
+    }
+    
     const auth = getAuth(app);
     const provider = new GoogleAuthProvider();
     // remove account selection prompt, use default account
@@ -163,9 +175,105 @@ const useGlobalSignup = ({
     }
   };
 
-  // goole signup or login
+  // Google signup or login - Browser-based in Electron, popup in web
   const loginViaGoogle = async () => {
     const auth = getAuth(app);
+    
+    // Electron: Use system browser OAuth flow
+    if (isElectron()) {
+      try {
+        console.log('[Auth] Starting Electron OAuth flow...');
+        
+        // Get client ID/secret from environment variables (renderer)
+        // Desktop OAuth clients ship a "client secret" that Google does not treat as confidential
+        const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
+        const clientSecret = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_SECRET;
+
+        if (!clientId) {
+          throw new Error('Google Client ID not configured. Please set NEXT_PUBLIC_GOOGLE_CLIENT_ID in your environment.');
+        }
+
+        toast.info('Opening browser for authentication...');
+
+        // Pass client ID (and secret, if provided) to main process
+        const result = await window.electron.googleOAuth({ clientId, clientSecret });
+        
+        if (!result.success || !result.tokens) {
+          throw new Error(result.error || 'OAuth failed - no tokens received');
+        }
+        
+        console.log('[Auth] OAuth successful, signing in to Firebase...');
+        
+        // Save refresh_token securely if available
+        if (result.tokens.refresh_token) {
+          try {
+            console.log('[Auth] Saving refresh token...');
+            const saveResult = await window.electron.saveRefreshToken({ 
+              token: result.tokens.refresh_token 
+            });
+            if (saveResult.success) {
+              console.log('[Auth] Refresh token saved successfully');
+              if (saveResult.warning) {
+                console.warn('[Auth] Warning:', saveResult.warning);
+              }
+            } else {
+              console.warn('[Auth] Failed to save refresh token:', saveResult.error);
+            }
+          } catch (saveError) {
+            console.error('[Auth] Error saving refresh token:', saveError);
+            // Don't block login if saving refresh token fails
+          }
+        }
+        
+        // Use the id_token to sign in with Firebase
+        const credential = GoogleAuthProvider.credential(result.tokens.id_token);
+        const authResult = await signInWithCredential(auth, credential);
+        
+        // Immediately fetch user profile from backend and write to localStorage
+        // This ensures data is available even if Firestore sync is delayed or fails
+        try {
+          console.log('[Auth] Fetching user profile from backend...');
+          const userProfile = await apiFetch(initUserAssetsEndpoint, {
+            method: 'POST',
+            body: JSON.stringify({}),
+          });
+          
+          console.log('[Auth] Got user profile:', userProfile);
+          
+          // Write to localStorage immediately
+          if (userProfile && userProfile.user_id) {
+            if (userProfile.preferred_name) {
+              localStorage.setItem(`preferred_name_${userProfile.user_id}`, userProfile.preferred_name);
+              console.log('[Auth] Saved preferred_name to localStorage:', userProfile.preferred_name);
+            }
+            if (userProfile.custom_title) {
+              localStorage.setItem(`custom_title_${userProfile.user_id}`, userProfile.custom_title);
+            }
+            if (userProfile.organization) {
+              localStorage.setItem(`organization_${userProfile.user_id}`, userProfile.organization);
+            }
+            
+            // Don't manage avatar in login flow - let existing system handle it
+            // This prevents any interference with custom avatar management
+          }
+        } catch (profileError) {
+          console.warn('[Auth] Failed to fetch user profile:', profileError);
+          // Don't block login if profile fetch fails
+        }
+        
+        setModalVisible?.(false);
+        signupSuccess?.();
+        signInSuccessWithAuthResult(authResult, 'google-login');
+        
+        toast.success('Successfully signed in!');
+      } catch (error: any) {
+        console.error('Electron Google login failed:', error);
+        toast.error(error.message || 'Failed to sign in with Google');
+      }
+      return;
+    }
+    
+    // Web: Use popup flow (original behavior)
     const provider = new GoogleAuthProvider();
     provider.setCustomParameters({ prompt: 'select_account' });
     try {

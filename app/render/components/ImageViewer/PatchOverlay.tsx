@@ -1,33 +1,26 @@
-import React, { useRef, useEffect, useCallback } from "react";
+import React, { useRef, useEffect, useCallback, useMemo, useState } from "react";
 import OpenSeadragon from "openseadragon";
 import { useSelector } from "react-redux";
 import { mat2d } from "gl-matrix";
 import { RootState } from "@/store";
-import { ShapeData, RectangleCoords } from "@/store/slices/shapeSlice";
-// import { selectPatchClassificationData } from "@/store/slices/annotationSlice";
-
-const ZOOM_SCALE = 16; // Keep in sync with DrawingOverlay / Annotorious selection scaling
-
-const selectPatchClassificationData = (state: RootState) => null; // Placeholder
+import { ShapeData, RectangleCoords } from "@/store/slices/viewer/shapeSlice";
+import { selectPatchClassificationData } from "@/store/slices/viewer/annotationSlice";
+import EventBus from '@/utils/EventBus';
 
 // Point-in-rectangle (ROI) using image-space coordinates
 const isPointInRectangle = (x: number, y: number, rect: RectangleCoords | null): boolean => {
   if (!rect) return false;
-  const rx1 = rect.x1 * ZOOM_SCALE;
-  const ry1 = rect.y1 * ZOOM_SCALE;
-  const rx2 = rect.x2 * ZOOM_SCALE;
-  const ry2 = rect.y2 * ZOOM_SCALE;
-  const minX = Math.min(rx1, rx2);
-  const maxX = Math.max(rx1, rx2);
-  const minY = Math.min(ry1, ry2);
-  const maxY = Math.max(ry1, ry2);
+  const minX = Math.min(rect.x1, rect.x2);
+  const maxX = Math.max(rect.x1, rect.x2);
+  const minY = Math.min(rect.y1, rect.y2);
+  const maxY = Math.max(rect.y1, rect.y2);
   return x >= minX && x <= maxX && y >= minY && y <= maxY;
 }
 
 // Point-in-polygon (ROI) using image-space coordinates (ray casting)
 const isPointInPolygon = (x: number, y: number, polygonPoints: [number, number][] | undefined): boolean => {
   if (!polygonPoints || polygonPoints.length < 3) return false;
-  const pts = polygonPoints.map(p => [p[0] * ZOOM_SCALE, p[1] * ZOOM_SCALE] as [number, number]);
+  const pts = polygonPoints.map(p => [p[0], p[1]] as [number, number]);
   let inside = false;
   for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
     const xi = pts[i][0], yi = pts[i][1];
@@ -40,7 +33,7 @@ const isPointInPolygon = (x: number, y: number, polygonPoints: [number, number][
 
 interface DrawingOverlayProps {
   viewer: OpenSeadragon.Viewer | null;
-  patches: Array<[number, number, number, string]>; // [idx, x, y, color]
+  patches: Array<[number, number, number, number, number, string, number]>; // [idx, x, y, width, height, color, class_id]
   patchClassificationData?: {
     nuclei_class_id: number[];
     nuclei_class_name: string[];
@@ -54,9 +47,41 @@ const PatchOverlay: React.FC<DrawingOverlayProps> = ({
   patchClassificationData
 }) => {
   const overlayRef = useRef<HTMLCanvasElement>(null);
-  const annotationTypes = useSelector((state: RootState) => state.annotations.annotationTypeMap);
   const reduxPatchClassificationData = useSelector(selectPatchClassificationData);
   const shapeData = useSelector((state: RootState) => state.shape.shapeData);
+  const overlayAlpha = useSelector((state: RootState) => state.viewerSettings.overlayAlpha) ?? 0.4;
+  
+  // Store color change mappings: old color -> new color
+  // This is updated when user changes a color via EventBus
+  const [colorChangeMap, setColorChangeMap] = useState<Map<string, string>>(new Map());
+  
+  // Listen for color change events from PatchClassificationPanel
+  useEffect(() => {
+    const handleColorChange = (data: { oldColor: string; newColor: string; className: string }) => {
+      setColorChangeMap(prev => {
+        const newMap = new Map(prev);
+        newMap.set(data.oldColor, data.newColor);
+        return newMap;
+      });
+    };
+    
+    EventBus.on('patch-color-changed', handleColorChange);
+    return () => {
+      EventBus.off('patch-color-changed', handleColorChange);
+    };
+  }, []);
+  
+  // Clear color change map when patches are refreshed from backend
+  // This ensures we don't use stale mappings after backend update
+  useEffect(() => {
+    // When patches change (likely from backend refresh), clear the color change map
+    // because backend colors should now match Redux colors
+    setColorChangeMap(new Map());
+  }, [patches.length]); // Clear when number of patches changes (indicates refresh)
+  
+  // Ground truth annotation highlighting (from remote branch)
+  const highlightGtAnnotations = useSelector((state: RootState) => state.viewerSettings.highlightGtAnnotations);
+  const gtHighlightTissueIndices = useSelector((state: RootState) => state.gtHighlight.tissueIndices);
   // const slideDimensions = useSelector((state: RootState) => state.svsPath.slideInfo.dimensions); // Access slide dimensions if needed for other calculations
 
   /**
@@ -157,48 +182,110 @@ const PatchOverlay: React.FC<DrawingOverlayProps> = ({
     ctx.setTransform(a, b, c, d, e, f);
 
     // ----- Draw patches in image coordinates (transform handles rotation/scale) -----
-    const originalPatchImageSize = 224 * 16; // image-space size
     const desiredFixedScreenGap = 2; // pixels
     const minVisiblePatchSize = 3; // pixels
 
     // Compute screen pixels per image unit from the transform (uniform scale)
     const scale = Math.hypot(a, b);
-    const cellScreenPx = scale * originalPatchImageSize;
+    const gtTissueSet = highlightGtAnnotations && gtHighlightTissueIndices.length > 0 ? new Set(gtHighlightTissueIndices) : null;
 
-    let effectiveGap = desiredFixedScreenGap;
-    if (cellScreenPx - desiredFixedScreenGap < minVisiblePatchSize) {
-      effectiveGap = Math.max(0, Math.floor(cellScreenPx - minVisiblePatchSize));
-    }
-
-    const drawSizeScreenPx = Math.max(minVisiblePatchSize, cellScreenPx - effectiveGap);
-    if (drawSizeScreenPx <= 0) return;
-
-    const drawSizeImageUnits = drawSizeScreenPx / scale;
-    const offsetImageUnits = ((cellScreenPx - drawSizeScreenPx) / 2) / scale; // center-inset
-
-    patches.forEach(([idx, x, y, color]) => {
-      const drawXImage = (x - originalPatchImageSize / 2) + offsetImageUnits;
-      const drawYImage = (y - originalPatchImageSize / 2) + offsetImageUnits;
-
-      const finalColor = hexToRgb(color || '#aaaaaa');
-      ctx.fillStyle = `rgba(${finalColor[0]}, ${finalColor[1]}, ${finalColor[2]}, 0.6)`;
-      ctx.fillRect(drawXImage, drawYImage, drawSizeImageUnits, drawSizeImageUnits);
-
-      // Highlight if patch center is inside ROI (rectangle or polygon)
-      if (shapeData) {
-        const hit = (shapeData.polygonPoints && shapeData.polygonPoints.length >= 3)
-          ? isPointInPolygon(x, y, shapeData.polygonPoints)
-          : (shapeData.rectangleCoords ? isPointInRectangle(x, y, shapeData.rectangleCoords) : false);
-        if (hit) {
-          ctx.strokeStyle = '#ffff00';
-          // Keep a ~2px screen-space stroke width regardless of zoom
-          const scale = Math.hypot(a, b);
-          ctx.lineWidth = Math.max(1 / scale, 2 / scale);
-          ctx.strokeRect(drawXImage, drawYImage, drawSizeImageUnits, drawSizeImageUnits);
+    patches.forEach((patch) => {
+      // Extract patch data: [idx, x, y, width, height, color, class_id]
+      // Handle both old format (without class_id) and new format (with class_id)
+      const idx = patch[0];
+      const x = patch[1];
+      const y = patch[2];
+      const width = patch[3];
+      const height = patch[4];
+      const color = patch[5];
+      const class_id = patch.length > 6 ? patch[6] : -1; // Support old format without class_id
+      
+      // Apply optimistic color update from Redux state
+      // Similar to nuclei: use class_id to directly access color from Redux state
+      let finalColor = color;
+      
+      if (reduxPatchClassificationData && 
+          reduxPatchClassificationData.class_hex_color &&
+          class_id >= 0 && 
+          class_id < reduxPatchClassificationData.class_hex_color.length) {
+        // Direct color lookup by class_id (same as nuclei implementation)
+        finalColor = reduxPatchClassificationData.class_hex_color[class_id];
+      } else if (reduxPatchClassificationData && 
+                 reduxPatchClassificationData.class_name && 
+                 reduxPatchClassificationData.class_hex_color) {
+        // Fallback: if class_id is invalid, try color matching (for backward compatibility)
+        const normalizedPatchColor = (color || '').toLowerCase().trim();
+        
+        // Check if this is an old color that has been changed
+        const changedColor = colorChangeMap.get(normalizedPatchColor);
+        if (changedColor) {
+          finalColor = changedColor;
+        } else {
+          // Check if this color matches any current color in Redux state
+          for (let i = 0; i < reduxPatchClassificationData.class_hex_color.length; i++) {
+            const reduxColor = reduxPatchClassificationData.class_hex_color[i];
+            const normalizedReduxColor = (reduxColor || '').toLowerCase().trim();
+            
+            if (normalizedPatchColor === normalizedReduxColor) {
+              finalColor = reduxColor;
+              break;
+            }
+          }
         }
       }
+      
+      // Use dynamic patch dimensions from backend (already in image-space coordinates)
+      const patchImageWidth = width;
+      const patchImageHeight = height;
+      
+      // Compute screen size for this specific patch
+      const patchWidthScreenPx = scale * patchImageWidth;
+      const patchHeightScreenPx = scale * patchImageHeight;
+      
+      // Calculate effective gap for this patch
+      let effectiveGapX = desiredFixedScreenGap;
+      let effectiveGapY = desiredFixedScreenGap;
+      
+      if (patchWidthScreenPx - desiredFixedScreenGap < minVisiblePatchSize) {
+        effectiveGapX = Math.max(0, Math.floor(patchWidthScreenPx - minVisiblePatchSize));
+      }
+      if (patchHeightScreenPx - desiredFixedScreenGap < minVisiblePatchSize) {
+        effectiveGapY = Math.max(0, Math.floor(patchHeightScreenPx - minVisiblePatchSize));
+      }
+      
+      // Calculate draw size in screen pixels
+      const drawWidthScreenPx = Math.max(minVisiblePatchSize, patchWidthScreenPx - effectiveGapX);
+      const drawHeightScreenPx = Math.max(minVisiblePatchSize, patchHeightScreenPx - effectiveGapY);
+      
+      if (drawWidthScreenPx <= 0 || drawHeightScreenPx <= 0) return;
+      
+      // Convert back to image units
+      const drawWidthImageUnits = drawWidthScreenPx / scale;
+      const drawHeightImageUnits = drawHeightScreenPx / scale;
+      const offsetXImageUnits = ((patchWidthScreenPx - drawWidthScreenPx) / 2) / scale;
+      const offsetYImageUnits = ((patchHeightScreenPx - drawHeightScreenPx) / 2) / scale;
+
+      // Calculate draw position (patches are centered at x, y)
+      const drawXImage = (x - patchImageWidth / 2) + offsetXImageUnits;
+      const drawYImage = (y - patchImageHeight / 2) + offsetYImageUnits;
+
+      const colorToUse = finalColor || '#aaaaaa';
+      const finalColorRgb = hexToRgb(colorToUse);
+      ctx.fillStyle = `rgba(${finalColorRgb[0]}, ${finalColorRgb[1]}, ${finalColorRgb[2]}, ${overlayAlpha})`;
+      ctx.fillRect(drawXImage, drawYImage, drawWidthImageUnits, drawHeightImageUnits);
+
+      // Highlight if patch is user-annotated (GT) and preference is on, or if patch center is inside ROI
+      const isGtHighlight = gtTissueSet ? gtTissueSet.has(idx) : false;
+      const roiHit = shapeData && ((shapeData.polygonPoints && shapeData.polygonPoints.length >= 3)
+        ? isPointInPolygon(x, y, shapeData.polygonPoints)
+        : (shapeData.rectangleCoords ? isPointInRectangle(x, y, shapeData.rectangleCoords) : false));
+      if (isGtHighlight || roiHit) {
+        ctx.strokeStyle = '#ffff00';
+        ctx.lineWidth = Math.max(1 / scale, 2 / scale);
+        ctx.strokeRect(drawXImage, drawYImage, drawWidthImageUnits, drawHeightImageUnits);
+      }
     });
-  }, [viewer, patches, hexToRgb, shapeData]);
+  }, [viewer, patches, hexToRgb, shapeData, overlayAlpha, reduxPatchClassificationData, colorChangeMap, highlightGtAnnotations, gtHighlightTissueIndices]);
 
   // Setup event handlers for viewer updates
   useEffect(() => {
@@ -218,6 +305,12 @@ const PatchOverlay: React.FC<DrawingOverlayProps> = ({
     if (!viewer || !patches) return;
     updateOverlay();
   }, [viewer, patches, updateOverlay]);
+  
+  // Re-render overlay when Redux patch classification colors change (for optimistic updates)
+  useEffect(() => {
+    if (!viewer || !patches) return;
+    updateOverlay();
+  }, [viewer, patches, reduxPatchClassificationData?.class_hex_color, updateOverlay]);
 
   // Redraw when ROI selection changes
   useEffect(() => {

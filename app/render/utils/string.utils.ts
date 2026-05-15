@@ -116,4 +116,18 @@ export const sanitizeFilename = (originalName: string): string => {
   return finalName;
 };
 
+/**
+ * Validate a user-provided file or folder name before rename/create.
+ * Returns an error message string if invalid, or null if the name is acceptable.
+ */
+export const validateItemName = (name: string): string | null => {
+  if (!name || name.trim() === '') return 'Name cannot be empty.';
+  if (name.trim() !== name) return 'Name cannot start or end with spaces.';
+  if (name.includes('/')) return "Names cannot contain '/'.";
+  if (name.includes('\0')) return 'Name contains invalid characters.';
+  if (name === '.' || name === '..') return `'${name}' is a reserved name.`;
+  if (name.startsWith('..')) return "Names cannot start with '..'.";
+  if (name.startsWith('.')) return "Names cannot start with '.' (would create a hidden item).";
+  return null;
+};
 

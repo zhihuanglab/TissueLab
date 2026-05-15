@@ -1,3 +1,4 @@
+"use client";
 import React, { useEffect, useRef, useCallback, useState } from 'react';
 import OpenSeadragon from 'openseadragon';
 import { useAnnotatorInstance } from '@/contexts/AnnotatorContext';
@@ -192,8 +193,9 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
     // Clear existing content
     containerRef.current.innerHTML = '';
 
-    // Get the tiled image from viewer
-    const tiledImage = viewerInstance.world.getItemAt(0);
+    // Get the tiled image from viewer (get the last item which is usually the newest)
+    const itemCount = viewerInstance.world.getItemCount();
+    const tiledImage = itemCount > 0 ? viewerInstance.world.getItemAt(itemCount - 1) : null;
     if (!tiledImage) return;
 
       // Create navigator container
@@ -249,6 +251,19 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
       };
       viewerInstance.addHandler('navigator-scroll', navScrollHandler);
       navScrollHandlerRef.current = navScrollHandler;
+
+      // Force an immediate update of the viewer size and navigator
+      updateViewerSize();
+      
+      // Force a redraw after a short delay to ensure initialization finishes after DOM layout
+      setTimeout(() => {
+        if (navigatorRef.current && viewerInstance.viewport) {
+          try {
+            navigatorRef.current.updateSize();
+            navigatorRef.current.update(viewerInstance.viewport);
+          } catch (e) {}
+        }
+      }, 500);
     };
 
     const initNavigator = async () => {
@@ -272,7 +287,46 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
     // Initialize the navigator
     initNavigator();
 
-    return cleanupNavigator;
+    // Listen for image open/ready events
+    const handleOpen = () => {
+      console.log('[OSDNavigator] Image opened, initializing navigator');
+      initNavigator();
+      showNavigator(); // Reset auto-hide timer to give user time to see it
+    };
+
+    const handleAddItem = () => {
+      console.log('[OSDNavigator] World item added, initializing navigator');
+      initNavigator();
+      showNavigator(); // Reset auto-hide timer
+    };
+
+    if (viewerInstance) {
+      viewerInstance.addHandler('open', handleOpen);
+      if (viewerInstance.world) {
+        viewerInstance.world.addHandler('add-item', handleAddItem);
+      }
+    }
+
+    // Listen for z-layer changes to recreate navigator
+    const handleZLayerChange = () => {
+      // Wait a bit for the new tiled image to be added
+      setTimeout(() => {
+        initNavigator();
+      }, 300);
+    };
+
+    window.addEventListener('zLayerChanged', handleZLayerChange);
+
+    return () => {
+      cleanupNavigator();
+      if (viewerInstance) {
+        viewerInstance.removeHandler('open', handleOpen);
+        if (viewerInstance.world) {
+          viewerInstance.world.removeHandler('add-item', handleAddItem);
+        }
+      }
+      window.removeEventListener('zLayerChanged', handleZLayerChange);
+    };
   }, [viewerInstance, navigatorSizeRatio, updateNavigator, isMacOS, cleanupNavigator]);
 
   // Cleanup effect for fast reload

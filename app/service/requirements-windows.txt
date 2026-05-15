@@ -6,6 +6,7 @@ certifi==2024.8.30
 charset-normalizer==3.4.0
 fastapi==0.109.1
 frozenlist==1.5.0
+google-cloud-storage
 h5py==3.12.1
 idna==3.10
 importlib_metadata==8.5.0
@@ -16,6 +17,7 @@ nibabel
 numba
 numpy==1.26.4
 numcodecs==0.12.1
+orjson
 ome-types==0.5.2
 ome-zarr==0.9.0
 opencv-python
@@ -37,13 +39,17 @@ uvicorn==0.27.0
 websockets>=11.0.3
 yarl==1.17.1
 zarr==2.17.2
+zstandard
 pydicom
 pylibCZIrw; sys_platform == "win32"
 pyisyntax
 pyvips[binary]
 openai
 czifile
-tissuelab_sdk==0.1.8
+tissuelab_sdk==0.1.12
 # thumbnail-task-distributor
 celery
 zmq
+datasets
+fairscale
+einops

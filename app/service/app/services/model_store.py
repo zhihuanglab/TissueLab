@@ -1,6 +1,7 @@
 import json
 import os
 from typing import Dict, Any, Optional
+from app.core import logger
 
 
 class ModelStore:
@@ -33,20 +34,29 @@ class ModelStore:
     def load(self) -> None:
         if self._loaded:
             return
+
         self._ensure_dir()
+
+        data = {}
         if os.path.exists(self.registry_path):
             try:
                 with open(self.registry_path, "r", encoding="utf-8") as f:
-                    self._data = json.load(f)
-                    if "category_map" not in self._data:
-                        self._data["category_map"] = {}
-                    if "nodes" not in self._data:
-                        self._data["nodes"] = {}
-                    if "category_display_names" not in self._data:
-                        self._data["category_display_names"] = {}
+                    data = json.load(f) or {}
             except Exception:
-                # If corrupted, fall back to empty
-                self._data = {"category_map": {}, "nodes": {}}
+                data = {}
+
+        data = self.normalize_registry_dict(data)
+
+        # ---- seed preset only if registry is empty ----
+        if self.is_empty_registry(data):
+            preset = self.load_preset_registry()
+            preset = self.normalize_registry_dict(preset)
+
+            self._data = preset
+            self.save()
+        else:
+            self._data = data
+
         self._loaded = True
 
     def save(self) -> None:
@@ -60,57 +70,7 @@ class ModelStore:
         """Seed the store with built-in nodes so that built-ins also appear as plugins."""
         self.load()
         # Built-in categories and nodes
-        defaults = {
-            "TissueClassify": [
-                ("MuskClassification", {
-                    "displayName": "Patch Classification (MUSK)",
-                    "description": "Patch-level (tile) tissue classification using MUSK embeddings; consumes and writes under 'MuskNode'.",
-                    "icon": "/images/icons/patch_encoder_musk.png",
-                    "h5_group": "MuskNode",
-                    "inputs": "Patch embeddings [N,D] from MuskNode",
-                    "outputs": "Per-patch class probabilities [N,C]",
-                }),
-                ("BiomedParseNode", {
-                    "displayName": "BiomedParse",
-                    "description": "Pixel-accurate region segmentation for explicit boundary analysis when boundary precision is explicitly required; otherwise prefer embedding-backed classification (e.g., MUSK).",
-                    "icon": "/images/icons/tissue_segmentation_biomedparse.png",
-                    "outputs": "Region polygons/masks",
-                })
-            ],
-            "TissueSeg": [
-                ("MuskEmbedding", {
-                    "displayName": "Patch Embedding (MUSK)",
-                    "description": "Generates patch embeddings for the whole slide used downstream by patch classification.",
-                    "icon": "/images/icons/patch_encoder_musk.png",
-                    "h5_group": "MuskNode",
-                    "outputs": "Patch embeddings [N,D]",
-                })
-            ],
-            "NucleiSeg": [
-                ("SegmentationNode", {
-                    "displayName": "Cell/Nuclei Segmentation",
-                    "description": "Instance segmentation of nuclei/cells on WSI with per-nucleus polygons/centroids; prerequisite for per-cell metrics and classification.",
-                    "icon": "/images/icons/nuclei_segmentation_stardist.png",
-                    "outputs": "Per-nucleus contours and centroids",
-                })
-            ],
-            "NucleiClassify": [
-                ("ClassificationNode", {
-                    "displayName": "Nuclei Classification (NuClass)",
-                    "description": "Per-nucleus classifier assigning classes (e.g., tumor_cell, lymphocyte); consumes nuclei segmentation results.",
-                    "icon": "/images/icons/nuclei_classification_tissuelab_nuclass.png",
-                    "inputs": "Per-nucleus contours and centroids",
-                    "outputs": "Per-nucleus class probabilities",
-                })
-            ],
-            "Scripts": [
-                ("Scripts", {
-                    "displayName": "Code Calculation",
-                    "description": "Custom Python analysis for counts/ratios/spatial queries; no visualization unless explicitly requested.",
-                    "icon": "/images/icons/code_generator_tissuelab_code.png",
-                })
-            ],
-        }
+        defaults = {}
 
         # Display names for categories
         category_display = {
@@ -118,7 +78,7 @@ class ModelStore:
             "TissueSeg": "Tissue Segmentation",
             "NucleiSeg": "Cell Segmentation + Embedding",
             "NucleiClassify": "Nuclei Classification",
-            "Scripts": "Code Calculation"
+            "CodingAgent": "Coding Agent"
         }
 
         changed = False
@@ -223,6 +183,26 @@ class ModelStore:
         self.load()
         return self._data.get("category_display_names", {})
 
+    def get_all_panel_configs(self) -> Dict[str, Any]:
+        """Return user-registered custom panel configs keyed by node name.
+
+        Built-in nodes (StarDist, InstanSeg, …) render via dedicated React
+        components and have no panel_config in the registry. This method
+        only returns entries for nodes that were registered via the custom
+        node flow and stored a `panel_config` payload alongside their
+        metadata.
+        """
+        self.load()
+        out: Dict[str, Any] = {}
+        nodes = self._data.get("nodes", {}) or {}
+        for name, meta in nodes.items():
+            if not isinstance(meta, dict):
+                continue
+            cfg = meta.get("panel_config")
+            if cfg is not None:
+                out[name] = cfg
+        return out
+
     def delete_node(self, node_name: str) -> bool:
         """Remove a node from registry and from its category list. Returns True if removed."""
         self.load()
@@ -242,6 +222,48 @@ class ModelStore:
         if existed:
             self.save()
         return existed
+
+    def load_preset_registry(self) -> dict:
+        base_dir = os.path.dirname(self.registry_path)
+        preset_path = os.path.join(base_dir, "model_registry_preset.json")
+        if not os.path.exists(preset_path):
+            return {"nodes": {}, "category_map": {}, "category_display_names": {}}
+        try:
+            with open(preset_path, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            data.setdefault("nodes", {})
+            data.setdefault("category_map", {})
+            data.setdefault("category_display_names", {})
+            return data
+        except Exception as e:
+            logger.exception("[model_store] Error loading preset registry")
+            return {"nodes": {}, "category_map": {}, "category_display_names": {}}
+
+    def normalize_registry_dict(self, data: dict) -> dict:
+        if not isinstance(data, dict):
+            data = {}
+        data.setdefault("nodes", {})
+        data.setdefault("category_map", {})
+        data.setdefault("category_display_names", {})
+        if not isinstance(data["nodes"], dict):
+            data["nodes"] = {}
+        if not isinstance(data["category_map"], dict):
+            data["category_map"] = {}
+        if not isinstance(data["category_display_names"], dict):
+            data["category_display_names"] = {}
+        return data
+
+    def is_empty_registry(self, data: dict) -> bool:
+        """Check if registry is completely empty (all fields are empty)."""
+        nodes = data.get("nodes") or {}
+        category_map = data.get("category_map") or {}
+        category_display_names = data.get("category_display_names") or {}
+        
+        return (
+            isinstance(nodes, dict) and len(nodes) == 0 and
+            isinstance(category_map, dict) and len(category_map) == 0 and
+            isinstance(category_display_names, dict) and len(category_display_names) == 0
+        )
 
 
 # Singleton instance used across the service layer

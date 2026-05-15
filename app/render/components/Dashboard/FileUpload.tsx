@@ -1,12 +1,13 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { useDispatch } from 'react-redux';
 
-import { uploadFile, createInstance } from '../../utils/file.service';
-import { useInstanceCleanup } from '../../hooks/useInstanceCleanup';
+import { uploadFile, createInstance } from '../../services/file.service';
+import { useInstanceCleanup } from '../../hooks/viewer/useInstanceCleanup';
 import { addWSIInstance, updateInstanceWSIInfo } from '../../store/slices/wsiSlice';
 import { setCurrentPath, setSlideInfo } from '../../store/slices/svsPathSlice';
-import { setImageLoaded } from '../../store/slices/sidebarSlice';
-import { message } from 'antd';
+import { setImageLoaded } from '../../store/slices/layoutSlice';
+import { getErrorMessage } from '../../utils/common/apiResponse';
+import { toast } from 'sonner';
 import { AlertTriangle, RefreshCw, X } from 'lucide-react';
 
 interface FileUploadProps {
@@ -89,7 +90,7 @@ const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect, onUploadComplete,
       setUploadStatus('File uploaded successfully. Creating instance...');
 
       // Create instance for the uploaded file
-      const instanceData = await createInstance(uploadData.filename);
+      const instanceData = await createInstance(uploadData.fileName);
       
       let fileInfo = {
         fileName: selectedFile.name,
@@ -126,7 +127,7 @@ const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect, onUploadComplete,
       }
 
       setUploadStatus('Slide loaded successfully.');
-      message.success('File uploaded and loaded successfully!');
+      toast.success('File uploaded and loaded successfully!');
       
       onUploadComplete(loadData.dimensions);
     } catch (error: any) {
@@ -139,12 +140,12 @@ const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect, onUploadComplete,
       if (error.name === 'AbortError' || error.message?.includes('cancelled')) {
         setUploadInterrupted(true);
         setUploadStatus('Upload was cancelled.');
-        message.warning('Upload was cancelled.');
+        toast.warning('Upload was cancelled.');
       } else {
-        const errorMessage = error.message || 'An unknown error occurred';
+        const errorMessage = getErrorMessage(error, 'Failed to upload file');
         setUploadError(errorMessage);
-        setUploadStatus(`Upload failed: ${errorMessage}`);
-        message.error(`Upload failed: ${errorMessage}`);
+        setUploadStatus(errorMessage);
+        toast.error(errorMessage);
       }
     } finally {
       if (progressInterval) {
@@ -160,7 +161,8 @@ const FileUpload: React.FC<FileUploadProps> = ({ onFileSelect, onUploadComplete,
       abortController.abort();
       setUploadInterrupted(true);
       setUploadStatus('Upload cancelled.');
-      message.info('Upload cancelled.');
+      console.log('handleCancelUpload fired');
+      toast('Upload cancelled.');
     }
   };
 

@@ -5,7 +5,7 @@ import numpy as np
 from skimage.color import rgb2hed
 from skimage.filters import threshold_otsu
 from skimage import morphology, measure
-import h5py
+import zarr
 import os
 
 # this is for debug
@@ -27,7 +27,7 @@ class PostProcess:
         self.load_nuclei_data()
 
     def run(self):
-        # self.draw_nuclei_contours() # Note: we should not use it in Python. Load h5 file and visualize in JS.
+        # self.draw_nuclei_contours() # Note: we should not use it in Python. Load zarr file and visualize in JS.
         # self.object_detector()
         pass
 
@@ -67,8 +67,15 @@ class PostProcess:
     def load_nuclei_data(self):
         if not self.nuclei_data_loaded:
             try:
-                h5_path = os.path.join("/home/zhihuang/Desktop/TissueLab/example_WSI", 'nuclei_data.h5')
-                with h5py.File(h5_path, 'r') as hf:
+                # Resolve via EXAMPLE_WSI_PATH; fall back to the bundled sample
+                # directory so this works without a developer-specific path.
+                example_root = os.environ.get(
+                    "EXAMPLE_WSI_PATH",
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "..", "storage", "example_WSI"),
+                )
+                zarr_path = os.path.join(example_root, 'nuclei_data.zarr')
+                with zarr.open(zarr_path, 'r') as hf:
                     # Safely load datasets
                     centroids_dataset = hf['centroids']
                     contours_dataset = hf['contours']

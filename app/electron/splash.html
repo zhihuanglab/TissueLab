@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TissueLab</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: linear-gradient(135deg, #020617 0%, #0f172a 50%, #1e293b 100%);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            overflow: hidden;
+            position: relative;
+            user-select: none;
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+        }
+        
+        /* Dark glowing background animation */
+        body::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(circle at 20% 80%, rgba(72, 61, 139, 0.15) 0%, transparent 50%),
+                        radial-gradient(circle at 80% 20%, rgba(72, 61, 139, 0.1) 0%, transparent 50%),
+                        radial-gradient(circle at 40% 40%, rgba(99, 82, 162, 0.08) 0%, transparent 50%);
+            animation: backgroundGlow 8s ease-in-out infinite alternate;
+            pointer-events: none;
+        }
+        
+        body::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(circle at 60% 60%, rgba(72, 61, 139, 0.12) 0%, transparent 40%),
+                        radial-gradient(circle at 30% 70%, rgba(99, 82, 162, 0.06) 0%, transparent 60%);
+            animation: backgroundGlow 12s ease-in-out infinite alternate-reverse;
+            pointer-events: none;
+        }
+        
+        @keyframes backgroundGlow {
+            0% { 
+                opacity: 0.3;
+                transform: scale(1);
+            }
+            50% { 
+                opacity: 0.6;
+                transform: scale(1.05);
+            }
+            100% { 
+                opacity: 0.4;
+                transform: scale(0.95);
+            }
+        }
+        
+        .splash-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            color: white;
+            gap: 2rem;
+            min-height: 60vh;
+            padding: 0 2rem;
+        }
+        
+        .left-section {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            flex: 0 0 auto;
+            width: 200px;
+            height: 100%;
+        }
+        
+        .right-section {
+            margin-top: -1.5rem;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            justify-content: center;
+            flex: 0 0 auto;
+            width: 400px;
+            height: 100%;
+        }
+
+        .logo-container {
+            position: relative;
+            margin-bottom: 0rem;
+            pointer-events: none;
+        }
+        
+        .logo-container .logo {
+            pointer-events: auto;
+        }
+
+        .logo {
+            width: 80px;
+            height: 80px;
+            background: transparent;
+            pointer-events: auto;
+        }
+        
+        /* Remove the complex animation and use JavaScript instead */
+
+        .logo-glow {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 140px;
+            height: 140px;
+            background: radial-gradient(circle, rgba(72, 61, 139, 0.4) 0%, transparent 70%);
+            border-radius: 50%;
+            animation: glow 2s ease-in-out infinite alternate;
+        }
+
+        .app-name {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 1rem;
+        }
+        
+        .tissue-text {
+            color: #e6e7e8;
+            font-size: 1.5rem;
+            text-shadow: 0 0 10px rgba(255, 255, 255, 0.3);
+        }
+        
+        .lab-text {
+            color: #6352a2;
+            font-size: 1.5rem;
+            text-shadow: 0 0 10px rgba(72, 61, 139, 0.5);
+        }
+
+        .app-subtitle {
+            font-size: 1.1rem;
+            color: #94a3b8;
+            margin-bottom: 0.5rem;
+            font-weight: 300;
+        }
+
+        .loading-container {
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+            margin-top: 2rem;
+            gap: 1rem;
+        }
+
+        .loading-text {
+            font-size: 1rem;
+            color: #cbd5e1;
+            font-weight: 500;
+        }
+
+        .loading-spinner {
+            width: 20px;
+            height: 20px;
+            border: 2px solid #483D8B;
+            border-top: 2px solid #ffffff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        .huang-lab-logo {
+            width: 120px;
+            height: 60px;
+            margin-top: 0rem;
+            opacity: 0.8;
+        }
+
+        .copyright-section {
+            color: #94a3b8;
+            font-size: 0.9rem;
+            margin-top: 2rem;
+        }
+        
+        .copyright-content {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .copyright-text {
+            font-size: 0.8rem;
+            color: #64748b;
+            margin-top: 0.25rem;
+        }
+
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+
+        /* Responsive design */
+        @media (max-width: 600px) {
+            .app-name { font-size: 2rem; }
+            .logo { width: 100px; height: 100px; }
+            .logo-glow { width: 120px; height: 120px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="splash-container">
+        <div class="left-section">
+            <div class="logo-container">
+                <div class="logo-glow"></div>
+                <svg class="logo" viewBox="0 0 176.68 176.68" xmlns="http://www.w3.org/2000/svg">
+                    <defs>
+                        <style>
+                            .cls-1 { fill: #6352a2; }
+                            .cls-2 { fill: #e6e7e8; }
+                            
+                            /* Auto-trigger animation - rectangles disappear and reappear */
+                            .rect-1 { animation: rebuild 3s ease-in-out infinite; animation-delay: 0.05s; }
+                            .rect-2 { animation: rebuild 3s ease-in-out infinite; animation-delay: 0.09s; }
+                            .rect-3 { animation: rebuild 3s ease-in-out infinite; animation-delay: 0.01s; }
+                            .rect-4 { animation: rebuild 3s ease-in-out infinite; animation-delay: 0.26s; }
+                            .rect-5 { animation: rebuild 3s ease-in-out infinite; animation-delay: 0.19s; }
+                            .rect-6 { animation: rebuild 3s ease-in-out infinite; animation-delay: 0.23s; }
+                            .rect-7 { animation: rebuild 3s ease-in-out infinite; animation-delay: 0.15s; }
+                            .rect-8 { animation: rebuild 3s ease-in-out infinite; animation-delay: 0.11s; }
+                            
+                            @keyframes rebuild {
+                                0% { opacity: 1; }
+                                5% { opacity: 0; }
+                                10% { opacity: 0; }
+                                15% { opacity: 1; }
+                                100% { opacity: 1; }
+                            }
+                        </style>
+                    </defs>
+                    <g>
+                        <rect class="cls-2 rect-1" x="0" width="52.19" height="52.19"/>
+                        <rect class="cls-2 rect-2" x="62.24" width="52.19" height="52.19"/>
+                        <rect class="cls-2 rect-3" x="124.49" width="52.19" height="52.19"/>
+                        <rect class="cls-1 rect-4" x="0" y="62.24" width="52.19" height="52.19"/>
+                        <rect class="cls-2 rect-5" x="62.24" y="62.24" width="52.19" height="52.19"/>
+                        <rect class="cls-1 rect-6" x="0" y="124.49" width="52.19" height="52.19"/>
+                        <rect class="cls-1 rect-7" x="62.24" y="124.49" width="52.19" height="52.19"/>
+                        <rect class="cls-1 rect-8" x="124.49" y="124.49" width="52.19" height="52.19"/>
+                    </g>
+                </svg>
+            </div>
+            
+            <div class="app-name">
+                <span class="tissue-text">Tissue</span><span class="lab-text">Lab</span>
+            </div>
+        </div>
+        
+        <div class="right-section">
+            <p class="app-subtitle">Agentic AI Platform for Medical Image Analysis</p>
+            <p class="app-subtitle">Developed by Zhi Huang Lab</p>
+            <div class="loading-container">
+                <div class="loading-text">Starting application...</div>
+                <div class="loading-spinner"></div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="copyright-section">
+        <div class="copyright-content">
+            <span>Copyright ©</span>
+            <img src="assets/icons/huang_lab.svg" alt="Huang Lab Logo" class="huang-lab-logo">
+            <span> 2025 | All rights reserved.</span>
+        </div>
+    </div>
+    
+
+    <script>
+        // Listen for messages from main process
+        const { ipcRenderer } = require('electron');
+        
+        // Listen for splash ready event
+        ipcRenderer.on('splash-ready', () => {
+            console.log('Splash screen is ready');
+        });
+        
+        // Listen for main window ready event
+        ipcRenderer.on('main-window-ready', () => {
+            // Add fade out effect
+            document.body.style.transition = 'opacity 0.5s ease-out';
+            document.body.style.opacity = '0';
+            
+            setTimeout(() => {
+                // Close splash window
+                window.close();
+            }, 500);
+        });
+        
+        // Handle error events
+        ipcRenderer.on('splash-error', (event, error) => {
+            console.error('Splash screen error:', error);
+            document.querySelector('.loading-text').textContent = 'Encountered an issue, please wait...';
+        });
+        
+        // Auto-trigger SVG animation
+        function triggerLogoAnimation() {
+            const logoObject = document.querySelector('.logo object');
+            if (logoObject) {
+                // Get the SVG document
+                const svgDoc = logoObject.contentDocument;
+                if (svgDoc) {
+                    const svgElement = svgDoc.querySelector('#Layer_2');
+                    if (svgElement) {
+                        // Simulate hover by adding/removing hover class
+                        svgElement.classList.add('hovered');
+                        setTimeout(() => {
+                            svgElement.classList.remove('hovered');
+                        }, 1000);
+                    }
+                }
+            }
+        }
+        
+        // Start animation loop
+        setTimeout(() => {
+            triggerLogoAnimation();
+            setInterval(triggerLogoAnimation, 3000);
+        }, 1000);
+    </script>
+</body>
+</html>

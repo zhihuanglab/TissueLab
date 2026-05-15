@@ -9,8 +9,7 @@
 <div align="center">
 
 [![arXiv](https://img.shields.io/badge/arXiv-2509.20279-b31b1b.svg)](https://arxiv.org/abs/2509.20279)
-[![Platform](https://img.shields.io/badge/Platform-www.tissuelab.org-blue.svg)](https://www.tissuelab.org)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Penn%20Academic-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
 
 </div>
@@ -18,13 +17,10 @@
 <br>
 
 <div align="center">
-  <img src="app/TissueLab_logo.ico" width="150px" />
+  <img src="app/render/public/brand/TissueLab_logo.png" width="150px" />
 </div>
 
 <br>
-
-## 🚀 Platform Access
-**Live Demo**: [www.tissuelab.org](https://www.tissuelab.org)
 
 ## 🖥️ YouTube Demonstration Video
 - [TissueLab Demonstrations](https://www.youtube.com/watch?v=rssWT4Mehqw) - A demonstration video showcasing TissueLab experimental results and visualizations
@@ -33,6 +29,31 @@
 **Paper**: [A co-evolving agentic AI system for medical imaging analysis](https://arxiv.org/abs/2509.20279) (arXiv:2509.20279)
 
 **Experimental Results and Video Illustrations**: https://github.com/zhihuanglab/TissueLab-Experiment  
+
+## 🔬 Reproducing Our Research Findings
+
+Our paper demonstrates TissueLab co-evolving at three complementary levels — tool, strategy, and slide-level workflow. The integration status in this open-source platform is as follows:
+
+### Integrated and usable today
+- **Tool-level co-evolution & the full agent stack** — workflow / entrance / summary agents, customizable tool factories across pathology, radiology, and spatial omics, pixel-level active learning, and one-click model integration are all shipped in the open-source build.
+
+  📹 **Demo video**: [`tutorials/tool_level_coevolving_demo.mp4`](tutorials/tool_level_coevolving_demo.mp4) — how tool-level co-evolution adapts to different disease settings using only the local build (no ecosystem dependencies).
+
+- **Slide-level co-evolution — discovery mode (TL Coscientist)** — the open-ended scientific-discovery agent used in the paper's Alzheimer's disease biomarker experiment on SEA-AD hippocampal slides, where TissueLab autonomously proposed, implemented, and validated interpretable donor-level biomarker panels for continuous memory decline.
+
+  📹 **Demo video**: [`tutorials/tissuelab_research_demo.mp4`](tutorials/tissuelab_research_demo.mp4) — end-to-end walkthrough showing how to drive TL Coscientist in the app.
+
+### Coming soon (integration in progress)
+These features run in our lab today but are not yet exposed as a turnkey experience in the open-source build. We are actively wiring the remaining research code into the platform and hardening it for general use:
+
+- **Strategy-level co-evolution** — the self-corrective skill-distillation regime used in the paper's lymph node metastasis (LNCO2) experiment.
+- **Slide-level co-evolution — decision-support mode** — the criteria-anchored workflow refinement used in the paper's breast-cancer tubule formation grading experiment, surpassing both human-orchestrated workflows and training-based foundation-model baselines.
+- **Per-class patch maps (1-vs-rest patch classification)** — every patch classification experiment in the paper was run in 1-vs-rest mode, training one binary classifier per class so each class has its own dedicated patch map. Integration in progress, coming soon.
+
+### Reproducibility artifacts (scripts + Zenodo data) — coming soon
+For each of the three experiments above (AD biomarker discovery, strategy co-evolution, tubule formation), we will publish standalone scripts and the accompanying datasets on **Zenodo** so that the results can be reproduced without waiting for the full in-app integration to land. Direct links will be added here as each release goes live.
+
+If you need early access for review or collaboration in the meantime, please open an issue or reach out via the contact channels at the bottom.
 
 ## 🌟 Abstract
 
@@ -104,64 +125,69 @@ git lfs pull
 ```bash
 # Install Electron dependencies
 cd app
-    npm install
+npm install
 
 # Install Frontend dependencies
 cd render
-    npm install
-    npm run build
-    cd ..
+npm install
+cd ..
+
+# Build the frontend (driven from app/, runs next build + bundles standalone output)
+npm run build
 
 # Install Backend dependencies
 cd service
 conda create -n tissuelab-ai python=3.11
 conda activate tissuelab-ai
-pip install -r requirements-windows.txt  # Choose your platform
-cd ..
+pip install -r requirements-windows.txt  # Choose your platform: -windows / -macos / -linux
+cd ../..
 ```
 
 ### 3. Configure Environment (Optional)
 
-**By default**, TissueLab connects to our ecosystem services. No additional configuration needed.
+**By default**, TissueLab ships with working configuration that points at our hosted ecosystem services (`ctrl.vlm.ai`). No additional setup needed to run.
 
-**To build your own agent**, configure the frontend:
+Both frontend and backend read a single `.env` file each:
 
+- **Frontend**: `app/render/.env` — endpoints, Firebase Web config, Google OAuth client.
+- **Backend**: `app/service/.env` — Firebase project ID, ctrl service endpoint, OpenAI key.
+
+**To point at your own agent / ctrl service**, edit `app/render/.env`:
 ```bash
-# Navigate to frontend directory
-cd app/render
-
-# Create environment file
-touch .env.local
-
-# Edit configuration for your own agent:
 PUBLIC_CTRL_SERVICE_HOST=your-agent-host
 PUBLIC_CTRL_SERVICE_API_ENDPOINT=https://your-agent-endpoint.com
 ```
 
-**To use your own OpenAI key**, configure the backend:
-
+**To use your own OpenAI key**, edit `app/service/.env`:
 ```bash
-# Navigate to backend directory
-cd app/service
-
-# Create environment file
-touch .env
-
-# Add your OpenAI key:
 OPENAI_API_KEY=your-open-ai-key
 ```
 
 ### 4. Launch TissueLab
 
+Frontend and backend run as separate processes; start each in its own terminal.
+
 ```bash
-# Start the complete application
-npm start
+# Terminal 1 — Python backend (port 5001)
+cd app
+npm run start-backend
+# equivalent: cd app/service && conda activate tissuelab-ai && python main.py
 ```
 
-The application will automatically:
-- Start the Electron desktop window
-- Launch the Python backend service (port 5001)
-- Serve the frontend interface (port 3000)
+```bash
+# Terminal 2 — Electron + Next.js dev server (frontend on port 3000)
+cd app
+npm run dev
+```
+
+For a production-style launch off the built standalone output (after `npm run build`):
+```bash
+# Terminal 1 — backend
+cd app && npm run start-backend
+
+# Terminal 2 — Electron loading the prebuilt bundle
+cd app && npm start
+```
 
 ## 🏗️ Architecture Overview
 
@@ -229,43 +255,21 @@ TissueLab/
 - **Zustand** - State management
 - **React Query** - Data fetching and caching
 
-### Development Workflow
-```bash
-# Development mode with hot reload
-cd app/render
-npm run dev
-
-# Production build
-    npm run build
-
-# Type checking
-npm run type-check
-
-# Linting
-npm run lint
-```
 
 ### Environment Configuration
 
-TissueLab supports flexible configuration for different deployment scenarios:
+TissueLab uses one `.env` file per side; both ship with sane defaults pointing at our hosted ecosystem.
 
-#### Default Configuration
-**By default**, TissueLab connects to our ecosystem services. No additional configuration needed.
-
-#### Build Your Own Agent (Frontend Configuration)
-To use your own agent system, configure the frontend:
-
+#### Build Your Own Agent (Frontend)
+Edit `app/render/.env`:
 ```bash
-# Create app/render/.env.local with:
 PUBLIC_CTRL_SERVICE_HOST=localhost
 PUBLIC_CTRL_SERVICE_API_ENDPOINT=http://localhost:5001
 ```
 
-#### Custom OpenAI Integration
-To use your own OpenAI API key:
-
+#### Custom OpenAI Integration (Backend)
+Edit `app/service/.env`:
 ```bash
-# Create app/render/.env.local with:
 OPENAI_API_KEY=your-open-ai-key
 ```
 
@@ -280,7 +284,9 @@ app/render/
 ├── pages/               # Next.js pages (routes)
 │   ├── dashboard.tsx    # Main dashboard
 │   ├── imageViewer.tsx  # Image analysis interface
-│   └── AIModelZoo.tsx   # AI model marketplace
+│   ├── community/       # Community workflow gallery
+│   ├── study.tsx        # Study browser
+│   └── datasets.tsx     # Dataset management
 ├── hooks/               # Custom React hooks
 ├── services/            # API service layer
 ├── store/               # State management
@@ -310,11 +316,16 @@ app/render/
 app/service/
 ├── app/                           # Main FastAPI application
 │   ├── api/                       # API endpoints
+│   │   ├── tasks.py              # Workflow / task orchestration
 │   │   ├── seg.py                # Segmentation endpoints
 │   │   ├── load.py               # Data loading endpoints
-│   │   ├── h5.py                 # H5 file management
-│   │   ├── feedback.py           # User feedback endpoints
-│   │   └── active_learning.py   # Active learning endpoints
+│   │   ├── data.py               # Dataset & file management
+│   │   ├── radiology.py          # Radiology (Niivue) endpoints
+│   │   ├── review.py             # Review workflow endpoints
+│   │   ├── agent.py              # Local LLM / discovery agent
+│   │   ├── thumbnail.py          # Thumbnail generation
+│   │   ├── activation.py         # TaskNode activation lifecycle
+│   │   └── feedback.py           # User feedback endpoints
 │   ├── services/                 # Business logic services
 │   │   ├── factory/              # AI model factories
 │   │   │   ├── nuclei_segmentation.py
@@ -351,9 +362,17 @@ python main.py --port 5001
 ```
 
 ### API Endpoints
-- `/api/load` - Data loading and processing
-- `/api/feedback` - User feedback collection
-- `/ws` - WebSocket connections for real-time updates
+- `/api/tasks` — Workflow orchestration, node registration, classifier I/O
+- `/api/seg` — Segmentation requests and result retrieval
+- `/api/load` — Image / tile loading
+- `/api/data` — Dataset & file metadata
+- `/api/radiology` — Volumetric (Niivue) workflows
+- `/api/review` — Review / annotation workflow
+- `/api/agent` — Local LLM and discovery sessions
+- `/api/thumbnail` — Thumbnail generation
+- `/api/activation` — TaskNode activation status (SSE)
+- `/api/feedback` — User feedback collection
+- `/ws` — WebSocket connections (segmentation, thumbnail, presence, atlas, keywords)
 
 ## 🔧 Integrate Your Own Model
 
@@ -421,11 +440,7 @@ Reference implementation and examples:
 - **Purpose**: See how other models are integrated
 - **Examples**: Complete model integration examples
 
-⚠️ **Important**: Due to recent changes in local memory container storage format from **H5** to **Zarr**:
-- If running from **this source code**, please use the historical commit [https://github.com/zhihuanglab/Tissuelab-Model-Zoo/tree/754d9ff44c183428b8d0835f6d90ec2b832876c9](https://github.com/zhihuanglab/Tissuelab-Model-Zoo/tree/754d9ff44c183428b8d0835f6d90ec2b832876c9) as compatible source code.
-- If using our **latest software (Zarr version)**, you can use the latest Model Zoo.
-
-Note: The code logic remains consistent; only the storage format has been updated from H5 to Zarr.
+TissueLab uses Zarr as its on-disk container format. The latest Model Zoo is compatible out of the box.
 
 #### 2. **TissueLab SDK**
 Pre-built image processing utilities:
@@ -462,7 +477,6 @@ pip install fastapi uvicorn tissuelab-sdk
 ## 📢 News
 
 - **Sep 24, 2025**. Our paper *"A co-evolving agentic AI system for medical imaging analysis"* has been published on [arXiv:2509.20279](https://arxiv.org/abs/2509.20279).
-- **Sep 29, 2025**. TissueLab platform is now live at [www.tissuelab.org](https://www.tissuelab.org).
 - **Sep 29, 2025**. Initial release of the **TissueLab** open-source ecosystem.
 
 ## 🤝 Contributing
@@ -471,11 +485,10 @@ We welcome contributions from the community! Please see our tutorial for details
 
 ## 📜 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the Penn Academic Software License — see the [LICENSE](LICENSE) file for terms. Commercial use requires a separate license from the University of Pennsylvania.
 
 ## 📞 Contact & Support
 
-- **Platform**: [www.tissuelab.org](https://www.tissuelab.org)
 - **Paper**: [arXiv:2509.20279](https://arxiv.org/abs/2509.20279)
 - **Issues**: [GitHub Issues](https://github.com/zhihuanglab/TissueLab/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/zhihuanglab/TissueLab/discussions)

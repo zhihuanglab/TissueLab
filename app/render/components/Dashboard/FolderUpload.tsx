@@ -1,12 +1,13 @@
 import React, { useState } from 'react';
-import { CButton, CSpinner, CListGroupItem } from '@coreui/react';
-import { uploadFolderPath, uploadFilePath, loadFileData, createInstance } from '@/utils/file.service';
+import { Button } from '@/components/ui/button';
+import { Loader2 } from 'lucide-react';
+import { uploadFolderPath, uploadFilePath, loadFileData, createInstance } from '@/services/file.service';
 import { useDispatch, useSelector } from "react-redux";
 import { RootState } from "@/store";
 import path from 'path';
-// import {updateFiles, updateProject} from "@/store/slices/uploadedFilesSlice";
-import { setFileTree, updateFiles, setFolderName } from '@/store/slices/uploadedFilesSlice';
-import { setImageLoaded } from '@/store/slices/sidebarSlice';
+import { getErrorMessage } from '@/utils/common/apiResponse';
+import { setFolderFileTree, updateFolderFiles, setFolderName, setCurrentFolder } from '@/store/slices/fileManagerSlice';
+import { setImageLoaded } from '@/store/slices/layoutSlice';
 import { addWSIInstance, updateInstanceWSIInfo, replaceCurrentInstance } from '@/store/slices/wsiSlice';
 import { setCurrentPath, setSlideInfo } from '@/store/slices/svsPathSlice';
 
@@ -17,9 +18,9 @@ interface FolderUploadProps {
 
 const FolderUpload: React.FC<FolderUploadProps> = ({ onFolderSelect, onWsiUploadComplete }) => {
   const dispatch = useDispatch();
-  const folderName = useSelector((state: RootState) => state.uploadedFiles.currentFolder?.folderName);
-  const fileTree = useSelector((state: RootState) => state.uploadedFiles.currentFolder?.fileTree);
-  const wsiFiles = useSelector((state: RootState) => state.uploadedFiles.currentFolder?.wsiFiles);
+  const folderName = useSelector((state: RootState) => state.fileManager.currentFolder?.folderName);
+  const fileTree = useSelector((state: RootState) => state.fileManager.currentFolder?.fileTree);
+  const wsiFiles = useSelector((state: RootState) => state.fileManager.currentFolder?.wsiFiles);
 
 
   const [isUploading, setIsUploading] = useState(false);
@@ -43,13 +44,17 @@ const FolderUpload: React.FC<FolderUploadProps> = ({ onFolderSelect, onWsiUpload
           return;
         }
 
-        dispatch(setFolderName(selected_path))
-        dispatch(setFileTree(response.file_tree_dict))
-        dispatch(updateFiles(response.wsi_files || []));
+        dispatch(setCurrentFolder({
+          folderName: selected_path,
+          wsiFiles: response.wsi_files || [],
+          createdAt: new Date().toISOString(),
+          lastModified: new Date().toISOString(),
+          fileTree: response.file_tree_dict
+        }));
       }
     } catch (error: any) {
       console.error('Error selecting folder:', error);
-      setUploadStatus(`Error: ${error.message || 'Failed to upload folder'}`);
+      setUploadStatus(getErrorMessage(error, 'Failed to upload folder'));
     }
   };
 
@@ -99,10 +104,10 @@ const FolderUpload: React.FC<FolderUploadProps> = ({ onFolderSelect, onWsiUpload
       const uploadData = await uploadFilePath(relativePath);
       setUploadStatus('WSI file uploaded successfully. Loading slide...');
 
-      const loadData = await loadFileData(uploadData.filename);
+      const loadData = await loadFileData(uploadData.fileName);
       
       // Create instance for the WSI
-      const instanceData = await createInstance(uploadData.filename);
+      const instanceData = await createInstance(uploadData.fileName);
       
       let fileInfo = {
         fileName: path.basename(relativePath.replace(/\\/g, '/')), // Normalize path separators
@@ -134,13 +139,24 @@ const FolderUpload: React.FC<FolderUploadProps> = ({ onFolderSelect, onWsiUpload
 
   return (
     <div>
-      {/*@ts-ignore*/}
-      <CButton onClick={handleFolderSelect} disabled={isUploading}>
-        {/*@ts-ignore*/}
-        {isUploading ? <CSpinner size="sm" /> : 'Select Folder'}
-      </CButton>
-      {folderName && <p>Selected folder: {folderName}</p>}
-      {uploadStatus && <p>{uploadStatus}</p>}
+      <Button
+        type="button"
+        variant="default"
+        onClick={handleFolderSelect}
+        disabled={isUploading}
+      >
+        {isUploading ? (
+          <span className="flex items-center gap-2 text-sm">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Loading...
+          </span>
+        ) : (
+          'Select Folder'
+        )}
+      </Button>
+
+      {folderName && <p className="mt-2 text-sm text-muted-foreground">Selected folder: {folderName}</p>}
+      {uploadStatus && <p className="mt-1 text-sm text-muted-foreground">{uploadStatus}</p>}
       <div style={{ display: 'flex', marginTop: '20px' }}>
         <div style={{ flex: 1, marginRight: '10px' }}>
           <h4>Folder Structure:</h4>
@@ -166,14 +182,14 @@ const FolderUpload: React.FC<FolderUploadProps> = ({ onFolderSelect, onWsiUpload
             padding: '10px'
           }}>
             {wsiFiles?.map((relativePath, index) => (
-              // @ts-ignore
-              <CListGroupItem
+              <button
                 key={index}
+                type="button"
                 onClick={() => handleWsiUpload(relativePath)}
-                style={{ cursor: 'pointer', marginBottom: '5px', whiteSpace: 'nowrap' }}
+                className="w-full text-left text-sm px-3 py-2 mb-2 rounded-md border border-border/60 hover:bg-status-uploading/10 transition"
               >
                 {relativePath.split('/').pop()}
-              </CListGroupItem>
+              </button>
             ))}
           </div>
         </div>

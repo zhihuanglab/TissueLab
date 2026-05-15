@@ -16,6 +16,12 @@ dist
 #package-lock.json
 libopenjpeg*
 
+# Firebase admin SDK service account keys (never commit)
+app/service/credentials/
+
+# Runtime agent state (discovery sessions, etc.) — created by users at runtime
+app/service/app/services/storage/discovery_sessions/
+
 # Distribution / packaging
 .Python
 build/
