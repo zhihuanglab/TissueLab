@@ -1001,7 +1001,11 @@ export const WorkflowGraph: React.FC = () => {
             })
           )
 
-          await startWorkflowAllowingForceOverride(payload)
+          // Batch files run strictly one after another, so taking over any
+          // workflow the backend still considers active is the intended behavior
+          // (e.g. a previous file whose task node crashed and left it stuck).
+          // Force-override silently instead of popping the confirm modal mid-batch.
+          await startWorkflow({ ...payload, force_override: true })
           const result = await waitForWorkflowCompleteSignal()
           if (result.finalStatus === "stopped") {
             batchAbortRef.current = true
@@ -1015,16 +1019,9 @@ export const WorkflowGraph: React.FC = () => {
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : "Workflow failed while processing this file."
-          if (message === FORCE_OVERRIDE_CANCELLED) {
-            batchAbortRef.current = true
-            status = "skipped"
-            errorPhase = "skipped"
-            errorMessage = "Force override cancelled."
-          } else {
-            status = "error"
-            errorMessage = message
-            errorPhase = message.toLowerCase().includes("timed out") ? "timeout" : "start"
-          }
+          status = "error"
+          errorMessage = message
+          errorPhase = message.toLowerCase().includes("timed out") ? "timeout" : "start"
         }
 
         const finishedAt = Date.now()
@@ -1087,7 +1084,7 @@ export const WorkflowGraph: React.FC = () => {
       assertBatchTaskNodesRunning,
       resetAllGraphProgress,
       shapeData,
-      startWorkflowAllowingForceOverride,
+      startWorkflow,
       updateBatchItem,
       waitForWorkflowCompleteSignal,
     ]

@@ -42,11 +42,11 @@ export const buildGeneratedPanel = (
   const joinedValue = Array.isArray(step.input) ? step.input.join(", ") : step.input ?? step.prompt ?? ""
   const isCodingAgent = modelId === panelMap.CodingAgent.defaultType
 
-  // Parse `key=value` items from step.input so each panel field gets its own value
-  // (e.g. patch_size=224 / level=0 / tissue_threshold=0.1). Without this we used to
-  // stuff `joinedValue` into every field, which is right for single-`prompt` panels
-  // (CodingAgent, TissueClassify, etc.) but wrong for panels with multiple typed
-  // fields like TissueSeg/MuskEmbedding — every field would render the same blob.
+  // Parse `key=value` items from step.input so each typed panel field gets its own value
+  // (e.g. patch_size=224 / level=0 / tissue_threshold=0.1 / target_mpp=0.25). Without this
+  // we used to stuff `joinedValue` into every field, so multi-field panels like
+  // TissueSeg/MuskEmbedding and NucleiSeg rendered the same blob (often the WSI path) in
+  // every input.
   const inputItems: string[] = Array.isArray(step.input)
     ? step.input.filter((v): v is string => typeof v === "string")
     : []
@@ -58,14 +58,14 @@ export const buildGeneratedPanel = (
     const value = raw.slice(eq + 1).trim()
     if (key) parsedInput[key] = value
   }
-  const isSinglePromptPanel =
-    cfg.defaultContent.length === 1 && cfg.defaultContent[0]?.key === "prompt"
 
-  // Coding Agent: only the prompt should get the chat step text — do not overwrite script_run_policy /
-  // digest fields with the same string (that broke policy detection and triggered spurious auto-runs).
   const content = cfg.defaultContent.map((contentItem: any) => {
+    // Coding Agent: only `prompt` gets the chat step text — never overwrite script_run_policy /
+    // digest fields (that broke policy detection and triggered spurious auto-runs).
     if (isCodingAgent && contentItem.key !== "prompt") return { ...contentItem }
-    if (isSinglePromptPanel) return { ...contentItem, value: joinedValue }
+    // `prompt` always carries the joined chat step text (calculation text / classes / etc.).
+    if (contentItem.key === "prompt") return { ...contentItem, value: joinedValue }
+    // Typed fields take their own `key=value` from step.input; leave default when absent.
     if (Object.prototype.hasOwnProperty.call(parsedInput, contentItem.key)) {
       return { ...contentItem, value: parsedInput[contentItem.key] }
     }
