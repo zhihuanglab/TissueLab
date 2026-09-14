@@ -43,7 +43,7 @@ fastslide==0.8.0
 # (no OpenSlide / JPEG-2000 / HEIF / JXL loaders); on Windows use the full
 # "vips-dev-w64-all" build, unpacked at C:\vips (or TL_VIPS_DIR) with its bin
 # folder on PATH. main.py adds it at startup and main_windows.spec bundles it.
-pyvips==3.1.1
+pyvips==3.2.0
 
 # Radiology / extra slide formats — imported by tissuelab_sdk.wrapper
 nibabel==5.4.2
