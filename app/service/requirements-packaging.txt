@@ -1,41 +1,74 @@
-# Packaging requirements - minimal runtime dependencies
+# Packaging requirements — runtime dependencies for the frozen AI Service.
+#
+# This is the install set for the PyInstaller build (main_macos.spec /
+# main_windows.spec). It must cover every module those specs collect; anything
+# missing here silently drops out of the bundle and fails at runtime.
+#
+# Versions resolved 2026-08-28 against Python 3.11 as the latest mutually
+# compatible set; the full app import graph was verified against them.
+
 # Core frameworks
-fastapi==0.115.4
-uvicorn==0.32.0
-pydantic==2.9.2
-pydantic-settings==2.0.3
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pydantic==2.13.5
+pydantic-settings==2.15.0
+python-multipart==0.0.32
+python-dotenv==1.2.3
 
-# Image processing core
-Pillow>=8.3.2
-numpy==1.26.4
-opencv-python
-scipy==1.13.1
-scikit-image==0.22.0
+# Arrays and image processing core
+numpy==2.4.6
+opencv-python-headless==5.0.0.93
+Pillow==12.3.0
+scipy==1.17.1
+h5py==3.16.0
+matplotlib==3.11.1
 
-# Medical image format support
-h5py==3.12.1
-pyisyntax
-pyvips[binary]
+# Zarr storage stack (app/utils/zarr_store.py, app/config/zarr_config.py)
+zarr==3.1.6
+filelock==3.32.4
+zstandard==0.25.0
+
+# Whole-slide image readers
+tifffile==2026.3.3
+tiffslide==3.0.1
+imagecodecs==2026.3.6
+fastslide==0.8.0
+# pyvips wrapper only. The pyvips[binary] wheel ships a cut-down libvips
+# (no OpenSlide / JPEG-2000 / HEIF / JXL loaders); on Windows use the full
+# "vips-dev-w64-all" build, unpacked at C:\vips (or TL_VIPS_DIR) with its bin
+# folder on PATH. main.py adds it at startup and main_windows.spec bundles it.
+pyvips==3.1.1
+
+# Radiology / extra slide formats — imported by tissuelab_sdk.wrapper
+nibabel==5.4.2
+pydicom==3.0.2
+# CZI: only tissuelab_sdk/wrapper/windows.py imports czifile, and czifile
+# 2019.7.2.1 needs tifffile.stripnull, which modern tifffile removed. Windows
+# reads CZI through pylibCZIrw instead, so czifile is deliberately not shipped.
+pylibCZIrw; sys_platform == 'win32'
+pywin32; sys_platform == 'win32'
 
 # Network and API
-requests==2.32.3
-aiohttp==3.10.10
-websockets>=11.0.3
-
-# Authentication and security
-PyJWT>=2.8.0
-
-# Task queue
-celery
-pyzmq
+requests==2.34.2
+aiohttp==3.14.3
+websockets==17.1
 
 # AI/ML core
-tissuelab_sdk==0.1.12
-openai
+# 0.1.14 is the first release that allows numpy>=2; 0.1.12 hard-pinned
+# numpy==1.26.4 and blocked the whole upgrade.
+tissuelab_sdk==0.1.14
+openai==3.5.0
+# Loads .tlcls classifiers via XGBClassifier.load_model (app/api/seg.py). Must
+# stay <= 3.0 to read the legacy `binf` models the tasknodes produce; 3.1+
+# removed binf loading. Same pin the hosted control plane used.
+xgboost==3.0.5
+
+# File manager background sweeps (expired download links, stale upload sessions)
+schedule==1.2.2
 
 # Data processing
-tqdm==4.67.0
-orjson
+orjson==3.12.0
+PyYAML==6.0.3
 
 # System tools
-psutil==6.1.0
+psutil==7.2.2

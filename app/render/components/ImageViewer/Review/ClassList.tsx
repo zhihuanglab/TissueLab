@@ -16,16 +16,10 @@ const ClassList: React.FC<ClassListProps> = ({
 }) => {
   // Add safety checks
   const safeNucleiClasses = nucleiClasses || [];
-  
-  // Add special Active Learning classes
-  const specialClasses = [
-    { name: "Other", color: "#F3F4F6" },
-    { name: "Not Sure", color: "#FED7AA" },
-    { name: "Incorrect Segmentation", color: "#FECACA" }
-  ];
-  
-  // Combine all classes
-  const allClasses = [...safeNucleiClasses, ...specialClasses];
+
+  // Only the project's own nuclei classes are offered. "Other" / "Not Sure" /
+  // "Incorrect Segmentation" were removed — they all fold into Negative control.
+  const allClasses = safeNucleiClasses;
 
   return (
     <div>
@@ -49,7 +43,7 @@ const ClassList: React.FC<ClassListProps> = ({
               onClick={() => onSelectClass(cls.name)}
             >
               {/* Radio button */}
-              <div className="w-3 h-3 sm:w-4 sm:h-4 rounded-full border-2 border-border flex items-center justify-center flex-shrink-0">
+              <div className="w-3 h-3 sm:w-4 sm:h-4 rounded-full border-2 border-border flex items-center justify-center shrink-0">
                 {isSelected && (
                   <div className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-blue-500" />
                 )}
@@ -57,7 +51,7 @@ const ClassList: React.FC<ClassListProps> = ({
               
               {/* Color square */}
               <div 
-                className="w-3 h-3 sm:w-4 sm:h-4 rounded border border-border flex-shrink-0"
+                className="w-3 h-3 sm:w-4 sm:h-4 rounded border border-border shrink-0"
                 style={{ backgroundColor: cls.color }}
               />
               

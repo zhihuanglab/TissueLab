@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { webglContextManager } from '@/utils/webglContextManager';
+import { webglContextManager } from '@/utils/viewer/webglContextManager';
 
 /**
  * WebGL cleanup hook

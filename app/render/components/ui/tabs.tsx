@@ -1,7 +1,7 @@
 import * as React from "react"
 import * as TabsPrimitive from "@radix-ui/react-tabs"
 
-import { cn } from "@/utils/twMerge"
+import { cn } from "@/utils/common/twMerge"
 
 const Tabs = TabsPrimitive.Root
 

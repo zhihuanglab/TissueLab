@@ -1,6 +1,6 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
 
-export type DrawingTool = 'rectangle' | 'polygon' | 'move' | 'line' | 'filter';
+export type DrawingTool = 'rectangle' | 'polygon' | 'lasso' | 'move' | 'line' | 'filter';
 
 interface ToolState {
   currentTool: DrawingTool;

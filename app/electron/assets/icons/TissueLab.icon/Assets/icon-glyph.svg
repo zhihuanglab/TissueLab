@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Foreground layer of the macOS 26 app icon. Icon Composer edits this in place;
+  actool compiles the enclosing .icon into the Assets.car the system composes
+  the Liquid Glass icon from.
+
+  Two numbers here were measured, not guessed (see the commit that added this):
+  - the grid is 684 of 1024 so that it lands at 68% of the rendered plate, the
+    same proportion the old flat icon had. At the legacy 556 it renders at 55%
+    and floats in the middle of an empty plate.
+  - the light squares are #b9bbc0, not the brand's #e6e7e8. On the old flat
+    white plate #e6e7e8 gave 37 points of contrast; on the glass it gives 21
+    and the squares wash out. #b9bbc0 puts it back at 37.
+
+  No plate, no rounded corners, no shadow: the system draws all three.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <g transform="translate(170.0, 170.0) scale(3.871406)">
+    <rect fill="#b9bbc0" x="0" y="0" width="52.19" height="52.19"/>
+    <rect fill="#b9bbc0" x="62.24" y="0" width="52.19" height="52.19"/>
+    <rect fill="#b9bbc0" x="124.49" y="0" width="52.19" height="52.19"/>
+    <rect fill="#6352a2" x="0" y="62.24" width="52.19" height="52.19"/>
+    <rect fill="#b9bbc0" x="62.24" y="62.24" width="52.19" height="52.19"/>
+    <rect fill="#6352a2" x="0" y="124.49" width="52.19" height="52.19"/>
+    <rect fill="#6352a2" x="62.24" y="124.49" width="52.19" height="52.19"/>
+    <rect fill="#6352a2" x="124.49" y="124.49" width="52.19" height="52.19"/>
+  </g>
+</svg>

@@ -1,6 +1,6 @@
 'use client';
 
-import { app } from './firebaseConfig';
+import { app } from './firebase.config';
 import {
   Firestore,
   getFirestore,
@@ -29,6 +29,14 @@ export function getFirestoreDb(): Firestore {
           : persistentLocalCache({
               tabManager: persistentSingleTabManager({}),
             }),
+        // Default Firestore behavior is to throw on any `undefined` value
+        // anywhere in the payload — including deeply nested optional fields
+        // in objects we hand off (e.g. cohort.criteria, cohort.schema.*).
+        // That made cohort cards vanish across refreshes: the in-memory
+        // state still rendered them but `setDoc` rejected the whole write
+        // and the caller only logged to console. Treat undefined as "skip
+        // this field" so partially-populated docs land cleanly.
+        ignoreUndefinedProperties: true,
       });
       return db;
     } catch {

@@ -10,7 +10,7 @@ import {
 } from "@/store/slices/layoutSlice";
 import { AnnouncementDialog } from "./AnnouncementDialog";
 
-import { cn } from "@/utils/twMerge";
+import { cn } from "@/utils/common/twMerge";
 import {
   Megaphone,
   MoreHorizontal,
@@ -111,7 +111,7 @@ const AppHeader: React.FC = () => {
 
   return (
     <header
-      className="electron-drag relative flex flex-shrink-0 items-center bg-background pl-2.5 px-6 transition-colors duration-300"
+      className="electron-drag relative flex shrink-0 items-center bg-background pl-2.5 px-6 transition-colors duration-300"
       style={{ height: titlebarHeight }}>
       <div className="electron-no-drag flex items-center space-x-2">
         {!sidebarShow ? (

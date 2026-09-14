@@ -1,6 +1,9 @@
 from fastapi import APIRouter
 from app.core.response import success_response, error_response
-import asyncio
+from app.services.activation import (
+    start_auto_activation_background,
+    get_auto_activation_status,
+)
 
 
 activation_router = APIRouter()
@@ -14,15 +17,11 @@ async def trigger_auto_activation():
     Returns immediately with a status payload. Use existing endpoints to observe progress
     (e.g., logs via /api/tasks/v1/logs/tail or custom SSE events if available).
     """
+    # Coroutine on purpose, though it never awaits: start_auto_activation_background
+    # calls asyncio.get_running_loop(), and a plain `def` route runs in a worker
+    # thread where there is no running loop.
     try:
-        from app.services.auto_activation_service import auto_activate_all_tasknodes
-
-        loop = asyncio.get_running_loop()
-
-        # Run the async auto-activation in a separate thread to avoid blocking the event loop
-        # because the underlying implementation performs blocking subprocess operations.
-        loop.run_in_executor(None, lambda: asyncio.run(auto_activate_all_tasknodes()))
-
+        start_auto_activation_background()
         return success_response({
             "status": "starting",
             "message": "Auto-activation started in background"
@@ -32,14 +31,8 @@ async def trigger_auto_activation():
 
 
 @activation_router.get("/v1/status", summary="Get auto-activation configuration status")
-def get_auto_activation_status():
+def auto_activation_status():
     try:
-        from app.services.auto_activation_service import get_activation_status_message, is_auto_activation_enabled
-        return success_response({
-            "enabled": bool(is_auto_activation_enabled()),
-            "message": get_activation_status_message(),
-        })
+        return success_response(get_auto_activation_status())
     except Exception as e:
         return error_response(f"Failed to get auto-activation status: {e}")
-
-

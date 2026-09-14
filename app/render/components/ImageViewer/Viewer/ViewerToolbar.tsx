@@ -1,13 +1,6 @@
 "use client";
 
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
@@ -19,18 +12,24 @@ import { useViewerSettings } from '@/hooks/viewer/useViewerSettings';
 import { RootState } from '@/store';
 import { setIsMinimized } from '@/store/slices/fileManagerSlice';
 import { setRoiRecommendType } from '@/store/slices/viewer/viewerSettingsSlice';
-import { ChevronDown, ChevronUp, Compass, Filter, Folder, FolderOpen, PictureInPicture2 } from "lucide-react";
-import React, { useMemo, useState } from "react";
-import { FiMove } from "react-icons/fi";
-import { LiaDrawPolygonSolid } from "react-icons/lia";
-import { LuRuler } from "react-icons/lu";
-import { PiRectangle } from "react-icons/pi";
+import { ChevronDown, ChevronUp, Folder, FolderOpen, PictureInPicture2 } from "lucide-react";
+import React, { useCallback, useMemo } from "react";
 import { useDispatch, useSelector } from "react-redux";
-import { toast } from "sonner";
 import { PresenceAvatars } from "./PresenceAvatar";
 import { OverflowItemDef, OverflowToolbarSection } from "./ToolbarOverflowPanel";
+import {
+  CompassRecommendItem,
+  MaskSelectItem,
+  OverlayModeItem,
+  ToolbarDividerItem,
+  ToolbarIconButtonItem,
+  overlayUnavailableToast,
+} from "./viewerToolbarOverflowItems";
 
-/** Vertical rule between toolbar groups — wider stroke, higher contrast. */
+import { toast } from "sonner";
+import type { OverlayPendingRequest } from "@/utils/viewer/overlayRequestNotify";
+import { getRestrictedAccessMode } from "@/utils/common/pathAccess.utils";
+import { useActiveSlidePath } from "@/utils/viewer/slidePath";
 function ToolbarDivider() {
   return (
     <div
@@ -47,10 +46,16 @@ interface ViewerToolbarProps {
   showBackendAnnotations: boolean;
   setShowBackendAnnotations: React.Dispatch<React.SetStateAction<boolean>>;
   keydownUpdate: (prev: boolean, newVal: boolean) => void;
+  showBackendAnnotationsRef: React.MutableRefObject<boolean>;
 
   showPatches: boolean;
   setShowPatches: React.Dispatch<React.SetStateAction<boolean>>;
   keydownUpdatePatches: (prev: boolean, newVal: boolean) => void;
+  showPatchesRef: React.MutableRefObject<boolean>;
+
+  pendingRequest: OverlayPendingRequest;
+  setPendingRequest: React.Dispatch<React.SetStateAction<OverlayPendingRequest>>;
+  socket: WebSocket | null;
 
   showMask: boolean;
   setShowMask: React.Dispatch<React.SetStateAction<boolean>>;
@@ -67,62 +72,20 @@ interface ViewerToolbarProps {
   onlineUsers?: PresenceUser[];
 }
 
-interface ModeButtonProps {
-  label: string;
-  isActive: boolean;
-  onClick: () => void;
-  disabled?: boolean;
-  tooltip: string;
-  shortcut?: string;
-}
-
-function ModeButton({
-  label,
-  isActive,
-  onClick,
-  disabled = false,
-  tooltip,
-  shortcut,
-}: ModeButtonProps) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          onClick={onClick}
-          disabled={disabled}
-          className={`flex items-center justify-center px-2 py-1 rounded-[4px] transition-colors relative z-0 border-none outline-none w-[86px] ${
-            isActive
-              ? "bg-foreground/10 text-foreground"
-              : "text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
-          } ${disabled ? "opacity-30 cursor-not-allowed" : ""}`}
-        >
-          <span
-            className={`text-xs font-sm whitespace-nowrap ${isActive ? "font-medium" : ""}`}
-          >
-            {label}
-          </span>
-          {shortcut && (
-            <span className="absolute -top-1.5 -right-1 z-[100] rounded min-w-[16px] h-[12px] px-1 flex items-center justify-center font-semibold text-[10px] pointer-events-none shadow-sm leading-tight border-none bg-muted-foreground/20 text-muted-foreground">
-              {shortcut}
-            </span>
-          )}
-        </button>
-      </TooltipTrigger>
-      <TooltipContent side="bottom">{tooltip}</TooltipContent>
-    </Tooltip>
-  );
-}
-
 export default function ViewerToolbar({
   currentTool,
   onToolClick,
   showBackendAnnotations,
   setShowBackendAnnotations,
   keydownUpdate,
+  showBackendAnnotationsRef,
   showPatches,
   setShowPatches,
   keydownUpdatePatches,
+  showPatchesRef,
+  pendingRequest,
+  setPendingRequest,
+  socket,
   showMask,
   setShowMask,
   maskOptions = [],
@@ -143,334 +106,358 @@ export default function ViewerToolbar({
   const nucleiClasses = useSelector((state: RootState) => state.annotations.nucleiClasses);
   const patchClassificationData = useSelector((state: RootState) => state.annotations.patchClassificationData);
   const roiRecommendType = useSelector((state: RootState) => state.viewerSettings.roiRecommendType);
-
-  const [toolbarHasOverflow, setToolbarHasOverflow] = useState(false);
+  const slidePath = useActiveSlidePath();
+  const accessMode = getRestrictedAccessMode(slidePath);
+  const isViewerShare = accessMode === "viewer";
+  const isSamplesReadOnly = accessMode === "samples";
 
   const maskOptionsWithoutDefault = useMemo(
     () => maskOptions.filter((o) => o.key !== "mask"),
     [maskOptions],
   );
 
-  const toggleFileBrowser = () => {
-    dispatch(setIsMinimized(!isMinimized));
-  };
+  const tissueClassNames = patchClassificationData?.class_name ?? [];
+  const tissueClassColors = patchClassificationData?.class_hex_color ?? [];
 
-  const renderIconButton = (
-    onClick: () => void,
-    isActive: boolean,
-    icon: React.ReactNode,
-    tooltip: string,
-    shortcut?: string,
-  ) => (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          onClick={onClick}
-          className={`flex items-center px-1 py-1 rounded-[4px] transition-colors hover:bg-foreground/10 hover:text-foreground relative z-0 ${
-            isActive ? "bg-foreground/10 text-foreground" : "text-muted-foreground"
-          }`}
-        >
-          {icon}
-          {shortcut && (
-            <span className="absolute -top-1 -right-2 z-[100] rounded min-w-[16px] h-[12px] px-1 flex items-center justify-center font-semibold text-[10px] pointer-events-none shadow-sm leading-tight bg-muted-foreground/20 text-muted-foreground">
-              {shortcut.length > 5 ? shortcut.slice(0, 4) + ".." : shortcut}
-            </span>
-          )}
-        </button>
-      </TooltipTrigger>
-      <TooltipContent side="bottom">{tooltip}</TooltipContent>
-    </Tooltip>
+  const handleSelectRoiType = useCallback(
+    (type: "nuclei" | "tissue") => dispatch(setRoiRecommendType(type)),
+    [dispatch],
   );
 
-  // All items that can overflow — ordered left-to-right; rightmost items overflow first.
-  // Dividers use skipInOverflow: true so they don't appear inside the overflow panel
-  // and trailing dividers are trimmed automatically.
-  const allOverflowItems: OverflowItemDef[] = [
+  const toggleFileBrowser = useCallback(
+    () => dispatch(setIsMinimized(!isMinimized)),
+    [dispatch, isMinimized],
+  );
+
+  // Memoized so overflow measurement ghosts aren't rebuilt every parent render.
+  const allOverflowItems: OverflowItemDef[] = useMemo(
+    () => [
     // ── Tool group ────────────────────────────────────────────────────────────
     {
-      key: "tool-move",
-      render: () => renderIconButton(() => onToolClick("move"), currentTool === "move", <FiMove size={20} strokeWidth={1.5} />, "Move", bindings["tool.move"]),
-    },
-    {
-      key: "tool-polygon",
-      render: () => renderIconButton(() => onToolClick("polygon"), currentTool === "polygon", <LiaDrawPolygonSolid size={20} />, "Polygon", bindings["tool.polygon"]),
-    },
-    {
-      key: "tool-rectangle",
-      render: () => renderIconButton(() => onToolClick("rectangle"), currentTool === "rectangle", <PiRectangle size={20} />, "Rectangle", bindings["tool.rectangle"]),
-    },
-    {
-      key: "tool-line",
-      render: () => renderIconButton(() => onToolClick("line"), currentTool === "line", <LuRuler size={20} />, "Ruler", bindings["tool.line"]),
-    },
-    {
-      key: "tool-filter",
-      render: () => renderIconButton(() => onToolClick("filter"), currentTool === "filter", <Filter size={20} strokeWidth={1.5} />, "Filter", bindings["tool.filter"]),
-    },
-    ...(onGoToRecommended
-      ? [
-          {
-            key: "tool-compass",
-            render: () => (
-              <DropdownMenu>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className="inline-flex">
-                      <DropdownMenuTrigger asChild>
-                        <button
-                          type="button"
-                          className="flex items-center px-1 py-1 rounded-[4px] transition-colors hover:bg-foreground/10 hover:text-foreground text-muted-foreground"
-                          aria-label="Go to recommended region"
-                        >
-                          <Compass size={20} strokeWidth={1.5} />
-                        </button>
-                      </DropdownMenuTrigger>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom">Go to recommended</TooltipContent>
-                </Tooltip>
-                <DropdownMenuContent align="center" side="bottom" className="min-w-[200px]">
-                  <DropdownMenuLabel className="cursor-default text-muted-foreground font-normal">
-                    ROIs
-                  </DropdownMenuLabel>
-                  <div className="flex gap-0.5 p-1.5 pb-2 border-b border-border/60">
-                    <button
-                      type="button"
-                      onClick={(e) => { e.stopPropagation(); dispatch(setRoiRecommendType("nuclei")); }}
-                      className={`flex-1 px-2 py-1 rounded text-xs font-medium transition-colors ${roiRecommendType === "nuclei" ? "bg-foreground/15 text-foreground" : "text-muted-foreground hover:bg-foreground/10 hover:text-foreground"}`}
-                    >
-                      Nuclei
-                    </button>
-                    <button
-                      type="button"
-                      onClick={(e) => { e.stopPropagation(); dispatch(setRoiRecommendType("tissue")); }}
-                      className={`flex-1 px-2 py-1 rounded text-xs font-medium transition-colors ${roiRecommendType === "tissue" ? "bg-foreground/15 text-foreground" : "text-muted-foreground hover:bg-foreground/10 hover:text-foreground"}`}
-                    >
-                      Tissue
-                    </button>
-                  </div>
-                  {roiRecommendType === "nuclei" ? (
-                    nucleiClasses?.length > 0 ? (
-                      nucleiClasses.map((c, index) => (
-                        <DropdownMenuItem
-                          key={`nuclei-${index}`}
-                          onSelect={(e) => { e.preventDefault(); onGoToRecommended("nuclei", index); }}
-                          className="flex items-center gap-2"
-                        >
-                          <span className="h-3 w-3 rounded-full shrink-0" style={{ backgroundColor: c.color }} />
-                          <span className="truncate">{c.name}</span>
-                        </DropdownMenuItem>
-                      ))
-                    ) : (
-                      <div className="px-2 py-2 text-xs text-muted-foreground">No nuclei classes</div>
-                    )
-                  ) : patchClassificationData?.class_name?.length ? (
-                    patchClassificationData.class_name.map((name, index) => (
-                      <DropdownMenuItem
-                        key={`tissue-${index}`}
-                        onSelect={(e) => { e.preventDefault(); onGoToRecommended("tissue", index); }}
-                        className="flex items-center gap-2"
-                      >
-                        <span className="h-3 w-3 rounded-full shrink-0" style={{ backgroundColor: patchClassificationData.class_hex_color?.[index] ?? "#888" }} />
-                        <span className="truncate">{name}</span>
-                      </DropdownMenuItem>
-                    ))
-                  ) : (
-                    <div className="px-2 py-2 text-xs text-muted-foreground">No tissue classes</div>
-                  )}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            ),
-          } satisfies OverflowItemDef,
-        ]
-      : []),
-
-    // ── Divider: tools → overlays ─────────────────────────────────────────────
-    { key: "sep-tools-overlays", render: () => <ToolbarDivider />, skipInOverflow: true },
-
-    // ── Overlay group ─────────────────────────────────────────────────────────
-    {
-      key: "overlay-cell",
-      render: () => (
-        <ModeButton
-          label="Cell Overlay"
-          isActive={showBackendAnnotations}
-          disabled={!nucleiModeAvailable}
-          tooltip={nucleiModeAvailable ? "Toggle Nuclei Annotations" : "Currently unavailable"}
-          shortcut={bindings["toggleNuclei"]}
-          onClick={() => {
+        key: "tool-move",
+        Component: ToolbarIconButtonItem,
+        props: {
+          onClick: () => onToolClick("move"),
+          isActive: currentTool === "move",
+          tool: "move",
+          tooltip: "Move",
+          shortcut: bindings["tool.move"],
+        },
+      },
+      {
+        key: "tool-lasso",
+        Component: ToolbarIconButtonItem,
+        props: {
+          onClick: () => onToolClick("lasso"),
+          isActive: currentTool === "lasso",
+          tool: "lasso",
+          tooltip: "Lasso",
+          shortcut: bindings["tool.lasso"],
+        },
+      },
+      {
+        key: "tool-rectangle",
+        Component: ToolbarIconButtonItem,
+        props: {
+          onClick: () => onToolClick("rectangle"),
+          isActive: currentTool === "rectangle",
+          tool: "rectangle",
+          tooltip: "Rectangle",
+          shortcut: bindings["tool.rectangle"],
+        },
+      },
+      {
+        key: "tool-polygon",
+        Component: ToolbarIconButtonItem,
+        props: {
+          onClick: () => onToolClick("polygon"),
+          isActive: currentTool === "polygon",
+          tool: "polygon",
+          tooltip: "Polygon",
+          shortcut: bindings["tool.polygon"],
+        },
+      },
+      {
+        key: "tool-line",
+        Component: ToolbarIconButtonItem,
+        props: {
+          onClick: () => onToolClick("line"),
+          isActive: currentTool === "line",
+          tool: "line",
+          tooltip: "Ruler",
+          shortcut: bindings["tool.line"],
+        },
+      },
+      {
+        key: "tool-filter",
+        Component: ToolbarIconButtonItem,
+        props: {
+          onClick: () => onToolClick("filter"),
+          isActive: currentTool === "filter",
+          tool: "filter",
+          tooltip: "Filter",
+          shortcut: bindings["tool.filter"],
+        },
+      },
+      ...(onGoToRecommended
+        ? [
+            {
+              key: "tool-compass",
+              Component: CompassRecommendItem,
+              props: {
+                roiRecommendType,
+                nucleiClasses: nucleiClasses ?? [],
+                tissueClassNames,
+                tissueClassColors,
+                onSelectRoiType: handleSelectRoiType,
+                onGoToRecommended,
+              },
+            },
+          ]
+        : []),
+      // ── Divider: tools → overlays ─────────────────────────────────────────────
+      {
+        key: "sep-tools-overlays",
+        Component: ToolbarDividerItem,
+        skipInOverflow: true,
+      },
+      // ── Overlay group ─────────────────────────────────────────────────────────
+      {
+        key: "overlay-cell",
+        Component: OverlayModeItem,
+        props: {
+          label: "Cell Overlay",
+          isActive: showBackendAnnotations,
+          disabled: !nucleiModeAvailable,
+          tooltip: nucleiModeAvailable ? "Toggle Nuclei Annotations" : "Currently unavailable",
+          shortcut: bindings["toggleNuclei"],
+          onClick: () => {
             if (!nucleiModeAvailable) {
-              toast("Nuclei mode is unavailable for this image.");
+              overlayUnavailableToast.nuclei();
               return;
             }
             const prev = showBackendAnnotations;
             const next = !prev;
+            showBackendAnnotationsRef.current = next;
+
+            if (pendingRequest.nuclei) {
+              if (next) {
+                toast("It's loading, please wait...");
+                showBackendAnnotationsRef.current = prev;
+                return;
+              }
+              setPendingRequest((p) => ({ ...p, nuclei: false }));
+              setShowBackendAnnotations(false);
+              keydownUpdate(true, false);
+              return;
+            }
+
+            if (next && (!socket || socket.readyState !== WebSocket.OPEN)) {
+              toast.error(
+                "Nuclei overlay requires an open WebSocket connection. Please check your connection and try again.",
+              );
+              showBackendAnnotationsRef.current = prev;
+              return;
+            }
+
+            setPendingRequest((p) => ({ ...p, nuclei: next }));
             setShowBackendAnnotations(next);
             keydownUpdate(prev, next);
-          }}
-        />
-      ),
-    },
-    {
-      key: "overlay-patch",
-      render: () => (
-        <ModeButton
-          label="Patch Overlay"
-          isActive={showPatches}
-          disabled={!patchModeAvailable}
-          tooltip={patchModeAvailable ? "Toggle Patch Annotations" : "Currently unavailable"}
-          shortcut={bindings["togglePatches"]}
-          onClick={() => {
+          },
+        },
+      },
+      {
+        key: "overlay-patch",
+        Component: OverlayModeItem,
+        props: {
+          label: "Patch Overlay",
+          isActive: showPatches,
+          disabled: !patchModeAvailable,
+          tooltip: patchModeAvailable ? "Toggle Patch Annotations" : "Currently unavailable",
+          shortcut: bindings["togglePatches"],
+          onClick: () => {
             if (!patchModeAvailable) {
-              toast("Patch mode is unavailable for this image.");
+              overlayUnavailableToast.patch();
               return;
             }
             const prev = showPatches;
             const next = !prev;
+            showPatchesRef.current = next;
+
+            if (pendingRequest.patches) {
+              if (next) {
+                toast("It's loading, please wait...");
+                showPatchesRef.current = prev;
+                return;
+              }
+              setPendingRequest((p) => ({ ...p, patches: false }));
+              setShowPatches(false);
+              keydownUpdatePatches(true, false);
+              return;
+            }
+
+            if (next && (!socket || socket.readyState !== WebSocket.OPEN)) {
+              toast.error(
+                "Patch overlay requires an open WebSocket connection. Please check your connection and try again.",
+              );
+              showPatchesRef.current = prev;
+              return;
+            }
+
+            setPendingRequest((p) => ({ ...p, patches: next }));
             setShowPatches(next);
             keydownUpdatePatches(prev, next);
-          }}
-        />
-      ),
-    },
-    {
-      key: "overlay-mask",
-      render: () => (
-        <ModeButton
-          label="Mask Overlay"
-          isActive={showMask}
-          disabled={!maskModeAvailable}
-          tooltip={maskModeAvailable ? "Toggle Segmentation Mask Overlay" : "Currently unavailable"}
-          shortcut={bindings["toggleMask"]}
-          onClick={() => {
+          },
+        },
+      },
+      {
+        key: "overlay-mask",
+        Component: OverlayModeItem,
+        props: {
+          label: "Tissue Overlay",
+          isActive: showMask,
+          disabled: !maskModeAvailable,
+          tooltip: maskModeAvailable ? "Toggle Tissue Segmentation Overlay" : "Currently unavailable",
+          shortcut: bindings["toggleMask"],
+          onClick: () => {
             if (!maskModeAvailable) {
-              toast("Mask overlay is unavailable for this image.");
+              overlayUnavailableToast.mask();
               return;
             }
             setShowMask(!showMask);
-          }}
-        />
-      ),
-    },
-    ...(maskOptionsWithoutDefault.length > 0
-      ? [
-          {
-            key: "overlay-mask-select",
-            render: () => (
-              <DropdownMenu>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className="inline-flex min-w-0">
-                      <DropdownMenuTrigger asChild>
-                        <button
-                          type="button"
-                          className="flex items-center justify-center px-1.5 py-1 rounded-[4px] text-muted-foreground hover:bg-foreground/10 hover:text-foreground transition-colors border-none outline-none min-w-0"
-                          aria-label="Select mask"
-                        >
-                          <span className="text-xs truncate max-w-[72px]">
-                            {maskOptionsWithoutDefault.find((o) => o.key === selectedMaskKey)?.label
-                              ?? (selectedMaskKey === "" || selectedMaskKey === "mask"
-                                ? "Mask"
-                                : maskOptionsWithoutDefault[0]?.label ?? "Mask")}
-                          </span>
-                          <ChevronDown className="h-3 w-3 ml-0.5 shrink-0" />
-                        </button>
-                      </DropdownMenuTrigger>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom">Select which mask to show</TooltipContent>
-                </Tooltip>
-                <DropdownMenuContent align="end" side="bottom" className="w-[180px] p-1">
-                  {maskOptionsWithoutDefault.map((opt) => (
-                    <DropdownMenuItem
-                      key={opt.key}
-                      className="pl-4 pr-2 py-1.5"
-                      onSelect={(e) => { e.preventDefault(); onSelectMaskKey?.(opt.key); }}
-                    >
-                      <span
-                        className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 mr-2 ${
-                          selectedMaskKey === opt.key ? "bg-primary" : "bg-transparent"
-                        }`}
-                        aria-hidden
-                      />
-                      <span className={selectedMaskKey === opt.key ? "font-medium" : ""}>
-                        {opt.label}
-                      </span>
-                    </DropdownMenuItem>
-                  ))}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            ),
-          } satisfies OverflowItemDef,
-        ]
-      : []),
-
-    // ── Spacer + presence / user slots (conditional) ──────────────────────────
-    // The spacer is always visible and flex-1 so presence stays right-aligned.
-    // No divider between overlays and presence — the spacer provides the separation.
-    {
-      key: "spacer-overlays-presence",
-      isSpacer: true,
-      skipInOverflow: true,
-      render: () => <div className="flex-1 min-w-0" />,
-    } satisfies OverflowItemDef,
-    ...(onlineUsers?.length
-      ? [
-          {
-            key: "presence",
-            render: () => (
-              <div className="flex h-6 items-center">
-                <PresenceAvatars users={onlineUsers} />
-              </div>
-            ),
-          } satisfies OverflowItemDef,
-        ]
-      : []),
-  ];
+          },
+        },
+      },
+      ...(maskOptionsWithoutDefault.length > 0
+        ? [
+            {
+              key: "overlay-mask-select",
+              Component: MaskSelectItem,
+              props: {
+                options: maskOptionsWithoutDefault,
+                selectedMaskKey,
+                onSelectMaskKey,
+              },
+            },
+          ]
+        : []),
+    ],
+    [
+      bindings,
+      currentTool,
+      handleSelectRoiType,
+      keydownUpdate,
+      keydownUpdatePatches,
+      maskModeAvailable,
+      maskOptionsWithoutDefault,
+      nucleiClasses,
+      nucleiModeAvailable,
+      onGoToRecommended,
+      onSelectMaskKey,
+      onToolClick,
+      patchModeAvailable,
+      pendingRequest,
+      roiRecommendType,
+      selectedMaskKey,
+      setPendingRequest,
+      setShowBackendAnnotations,
+      setShowMask,
+      setShowPatches,
+      showBackendAnnotations,
+      showBackendAnnotationsRef,
+      showMask,
+      showPatches,
+      showPatchesRef,
+      socket,
+      tissueClassColors,
+      tissueClassNames,
+    ],
+  );
 
   return (
     <TooltipProvider delayDuration={400}>
-      <div className="flex w-full min-w-0 min-h-10 items-center gap-3 overflow-visible border-l border-border/60 bg-muted px-4 py-1.5">
-
+      <div className="flex w-full min-w-0 min-h-10 items-center gap-3 overflow-visible border-l border-border/60 bg-muted px-4 pb-1.5 pt-2.5">
         {/* Files button — always visible, left anchor */}
-        <div className="flex shrink-0 items-center">
-          {renderIconButton(
-            toggleFileBrowser,
-            !isMinimized,
-            isMinimized ? <Folder className="h-5 w-5" strokeWidth={1.5} /> : <FolderOpen className="h-5 w-5" strokeWidth={1.5} />,
-            "File Browser",
-          )}
+        <div className="flex shrink-0 items-center gap-3">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={toggleFileBrowser}
+                className={`relative z-0 flex items-center rounded-[4px] px-1 py-1 transition-colors hover:bg-foreground/10 hover:text-foreground ${
+                  !isMinimized ? "bg-foreground/10 text-foreground" : "text-muted-foreground"
+                }`}
+              >
+                {isMinimized ? (
+                  <Folder className="h-5 w-5" strokeWidth={1.5} />
+                ) : (
+                  <FolderOpen className="h-5 w-5" strokeWidth={1.5} />
+                )}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">File Browser</TooltipContent>
+          </Tooltip>
+          <ToolbarDivider />
         </div>
 
-        <ToolbarDivider />
-
         {/*
-          All overflowable items (tools, overlays, presence) in a single section.
-          flex-1 + min-w-0 gives it all remaining space.
-          The "…" button lives at the right edge of this section (via internal spacer),
-          so it naturally sits flush against the Navigator button below.
+          Overflowable toolbar items (tools, overlays). Presence avatars are
+          fixed on the right — they do not participate in overflow layout.
         */}
         <OverflowToolbarSection
           items={allOverflowItems}
           className="flex-1 min-w-0"
-          onOverflowChange={setToolbarHasOverflow}
         />
 
-        {!toolbarHasOverflow && <ToolbarDivider />}
+        <div className="flex shrink-0 items-center gap-3">
+          {isViewerShare ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span
+                  className="inline-flex shrink-0 items-center rounded border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[11px] font-medium tracking-wide text-sky-700 dark:text-sky-300"
+                  aria-label="Viewer"
+                >
+                  Viewer
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="max-w-xs">
+                Shared with you as Viewer. You can see this slide and overlays, but cannot annotate or run workflows.
+              </TooltipContent>
+            </Tooltip>
+          ) : isSamplesReadOnly ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span
+                  className="inline-flex shrink-0 items-center rounded border border-muted-foreground/30 bg-muted/60 px-2 py-0.5 text-[11px] font-medium tracking-wide text-muted-foreground"
+                  aria-label="Read-only"
+                >
+                  Read-only
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="max-w-xs">
+                Public Samples folder. Browse freely, but annotate and workflows require a copy in your Personal workspace.
+              </TooltipContent>
+            </Tooltip>
+          ) : null}
+          {onlineUsers.length > 0 && (
+            <>
+              <PresenceAvatars users={onlineUsers} />
+              <ToolbarDivider />
+            </>
+          )}
 
-        {/* Navigator — always visible, right anchor */}
-        <button
-          type="button"
-          onClick={toggleShowNavigator}
-          className="flex shrink-0 items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
-        >
-          <div className="flex items-center gap-0.5 rounded-[4px] p-1 hover:bg-foreground/10">
-            <PictureInPicture2 className="h-4 w-4 text-muted-foreground" />
-            {showNavigator ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-          </div>
-        </button>
-
+          {/* Navigator — always visible, right anchor */}
+          <button
+            type="button"
+            onClick={toggleShowNavigator}
+            className="flex shrink-0 items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <div className="flex items-center gap-0.5 rounded-[4px] p-1 hover:bg-foreground/10">
+              <PictureInPicture2 className="h-4 w-4 text-muted-foreground" />
+              {showNavigator ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+            </div>
+          </button>
+        </div>
       </div>
     </TooltipProvider>
   );

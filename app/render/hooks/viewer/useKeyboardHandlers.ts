@@ -4,78 +4,60 @@ import { toast } from 'sonner';
 import { AppDispatch } from '@/store';
 import { setTool } from '@/store/slices/viewer/toolSlice';
 import { useShortcuts } from '@/hooks/viewer/useShortcuts';
+import type { OverlayPendingRequest } from '@/utils/viewer/overlayRequestNotify';
 
 const MIN_PRESS_INTERVAL = 300; // Minimum 300ms between presses
-const QUICK_FALLBACK_DELAY_MS = 600;
-const RECENT_REFRESH_WINDOW_MS = 8000;
 
 interface UseKeyboardHandlersParams {
   socket: WebSocket | null;
-  allTilesLoaded: boolean;
-  isZarrInitializing: boolean;
-  isRequestPending: boolean;
-  existAnnotationFile: boolean;
-  showBackendAnnotations: boolean;
-  showPatches: boolean;
-  showMask: boolean;
+  pendingRequest: OverlayPendingRequest;
   setShowBackendAnnotations: React.Dispatch<React.SetStateAction<boolean>>;
   setShowPatches: React.Dispatch<React.SetStateAction<boolean>>;
   setShowMask: React.Dispatch<React.SetStateAction<boolean>>;
-  setCurrentRequestType: (type: 'space' | 'x' | null) => void;
-  setIsRequestPending: (pending: boolean) => void;
+  setPendingRequest: React.Dispatch<React.SetStateAction<OverlayPendingRequest>>;
   keydownUpdate: (prev: boolean, newVal: boolean) => void;
   keydownUpdatePatches: (prev: boolean, newVal: boolean) => void;
-  resendSetPath: () => void;
-  quickSpaceFallbackTimerRef: React.MutableRefObject<ReturnType<typeof setTimeout> | null>;
-  lastWorkflowRefreshTsRef: React.MutableRefObject<number>;
+  /** Updated synchronously on toggle so late WS frames / session ticks share one gate. */
+  showBackendAnnotationsRef: React.MutableRefObject<boolean>;
+  showPatchesRef: React.MutableRefObject<boolean>;
 }
 
 /**
- * Hook to handle keyboard shortcuts for the viewer
- * Extracted from OpenSeadragonContainer to improve code organization
- * 
- * Note: This hook handles keyboard event processing, while useShortcuts handles
- * shortcut configuration management (loading/saving bindings from localStorage).
+ * Hook to handle keyboard shortcuts for the viewer.
+ * Listener is mounted once; latest socket/pending/handlers are read from refs.
  */
 export const useKeyboardHandlers = (params: UseKeyboardHandlersParams) => {
   const dispatch = useDispatch<AppDispatch>();
   const { bindings } = useShortcuts();
-  const {
-    socket,
-    allTilesLoaded,
-    isZarrInitializing,
-    isRequestPending,
-    existAnnotationFile,
-    showBackendAnnotations,
-    showPatches,
-    showMask,
-    setShowBackendAnnotations,
-    setShowPatches,
-    setShowMask,
-    setCurrentRequestType,
-    setIsRequestPending,
-    keydownUpdate,
-    keydownUpdatePatches,
-    resendSetPath,
-    quickSpaceFallbackTimerRef,
-    lastWorkflowRefreshTsRef,
-  } = params;
 
-  // Ref to track last key press time for debouncing
-  const lastKeyPressTimeRef = useRef<{ space: number; x: number; m: number }>({ space: 0, x: 0, m: 0 });
+  const paramsRef = useRef(params);
+  paramsRef.current = params;
+  const bindingsRef = useRef(bindings);
+  bindingsRef.current = bindings;
+
+  // Debounce per feature toggle (bindings are user-configurable).
+  const lastKeyPressTimeRef = useRef<{ nuclei: number; patches: number; mask: number }>({
+    nuclei: 0,
+    patches: 0,
+    mask: 0,
+  });
 
   useEffect(() => {
-    const defer = (fn: () => void) => {
-      window.setTimeout(fn, 0);
-    };
-
     const handleKeyDown = (event: KeyboardEvent) => {
-      // Log space key for debugging
-      if (event.key === ' ') {
-        console.log('[OpenSeadragonContainer] Space key event received');
-      }
+      const {
+        socket,
+        pendingRequest,
+        setShowBackendAnnotations,
+        setShowPatches,
+        setShowMask,
+        setPendingRequest,
+        keydownUpdate,
+        keydownUpdatePatches,
+        showBackendAnnotationsRef,
+        showPatchesRef,
+      } = paramsRef.current;
+      const keys = bindingsRef.current;
 
-      // Check if the target is an input element (input, textarea, select, etc.)
       const target = event.target as HTMLElement;
       const isInputElement =
         target.tagName === 'INPUT' ||
@@ -83,20 +65,8 @@ export const useKeyboardHandlers = (params: UseKeyboardHandlersParams) => {
         target.tagName === 'SELECT' ||
         target.contentEditable === 'true';
 
-      if (isInputElement) {
-        if (event.key === ' ') {
-          console.log('[OpenSeadragonContainer] 🛑 Space key ignored - target is input element');
-        }
-        return;
-      }
-
-      // Ignore auto-repeat to prevent rapid toggle on/off (especially for X)
-      if (event.repeat) {
-        if (event.key === ' ') {
-          console.log('[OpenSeadragonContainer] 🛑 Space key ignored - auto-repeat');
-        }
-        return;
-      }
+      if (isInputElement) return;
+      if (event.repeat) return;
 
       const eventKeyNorm =
         event.key === ' '
@@ -106,218 +76,117 @@ export const useKeyboardHandlers = (params: UseKeyboardHandlersParams) => {
             : event.code;
       const bind = (k: string) => (k.length === 1 ? k.toLowerCase() : k);
 
-      // Handle Space key (toggle nuclei)
-      if (eventKeyNorm === bind(bindings.toggleNuclei)) {
-        console.log('[OpenSeadragonContainer] ✅ Space key matched toggle binding - processing...');
-
-
-
-        // Debounce: prevent rapid consecutive presses
+      // Toggle nuclei / backend cell overlay
+      if (eventKeyNorm === bind(keys.toggleNuclei)) {
         const now = Date.now();
-        if (now - lastKeyPressTimeRef.current.space < MIN_PRESS_INTERVAL) {
-          console.log('[Space Key] Debounced - too fast');
+        if (now - lastKeyPressTimeRef.current.nuclei < MIN_PRESS_INTERVAL) {
           event.preventDefault();
           return;
         }
-        lastKeyPressTimeRef.current.space = now;
+        lastKeyPressTimeRef.current.nuclei = now;
 
-        // Toggle backend annotation display
-        setShowBackendAnnotations((prev) => {
-          const newVal = !prev;
+        // Decide, then commit. This block used to live inside the setState
+        // updater, so every side effect in it (set_path sends, pending flips,
+        // toasts) replayed whenever React invoked the updater twice.
+        // The ref is the shared source of truth for this gate.
+        const prev = showBackendAnnotationsRef.current;
+        const newVal = !prev;
 
-          // Check if Zarr is still initializing (just opened the image)
-          // Allow first press to proceed even if Zarr is initializing - it will trigger the request
-          if (newVal && isZarrInitializing && !prev) {
-            console.log('[Space Key] Zarr initializing but allowing first press to proceed');
-            resendSetPath();
-            // Don't block the first press, let it proceed to trigger the request
-          } else if (newVal && isZarrInitializing) {
-            toast('Image is loading, please wait a moment...');
-            return prev; // Keep current state, don't toggle yet
-          }
-
-          // Check if request is already pending
-          if (isRequestPending) {
-            if (newVal) {
-              // Trying to open while loading - show message but keep state as "will open"
-              toast("It's loading, please wait...");
-              return true; // Return true so layer shows when loading completes
-            } else {
-              // Trying to close while loading - allow it and reset states
-              setIsRequestPending(false);
-              setCurrentRequestType(null);
-              if (quickSpaceFallbackTimerRef.current) {
-                clearTimeout(quickSpaceFallbackTimerRef.current as unknown as number);
-                quickSpaceFallbackTimerRef.current = null;
-              }
-              defer(() => keydownUpdate(true, false)); // Force close outside render update
-              return false;
-            }
-          }
-
-          // Check WebSocket connection status immediately
-          if (!socket || socket.readyState !== WebSocket.OPEN) {
-            toast.error(
-              'Space key highlights nuclei segmentation. However, WebSocket connection is not available. Please check your connection and try again.'
-            );
-            setCurrentRequestType(null); // Reset request type after showing error
-            return prev; // Don't change state if connection failed
-          }
-
-          // Always allow space key to trigger, even if no annotation file is loaded yet
-          // This ensures the first press will send the WebSocket request
+        // No set_path resend while zarr initialises: one is already in flight and
+        // its ack opens the wire gate and forces a sync. Re-binding here made the
+        // backend answer twice, so every toggle during load cost two viewport
+        // requests, two settles and two contour FIFO entries.
+        if (pendingRequest.nuclei) {
           if (newVal) {
-            // When turning on backend annotations, always try to request data
-            console.log('Space key pressed - attempting to load backend annotations');
-            setCurrentRequestType('space'); // Set request type for error message context
-            setIsRequestPending(true); // Set pending state
-            defer(() => keydownUpdate(prev, newVal));
-
-            // Quick fallback: if no response comes shortly and no recent workflow refresh, show error
-            if (quickSpaceFallbackTimerRef.current) {
-              clearTimeout(quickSpaceFallbackTimerRef.current as unknown as number);
-              quickSpaceFallbackTimerRef.current = null;
-            }
-            const now = Date.now();
-            const withinRecentRefresh = now - lastWorkflowRefreshTsRef.current < RECENT_REFRESH_WINDOW_MS;
-            if (!withinRecentRefresh) {
-              quickSpaceFallbackTimerRef.current = setTimeout(() => {
-                // Check if Zarr is still initializing before showing error
-                if (isZarrInitializing) {
-                  toast('Image is loading, please wait a moment...');
-                  setCurrentRequestType(null);
-                  setIsRequestPending(false);
-                  quickSpaceFallbackTimerRef.current = null;
-                  return;
-                }
-
-                if (!existAnnotationFile) {
-                  toast.warning('Zarr file not found. Please run segmentation workflow first.');
-                  setCurrentRequestType(null);
-                  setIsRequestPending(false);
-                }
-                quickSpaceFallbackTimerRef.current = null;
-              }, QUICK_FALLBACK_DELAY_MS);
-            }
+            toast("It's loading, please wait...");
+            showBackendAnnotationsRef.current = true;
+            setShowBackendAnnotations(true);
           } else {
-            // When turning off, reset states and proceed
-            setIsRequestPending(false);
-            setCurrentRequestType(null);
-            if (quickSpaceFallbackTimerRef.current) {
-              clearTimeout(quickSpaceFallbackTimerRef.current as unknown as number);
-              quickSpaceFallbackTimerRef.current = null;
-            }
-            if (existAnnotationFile) {
-              defer(() => keydownUpdate(prev, newVal));
-            } else {
-              console.log('No annotation file loaded, but turning off backend annotations');
-            }
+            showBackendAnnotationsRef.current = false;
+            setPendingRequest((p) => ({ ...p, nuclei: false }));
+            keydownUpdate(true, false);
+            setShowBackendAnnotations(false);
           }
-          return newVal;
-        });
-        event.preventDefault(); // prevent scrolling
-      }
-      // Handle X key (toggle patches)
-      else if (eventKeyNorm === bind(bindings.togglePatches)) {
-
-
-        // Debounce: prevent rapid consecutive presses
-        const now = Date.now();
-        if (now - lastKeyPressTimeRef.current.x < MIN_PRESS_INTERVAL) {
-          console.log('[X Key] Debounced - too fast');
-          event.preventDefault();
-          return;
+        } else if (!socket || socket.readyState !== WebSocket.OPEN) {
+          toast.error(
+            'Nuclei overlay requires an open WebSocket connection. Please check your connection and try again.',
+          );
+          setPendingRequest((p) => ({ ...p, nuclei: false }));
+          showBackendAnnotationsRef.current = prev;
+        } else {
+          showBackendAnnotationsRef.current = newVal;
+          setPendingRequest((p) => ({ ...p, nuclei: newVal }));
+          // Refs already updated; overlayNeedKey effect owns reset/sync.
+          keydownUpdate(prev, newVal);
+          setShowBackendAnnotations(newVal);
         }
-        lastKeyPressTimeRef.current.x = now;
-
-        // Toggle patch display
-        setShowPatches((prev) => {
-          const newVal = !prev;
-
-          // Check if Zarr is still initializing (just opened the image)
-          // Allow first press to proceed even if Zarr is initializing - it will trigger the request
-          if (newVal && isZarrInitializing && !prev) {
-            console.log('[X Key] Zarr initializing but allowing first press to proceed');
-            resendSetPath();
-            // Don't block the first press, let it proceed to trigger the request
-          } else if (newVal && isZarrInitializing) {
-            toast('Image is loading, please wait a moment...');
-            return prev; // Keep current state, don't toggle yet
-          }
-
-          // Check if request is already pending
-          if (isRequestPending) {
-            if (newVal) {
-              // Trying to open while loading - show message but keep state as "will open"
-              toast("It's loading, please wait...");
-              return true; // Return true so layer shows when loading completes
-            } else {
-              // Trying to close while loading - allow it and reset states
-              setIsRequestPending(false);
-              setCurrentRequestType(null);
-              defer(() => keydownUpdatePatches(true, false)); // Force close outside render update
-              return false;
-            }
-          }
-
-          // Check WebSocket connection status immediately
-          if (!socket || socket.readyState !== WebSocket.OPEN) {
-            toast.error(
-              'X key displays patch classification. However, WebSocket connection is not available. Please check your connection and try again.'
-            );
-            return prev; // Don't change state if connection failed
-          }
-
-          // Set pending state and request type based on action
-          if (newVal) {
-            setCurrentRequestType('x');
-            setIsRequestPending(true);
-          } else {
-            setIsRequestPending(false);
-            setCurrentRequestType(null);
-          }
-
-          defer(() => keydownUpdatePatches(prev, newVal));
-          return newVal;
-        });
         event.preventDefault();
       }
-      // Handle M key (toggle mask)
-      else if (eventKeyNorm === bind(bindings.toggleMask)) {
-
-
-        // Debounce: prevent rapid consecutive presses
+      // Toggle patch classification overlay
+      else if (eventKeyNorm === bind(keys.togglePatches)) {
         const now = Date.now();
-        if (now - lastKeyPressTimeRef.current.m < MIN_PRESS_INTERVAL) {
-          console.log('[M Key] Debounced - too fast');
+        if (now - lastKeyPressTimeRef.current.patches < MIN_PRESS_INTERVAL) {
           event.preventDefault();
           return;
         }
-        lastKeyPressTimeRef.current.m = now;
+        lastKeyPressTimeRef.current.patches = now;
 
-        // Toggle mask display
+        // Same shape as the nuclei toggle: decide first, commit once.
+        const prevPatches = showPatchesRef.current;
+        const newPatches = !prevPatches;
+
+        if (pendingRequest.patches) {
+          if (newPatches) {
+            toast("It's loading, please wait...");
+            showPatchesRef.current = true;
+            setShowPatches(true);
+          } else {
+            showPatchesRef.current = false;
+            setPendingRequest((p) => ({ ...p, patches: false }));
+            keydownUpdatePatches(true, false);
+            setShowPatches(false);
+          }
+        } else if (!socket || socket.readyState !== WebSocket.OPEN) {
+          toast.error(
+            'Patch overlay requires an open WebSocket connection. Please check your connection and try again.',
+          );
+          showPatchesRef.current = prevPatches;
+        } else {
+          showPatchesRef.current = newPatches;
+          setPendingRequest((p) => ({ ...p, patches: newPatches }));
+          keydownUpdatePatches(prevPatches, newPatches);
+          setShowPatches(newPatches);
+        }
+        event.preventDefault();
+      }
+      // Toggle mask
+      else if (eventKeyNorm === bind(keys.toggleMask)) {
+        const now = Date.now();
+        if (now - lastKeyPressTimeRef.current.mask < MIN_PRESS_INTERVAL) {
+          event.preventDefault();
+          return;
+        }
+        lastKeyPressTimeRef.current.mask = now;
         setShowMask((prev) => !prev);
         event.preventDefault();
       }
-      // Handle tool switching shortcuts
-      else if (eventKeyNorm === bind(bindings['tool.move'])) {
-        // switch to move tool
+      // Tool switching shortcuts
+      else if (eventKeyNorm === bind(keys['tool.move'])) {
         dispatch(setTool('move'));
         event.preventDefault();
-      } else if (eventKeyNorm === bind(bindings['tool.polygon'])) {
-        // switch to polygon tool
+      } else if (eventKeyNorm === bind(keys['tool.lasso'])) {
+        dispatch(setTool('lasso'));
+        event.preventDefault();
+      } else if (eventKeyNorm === bind(keys['tool.polygon'])) {
         dispatch(setTool('polygon'));
         event.preventDefault();
-      } else if (eventKeyNorm === bind(bindings['tool.rectangle'])) {
-        // switch to rectangle tool
+      } else if (eventKeyNorm === bind(keys['tool.rectangle'])) {
         dispatch(setTool('rectangle'));
         event.preventDefault();
-      } else if (eventKeyNorm === bind(bindings['tool.line'])) {
-        // switch to ruler tool
+      } else if (eventKeyNorm === bind(keys['tool.line'])) {
         dispatch(setTool('line'));
         event.preventDefault();
-      } else if (eventKeyNorm === bind(bindings['tool.filter'])) {
-        // switch to filter tool (draws like rectangle)
+      } else if (eventKeyNorm === bind(keys['tool.filter'])) {
         dispatch(setTool('filter'));
         event.preventDefault();
       }
@@ -325,24 +194,5 @@ export const useKeyboardHandlers = (params: UseKeyboardHandlersParams) => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [
-    bindings,
-    socket,
-    allTilesLoaded,
-    isZarrInitializing,
-    isRequestPending,
-    existAnnotationFile,
-    showMask,
-    setShowBackendAnnotations,
-    setShowPatches,
-    setShowMask,
-    setCurrentRequestType,
-    setIsRequestPending,
-    keydownUpdate,
-    keydownUpdatePatches,
-    resendSetPath,
-    quickSpaceFallbackTimerRef,
-    lastWorkflowRefreshTsRef,
-    dispatch,
-  ]);
+  }, [dispatch]);
 };

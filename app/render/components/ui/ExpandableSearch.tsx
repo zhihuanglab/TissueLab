@@ -2,7 +2,7 @@
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { cn } from "@/utils/twMerge";
+import { cn } from "@/utils/common/twMerge";
 import { Search, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
@@ -79,7 +79,7 @@ export function ExpandableSearch({
       ref={containerRef}
       className={cn(
         "relative overflow-hidden transition-all duration-300 ease-in-out",
-        isExpanded ? "flex-1 min-w-[240px] max-w-full" : "w-9 h-9 flex-shrink-0"
+        isExpanded ? "flex-1 min-w-[240px] max-w-full" : "w-9 h-9 shrink-0"
       )}
     >
       {!isExpanded ? (

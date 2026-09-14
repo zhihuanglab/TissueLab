@@ -5,15 +5,15 @@ import type { RootState } from '@/store'
 import { useRouter } from 'next/router'
 import Image from 'next/image'
 import { communityService } from '@/services/community.service'
-import { classifiersService } from '@/services/classifiers.service'
+import { classifiersService } from '@/services/classifier/community'
 import { usersService, UserProfile as APIUserProfile } from '@/services/users.service'
 import { apiFetch } from '@/utils/common/apiFetch'
 import { getErrorMessage } from '@/utils/common/apiResponse'
 import { InlineSpinner } from '@/components/assets/PageLoading'
 import { ClassifiersHeader } from '@/components/community/Classifiers-Header'
 import { ColorTag, getTagColor } from '@/components/ui/color-tag'
-import { CTRL_SERVICE_API_ENDPOINT } from '@/constants/config'
-import { useUserInfo } from '@/provider/UserInfoProvider'
+import { COMMUNITY_API_ENDPOINT } from '@/config/api.config'
+import { useUserInfo } from '@/contexts/UserInfoProvider'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -22,7 +22,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Separator } from "@/components/ui/separator"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog"
-import { downloadCommunityClassifier, downloadCommunityModel } from '@/utils/dashboard/fileManager.service'
+import { downloadCommunityClassifier, downloadCommunityModel } from '@/services/fileManager.service'
 import { toast } from 'sonner'
 import {
   ArrowLeft,
@@ -235,7 +235,7 @@ const formatSizeToMB = (size: any): string => {
 const fetchUserModelsFromAPI = async (username: string): Promise<UserModel[]> => {
   try {
     // Fetch from Firebase models public list
-    const response = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/models/public`, {
+    const response = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/models/public`, {
       method: 'GET'
     });
     const baseList = response?.models || [];
@@ -325,7 +325,7 @@ const UserModelCard = React.memo(function UserModelCard({ model, isCurrentUser, 
       }
 
       try {
-        const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/models/${model.id}`, {
+        const result = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/models/${model.id}`, {
           method: 'GET'
         })
 
@@ -361,7 +361,7 @@ const UserModelCard = React.memo(function UserModelCard({ model, isCurrentUser, 
       await downloadCommunityModel(model.id, filename)
       
       try {
-        const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/models/${model.id}`, {
+        const result = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/models/${model.id}`, {
           method: 'GET',
         });
         
@@ -388,7 +388,7 @@ const UserModelCard = React.memo(function UserModelCard({ model, isCurrentUser, 
       try {
         // Always try to delete from backend (for both Firebase and localStorage)
         try {
-          const deleteUrl = `${CTRL_SERVICE_API_ENDPOINT}/community/v1/models/${model.id}`
+          const deleteUrl = `${COMMUNITY_API_ENDPOINT}/community/v1/models/${model.id}`
           const deleteResponse = await apiFetch(deleteUrl, {
             method: 'DELETE'
           })
@@ -436,7 +436,7 @@ const UserModelCard = React.memo(function UserModelCard({ model, isCurrentUser, 
       setIsStarred(newIsStarred)
       setStarCount(newStarCount)
 
-      const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/models/${model.id}/star`, {
+      const result = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/models/${model.id}/star`, {
         method: newIsStarred ? 'POST' : 'DELETE',
         headers: { 'Content-Type': 'application/json' }
       })
@@ -602,7 +602,7 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
 
       // Then try to get fresh data from API
       try {
-        const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/classifiers/${classifier.id}`, {
+        const result = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/classifiers/${classifier.id}`, {
           method: 'GET'
         })
 
@@ -641,7 +641,7 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
       
       // Fetch updated download count from backend after successful download
       try {
-        const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/classifiers/${classifier.id}`, {
+        const result = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/classifiers/${classifier.id}`, {
           method: 'GET',
         });
         
@@ -654,7 +654,7 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
         // Still show success message even if count update fails
       }
 
-      toast.success('Classifier downloaded', { description: `${classifier.title} → ${filename}` } as any)
+      toast.success('Classifier imported', { description: `${classifier.title} → ${filename}` } as any)
     } catch (error) {
       console.error('Download error:', error)
       toast.error(getErrorMessage(error, 'Download failed'))
@@ -672,7 +672,7 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
 
         if (classifier.id.startsWith('uploaded-')) {
           try {
-            const deleteUrl = `${CTRL_SERVICE_API_ENDPOINT}/community/v1/classifiers/${classifier.id}`
+            const deleteUrl = `${COMMUNITY_API_ENDPOINT}/community/v1/classifiers/${classifier.id}`
 
             const deleteResponse = await apiFetch(deleteUrl, {
               method: 'DELETE'
@@ -720,7 +720,7 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
       setIsStarred(newIsStarred)
       setStarCount(newStarCount)
 
-      const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/classifiers/${classifier.id}/star`, {
+      const result = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/classifiers/${classifier.id}/star`, {
         method: newIsStarred ? 'POST' : 'DELETE',
         headers: { 'Content-Type': 'application/json' }
       })
@@ -949,7 +949,7 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
               size="sm"
               variant="outline"
               onClick={handleDelete}
-              className="text-red-600 hover:text-red-700 hover:border-red-300 flex-shrink-0"
+              className="text-red-600 hover:text-red-700 hover:border-red-300 shrink-0"
             >
               <Trash2 className="w-3 h-3" />
             </Button>
@@ -1288,7 +1288,7 @@ export default function UserProfile() {
       } : null)
 
       // API call to follow/unfollow
-      const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/users/v1/${newFollowState ? 'follow' : 'unfollow'}`, {
+      const result = await apiFetch(`${COMMUNITY_API_ENDPOINT}/users/v1/${newFollowState ? 'follow' : 'unfollow'}`, {
         method: 'POST',
         body: JSON.stringify({ target_user_id: userProfile.username }),
         headers: { 'Content-Type': 'application/json' }
@@ -1391,7 +1391,7 @@ export default function UserProfile() {
 
     try {
       setLoadingFollowers(true)
-      const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/users/v1/followers`, {
+      const result = await apiFetch(`${COMMUNITY_API_ENDPOINT}/users/v1/followers`, {
         method: 'POST',
         body: JSON.stringify({ target_user_id: userProfile.username }),
         headers: { 'Content-Type': 'application/json' }
@@ -1413,7 +1413,7 @@ export default function UserProfile() {
 
     try {
       setLoadingFollowing(true)
-      const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/users/v1/following`, {
+      const result = await apiFetch(`${COMMUNITY_API_ENDPOINT}/users/v1/following`, {
         method: 'POST',
         body: JSON.stringify({ target_user_id: userProfile.username }),
         headers: { 'Content-Type': 'application/json' }
@@ -1476,7 +1476,7 @@ export default function UserProfile() {
           // If viewing other user's profile or API current-user call failed, fetch public profile
           if (!profileData) {
             try {
-              const publicProfile = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/users/v1/public_profile/${username}`, { method: 'GET' })
+              const publicProfile = await apiFetch(`${COMMUNITY_API_ENDPOINT}/users/v1/public_profile/${username}`, { method: 'GET' })
               if (publicProfile && publicProfile.found) {
                 const displayName = publicProfile.preferred_name || `User ${(username as string).substring(0, 8)}`
                 const joinDate = publicProfile.registered_at ? new Date(publicProfile.registered_at).toISOString().split('T')[0] : new Date().toISOString().split('T')[0]
@@ -1645,7 +1645,7 @@ export default function UserProfile() {
 
           // Initialize follow state from API
           try {
-            const followStatusResult = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/users/v1/follow_status`, {
+            const followStatusResult = await apiFetch(`${COMMUNITY_API_ENDPOINT}/users/v1/follow_status`, {
               method: 'POST',
               body: JSON.stringify({ target_user_id: username }),
               headers: { 'Content-Type': 'application/json' }
@@ -1811,7 +1811,7 @@ export default function UserProfile() {
                       className="w-full h-full object-cover rounded-full"
                     />
                   ) : (
-                    <div className="w-full h-full bg-gradient-to-br from-green-400 to-blue-500 rounded-full flex items-center justify-center">
+                    <div className="w-full h-full bg-linear-to-br from-green-400 to-blue-500 rounded-full flex items-center justify-center">
                       <User className="w-12 h-12 text-white" />
                     </div>
                   )}
@@ -2119,7 +2119,7 @@ export default function UserProfile() {
               <div className="flex flex-col lg:flex-row items-stretch lg:items-center gap-2 lg:gap-3">
                 {/* Search */}
                 <div className="flex items-center w-full lg:w-48 bg-white border border-gray-200 rounded-lg px-3 py-2">
-                  <Search className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
+                  <Search className="w-4 h-4 text-gray-400 mr-2 shrink-0" />
                   <input
                     className="flex-1 border-none outline-none bg-transparent text-sm text-gray-900 placeholder-gray-400 min-w-0"
                     placeholder="Full-text search"
@@ -2133,10 +2133,10 @@ export default function UserProfile() {
                 {/* Selected Tags Display */}
                 {selectedModelTags.length > 0 && (
                   <div className="flex items-center gap-2 overflow-x-auto pb-1 w-full lg:w-auto lg:max-w-[400px]">
-                    <span className="text-sm text-[#594a93] font-medium whitespace-nowrap flex-shrink-0">Tags:</span>
+                    <span className="text-sm text-[#594a93] font-medium whitespace-nowrap shrink-0">Tags:</span>
                     <div className="flex items-center gap-2 min-w-0 overflow-x-auto">
                       {selectedModelTags.map((tag) => (
-                        <div key={tag} className="flex items-center gap-1 rounded-lg px-2 py-1 whitespace-nowrap flex-shrink-0 border bg-gray-100 text-gray-600 border-gray-300">
+                        <div key={tag} className="flex items-center gap-1 rounded-lg px-2 py-1 whitespace-nowrap shrink-0 border bg-gray-100 text-gray-600 border-gray-300">
                           <span className="text-xs">{tag}</span>
                           <button
                             onClick={() => handleModelTagClick(tag)}
@@ -2310,7 +2310,7 @@ export default function UserProfile() {
                               className="w-full h-full object-cover rounded-full"
                             />
                           ) : (
-                            <div className="w-full h-full bg-gradient-to-br from-blue-400 to-purple-500 rounded-full flex items-center justify-center">
+                            <div className="w-full h-full bg-linear-to-br from-blue-400 to-purple-500 rounded-full flex items-center justify-center">
                               <User className="w-5 h-5 text-white" />
                             </div>
                           )}
@@ -2368,7 +2368,7 @@ export default function UserProfile() {
                               className="w-full h-full object-cover rounded-full"
                             />
                           ) : (
-                            <div className="w-full h-full bg-gradient-to-br from-red-400 to-pink-500 rounded-full flex items-center justify-center">
+                            <div className="w-full h-full bg-linear-to-br from-red-400 to-pink-500 rounded-full flex items-center justify-center">
                               <User className="w-5 h-5 text-white" />
                             </div>
                           )}

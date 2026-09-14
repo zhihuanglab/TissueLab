@@ -3,9 +3,9 @@ requires = ["setuptools>=45", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tissuelab-ai-service"
+name = "tissuelab-service"
 version = "0.1.8"
-description = "AI Service for TissueLab"
+description = "TissueLab open edition — local single-process service"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp==3.10.10",
@@ -16,7 +16,6 @@ dependencies = [
     "charset-normalizer==3.4.0",
     "fastapi==0.109.1",
     "frozenlist==1.5.0",
-    "google-cloud-storage",
     "h5py==3.12.1",
     "idna==3.10",
     "importlib_metadata==8.5.0",
@@ -26,10 +25,9 @@ dependencies = [
     "nibabel",
     "numba",
     "numpy==1.26.4",
-    "numcodecs==0.12.1",
     "ome-types==0.5.2",
-    "ome-zarr==0.9.0",
     "opencv-python",
+    "filelock",
     "pillow==11.0.0",
     "pydantic==2.9.2",
     "pydantic-settings==2.0.3",
@@ -40,21 +38,22 @@ dependencies = [
     "requests==2.32.3",
     "scipy==1.13.1",
     "six==1.16.0",
-    "tifffile==2024.8.30",
-    "tiffslide==2.4.0",
+    "fsspec>=2024.10.0",
+    "imagecodecs",
+    "tifffile>=2025.5.21",
+    "tiffslide==3.0.0",
     "typing_extensions==4.12.2",
     "urllib3==1.26.20",
     "uvicorn==0.27.0",
     "websockets>=11.0.3",
     "yarl==1.17.1",
-    "zarr==2.17.2",
+    "zarr==3.1.5",
     "pydicom",
     "pylibCZIrw; sys_platform == 'win32'",
-    "pyisyntax",
-    "pyvips[binary]",
+    "fastslide",
+    "pyvips",
     "openai",
+    "schedule",
     "czifile",
     "tissuelab_sdk==0.1.12",
-    "celery",
-    "pyzmq",
 ]

@@ -13,6 +13,7 @@ interface UseChannelUpdatesParams {
   currentWSIInfo: any;
   currentWSIFileInfo: any;
   currentInstanceId?: string | null;
+  authToken: string | null;
   getTileUrl: (level: number, x: number, y: number) => string;
   setAllTilesLoaded: (loaded: boolean) => void;
 }
@@ -31,6 +32,7 @@ export const useChannelUpdates = (params: UseChannelUpdatesParams) => {
     currentWSIInfo,
     currentWSIFileInfo,
     currentInstanceId,
+    authToken,
     getTileUrl,
     setAllTilesLoaded,
   } = params;
@@ -39,7 +41,7 @@ export const useChannelUpdates = (params: UseChannelUpdatesParams) => {
   const rebuildTiledImage = useMemo(
     () => (newVisibleChannels?: number[]) => {
       const channelsToUse = newVisibleChannels || visibleChannels;
-      if (tileSource && viewerInstance && currentWSIInfo) {
+      if (tileSource && viewerInstance && currentWSIInfo && authToken) {
         try {
           // Get current dimensions from WSI info
           let level_0_width = 50000;
@@ -59,6 +61,7 @@ export const useChannelUpdates = (params: UseChannelUpdatesParams) => {
             getTileUrl,
             currentInstanceId ?? undefined,
             currentWSIFileInfo,
+            authToken,
             { channelSignature }
           );
 
@@ -68,7 +71,7 @@ export const useChannelUpdates = (params: UseChannelUpdatesParams) => {
         }
       }
     },
-    [tileSource, getTileUrl, viewerInstance, currentInstanceId, currentWSIInfo, currentWSIFileInfo, channelSignature]
+    [tileSource, getTileUrl, viewerInstance, currentInstanceId, currentWSIInfo, currentWSIFileInfo, channelSignature, authToken]
   );
 
   // Debounced effect to limit the number of calls to change channels
@@ -115,7 +118,7 @@ export const useChannelUpdates = (params: UseChannelUpdatesParams) => {
       console.log('[Update Channels] Current channels:', channels);
       console.log('[Update Channels] Current channelSignature:', channelSignature);
 
-      if (tileSource && viewerInstance && currentWSIInfo) {
+      if (tileSource && viewerInstance && currentWSIInfo && authToken) {
         try {
           // Get current dimensions from WSI info
           let level_0_width = 50000;
@@ -135,6 +138,7 @@ export const useChannelUpdates = (params: UseChannelUpdatesParams) => {
             getTileUrl,
             currentInstanceId ?? undefined,
             currentWSIFileInfo,
+            authToken,
             { channelSignature }
           );
 
@@ -159,6 +163,6 @@ export const useChannelUpdates = (params: UseChannelUpdatesParams) => {
     return () => {
       window.removeEventListener('updateChannels', handleUpdateChannels);
     };
-  }, [viewerInstance, tileSource, getTileUrl, currentInstanceId, visibleChannels, channels, channelSignature, currentWSIInfo, currentWSIFileInfo]);
+  }, [viewerInstance, tileSource, getTileUrl, currentInstanceId, visibleChannels, channels, channelSignature, currentWSIInfo, currentWSIFileInfo, authToken]);
 };
 

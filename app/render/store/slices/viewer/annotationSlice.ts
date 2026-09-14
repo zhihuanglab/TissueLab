@@ -1,12 +1,15 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { RootState } from '../../index';
-import { normalizePatchClassificationData } from '@/utils/patchClassificationUtils';
+import { normalizePatchClassificationData } from '@/utils/agent/patchClassification.utils';
 import { annotationTypeStore } from '@/store/zustand/slice/annotationTypesStore';
 
 // Export the interface for reuse in components
 export interface AnnotationClass {
   name: string;
+  /** Cells the user labelled AS this class. */
   count: number;
+  /** Cells the user marked "not this type" for this class. */
+  negativeCount?: number;
   color: string;
   persisted?: boolean;
 }
@@ -29,15 +32,11 @@ interface AnnotationState<T extends BaseAnnotation> {
   annotations: T[];
   nuclei_segmentation: T[];
   tissue_segmentation: string[];
-  patches: PatchOverlayEntry[];
   patchOverrides: Record<number, string>;
-  showTissueAnnotations: boolean;
-  showPatchAnnotations: boolean;
   isEditPanelOpen: boolean;
   editAnnotation: undefined | string;
   isGenerating: boolean;
   threshold: number;
-  polygon_threshold: number;
   patchClassificationData: PatchClassificationData | null;
   
   classificationEnabled: boolean;
@@ -45,8 +44,6 @@ interface AnnotationState<T extends BaseAnnotation> {
   
   nucleiClasses: AnnotationClass[];
   regionClasses: AnnotationClass[];
-  customOptions: string[];
-  selectedNucleiClasses: number[];
   activeManualClassificationClass: AnnotationClass | null;
 }
 
@@ -54,15 +51,11 @@ const initialState: AnnotationState<BaseAnnotation> = {
   annotations: [],
   nuclei_segmentation: [],
   tissue_segmentation: [],
-  patches: [],
   patchOverrides: {},
-  showTissueAnnotations: false,
-  showPatchAnnotations: false,
   isEditPanelOpen: false,
   editAnnotation: undefined,
   isGenerating: false,
   threshold: 100,
-  polygon_threshold: 10,
   patchClassificationData: null,
   
   classificationEnabled: false,
@@ -76,8 +69,6 @@ const initialState: AnnotationState<BaseAnnotation> = {
     },
   ],
   regionClasses: [],
-  customOptions: [],
-  selectedNucleiClasses: [0],
   activeManualClassificationClass: null,
 }
 
@@ -144,6 +135,9 @@ const annotationSlice = createSlice({
     toggleEditPanel: (state) => {
       state.isEditPanelOpen = !state.isEditPanelOpen
     },
+    setEditPanelOpen: (state, action: PayloadAction<boolean>) => {
+      state.isEditPanelOpen = action.payload
+    },
     setEditAnnotations: <T extends BaseAnnotation>(
       state: AnnotationState<T>,
       action: PayloadAction<string>
@@ -159,32 +153,9 @@ const annotationSlice = createSlice({
     clearTissueSegmentation: <T extends BaseAnnotation>(state: AnnotationState<T>) => { 
       state.tissue_segmentation = []
     },
-    setPatchOverlays: (
-      state,
-      action: PayloadAction<PatchOverlayEntry[]>
-    ) => {
-      const overrides = state.patchOverrides;
-      state.patches = action.payload.map((patch) => {
-        const overrideColor = overrides[patch[0]];
-        if (overrideColor) {
-          if (overrideColor === patch[5]) { // Color is at index 5 [idx, x, y, width, height, color, class_id]
-            delete overrides[patch[0]];
-            return patch;
-          }
-          // Preserve class_id if present (index 6), otherwise use -1
-          const class_id = patch.length > 6 ? patch[6] : -1;
-          return [patch[0], patch[1], patch[2], patch[3], patch[4], overrideColor, class_id] as PatchOverlayEntry;
-        }
-        return patch;
-      });
-    },
-    clearPatchOverlays: (state) => {
-      state.patches = [];
-    },
     clearPatchOverrides: (state) => {
       state.patchOverrides = {};
     },
-    /** Remove overrides for given IDs so next setPatches (from refetch) uses backend colors. */
     clearPatchOverridesForIds: (state, action: PayloadAction<number[]>) => {
       action.payload.forEach((id) => {
         delete state.patchOverrides[Number(id)];
@@ -204,25 +175,6 @@ const annotationSlice = createSlice({
           delete state.patchOverrides[Number(id)];
         }
       });
-
-      if (!state.patches.length) return;
-
-      const idSet = new Set(ids.map((id) => Number(id)));
-      state.patches = state.patches.map((patch) =>
-        idSet.has(patch[0])
-          ? (() => {
-              // Preserve class_id if present (index 6), otherwise use -1
-              const class_id = patch.length > 6 ? patch[6] : -1;
-              return [patch[0], patch[1], patch[2], patch[3], patch[4], color, class_id] as PatchOverlayEntry;
-            })()
-          : patch
-      );
-    },
-    toggleTissueAnnotations: (state) => {
-      state.showTissueAnnotations = !state.showTissueAnnotations
-    },
-    togglePatchAnnotations: (state) => {
-      state.showPatchAnnotations = !state.showPatchAnnotations
     },
     setPatchClassificationData: <T extends BaseAnnotation>(
       state: AnnotationState<T>,
@@ -256,11 +208,55 @@ const annotationSlice = createSlice({
         name: typeof cls.name === 'string' ? cls.name : String(cls.name ?? ''),
         persisted: cls.persisted ?? true,
       }));
-      
-      const negativeControl = normalized.find(cls => cls.name === 'Negative control');
-      const others = normalized.filter(cls => cls.name !== 'Negative control');
-      
-      state.nucleiClasses = negativeControl ? [negativeControl, ...others] : normalized;
+
+      // Dedup by name — the class list must never contain duplicate class names.
+      // Some upstream payloads can arrive one-entry-per-cell (e.g. a region labeled
+      // with 300 cells yielding 300 copies of the same name in dynamic_class_names);
+      // without this guard the panel renders the class 300 times. Keep first + merge
+      // a non-zero count / persisted flag from any later duplicate. Mirrors the
+      // name-uniqueness that addNucleiClass already enforces.
+      const byName = new Map<string, typeof normalized[number]>();
+      for (const cls of normalized) {
+        const prev = byName.get(cls.name);
+        if (!prev) {
+          byName.set(cls.name, cls);
+        } else {
+          byName.set(cls.name, {
+            ...prev,
+            count: prev.count || cls.count,
+            persisted: prev.persisted || cls.persisted,
+          });
+        }
+      }
+      const deduped = Array.from(byName.values());
+
+      const negativeControl = deduped.find(cls => cls.name === 'Negative control');
+      const others = deduped.filter(cls => cls.name !== 'Negative control');
+      const next = negativeControl ? [negativeControl, ...others] : deduped;
+
+      // Bail when the result is identical to what's already stored. Assigning an
+      // equal-but-new array still hands the store a fresh `nucleiClasses`
+      // reference, and that array is a dependency of DrawingOverlay's centroid
+      // and polygon buffer memos — so a redundant set rebuilds every vertex,
+      // color and index buffer for the whole slide. Re-loading a slide's
+      // classifications normally returns the exact same list, and that load now
+      // runs unawaited (see handleLoadClassification), so it lands after the
+      // first paint and the rebuild is fully visible as a stutter.
+      //
+      // Compare every field of AnnotationClass, not just names: the panel shows
+      // `count` and a genuine count change must still reach the store.
+      const current = state.nucleiClasses;
+      const unchanged =
+        current.length === next.length &&
+        next.every((cls, i) =>
+          cls.name === current[i].name &&
+          cls.count === current[i].count &&
+          cls.color === current[i].color &&
+          cls.persisted === current[i].persisted
+        );
+      if (unchanged) return;
+
+      state.nucleiClasses = next;
     },
 
     addNucleiClass: (state, action: PayloadAction<AnnotationClass>) => {
@@ -335,7 +331,6 @@ const annotationSlice = createSlice({
 })
 
 export const selectPatchClassificationData = (state: RootState) => state.annotations.patchClassificationData;
-export const selectPatchOverlays = (state: RootState) => state.annotations.patches;
 
 export const {
   setAnnotations,
@@ -344,16 +339,13 @@ export const {
   clearAnnotations,
   updateAnnotationById,
   toggleEditPanel,
+  setEditPanelOpen,
   setEditAnnotations,
   setTissueSegmentation,
   clearTissueSegmentation,
-  setPatchOverlays,
-  clearPatchOverlays,
   clearPatchOverrides,
   clearPatchOverridesForIds,
   updatePatchOverlayColors,
-  toggleTissueAnnotations,
-  togglePatchAnnotations,
   setNucleiSegmentation,
   clearNucleiSegmentation,
   addNucleiSegmentation,

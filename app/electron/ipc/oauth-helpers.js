@@ -7,7 +7,7 @@
  * @param {Function} params.openExternal - Function to open URL in system browser (shell.openExternal)
  * @returns {Promise<{success: boolean, tokens?: Object, error?: string}>}
  */
-async function performGoogleOAuth({ clientId, clientSecret, openExternal }) {
+async function performGoogleOAuth({ clientId, openExternal }) {
   const { generatePKCEPair } = require('../oauth/pkce');
   const { createCallbackServer } = require('../oauth/server');
   const crypto = require('crypto');
@@ -81,11 +81,6 @@ async function performGoogleOAuth({ clientId, clientSecret, openExternal }) {
       grant_type: 'authorization_code',
       code_verifier: codeVerifier,
     };
-    // Google's Desktop OAuth clients still require client_secret on token exchange
-    // even when PKCE is used. The "secret" is non-confidential for installed apps.
-    if (clientSecret) {
-      tokenParams.client_secret = clientSecret;
-    }
     
     const requestBody = new URLSearchParams(tokenParams).toString();
     
@@ -187,7 +182,7 @@ async function performGoogleOAuth({ clientId, clientSecret, openExternal }) {
  * @param {string} params.clientId - Google OAuth Client ID
  * @returns {Promise<{success: boolean, tokens?: Object, error?: string}>}
  */
-async function refreshGoogleToken({ refreshToken, clientId, clientSecret }) {
+async function refreshGoogleToken({ refreshToken, clientId }) {
   const https = require('https');
   const { URLSearchParams } = require('url');
   
@@ -204,9 +199,6 @@ async function refreshGoogleToken({ refreshToken, clientId, clientSecret }) {
       refresh_token: refreshToken,
       grant_type: 'refresh_token',
     };
-    if (clientSecret) {
-      tokenParams.client_secret = clientSecret;
-    }
     
     const requestBody = new URLSearchParams(tokenParams).toString();
     

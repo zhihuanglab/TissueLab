@@ -2,11 +2,13 @@
 import {
   Database,
   FileText,
+  Loader2,
   MousePointerClick,
   Network,
-  Settings
+  Settings,
 } from "lucide-react";
 import dynamic from 'next/dynamic';
+import { createPortal } from 'react-dom';
 import React, { ReactElement, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import AppHeader from "@/components/layouts/AppHeader";
@@ -19,48 +21,42 @@ const Annotorious = dynamic(() =>
     return mod.Annotorious;
   }), { ssr: false }
 );
-const OpenSeadragonContainer = dynamic(() => import('@/components/imageViewer/OpenSeadragonContainer'), {
+const OpenSeadragonContainer = dynamic(() => import('@/components/imageViewer/viewer/OpenSeadragonContainer'), {
   ssr: false,
 }) as React.FC<{ instanceId?: string }>;
 
-const NiivueContainer = dynamic(() => import('@/components/imageViewer/NiivueContainer'), {
+const NiivueContainer = dynamic(() => import('@/components/imageViewer/viewer/NiivueContainer'), {
   ssr: false,
 }) as React.FC<{ instanceId?: string }>;
 
 const MemoizedOpenSeadragonContainer = React.memo(OpenSeadragonContainer);
 const MemoizedNiivueContainer = React.memo(NiivueContainer);
 
-import FileUploader from "@/components/imageViewer/FileUploader";
+import FileUploader from "@/components/imageViewer/common/FileUploader";
 
 // api
 import { useInstanceCleanup } from '@/hooks/viewer/useInstanceCleanup';
 import { resetSegmentationData } from '@/services/file.service';
 
-import { useAnnotatorInstance } from '@/contexts/AnnotatorContext';
-
-import ResizableSidebar from "@/components/imageViewer/ResizableSidebar";
+import ResizableSidebar from "@/components/imageViewer/common/ResizableSidebar";
 import { WsProvider } from "@/contexts/WsProvider";
 import { RootState } from "@/store";
 import { useDispatch, useSelector } from "react-redux";
 // import ViewportControls from "@/components/ImageViewer/ViewportControls"; // Now using AppHeader for both environments
-import FileBrowserSidebar from "@/components/imageViewer/LeftSidebar/FileBrowserSidebar";
-import SidebarViewerSetting from "@/components/imageViewer/RightSidebar/SidebarViewerSetting";
+import FileBrowserSidebar from "@/components/imageViewer/folder/FileBrowserSidebar";
+import SidebarViewerSetting from "@/components/imageViewer/sidebar/settings/SidebarViewerSetting";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { setOutputPath, setPanels } from "@/store/slices/chat/workflowSlice";
-import {
-  applyWorkflowPreviewSteps,
-  findLastWorkflowCardPayload,
-} from "@/utils/workflow/hydrateWorkflowFromChat";
-import { setCurrentImagePath } from "@/store/slices/fileManagerSlice";
+import type { WorkflowPanel } from "@/store/slices/chat/workflowSlice";
 import { useWorkflowHistory } from "@/store/zustand/store";
-import { setImageLoaded } from "@/store/slices/layoutSlice";
-import { resetSvsPath } from "@/store/slices/svsPathSlice";
-import { resetWSIState } from "@/store/slices/wsiSlice";
-import EventBus from "@/utils/EventBus";
-import { getFileViewerType } from "@/utils/dashboard/fileTypeUtils";
-import { cn } from "@/utils/twMerge";
-import { useUserInfo } from "@/provider/UserInfoProvider";
+import useRootStore from "@/store/zustand/store";
+import { formatPath } from "@/utils/common/path.utils";
+import { setWsiOpening } from "@/store/slices/layoutSlice";
+import { useActiveSlidePath } from "@/utils/viewer/slidePath";
+import eventBus from "@/utils/common/eventBus";
+import { getFileViewerType } from "@/utils/dashboard/fileType.utils";
+import { cn } from "@/utils/common/twMerge";
 
 
 function formatRelativeTime(timestamp: number): string {
@@ -74,10 +70,21 @@ function formatRelativeTime(timestamp: number): string {
   return `${days}d ago`;
 }
 
+/** Convert saved workflow-history panels into the step shape the WorkflowGraph
+ *  rebuilds from (each typed content field becomes a `key=value` input). */
+function workflowPanelsToSteps(panels: WorkflowPanel[]) {
+  return panels.map((panel, index) => ({
+    step: index + 1,
+    model: String(panel.stepName || panel.type || ''),
+    impl: panel.type || null,
+    input: (panel.content || [])
+      .filter((c) => c.key && typeof c.value === 'string' && c.value.trim() !== '')
+      .map((c) => `${c.key}=${c.value}`),
+  }));
+}
+
 const ImageViewer = () => {
   const dispatch = useDispatch();
-  const { setInstanceId, setAnnotatorInstance, setViewerInstance } = useAnnotatorInstance();
-  const { userIdentity } = useUserInfo();
   const historyEntries = useWorkflowHistory((s) => s.entries);
   const selectedHistoryId = useWorkflowHistory((s) => s.selectedHistoryId);
   const selectEntry = useWorkflowHistory((s) => s.selectEntry);
@@ -88,7 +95,7 @@ const ImageViewer = () => {
   const loadFromCloud = useWorkflowHistory((s) => s.loadFromCloud);
   const livePanels = useSelector((state: RootState) => state.workflow.panels);
   const liveOutputPath = useSelector((state: RootState) => state.workflow.outputPath);
-  const chatMessages = useSelector((state: RootState) => state.chat.messages);
+  const queueWorkflowFromChatCard = useRootStore((s) => s.queueWorkflowFromChatCard);
   const isWorkflowRunning = useSelector((state: RootState) => state.workflow.isRunning);
   const runningExecutionId = useSelector((state: RootState) => state.workflow.runningExecutionId);
   const executionToWorkflowIdMap = useSelector((state: RootState) => state.workflow.executionToWorkflowIdMap);
@@ -100,7 +107,8 @@ const ImageViewer = () => {
   }, [runningExecutionId, isWorkflowRunning, executionToWorkflowIdMap]);
 
   const { instances } = useSelector((state: RootState) => state.wsi);
-  const currentPath = useSelector((state: RootState) => state.svsPath.currentPath);
+  const activeInstanceId = useSelector((state: RootState) => state.wsi.activeInstanceId);
+  const currentPath = useActiveSlidePath();
   const isMobile = useSelector((state: RootState) => state.layout.isMobile);
   const [isSidebarVisible, setIsSidebarVisible] = useState(false);
   /** Once true, keep ResizableSidebar mounted (hidden when closed) so Workflow / Workflow Graph state is not destroyed. */
@@ -110,8 +118,6 @@ const ImageViewer = () => {
   const [showPrefsPopup, setShowPrefsPopup] = useState(false);
   const [sidebarContent, setSidebarContent] = useState<string | null>(null);
   const [showSettingsBadge, setShowSettingsBadge] = useState(false);
-  const [isElectron, setIsElectron] = useState(false);
-  const previousUserIdentityRef = useRef(userIdentity);
   const imageUploaded = useSelector(
     (state: RootState) => state.layout.imageLoaded
   )
@@ -121,27 +127,26 @@ const ImageViewer = () => {
     return instanceEntries.some((instance) => instance?.isActive);
   }, [currentPath, imageUploaded, instances]);
 
+  // Full-screen "Opening…" cover so opening a slide always reads as click → loading →
+  // OpenSeadragon, without flashing the empty FileUploader placeholder. wsiOpening
+  // (Redux) is set when any open is triggered (dashboard click / file browser); it
+  // lives in Redux so it survives the dashboard → /imageViewer navigation. The cover
+  // lifts once the slide actually renders (hasRenderableViewer).
+  const wsiOpening = useSelector((state: RootState) => state.layout.wsiOpening);
+  const showOpeningCover = wsiOpening;
+  useEffect(() => {
+    if (hasRenderableViewer && wsiOpening) {
+      dispatch(setWsiOpening(false));
+    }
+  }, [hasRenderableViewer, wsiOpening, dispatch]);
+  useEffect(() => {
+    if (!showOpeningCover) return;
+    const t = setTimeout(() => { dispatch(setWsiOpening(false)); }, 60000); // safety: never trap the user
+    return () => clearTimeout(t);
+  }, [showOpeningCover, dispatch]);
+
   // Use instance cleanup hook
   useInstanceCleanup();
-
-  useEffect(() => {
-    setIsElectron(typeof window !== 'undefined' && !!(window as any).electron);
-  }, []);
-
-  useEffect(() => {
-    const previousIdentity = previousUserIdentityRef.current;
-    if (previousIdentity === 3 && userIdentity !== 3) {
-      setAnnotatorInstance(null);
-      setViewerInstance(null);
-      setInstanceId(null);
-      dispatch(resetWSIState());
-      dispatch(resetSvsPath());
-      dispatch(setCurrentImagePath(null));
-      dispatch(setOutputPath(''));
-      dispatch(setImageLoaded(false));
-    }
-    previousUserIdentityRef.current = userIdentity;
-  }, [dispatch, setAnnotatorInstance, setInstanceId, setViewerInstance, userIdentity]);
 
   // Check if user has clicked settings button before
   useEffect(() => {
@@ -151,7 +156,7 @@ const ImageViewer = () => {
     }
   }, []);
 
-  // Load workflow history from Firebase on mount
+  // Load workflow history from the service on mount
   useEffect(() => {
     loadFromCloud();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -161,20 +166,19 @@ const ImageViewer = () => {
   }, [isSidebarVisible]);
 
   useEffect(() => {
-    if (
-      sidebarContent === 'SidebarWorkflow' ||
-      sidebarContent === 'SidebarWorkflowGraph'
-    ) {
+    if (sidebarContent === 'SidebarWorkflowGraph') {
       setWorkflowRailsMounted(true);
     }
   }, [sidebarContent]);
 
-  // Add this useEffect
+  // Add this useEffect — only reset on page unmount, not when active instance switches.
+  const activeInstanceIdRef = useRef(activeInstanceId);
+  activeInstanceIdRef.current = activeInstanceId;
   useEffect(() => {
-    // Return cleanup function that runs when component unmounts
     return () => {
-      // Call reset API endpoint
-      resetSegmentationData()
+      const id = activeInstanceIdRef.current;
+      if (!id) return;
+      resetSegmentationData(id)
         .then(response => {
           console.log('Successfully reset segmentation data:', response);
         })
@@ -182,7 +186,7 @@ const ImageViewer = () => {
           console.error('Failed to reset segmentation data:', error);
         });
     };
-  }, []); // Empty dependency array means this runs once on mount and cleanup runs on unmount
+  }, []);
 
   const toggleSidebar = useCallback((content: string) => {
     if (sidebarContent === content) {
@@ -194,18 +198,20 @@ const ImageViewer = () => {
     }
   }, [sidebarContent]);
 
-  // Listen for requests to open a specific sidebar from nested components
+  // Listen for requests to open a specific sidebar from nested components.
+  // This always opens/switches to the requested sidebar — it must NOT toggle
+  // it closed when the same sidebar is already open (that unmounts the chat
+  // mid-request and makes the header flash blank).
   useEffect(() => {
     const handler = (content: string) => {
-      // Open and switch to the requested sidebar
-      // @ts-ignore
-      toggleSidebar(content)
+      setIsSidebarVisible(true);
+      setSidebarContent(content);
     }
-    EventBus.on('open-sidebar', handler);
+    eventBus.on('open-sidebar', handler);
     return () => {
-      EventBus.off('open-sidebar', handler);
+      eventBus.off('open-sidebar', handler);
     }
-  }, [toggleSidebar]);
+  }, []);
 
   const isCoPilotEnabled = useSelector((state: RootState) => state.coPilot.enabled);
   
@@ -237,6 +243,15 @@ const ImageViewer = () => {
         <div className="h-screen flex">
         {/* File Browser Sidebar - LEFT (Full Height) */}
           <FileBrowserSidebar />
+
+          {/* Loading cover — opaque, over everything, until the slide renders. */}
+          {showOpeningCover && typeof document !== 'undefined' && createPortal(
+            <div className="fixed inset-0 z-[9999] flex flex-col items-center justify-center gap-4 bg-background">
+              <Loader2 className="h-8 w-8 animate-spin text-primary" />
+              <div className="text-sm text-muted-foreground">Opening image…</div>
+            </div>,
+            document.body
+          )}
         
             {/* Right Content Area */}
             <div className="flex-1 flex flex-col min-h-0 overflow-x-hidden">
@@ -254,10 +269,14 @@ const ImageViewer = () => {
                   {Object.entries(instances).map(([instanceId, instance]) => {
                     const fileName = instance.fileInfo?.fileName || '';
                     const viewerType = getFileViewerType(fileName);
-                    
+                    // Remount when THIS instance's slide changes (not when focus flips).
+                    // Keying on isActive remounted both panes on every pane switch and
+                    // dropped unsaved popup drafts + blew WebGL contexts.
+                    const wrapperKey = `${instanceId}::${instance.filePath || ''}`;
+
                     return (
                       <div
-                        key={instanceId}
+                        key={wrapperKey}
                         className={`absolute inset-0 w-full h-full ${
                           instance.isActive ? 'z-10' : 'z-0 pointer-events-none'
                         }`}
@@ -275,7 +294,6 @@ const ImageViewer = () => {
                       </div>
                     );
                   })}
-
                 </div>
               ) : (
                 <FileUploader />
@@ -305,7 +323,6 @@ const ImageViewer = () => {
               >
                 <ResizableSidebar
                   sidebarContent={sidebarContent}
-                  isElectron={isElectron}
                   keepWorkflowRailsAlive={workflowRailsMounted}
                 />
               </div>
@@ -320,7 +337,6 @@ const ImageViewer = () => {
               >
                 <ResizableSidebar
                   sidebarContent={sidebarContent}
-                  isElectron={isElectron}
                   fullScreen
                   keepWorkflowRailsAlive={workflowRailsMounted}
                 />
@@ -342,8 +358,8 @@ const ImageViewer = () => {
 
                 <Button
                   variant="ghost"
-                  onClick={() => toggleSidebar('SidebarWorkflowGraph')}
-                  className={navButtonClass(sidebarContent === 'SidebarWorkflowGraph')}
+                  onClick={() => toggleSidebar('SidebarChat')}
+                  className={navButtonClass(sidebarContent === 'SidebarChat' || sidebarContent === 'SidebarWorkflowGraph')}
                 >
                   <Network className="h-4 w-4 shrink-0" />
                   <span className="truncate">Agentic AI</span>
@@ -390,7 +406,7 @@ const ImageViewer = () => {
                                 onClick={() => {
                                   if (
                                     selectedHistoryId === entry.id &&
-                                    sidebarContent === 'SidebarWorkflow' &&
+                                    sidebarContent === 'SidebarWorkflowGraph' &&
                                     isSidebarVisible
                                   ) {
                                     setIsSidebarVisible(false);
@@ -401,8 +417,16 @@ const ImageViewer = () => {
                                   selectEntry(entry.id);
                                   dispatch(setPanels(entry.panels));
                                   dispatch(setOutputPath(entry.outputPath));
+                                  // Rebuild the WorkflowGraph from the saved entry's panels.
+                                  const steps = workflowPanelsToSteps(entry.panels);
+                                  if (steps.length > 0) {
+                                    queueWorkflowFromChatCard({
+                                      steps,
+                                      formattedPath: formatPath(currentPath ?? ''),
+                                    });
+                                  }
                                   setIsSidebarVisible(true);
-                                  setSidebarContent('SidebarWorkflow');
+                                  setSidebarContent('SidebarWorkflowGraph');
                                 }}
                               >
                                 <span
@@ -460,7 +484,7 @@ ImageViewer.getLayout = function getLayout(page: ReactElement) {
       <div className="app-container flex h-screen w-full overflow-hidden">
         <AppSidebar />
         <div className="main-content-wrapper flex flex-col h-screen flex-1 min-w-0 transition-all duration-300 px-0">
-          <main className="flex-grow-1 h-full overflow-hidden">
+          <main className="grow-1 h-full overflow-hidden">
             {page}
           </main>
         </div>

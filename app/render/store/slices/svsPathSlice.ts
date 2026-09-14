@@ -18,8 +18,8 @@ interface SlideInfo {
   totalTiles: number;
 }
 
+/** Slide metadata / channel UI state. Slide path lives on ``wsi.instances[id].filePath``. */
 interface SvsPathState {
-  currentPath: string | null;
   totalChannels: number;
   channels: Channel[];
   visibleChannels: number[];
@@ -27,7 +27,6 @@ interface SvsPathState {
 }
 
 const initialState: SvsPathState = {
-  currentPath: null,
   totalChannels: 3,
   channels: [],
   visibleChannels: [],
@@ -53,9 +52,6 @@ const svsPathSlice = createSlice({
   name: 'svsPath',
   initialState,
   reducers: {
-    setCurrentPath: (state, action: PayloadAction<{ path: string | null }>) => {
-      state.currentPath = action.payload.path;
-    },
     setSlideInfo: (state, action: PayloadAction<Partial<SlideInfo>>) => {
       state.slideInfo = {
         ...state.slideInfo,
@@ -128,7 +124,6 @@ const svsPathSlice = createSlice({
 });
 
 export const { 
-  setCurrentPath, 
   setTotalChannels, 
   toggleChannel,
   setChannelColor,
@@ -142,4 +137,4 @@ export const {
   resetSvsPath
 } = svsPathSlice.actions;
 
-export default svsPathSlice.reducer; 
+export default svsPathSlice.reducer;

@@ -8,11 +8,12 @@ import {
 } from "@/components/ui/tooltip";
 
 import { Button } from "@/components/ui/button";
-import { cn } from "@/utils/twMerge";
+import { cn } from "@/utils/common/twMerge";
 import {
   ChevronLeft,
   Eye,
   EyeOff,
+  FolderPlus,
   Grid2x2,
   List,
   RefreshCw,
@@ -51,6 +52,8 @@ interface Props {
   disableRefresh?: boolean;
   disableOpenFolder?: boolean;
 
+  /** Leftmost toolbar slot (e.g. Select) — before Go Up. */
+  leadingActions?: React.ReactNode;
   extraActions?: React.ReactNode;
 }
 
@@ -79,47 +82,65 @@ export function FileHeader({
   disableNewFolder = false,
   disableRefresh = false,
   disableOpenFolder = false,
+  leadingActions,
   extraActions,
 }: Props) {
 
+  // Primary "create / open" actions shown next to the title in the standalone
+  // layout. When title is empty (dashboard mounts the file manager under a
+  // tab strip), there's nothing on the left to anchor a separate row, so we
+  // merge these into the breadcrumb row below to avoid leaving the top of
+  // the card half-empty.
+  const primaryActions = (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {showNewFolder && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onNewFolder}
+              disabled={disableNewFolder}
+              aria-label="New folder"
+              className="h-7 min-w-9 px-2.5 text-muted-foreground hover:bg-foreground/10 hover:text-foreground disabled:opacity-50"
+            >
+              <FolderPlus className="h-3.5 w-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">New Folder</TooltipContent>
+        </Tooltip>
+      )}
+
+      {showOpenFolder && onOpenFolder && (
+        <Button
+          onClick={onOpenFolder}
+          disabled={disableOpenFolder}
+          className="h-7 px-2.5 text-xs"
+        >
+          Open Folder
+        </Button>
+      )}
+
+      {extraActions}
+    </div>
+  );
+
   return (
     <TooltipProvider delayDuration={500} skipDelayDuration={300}>
-      <div className="flex flex-col gap-4 pb-0 pt-2">
-        {/* ─── Title + Actions ───────────────────────────── */}
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-2xl font-bold text-foreground">
-            {title}
-          </h2>
-
-          <div className="flex flex-wrap items-center gap-2">
-            {showNewFolder && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={onNewFolder}
-                disabled={disableNewFolder}
-                className="h-9 w-28 px-4 text-sm"
-              >
-                New Folder
-              </Button>
-            )}
-
-            {showOpenFolder && onOpenFolder && (
-              <Button
-                onClick={onOpenFolder}
-                disabled={disableOpenFolder}
-                className="h-9 w-28 px-3 text-sm"
-              >
-                Open Folder
-              </Button>
-            )}
-
-            {extraActions}
+      <div className="flex flex-col gap-2 pb-0 pt-0">
+        {/* ─── Title row (only when a title is provided) ───── */}
+        {title && (
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-2xl font-bold text-foreground">
+              {title}
+            </h2>
+            {primaryActions}
           </div>
-        </div>
+        )}
 
         {/* ─── Breadcrumb + Back + Search ───────────────── */}
         <div className="flex flex-wrap items-center gap-3">
+          {leadingActions}
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
@@ -141,6 +162,9 @@ export function FileHeader({
           {breadcrumb}
 
           <div className="ml-auto flex flex-wrap items-center gap-2">
+            {/* Inlined primary actions when there's no title row to host
+                them. Keeps the compact single-row layout balanced. */}
+            {!title && primaryActions}
             {showRefresh && (
               <Button
                 variant="ghost"
@@ -148,14 +172,14 @@ export function FileHeader({
                 onClick={onRefresh}
                 aria-label="Refresh"
                 disabled={disableRefresh}
-                className="h-9 w-9 rounded-[6px] text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
+                className="h-7 w-7 rounded-[6px] text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
               >
-                <RefreshCw className={cn("h-4 w-4", disableRefresh && "animate-spin")} />
+                <RefreshCw className={cn("h-3.5 w-3.5", disableRefresh && "animate-spin")} />
               </Button>
             )}
 
             {showViewToggle && (
-              <div className="flex h-9 items-center gap-0.5 rounded-[6px] border border-border bg-card px-[3px]">
+              <div className="flex h-7 items-center gap-0.5 rounded-[6px] border border-border bg-card px-[3px]">
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button

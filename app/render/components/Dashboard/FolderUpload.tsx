@@ -7,9 +7,9 @@ import { RootState } from "@/store";
 import path from 'path';
 import { getErrorMessage } from '@/utils/common/apiResponse';
 import { setFolderFileTree, updateFolderFiles, setFolderName, setCurrentFolder } from '@/store/slices/fileManagerSlice';
-import { setImageLoaded } from '@/store/slices/layoutSlice';
+import { setImageLoaded, setWsiOpening } from '@/store/slices/layoutSlice';
 import { addWSIInstance, updateInstanceWSIInfo, replaceCurrentInstance } from '@/store/slices/wsiSlice';
-import { setCurrentPath, setSlideInfo } from '@/store/slices/svsPathSlice';
+import { setSlideInfo } from '@/store/slices/svsPathSlice';
 
 interface FolderUploadProps {
   onFolderSelect: (folderPath: string) => void;
@@ -97,6 +97,7 @@ const FolderUpload: React.FC<FolderUploadProps> = ({ onFolderSelect, onWsiUpload
   };
 
   const handleWsiUpload = async (relativePath: string) => {
+    dispatch(setWsiOpening(true)); // full-screen loading cover until the viewer renders
     setIsUploading(true);
     setUploadStatus(`Uploading ${relativePath}...`);
 
@@ -131,6 +132,7 @@ const FolderUpload: React.FC<FolderUploadProps> = ({ onFolderSelect, onWsiUpload
       onWsiUploadComplete(loadData.dimensions);
     } catch (error) {
       console.error('Error:', error);
+      dispatch(setWsiOpening(false)); // lift the cover so the error is visible
       setUploadStatus(`An error occurred while uploading ${relativePath}`);
     } finally {
       setIsUploading(false);

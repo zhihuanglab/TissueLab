@@ -56,6 +56,8 @@ export const FACTORY_WHITELIST_CONFIG: Record<string, string[]> = {
   'h5VBPhlW5uWXpJyDGOGcsWUjfoc2': ['*'], // Admin user
   'FDQaGQD50gN0D7JC9bmyKmRITHd2': ['*'], // Admin user
   'n9p2yJr3JiZf1O3FiPvNUFkIMoB2': ['*'], // Admin user
+  '6sr8yo3NYfXmnro7s8cI0nhxoSJ2': ['*'], // Admin user
+  'RObDJwDgi0WbXL73vv76gC3kpJJ2': ['*'], // Admin user
   'default': []
 }
 

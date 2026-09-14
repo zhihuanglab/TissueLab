@@ -4,20 +4,26 @@
       "BiomedParseClassification",
       "MuskClassification",
       "TotalSegmentatorClassification",
-      "PatchClassifier"
+      "HOptimusClassification",
+      "VirchowClassification"
     ],
     "TissueSeg": [
       "BiomedParseSegmentation",
       "MuskEmbedding",
       "TotalSegmentatorSegmentation",
-      "VISTA"
+      "VISTA",
+      "HOptimusEmbedding",
+      "VirchowEmbedding"
     ],
     "NucleiSeg": [
-      "SegmentationNode",
-      "InstanSegNode"
+      "StarDist",
+      "InstanSegNode",
+      "CellCast",
+      "Cytoformer"
     ],
     "NucleiClassify": [
-      "ClassificationNode"
+      "NuClass",
+      "CytoformerClassification"
     ],
     "SpatialOmics": [
       "CellCharter"
@@ -80,7 +86,7 @@
       "factory": "TissueClassify",
       "source": "builtin"
     },
-    "SegmentationNode": {
+    "StarDist": {
       "displayName": "Cell/Nuclei Segmentation",
       "description": "Instance segmentation of nuclei/cells on WSI with per-nucleus polygons/centroids; prerequisite for per-cell metrics and classification.",
       "icon": "/images/icons/nuclei_segmentation_stardist.png",
@@ -95,21 +101,41 @@
       "factory": "NucleiSeg",
       "source": "builtin",
       "inputs": "WSI path, pixel_size, model_type",
-      "outputs": "Per-nucleus contours, centroids, probability, embeddings"
+      "outputs": "Per-nucleus contours, centroids, probability, PLIP embeddings at Cell-Segmentation/embeddings [N,768]"
+    },
+    "Cytoformer": {
+      "displayName": "Cytoformer Cell Segmentation",
+      "description": "Nuclei/cell instance segmentation (StarDist geometry) with fine-tuned H-optimus-0 per-cell embeddings [N,1536]; prerequisite for Cytoformer nuclei classification.",
+      "icon": "/images/icons/nuclei_segmentation_stardist.png",
+      "factory": "NucleiSeg",
+      "source": "builtin",
+      "outputs": "Per-nucleus contours, centroids, and H-optimus-0 embeddings at Cell-Segmentation/embeddings [N,1536]"
+    },
+    "CellCast": {
+      "displayName": "CellCast Nuclei Segmentation",
+      "description": "Instance segmentation of nuclei/cells on WSI with per-nucleus polygons/centroids; prerequisite for per-cell metrics and classification.",
+      "icon": "/images/icons/nuclei_segmentation_stardist.png",
+      "factory": "NucleiSeg",
+      "source": "builtin",
+      "outputs": "Per-nucleus contours and centroids"
     },
     "VISTA": {
       "displayName": "VISTA Tissue Segmentation",
-      "description": "An interactive foundation model for histopathology image segmentation.",
+      "description": "Interactive foundation model for pixel-wise histopathology tissue segmentation; outputs dense region masks for the specified tissue class(es).",
       "icon": "/images/icons/vista.svg",
       "factory": "TissueSeg",
       "source": "builtin",
-      "inputs": "WSI path, bbox, model_type",
-      "outputs": "coordinates of tissue regions",
+      "inputs": "WSI path, tissue_class (prompt), model_type",
+      "outputs": "Dense tissue masks at Tissue-Segmentation/masks/<tissue> (bool) + DZI overlay",
       "panel": [
-        { "key": "tissue_class", "type": "input", "value": "" }
+        {
+          "key": "tissue_class",
+          "type": "input",
+          "value": ""
+        }
       ]
     },
-    "ClassificationNode": {
+    "NuClass": {
       "displayName": "Nuclei Classification (NuClass)",
       "description": "Per-nucleus classifier assigning classes (e.g., tumor_cell, lymphocyte); consumes nuclei segmentation results.",
       "icon": "/images/icons/nuclei_classification_tissuelab_nuclass.png",
@@ -117,6 +143,23 @@
       "source": "builtin",
       "inputs": "Per-nucleus contours and centroids",
       "outputs": "Per-nucleus class probabilities"
+    },
+    "CytoformerClassification": {
+      "displayName": "Cytoformer Nuclei Classification",
+      "description": "Per-nucleus classifier over H-optimus-0 embeddings. With no annotations it predicts zero-shot from the selected ORGAN (low-confidence cells become Negative control); annotate cells and it trains on your own classes instead. Requires Cytoformer cell segmentation first.",
+      "icon": "/images/icons/nuclei_classification_tissuelab_nuclass.png",
+      "factory": "NucleiClassify",
+      "source": "builtin",
+      "inputs": "Cell-Segmentation/embeddings [N,1536], organ",
+      "outputs": "Per-nucleus class with confidence",
+      "panel": [
+        {
+          "key": "organ",
+          "type": "select",
+          "value": "",
+          "label": "Organ"
+        }
+      ]
     },
     "CellCharter": {
       "displayName": "CellCharter",
@@ -152,14 +195,35 @@
       "factory": "CodingAgent",
       "source": "builtin"
     },
-    "PatchClassifier": {
-      "displayName": "Patch Classifier",
-      "description": "Per-patch classifier driven by an active-learning loop. Same class-management UI as NuClass but operates on patches — no nuclei segmentation step.",
+    "HOptimusEmbedding": {
+      "displayName": "Patch Embedding (H-optimus-0)",
+      "description": "Generates 1536-d H-optimus-0 patch embeddings for pathology whole slides, used downstream by patch classification.",
+      "icon": "/images/icons/musk_embedding.svg",
+      "factory": "TissueSeg",
+      "source": "builtin",
+      "outputs": "Patch embeddings [N,1536]"
+    },
+    "HOptimusClassification": {
+      "displayName": "H-optimus-0 Classification",
+      "description": "Patch-based classification for pathology whole slides. Run HOptimusEmbedding first to generate patch embeddings.",
       "icon": "/images/icons/musk_classification.svg",
       "factory": "TissueClassify",
+      "source": "builtin"
+    },
+    "VirchowEmbedding": {
+      "displayName": "Patch Embedding (Virchow)",
+      "description": "Generates 2560-d Virchow patch embeddings (class token + mean patch tokens) for pathology whole slides.",
+      "icon": "/images/icons/musk_embedding.svg",
+      "factory": "TissueSeg",
       "source": "builtin",
-      "inputs": "Patch embeddings",
-      "outputs": "Per-patch class probabilities"
+      "outputs": "Patch embeddings [N,2560]"
+    },
+    "VirchowClassification": {
+      "displayName": "Virchow Classification",
+      "description": "Patch-based classification. Run VirchowEmbedding first to generate patch embeddings.",
+      "icon": "/images/icons/musk_classification.svg",
+      "factory": "TissueClassify",
+      "source": "builtin"
     }
   },
   "category_display_names": {

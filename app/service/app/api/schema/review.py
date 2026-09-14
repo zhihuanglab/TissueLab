@@ -1,31 +1,13 @@
 from pydantic import BaseModel
-from typing import Optional, Literal, List
+from typing import Optional, Literal, List, Any
 
-class LabelRequest(BaseModel):
-    slide_id: str
-    cell_id: str
-    class_name: Optional[str] = None
-    label: Literal[0, 1]
-    prob: float
 
-class RemoveRequest(BaseModel):
-    slide_id: str
-    cell_id: str
+class RoiBox(BaseModel):
+    x1: float
+    y1: float
+    x2: float
+    y2: float
 
-class ReclassifyRequest(BaseModel):
-    slide_id: str
-    cell_id: str
-    original_class: str
-    new_class: str
-    prob: float
-    # Optional fields for color and centroid (passed from frontend to avoid reading Zarr)
-    centroid_x: Optional[float] = None
-    centroid_y: Optional[float] = None
-    cell_color: Optional[str] = None
-    is_manual_reclassification: Optional[bool] = False
-
-class SaveReclassificationsRequest(BaseModel):
-    slide_id: str
 
 class CandidatesRequest(BaseModel):
     slide_id: str
@@ -34,18 +16,23 @@ class CandidatesRequest(BaseModel):
     sort: Optional[str] = "asc"
     limit: Optional[int] = 80
     offset: Optional[int] = 0
-    # Accept either a comma-separated string or a list of ints
+    # Accept either a comma-separated string or a list of ints (legacy; prefer roi)
     cell_ids: Optional[object] = None
-    # New parameter to exclude reclassified cells
-    exclude_reclassified: Optional[bool] = False
+    # Spatial ROI — preferred over cell_ids to avoid giant payloads
+    roi: Optional[RoiBox] = None
+    polygon_points: Optional[List[Any]] = None
+    # New parameter to exclude saved cells
+    exclude_saved: Optional[bool] = False
     # New parameter to specify which side of threshold: 'left' (prob < threshold) or 'right' (prob >= threshold)
     side: Optional[Literal["left", "right"]] = "left"
+    # When true, return only cells already saved (reviewed) for this class
+    saved_only: Optional[bool] = False
 
 
-class ShuffleCandidatesRequest(BaseModel):
+class PatchTileRequest(BaseModel):
+    """A single patch tile at an adjustable view size (Target Patch preview)."""
     slide_id: str
-    threshold: Optional[float] = 0.5
-    limit: Optional[int] = 80
-    class_names: Optional[List[str]] = None  # filter to subset of classes
-    exclude: Optional[bool] = True
-
+    patch_id: int
+    # Side of the square region to read, in slide pixels. The patch size
+    # renders the patch exactly; larger shows surrounding context.
+    window_size_px: Optional[int] = None

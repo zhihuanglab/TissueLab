@@ -1,5 +1,5 @@
 "use client";
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Pagination,
   PaginationContent,
@@ -45,6 +45,33 @@ export const FileManagerPagination: React.FC<FileManagerPaginationProps> = ({
   onPageSizeChange,
   onPageClick,
 }) => {
+  // Container-width tracking for the pagination row. Same pattern as the
+  // file table above: when the panel is narrow, drop the secondary affordances
+  // (showing-text first, then items-per-page) so prev/next + page numbers
+  // — the only things you can't replicate elsewhere — always survive.
+  //
+  // Approximate widths reserved per piece, used to compose thresholds so the
+  // numbers stay maintainable instead of magic.
+  const RESERVED_PAGINATION = 280;        // prev + ~5 page links + next
+  const RESERVED_PERPAGE = 170;           // "Items per page:" + select
+  const RESERVED_SHOWING = 180;           // "Showing 1-25 of 1234 items"
+  const SHOW_PERPAGE_WIDTH = RESERVED_PAGINATION + RESERVED_PERPAGE;
+  const SHOW_SHOWING_WIDTH = SHOW_PERPAGE_WIDTH + RESERVED_SHOWING;
+
+  const [containerEl, setContainerEl] = useState<HTMLDivElement | null>(null);
+  const [containerWidth, setContainerWidth] = useState<number>(SHOW_SHOWING_WIDTH);
+  useEffect(() => {
+    if (!containerEl || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect?.width ?? 0;
+      if (w > 0) setContainerWidth(w);
+    });
+    ro.observe(containerEl);
+    return () => ro.disconnect();
+  }, [containerEl]);
+  const showShowing = containerWidth >= SHOW_SHOWING_WIDTH;
+  const showPerPage = containerWidth >= SHOW_PERPAGE_WIDTH;
+
   // Don't show pagination if total is 0
   if (pagination.total === 0) {
     return null;
@@ -102,36 +129,47 @@ export const FileManagerPagination: React.FC<FileManagerPaginationProps> = ({
   const pageNumbers = getPageNumbers();
 
   return (
-    <div className="flex flex-col sm:flex-row items-center justify-between gap-4 px-4 py-3 bg-card pl-6">
-      <div className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
-        <span>
-          Showing <span className='font-semibold'>{startItem}-{endItem}</span> of <span className='font-semibold'>{pagination.total}</span> items
-        </span>
-      </div>
-      <div className="flex items-center gap-4">
-        <div className="flex items-center gap-2">
-          <span className="text-sm text-gray-600 dark:text-gray-400 whitespace-nowrap">Items per page:</span>
-          <Select
-            value={pagination.limit === null ? 'all' : pagination.limit.toString()}
-            onValueChange={(value) => {
-              if (value === 'all') {
-                onPageSizeChange(null);
-              } else {
-                onPageSizeChange(parseInt(value, 10));
-              }
-            }}
-          >
-            <SelectTrigger className="w-[100px]">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="5">5</SelectItem>
-              <SelectItem value="10">10</SelectItem>
-              <SelectItem value="50">50</SelectItem>
-              <SelectItem value="all">All</SelectItem>
-            </SelectContent>
-          </Select>
+    <div
+      ref={setContainerEl}
+      className="flex flex-col sm:flex-row items-center justify-between gap-2 px-3 py-2 bg-card"
+    >
+      {showShowing ? (
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <span>
+            Showing <span className='font-semibold'>{startItem}-{endItem}</span> of <span className='font-semibold'>{pagination.total}</span>
+          </span>
         </div>
+      ) : (
+        // Empty spacer keeps `justify-between` working when "Showing…" is
+        // hidden: pagination stays right-aligned instead of jumping center.
+        <span aria-hidden />
+      )}
+      <div className="flex items-center gap-3">
+        {showPerPage && (
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs text-muted-foreground whitespace-nowrap">Per page:</span>
+            <Select
+              value={pagination.limit === null ? 'all' : pagination.limit.toString()}
+              onValueChange={(value) => {
+                if (value === 'all') {
+                  onPageSizeChange(null);
+                } else {
+                  onPageSizeChange(parseInt(value, 10));
+                }
+              }}
+            >
+              <SelectTrigger className="h-7 w-[72px] text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="5">5</SelectItem>
+                <SelectItem value="10">10</SelectItem>
+                <SelectItem value="50">50</SelectItem>
+                <SelectItem value="all">All</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        )}
         <Pagination>
           <PaginationContent className="m-0">
             <PaginationItem>

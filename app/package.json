@@ -1,6 +1,6 @@
 {
     "name": "TissueLab",
-    "version": "1.0.2",
+    "version": "1.1.0",
     "description": "Advancing digital pathology analysis for medical professionals and researchers",
     "author": {
         "name": "Huang Group",
@@ -23,25 +23,19 @@
         "testall": "conda activate tissuelab && pip install -r ../requirements.txt && npm install && cd render && npm install && npm run build && cd .. && npm start"
     },
     "devDependencies": {
-        "concurrently": "^9.2.1",
+        "concurrently": "^10.0.3",
         "cross-env": "^10.1.0",
-        "electron": "41.0.2",
-        "electron-builder": "^26.8.1",
-        "electron-is-dev": "^3.0.1",
+        "electron": "41.2.0",
+        "electron-builder": "^26.15.3",
         "@electron/notarize": "^3.1.1",
-        "@electron/packager": "^19.1.0"
-    },
-    "dependencies": {
-        "cors": "^2.8.6",
-        "express": "^5.2.1",
-        "http-proxy-middleware": "^3.0.5"
+        "@electron/packager": "^20.0.1"
     },
     "build": {
-        "includeSubNodeModules": true,
         "extraMetadata": {
             "description": "TissueLab"
         },
         "asar": true,
+        "afterPack": "./scripts/after-pack.js",
         "appId": "com.zhihuanglab.tissuelab",
         "files": [
             "electron/**/*",
@@ -68,6 +62,8 @@
             "!**/docs/**/*",
             "!**/examples/**/*",
             "!render/node_modules/**/*",
+            "!electron/assets/icons/Assets.car",
+            "!electron/assets/icons/TissueLab.icon/**/*",
             "!render/.next/cache/**/*"
         ],
         "asarUnpack": [
@@ -87,6 +83,9 @@
             "target": "dmg",
             "icon": "electron/assets/icons/icon.icns",
             "category": "public.app-category.developer-tools",
+            "extendInfo": {
+                "CFBundleIconName": "Icon"
+            },
             "hardenedRuntime": true,
             "gatekeeperAssess": false,
             "entitlements": "electron/assets/entitlements.mac.plist",

@@ -3,20 +3,27 @@
     "TissueClassify": [
       "BiomedParseClassification",
       "MuskClassification",
-      "TotalSegmentatorClassification"
+      "TotalSegmentatorClassification",
+      "HOptimusClassification",
+      "VirchowClassification"
     ],
     "TissueSeg": [
-      "MuskEmbedding",
       "BiomedParseSegmentation",
+      "MuskEmbedding",
       "TotalSegmentatorSegmentation",
-      "VISTA"
+      "VISTA",
+      "HOptimusEmbedding",
+      "VirchowEmbedding"
     ],
     "NucleiSeg": [
-      "SegmentationNode",
-      "InstanSegNode"
+      "StarDist",
+      "InstanSegNode",
+      "CellCast",
+      "Cytoformer"
     ],
     "NucleiClassify": [
-      "ClassificationNode"
+      "NuClass",
+      "CytoformerClassification"
     ],
     "SpatialOmics": [
       "CellCharter"
@@ -100,7 +107,7 @@
       "schema": null,
       "version": null,
       "source": "builtin",
-      "zarr_group": "MuskNode",
+      "zarr_group": "Patch-Segmentation",
       "inputs": null,
       "outputs": "Patch embeddings [N,D]"
     },
@@ -113,21 +120,21 @@
       "factory": "TissueClassify",
       "zarr_group": null
     },
-    "SegmentationNode": {
-      "displayName": "Cell/Nuclei Segmentation (StarDist)",
-      "description": "Default, production-validated nuclei segmentation on WSI using StarDist 2D_versatile_he. Produces per-nucleus contours, centroids, probability, and embeddings. Prerequisite for per-cell metrics and classification. Recommended first choice for H&E pathology.",
+    "StarDist": {
+      "displayName": "Cell/Nuclei Segmentation",
+      "description": "Instance segmentation of nuclei/cells on WSI with per-nucleus polygons/centroids; prerequisite for per-cell metrics and classification.",
       "icon": "/images/icons/nuclei_segmentation_stardist.png",
       "factory": "NucleiSeg",
       "schema": null,
       "version": null,
       "source": "builtin",
-      "zarr_group": null,
-      "inputs": "WSI path, pixel_size, stardist_pretrain",
-      "outputs": "Per-nucleus contours, centroids, probability, embeddings"
+      "zarr_group": "Cell-Segmentation",
+      "inputs": null,
+      "outputs": "Per-nucleus contours and centroids"
     },
     "InstanSegNode": {
       "displayName": "InstanSeg Nuclei Segmentation",
-      "description": "Alternative nuclei segmentation using InstanSeg's lightweight transformer. Produces per-nucleus contours, centroids, probability, and PLIP embeddings. Use only when explicitly requested or when StarDist is known to underperform on the modality.",
+      "description": "Fast nuclei segmentation using InstanSeg's lightweight transformer architecture. Produces per-nucleus contours, centroids, and PLIP embeddings. Alternative to StarDist with improved speed.",
       "icon": "/images/icons/nuclei_segmentation_stardist.png",
       "factory": "NucleiSeg",
       "schema": null,
@@ -135,21 +142,45 @@
       "source": "builtin",
       "h5_group": null,
       "inputs": "WSI path, pixel_size, model_type",
-      "outputs": "Per-nucleus contours, centroids, probability, embeddings",
-      "zarr_group": "SegmentationNode"
+      "outputs": "Per-nucleus contours, centroids, probability, PLIP embeddings at Cell-Segmentation/embeddings [N,768]",
+      "zarr_group": "Cell-Segmentation"
+    },
+    "Cytoformer": {
+      "displayName": "Cytoformer Cell Segmentation",
+      "description": "Nuclei/cell instance segmentation (StarDist geometry) with fine-tuned H-optimus-0 per-cell embeddings [N,1536]; prerequisite for Cytoformer nuclei classification.",
+      "icon": "/images/icons/nuclei_segmentation_stardist.png",
+      "factory": "NucleiSeg",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "zarr_group": "Cell-Segmentation",
+      "inputs": "WSI path, pixel_size",
+      "outputs": "Per-nucleus contours, centroids, and H-optimus-0 embeddings at Cell-Segmentation/embeddings [N,1536]"
+    },
+    "CellCast": {
+      "displayName": "CellCast Nuclei Segmentation",
+      "description": "Instance segmentation of nuclei/cells on WSI with per-nucleus polygons/centroids; prerequisite for per-cell metrics and classification.",
+      "icon": "/images/icons/nuclei_segmentation_stardist.png",
+      "factory": "NucleiSeg",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "zarr_group": "Cell-Segmentation",
+      "inputs": null,
+      "outputs": "Per-nucleus contours and centroids"
     },
     "VISTA": {
       "displayName": "VISTA Tissue Segmentation",
-      "description": "An interactive foundation model for histopathology image segmentation.",
+      "description": "Interactive foundation model for pixel-wise histopathology tissue segmentation; outputs dense region masks for the specified tissue class(es).",
       "icon": "/images/icons/vista.svg",
       "factory": "TissueSeg",
       "schema": null,
       "version": null,
       "source": "builtin",
       "h5_group": null,
-      "inputs": "WSI path, bbox, model_type",
-      "outputs": "coordinates of tissue regions",
-      "zarr_group": "SegmentationNode",
+      "inputs": "WSI path, tissue_class (prompt), model_type",
+      "outputs": "Dense tissue masks at Tissue-Segmentation/masks/<tissue> (bool) + DZI overlay",
+      "zarr_group": "Tissue-Segmentation",
       "panel": [
         {
           "key": "tissue_class",
@@ -158,7 +189,7 @@
         }
       ]
     },
-    "ClassificationNode": {
+    "NuClass": {
       "displayName": "Nuclei Classification (NuClass)",
       "description": "Per-nucleus classifier assigning classes (e.g., tumor_cell, lymphocyte); consumes nuclei segmentation results.",
       "icon": "/images/icons/nuclei_classification_tissuelab_nuclass.png",
@@ -166,9 +197,29 @@
       "schema": null,
       "version": null,
       "source": "builtin",
-      "zarr_group": null,
+      "zarr_group": "Cell-Classification",
       "inputs": "Per-nucleus contours and centroids",
       "outputs": "Per-nucleus class probabilities"
+    },
+    "CytoformerClassification": {
+      "displayName": "Cytoformer Nuclei Classification",
+      "description": "Per-nucleus classifier over H-optimus-0 embeddings. With no annotations it predicts zero-shot from the selected ORGAN (low-confidence cells become Negative control); annotate cells and it trains on your own classes instead. Requires Cytoformer cell segmentation first.",
+      "icon": "/images/icons/nuclei_classification_tissuelab_nuclass.png",
+      "factory": "NucleiClassify",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "zarr_group": "Cell-Classification",
+      "inputs": "Cell-Segmentation/embeddings [N,1536], organ",
+      "outputs": "Per-nucleus class with confidence",
+      "panel": [
+        {
+          "key": "organ",
+          "type": "select",
+          "value": "",
+          "label": "Organ"
+        }
+      ]
     },
     "CellCharter": {
       "displayName": "CellCharter",
@@ -223,6 +274,48 @@
       "zarr_group": null,
       "inputs": null,
       "outputs": null
+    },
+    "HOptimusEmbedding": {
+      "displayName": "Patch Embedding (H-optimus-0)",
+      "description": "Generates 1536-d H-optimus-0 patch embeddings for pathology whole slides, used downstream by patch classification.",
+      "icon": "/images/icons/musk_embedding.svg",
+      "factory": "TissueSeg",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "zarr_group": "Patch-Segmentation",
+      "inputs": null,
+      "outputs": "Patch embeddings [N,1536]"
+    },
+    "VirchowEmbedding": {
+      "displayName": "Patch Embedding (Virchow)",
+      "description": "Generates 2560-d Virchow patch embeddings (class token + mean patch tokens) for pathology whole slides.",
+      "icon": "/images/icons/musk_embedding.svg",
+      "factory": "TissueSeg",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "zarr_group": "Patch-Segmentation",
+      "inputs": null,
+      "outputs": "Patch embeddings [N,2560]"
+    },
+    "HOptimusClassification": {
+      "displayName": "H-optimus-0 Classification",
+      "description": "Patch-based classification. Run HOptimusEmbedding first to generate patch embeddings.",
+      "icon": "/images/icons/musk_classification.svg",
+      "schema": null,
+      "version": null,
+      "factory": "TissueClassify",
+      "zarr_group": null
+    },
+    "VirchowClassification": {
+      "displayName": "Virchow Classification",
+      "description": "Patch-based classification. Run VirchowEmbedding first to generate patch embeddings.",
+      "icon": "/images/icons/musk_classification.svg",
+      "schema": null,
+      "version": null,
+      "factory": "TissueClassify",
+      "zarr_group": null
     }
   },
   "category_display_names": {

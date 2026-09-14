@@ -2,10 +2,11 @@
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
-import { useUserInfo } from "@/provider/UserInfoProvider";
+import { useUserInfo } from "@/contexts/UserInfoProvider";
+import { useAuthorProfile } from "@/hooks/community/useAuthorProfile";
 import { RootState } from "@/store";
 import { useSignupModal } from "@/store/zustand/store";
-import { cn } from "@/utils/twMerge";
+import { cn } from "@/utils/common/twMerge";
 import { EllipsisVertical, User } from "lucide-react";
 import React, { useEffect, useRef, useState } from "react";
 import { useSelector } from "react-redux";
@@ -33,103 +34,48 @@ const UserAccountSection: React.FC<UserAccountSectionProps> = ({
     const [isProfileDropdownOpen, setIsProfileDropdownOpen] = useState(false);
     const [isAccountSettingsOpen, setIsAccountSettingsOpen] = useState(false);
     const [isPreferencesOpen, setIsPreferencesOpen] = useState(false);
-    const [customTitle, setCustomTitle] = useState("");
-    const [preferredName, setPreferredName] = useState("");
-    const [organization, setOrganization] = useState("");
-    const [avatarPreview, setAvatarPreview] = useState("");
-    const globalAvatarUrl = useSelector((state: RootState) => state.user.avatarUrl);
-    const globalPreferredName = useSelector((state: RootState) => state.user.preferredName);
-    const globalCustomTitle = useSelector((state: RootState) => state.user.customTitle);
-    const globalOrganization = useSelector((state: RootState) => state.user.organization);
     const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+    // Two avatar/name sources, merged at render time:
+    //   1. Redux (state.user.*) — updated synchronously when the user edits
+    //      their profile in AccountSettingsModal and by the Firestore
+    //      onSnapshot subscription inside UserInfoProvider. Wins when set
+    //      because it reflects the user's just-saved edits.
+    //   2. useAuthorProfile(uid) — backend `/v1/users/{uid}/public-profile`
+    //      which signs the GCS avatar URL server-side. Used as the source
+    //      of truth when Redux is empty (cold start, or the user's
+    //      Firestore profile is missing the avatar_url field). Same source
+    //      community cards use, so the sidebar can never disagree with
+    //      what's shown on a public profile.
+    // The previous version juggled three useState slots, four localStorage
+    // reads + writes, and three useEffects that all updated the same
+    // `avatarPreview` — drop all of that.
+    const reduxAvatarUrl = useSelector((s: RootState) => s.user.avatarUrl);
+    const reduxPreferredName = useSelector((s: RootState) => s.user.preferredName);
+    const reduxCustomTitle = useSelector((s: RootState) => s.user.customTitle);
+    const reduxOrganization = useSelector((s: RootState) => s.user.organization);
+    const authorProfile = useAuthorProfile(userInfo?.user_id ?? null);
 
     const isSidebar = variant === "sidebar" || variant === "sidebar-collapsed";
     const isCollapsed = variant === "sidebar-collapsed";
 
+    // `<img onError>` can null this out to force the gradient placeholder if
+    // the URL stops working mid-session. Defaults to whichever source has a
+    // value; recomputed every render so a fresh Redux/backend value reopens
+    // the image after an error.
+    const [avatarBroken, setAvatarBroken] = useState(false);
+    const effectiveAvatar = avatarBroken
+        ? ""
+        : reduxAvatarUrl || authorProfile?.avatarUrl || "";
     useEffect(() => {
-        if (typeof window !== "undefined" && userInfo?.user_id) {
-            try {
-                const rawTitle =
-                    globalCustomTitle || localStorage.getItem(`custom_title_${userInfo.user_id}`);
-                const rawName =
-                    globalPreferredName || localStorage.getItem(`preferred_name_${userInfo.user_id}`);
-                const rawOrg =
-                    globalOrganization || localStorage.getItem(`organization_${userInfo.user_id}`);
-                const rawAvatar =
-                    globalAvatarUrl || localStorage.getItem(`user_avatar_${userInfo.user_id}`);
+        // New URL arrived — give it another chance even if the previous one 404ed.
+        if (reduxAvatarUrl || authorProfile?.avatarUrl) setAvatarBroken(false);
+    }, [reduxAvatarUrl, authorProfile?.avatarUrl]);
 
-                const savedTitle = rawTitle && rawTitle !== "null" ? rawTitle : "";
-                const savedName = rawName && rawName !== "null" ? rawName : "";
-                const savedOrganization = rawOrg && rawOrg !== "null" ? rawOrg : "";
-                const savedAvatar = rawAvatar && rawAvatar !== "null" ? rawAvatar : "";
-
-                setCustomTitle(savedTitle);
-                setPreferredName(savedName);
-                setOrganization(savedOrganization);
-                setAvatarPreview(savedAvatar);
-            } catch (error) {
-                console.error("Error loading user preferences:", error);
-            }
-        }
-    }, [
-        userInfo?.user_id,
-        globalCustomTitle,
-        globalPreferredName,
-        globalOrganization,
-        globalAvatarUrl,
-    ]);
-
-    useEffect(() => {
-        if (globalAvatarUrl && globalAvatarUrl !== "null") {
-            setAvatarPreview(globalAvatarUrl);
-            return;
-        }
-        if (typeof window !== "undefined" && userInfo?.user_id) {
-            const savedAvatarRaw = localStorage.getItem(`user_avatar_${userInfo.user_id}`);
-            const savedAvatar = savedAvatarRaw && savedAvatarRaw !== "null" ? savedAvatarRaw : "";
-            setAvatarPreview(savedAvatar);
-        }
-    }, [globalAvatarUrl, userInfo?.user_id]);
-
-    useEffect(() => {
-        if (typeof window === "undefined" || !userInfo?.user_id) return;
-
-        const handleStorageChange = () => {
-            try {
-                const rawAvatar =
-                    globalAvatarUrl || localStorage.getItem(`user_avatar_${userInfo.user_id}`);
-                const rawTitle =
-                    globalCustomTitle || localStorage.getItem(`custom_title_${userInfo.user_id}`);
-                const rawName =
-                    globalPreferredName || localStorage.getItem(`preferred_name_${userInfo.user_id}`);
-                const rawOrg =
-                    globalOrganization || localStorage.getItem(`organization_${userInfo.user_id}`);
-
-                const savedAvatar = rawAvatar && rawAvatar !== "null" ? rawAvatar : "";
-                const savedTitle = rawTitle && rawTitle !== "null" ? rawTitle : "";
-                const savedName = rawName && rawName !== "null" ? rawName : "";
-                const savedOrganization = rawOrg && rawOrg !== "null" ? rawOrg : "";
-
-                setAvatarPreview(savedAvatar || "");
-                setCustomTitle(savedTitle);
-                setPreferredName(savedName);
-                setOrganization(savedOrganization);
-            } catch { }
-        };
-
-        window.addEventListener("storage", handleStorageChange);
-        window.addEventListener("localStorageChanged", handleStorageChange as EventListener);
-        return () => {
-            window.removeEventListener("storage", handleStorageChange);
-            window.removeEventListener("localStorageChanged", handleStorageChange as EventListener);
-        };
-    }, [
-        userInfo?.user_id,
-        globalAvatarUrl,
-        globalCustomTitle,
-        globalPreferredName,
-        globalOrganization,
-    ]);
+    const preferredName =
+        reduxPreferredName || authorProfile?.displayName || "";
+    const customTitle = reduxCustomTitle || "";
+    const organization = reduxOrganization || "";
 
     useEffect(() => {
         return () => {
@@ -196,17 +142,17 @@ const UserAccountSection: React.FC<UserAccountSectionProps> = ({
                     >
                         <Avatar
                             onClick={() => setIsProfileDropdownOpen(!isProfileDropdownOpen)}
-                            key={avatarPreview || "fallback"}
+                            key={effectiveAvatar || "fallback"}
                             className={cn(
                                 "cursor-pointer transition-all hover:ring-2 hover:ring-primary/40 border border-border shrink-0",
                                 isCollapsed ? "h-10 w-10" : "h-9 w-9"
                             )}
                         >
-                            {avatarPreview ? (
+                            {effectiveAvatar ? (
                                 <AvatarImage
-                                    src={avatarPreview}
+                                    src={effectiveAvatar}
                                     alt={preferredName || userInfo.email || "User"}
-                                    onError={() => setAvatarPreview("")}
+                                    onError={() => setAvatarBroken(true)}
                                 />
                             ) : null}
                             <AvatarFallback delayMs={0} className="bg-muted text-sm text-foreground">
@@ -229,7 +175,7 @@ const UserAccountSection: React.FC<UserAccountSectionProps> = ({
                             customTitle={customTitle}
                             preferredName={preferredName}
                             organization={organization}
-                            avatarPreview={avatarPreview}
+                            avatarPreview={effectiveAvatar}
                         />
                     </div>
                     {!isCollapsed && isSidebar && (
@@ -277,16 +223,13 @@ const UserAccountSection: React.FC<UserAccountSectionProps> = ({
                 </div>
             )}
 
+            {/* AccountSettingsModal now dispatches every profile field to
+                Redux itself, so consumers (this component, Chatbox, etc.)
+                pick up edits via the redux selectors without needing prop
+                callback plumbing. */}
             <AccountSettingsModal
                 isOpen={isAccountSettingsOpen}
                 onClose={() => setIsAccountSettingsOpen(false)}
-                onTitleUpdate={(title) => setCustomTitle(title)}
-                onPreferencesUpdate={(preferences) => {
-                    if (preferences.customTitle !== undefined) setCustomTitle(preferences.customTitle);
-                    if (preferences.preferredName !== undefined) setPreferredName(preferences.preferredName);
-                    if (preferences.organization !== undefined) setOrganization(preferences.organization);
-                    if (preferences.avatarPreview !== undefined) setAvatarPreview(preferences.avatarPreview);
-                }}
             />
 
             <PreferencesModal

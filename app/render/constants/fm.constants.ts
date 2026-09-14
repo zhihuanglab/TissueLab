@@ -1,10 +1,6 @@
-export const VIRTUAL_ROOT = '__root__';
-export const SHARED_ROOT = '__shared__';
-
 export const ROOT_DISPLAY = {
   root: 'Root',
   personal: 'Personal',
-  shared: 'Shared with me',
   samples: 'Samples',
   data: 'Data',
 } as const;
@@ -27,7 +23,7 @@ export interface VirtualLink {
 export const PUBLIC_VIRTUAL_LINKS: VirtualLink[] = [
   {
     alias: 'samples/Data',
-    target: '/data/public',  // Absolute system path
+    target: '/tissuelab/data',  // Absolute system path
     display_name: 'Data',
     read_only: true,
   },
@@ -41,6 +37,6 @@ export const PUBLIC_VIRTUAL_LINKS: VirtualLink[] = [
  */
 export const PUBLIC_READ_ONLY_PATHS: string[] = [
   'samples',
-  '/data/public',  // Absolute system path
+  '/tissuelab/data',  // Absolute system path
 ];
 

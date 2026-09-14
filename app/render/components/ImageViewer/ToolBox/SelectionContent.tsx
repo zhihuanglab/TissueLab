@@ -1,12 +1,13 @@
 "use client"
 
-import { useCallback, useState, useEffect } from "react"
+import { useCallback, useState, useEffect, useRef } from "react"
 import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
 import { ImageAnnotation } from "@annotorious/react"
 import { useDispatch, useSelector } from "react-redux"
+import { useActiveSlidePath, useInstanceSlidePath } from "@/utils/viewer/slidePath";
 import { AppDispatch, RootState } from "@/store"
-import { apiFetch } from '@/utils/common/apiFetch'
+import { segFetch } from '@/utils/common/segFetch'
 import { getErrorMessage } from "@/utils/common/apiResponse"
 import { toast } from "sonner"
 import {
@@ -14,17 +15,104 @@ import {
   setPatchClassificationData,
   updatePatchOverlayColors,
   clearPatchOverridesForIds,
-  selectPatchOverlays,
+  addNucleiClass,
+  deleteNucleiClass,
+  updateNucleiClass,
+  type PatchOverlayEntry,
 } from "@/store/slices/viewer/annotationSlice"
-import { AI_SERVICE_API_ENDPOINT } from "@/constants/config"
-import { formatPath } from "@/utils/pathUtils"
-import EventBus from "@/utils/EventBus"
-import { isPublicReadOnlyPath, getRestrictedDirectoryMessage } from "@/utils/sampleDirectoryUtils"
-import { getDefaultOutputPath } from "@/utils/workflowUtils"
+import { generateRandomColor } from "@/utils/common/color.utils"
+import { AI_SERVICE_API_ENDPOINT } from "@/config/api.config"
+import { formatPath } from "@/utils/common/path.utils"
+import eventBus from "@/utils/common/eventBus"
+import { usePathWriteAccess } from "@/hooks/usePathWriteAccess"
+import {
+  getDefaultOutputPath,
+  scheduleCoalescedClassificationAfterAnnotation,
+  scheduleCoalescedPatchClassificationAfterAnnotation,
+} from "@/utils/agent/workflow/workflow.utils"
 import { selectSelectedModelForPath } from "@/store/slices/chat/modelSelectionSlice"
 import { annotationTypeStore } from "@/store/zustand/slice/annotationTypesStore"
-import { savePNGFromCurrentSelection } from "@/utils/snapshot.util"
+import { savePNGFromCurrentSelection } from "@/utils/viewer/snapshot.utils"
 import { useRefreshGtHighlightIndices } from "@/hooks/viewer/useRefreshGtHighlightIndices"
+import { useUserInfo } from "@/contexts/UserInfoProvider"
+import { resolveAnnotatorLabel } from "@/utils/viewer/annotator"
+
+/** Prefer live Annotorious state — popup props lag behind resize. */
+function getLiveAnnotation(
+  annotator: any,
+  annotation: ImageAnnotation,
+): ImageAnnotation {
+  try {
+    const id = annotation?.id;
+    if (id && annotator?.getAnnotationById) {
+      return annotator.getAnnotationById(id) || annotation;
+    }
+  } catch {}
+  return annotation;
+}
+
+function getAnnotationSelector(ann: any): any {
+  const selector = ann?.target?.selector;
+  return Array.isArray(selector)
+    ? selector.find((s: any) => s?.type === 'POLYGON' || s?.type === 'RECTANGLE') ||
+        selector[0]
+    : selector;
+}
+
+function getPolygonPointsFromAnnotation(ann: any): number[][] | null {
+  const selector = getAnnotationSelector(ann);
+  if (String(selector?.type || '').toUpperCase() !== 'POLYGON') return null;
+  const points = selector?.geometry?.points;
+  return Array.isArray(points) && points.length > 0 ? points : null;
+}
+
+/** Live Annotorious bounds — Redux shapeCoords can lag ~50ms behind resize. */
+function getBBoxFromAnnotation(
+  ann: any,
+  fallback: { x1: number; y1: number; x2: number; y2: number } | null,
+): { x1: number; y1: number; x2: number; y2: number } | null {
+  const selector = getAnnotationSelector(ann);
+  const bounds = selector?.geometry?.bounds;
+  if (
+    bounds &&
+    typeof bounds.minX === 'number' &&
+    typeof bounds.minY === 'number' &&
+    typeof bounds.maxX === 'number' &&
+    typeof bounds.maxY === 'number'
+  ) {
+    return {
+      x1: bounds.minX,
+      y1: bounds.minY,
+      x2: bounds.maxX,
+      y2: bounds.maxY,
+    };
+  }
+  const g = selector?.geometry;
+  if (
+    String(selector?.type || '').toUpperCase() === 'RECTANGLE' &&
+    typeof g?.x === 'number' &&
+    typeof g?.y === 'number' &&
+    typeof g?.w === 'number' &&
+    typeof g?.h === 'number'
+  ) {
+    return { x1: g.x, y1: g.y, x2: g.x + g.w, y2: g.y + g.h };
+  }
+  const pts = getPolygonPointsFromAnnotation(ann);
+  if (pts && pts.length > 0) {
+    let minX = pts[0][0];
+    let minY = pts[0][1];
+    let maxX = pts[0][0];
+    let maxY = pts[0][1];
+    for (const [x, y] of pts) {
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+    return { x1: minX, y1: minY, x2: maxX, y2: maxY };
+  }
+  return fallback;
+}
 
 interface SelectionContentProps {
   annotation: ImageAnnotation
@@ -36,8 +124,10 @@ interface SelectionContentProps {
   annotatorInstance: any
   instanceId?: string | null
   onCancel: () => void
-  onSave: (color: string, customText?: string) => void
+  /** Dismiss AND drop the drawn shape — for marks that consume the region. */
+  onDiscardRegion?: () => void
   shapeCoords: { x1: number; y1: number; x2: number; y2: number } | null
+  patches?: PatchOverlayEntry[]
 }
 
 export default function SelectionContent({ 
@@ -50,22 +140,37 @@ export default function SelectionContent({
   annotatorInstance,
   instanceId: instanceIdProp,
   onCancel,
-  onSave,
-  shapeCoords
+  onDiscardRegion,
+  shapeCoords,
+  patches: currentPatches = [],
 }: SelectionContentProps) {
   const dispatch = useDispatch<AppDispatch>();
   const nucleiClasses = useSelector((state: RootState) => state.annotations.nucleiClasses);
   const reduxPatchClassificationData = useSelector(selectPatchClassificationData);
-  const currentPatches = useSelector(selectPatchOverlays);
-  const currentPath = useSelector((state: RootState) => state.svsPath.currentPath);
+  const recolorPatchOverlay = useCallback(
+    (payload: { ids: number[]; color: string; persistOverride?: boolean }) => {
+      dispatch(updatePatchOverlayColors(payload));
+    },
+    [dispatch],
+  );
+  /** Close after a mark that consumed the region; plain dismiss if unwired. */
+  const discardRegion = useCallback(() => {
+    (onDiscardRegion || onCancel)();
+  }, [onDiscardRegion, onCancel]);
+  const currentPath = useInstanceSlidePath(instanceIdProp);
+  const { assertWritable, toastIfDenied, allowed: pathWritable, tooltip: writeBlockTitle } = usePathWriteAccess(currentPath);
   const currentOrgan = useSelector((state: RootState) => state.workflow.currentOrgan);
   const updateAfterEveryAnnotation = useSelector((state: RootState) => state.workflow.updateAfterEveryAnnotation);
   const updatePatchAfterEveryAnnotation = useSelector((state: RootState) => state.workflow.updatePatchAfterEveryAnnotation);
   const patchClassifierPath = useSelector((state: RootState) => state.workflow.patchClassifierPath);
   const patchClassifierSavePath = useSelector((state: RootState) => state.workflow.patchClassifierSavePath);
   const selectedFolder = useSelector((state: RootState) => state.fileManager.selectedFolder);
-  // Local Electron-only build: cloud file source no longer exists.
-  const isWebMode = false;
+  const isWebMode = useSelector((state: RootState) => {
+    const activeInstanceId = state.wsi.activeInstanceId;
+    const activeInstance = activeInstanceId ? state.wsi.instances[activeInstanceId] : undefined;
+    const source = activeInstance?.fileInfo?.source as string | undefined;
+    return source === 'web';
+  });
   const selectedModelForCurrentPath = useSelector((state: RootState) => {
     let targetPath = selectedFolder || '';
     if (!targetPath && currentPath) {
@@ -79,12 +184,87 @@ export default function SelectionContent({
     return selectSelectedModelForPath(state, targetPath);
   });
 
-  const [formattedPath, setFormattedPath] = useState(formatPath(currentPath ?? ""));
   const refreshGtHighlightIndices = useRefreshGtHighlightIndices();
 
+  // ── Inline "add class" editors in the region popup ──
+  // Click "+" → an editable row (name input + color) appears; on Enter/blur it
+  // commits into the class list (locked, non-editable) and behaves like the other
+  // rows (Yes/No trigger the same annotation interface). Escape cancels.
+  const [addingNuclei, setAddingNuclei] = useState(false);
+  const [newNucleiName, setNewNucleiName] = useState("");
+  const [newNucleiColor, setNewNucleiColor] = useState("#888888");
+  const [addingTissue, setAddingTissue] = useState(false);
+  const [newTissueName, setNewTissueName] = useState("");
+  const [newTissueColor, setNewTissueColor] = useState("#888888");
+
+  const startAddNuclei = () => {
+    setNewNucleiName("");
+    setNewNucleiColor(generateRandomColor(nucleiClasses.map((c) => c.color)));
+    setAddingNuclei(true);
+  };
+  const commitNucleiClass = () => {
+    const name = newNucleiName.trim();
+    if (!name) { setAddingNuclei(false); return; }
+    if (nucleiClasses.some((c) => c.name.toLowerCase() === name.toLowerCase())) {
+      toast.warning(`Class "${name}" already exists`);
+      setAddingNuclei(false);
+      return;
+    }
+    dispatch(addNucleiClass({ name, count: 0, color: newNucleiColor }));
+    setAddingNuclei(false);
+  };
+  const removeNucleiClass = (index: number) => {
+    dispatch(deleteNucleiClass(index));
+  };
+
+  const startAddTissue = () => {
+    setNewTissueName("");
+    setNewTissueColor(generateRandomColor(reduxPatchClassificationData?.class_hex_color ?? []));
+    setAddingTissue(true);
+  };
+  const commitTissueClass = () => {
+    const name = newTissueName.trim();
+    const data = reduxPatchClassificationData;
+    if (!name || !data) { setAddingTissue(false); return; }
+    if (data.class_name.some((n: string) => n.toLowerCase() === name.toLowerCase())) {
+      toast.warning(`Class "${name}" already exists`);
+      setAddingTissue(false);
+      return;
+    }
+    const nextId = data.class_id.length ? Math.max(...data.class_id) + 1 : 0;
+    const newData: any = {
+      ...data,
+      class_id: [...data.class_id, nextId],
+      class_name: [...data.class_name, name],
+      class_hex_color: [...data.class_hex_color, newTissueColor],
+    };
+    if (data.class_counts) newData.class_counts = [...data.class_counts, 0];
+    dispatch(setPatchClassificationData(newData));
+    setAddingTissue(false);
+  };
+  const removeTissueClass = (index: number) => {
+    const data = reduxPatchClassificationData;
+    if (!data) return;
+    const keep = (_: unknown, i: number) => i !== index;
+    const newData: any = {
+      ...data,
+      class_id: data.class_id.filter(keep),
+      class_name: data.class_name.filter(keep),
+      class_hex_color: data.class_hex_color.filter(keep),
+    };
+    if (data.class_counts) newData.class_counts = data.class_counts.filter(keep);
+    dispatch(setPatchClassificationData(newData));
+  };
+
+  const formattedPath = formatPath(currentPath ?? "");
+
+  // Annotation author: stored as the user id (always traceable). Held in a
+  // ref so the save callbacks below don't need it in their dependency arrays.
+  const { userInfo } = useUserInfo();
+  const annotatorLabelRef = useRef('Unknown');
   useEffect(() => {
-    setFormattedPath(formatPath(currentPath ?? ""));
-  }, [currentPath]);
+    annotatorLabelRef.current = resolveAnnotatorLabel({ userId: userInfo?.user_id });
+  }, [userInfo?.user_id]);
 
   const isPointInsidePolygon = useCallback((x: number, y: number, polygon: number[][]) => {
     let inside = false;
@@ -101,10 +281,8 @@ export default function SelectionContent({
 
   const refreshPatchCountsFromServer = useCallback(async () => {
     try {
-      const resp = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/seg/v1/patch_classification`, {
-        method: 'GET',
-        returnAxiosFormat: true,
-      });
+      const resp = await segFetch(instanceIdProp, `${AI_SERVICE_API_ENDPOINT}/seg/v1/patch_classification`, {method: 'GET',
+        returnAxiosFormat: true});
       const payload = resp.data?.data ?? resp.data;
       if (!payload || !Array.isArray(payload.class_name) || payload.class_name.length === 0) {
         return;
@@ -158,7 +336,7 @@ export default function SelectionContent({
     } catch (error) {
       console.error('Failed to refresh patch classification data:', error);
     }
-  }, [dispatch, reduxPatchClassificationData]);
+  }, [dispatch, reduxPatchClassificationData, instanceIdProp]);
 
   const applyOptimisticAnnotationTypes = useCallback((
     updates: Array<{ id: string; classIndex?: number; color: string; category: string }>
@@ -181,29 +359,22 @@ export default function SelectionContent({
 
   const markAllNuclei = useCallback(async (item: any) => {
     // Check if in samples directory
-    if (isPublicReadOnlyPath(currentPath ?? undefined)) {
-      toast.error(getRestrictedDirectoryMessage('annotate'));
+    if (!assertWritable('annotate')) {
       onCancel();
       return;
     }
 
-    if (!shapeCoords) {
-      console.error("Shape coordinates (Raw BBox) not found in Redux state. Cannot mark nuclei.");
+    // Live Annotorious geometry — popup `annotation` props / Redux shapeCoords
+    // can lag after resize (shape dispatch is debounced ~50ms).
+    const live = getLiveAnnotation(annotatorInstance, annotation);
+    const bbox = getBBoxFromAnnotation(live, shapeCoords);
+    if (!bbox) {
+      console.error("Shape coordinates not found. Cannot mark nuclei.");
       return;
     }
-    const { x1: bboxX1, y1: bboxY1, x2: bboxX2, y2: bboxY2 } = shapeCoords;
-
-    // 2. Check if the original annotation is a Polygon and get its RAW points
-    let polygonRawPoints: number[][] | null = null;
-    let selectorType = annotation.target.selector?.type; // Store type for logging/debugging
-
-    if (selectorType === 'POLYGON') {
-      // Use type assertion for potentially dynamic geometry structure
-      const geometry = annotation.target.selector.geometry as any;
-      if (geometry && Array.isArray(geometry.points) && geometry.points.length > 0) {
-        polygonRawPoints = geometry.points;
-      }
-    }
+    const { x1: bboxX1, y1: bboxY1, x2: bboxX2, y2: bboxY2 } = bbox;
+    let polygonRawPoints = getPolygonPointsFromAnnotation(live);
+    const selectorType = getAnnotationSelector(live)?.type;
 
     // 3. Prepare API parameters
     const url = `${AI_SERVICE_API_ENDPOINT}/seg/v1/query`;
@@ -228,10 +399,8 @@ export default function SelectionContent({
 
     try {
       const urlWithParams = `${url}?${new URLSearchParams(apiParams as Record<string, string>).toString()}`;
-      const response = await apiFetch(urlWithParams, {
-        method: 'GET',
-        returnAxiosFormat: true,
-      });
+      const response = await segFetch(instanceIdProp, urlWithParams, {method: 'GET',
+        returnAxiosFormat: true});
       const responseData = response.data;
       const matching_indices = responseData?.matching_indices ?? [];
 
@@ -256,73 +425,57 @@ export default function SelectionContent({
         annotatorInstance.viewer.raiseEvent('animation-finish');
       }
 
-      if (annotation && annotatorInstance) {
-        const newRectangleBodies = annotation.bodies.filter((b) => b.purpose !== 'style');
-        newRectangleBodies.push({
-          id: String(Date.now()) + '-rectstyle',
-          annotation: annotation.id,
-          type: 'TextualBody',
-          purpose: 'style',
-          value: item.color,
-          created: new Date(),
-          creator: { id: 'default' },
-        });
+      // Selection consumed by the mark — see markTissue. The region used to be
+      // recolored to the class here; there is no shape left to recolor now.
+      discardRegion();
+      try {
+        annotatorInstance?.viewer?.forceRedraw?.();
+      } catch {}
 
-        const updatedRectangleAnnotation = {
-          ...annotation,
-          bodies: newRectangleBodies,
-        };
-        annotatorInstance.updateAnnotation(updatedRectangleAnnotation);
-
-        if (annotatorInstance.viewer) {
-          annotatorInstance.setSelected(null);
-          annotatorInstance.setSelected(updatedRectangleAnnotation.id);
-          annotatorInstance.viewer.forceRedraw();
-        }
-      }
-
-      onCancel();
-
+      // Omit matching_indices: backend re-queries from region_geometry / polygon_vertices
       const savePayload: any = {
         path: getDefaultOutputPath(formattedPath),
         wf_id: 1,
         region_geometry: { x1: bboxX1, y1: bboxY1, x2: bboxX2, y2: bboxY2 },
-        matching_indices,
         classification: item.name,
         color: item.color,
         method: `${selectorType || selectedTool || 'unknown'} selection`.toLowerCase(),
-        annotator: 'Unknown',
+        annotator: annotatorLabelRef.current,
         ui_nuclei_classes: nucleiClasses.map((cls) => cls.name),
         ui_nuclei_colors: nucleiClasses.map((cls) => cls.color),
         ui_organ: currentOrgan,
       };
       if (polygonRawPoints) savePayload.polygon_vertices = polygonRawPoints;
 
-      const headers: any = {};
       if (!instanceIdProp) {
         console.warn('[SelectionContent] Missing instanceIdProp; aborting save_annotation to avoid mismatched session.');
         return;
       }
-      headers['X-Instance-ID'] = instanceIdProp;
 
-      void apiFetch(`${AI_SERVICE_API_ENDPOINT}/tasks/v1/save_annotation`, {
-        method: 'POST',
+      void segFetch(instanceIdProp, `${AI_SERVICE_API_ENDPOINT}/tasks/v1/save_annotation`, {method: 'POST',
         body: JSON.stringify(savePayload),
-        headers,
-        returnAxiosFormat: true,
-      })
+        returnAxiosFormat: true})
         .then(() => {
           try {
-            EventBus.emit('refresh-annotations');
+            eventBus.emit('refresh-annotations');
           } catch {}
           try {
-            EventBus.emit('refresh-websocket-path', { path: formattedPath, forceReload: true });
+            eventBus.emit('refresh-websocket-path', {
+              path: formattedPath,
+              skipViewportRefresh: true,
+            });
           } catch {}
-          refreshGtHighlightIndices();
+          refreshGtHighlightIndices(currentPath);
 
           if (updateAfterEveryAnnotation && currentPath && nucleiClasses.length > 0) {
             const zarrPath = getDefaultOutputPath(formattedPath);
-            EventBus.emit('trigger-nuclei-update', { zarrPath, source: 'auto-selection-mark' });
+            // Coalesced, not a bare emit: WorkflowGraph drops the trigger while a
+            // run is in flight, so back-to-back marks lost every update after the
+            // first one. The coalescer replays a single follow-up on run finish.
+            scheduleCoalescedClassificationAfterAnnotation(() => ({
+              zarrPath,
+              source: 'auto-selection-mark',
+            }));
           }
         })
         .catch((err) => {
@@ -330,70 +483,49 @@ export default function SelectionContent({
           rollback();
           
           // Check if error is related to samples directory restriction
-          const errorMessage = getErrorMessage(err, '');
-          if (errorMessage.includes('sample directories') || errorMessage.includes('Cannot annotate in sample directories')) {
-            toast.error(getRestrictedDirectoryMessage('annotate nuclei'));
-          } else {
+          if (!toastIfDenied(err, 'annotate nuclei', 'Failed to save nuclei annotations. Reverted to previous state.')) {
             toast.error(getErrorMessage(err, 'Failed to save nuclei annotations. Reverted to previous state.'));
           }
           
-          EventBus.emit('refresh-websocket-path', { path: formattedPath, forceReload: true });
+          eventBus.emit('refresh-websocket-path', { path: formattedPath, skipViewportRefresh: true });
         });
     } catch (error) {
       console.error('Error during markAllNuclei API call or processing:', error);
       
       // Check if error is related to samples directory restriction
-      const errorMessage = getErrorMessage(error, '');
-      if (errorMessage.includes('sample directories') || errorMessage.includes('Cannot annotate in sample directories')) {
-        toast.error(getRestrictedDirectoryMessage('annotate nuclei'));
-      } else {
+      if (!toastIfDenied(error, 'annotate nuclei', 'Unable to mark nuclei for this region.')) {
         toast.error(getErrorMessage(error, 'Unable to mark nuclei for this region.'));
       }
     }
-  }, [
-    currentPath,
-    shapeCoords,
-    annotation,
-    nucleiClasses,
-    applyOptimisticAnnotationTypes,
-    annotatorInstance,
-    onCancel,
-    formattedPath,
-    selectedTool,
-    currentOrgan,
-    instanceIdProp,
-    updateAfterEveryAnnotation,
-    dispatch,
-    refreshGtHighlightIndices,
-  ]);
+  }, [assertWritable, toastIfDenied, currentPath, shapeCoords, annotation, nucleiClasses, applyOptimisticAnnotationTypes, annotatorInstance, onCancel, discardRegion, formattedPath, selectedTool, currentOrgan, instanceIdProp, updateAfterEveryAnnotation, dispatch, refreshGtHighlightIndices]);
 
   /** Mark region as "NOT this class" (negative selection): same as tissue, exclude_classes=[className] */
   const markNucleiExclude = useCallback(async (item: { name: string }) => {
-    if (isPublicReadOnlyPath(currentPath ?? undefined)) {
-      toast.error(getRestrictedDirectoryMessage('annotate'));
+    if (!assertWritable('annotate')) {
       onCancel();
       return;
     }
-    if (!shapeCoords) {
-      console.error("Shape coordinates (Raw BBox) not found in Redux state. Cannot mark nuclei exclude.");
+    const liveExcl = getLiveAnnotation(annotatorInstance, annotation);
+    const bboxExcl = getBBoxFromAnnotation(liveExcl, shapeCoords);
+    if (!bboxExcl) {
+      console.error("Shape coordinates not found. Cannot mark nuclei exclude.");
       return;
     }
-    const { x1: bboxX1, y1: bboxY1, x2: bboxX2, y2: bboxY2 } = shapeCoords;
-    let polygonRawPoints: number[][] | null = null;
-    const selectorType = annotation.target.selector?.type;
-    if (selectorType === 'POLYGON') {
-      const geometry = annotation.target.selector.geometry as any;
-      if (geometry?.points?.length) polygonRawPoints = geometry.points;
-    }
+    const { x1: bboxX1, y1: bboxY1, x2: bboxX2, y2: bboxY2 } = bboxExcl;
+    const polygonRawPoints = getPolygonPointsFromAnnotation(liveExcl);
     const url = `${AI_SERVICE_API_ENDPOINT}/seg/v1/query`;
     const apiParams: any = {
       x1: bboxX1, x2: bboxX2, y1: bboxY1, y2: bboxY2,
       file_path: formattedPath,
+      // Needed to tell which of the matched cells this "No" actually contradicts.
+      // Opt-in on the endpoint: plain viewport refreshes must not pay for it.
+      with_classes: 'true',
     };
     if (polygonRawPoints) apiParams.polygon_points = JSON.stringify(polygonRawPoints);
     try {
       const urlWithParams = `${url}?${new URLSearchParams(apiParams as Record<string, string>).toString()}`;
-      const response = await apiFetch(urlWithParams, { method: 'GET', returnAxiosFormat: true });
+      const response = await segFetch(instanceIdProp, urlWithParams, {method: 'GET',
+        returnAxiosFormat: true});
       const responseData = response.data;
       const matching_indices = responseData?.matching_indices ?? [];
       if (!matching_indices.length) {
@@ -405,78 +537,108 @@ export default function SelectionContent({
         toast.error('Missing session; cannot save.');
         return;
       }
-      onCancel();
+
+      // Only the cells this "No" contradicts lose their colour — the same rule
+      // the backend applies in _clear_contradicted_predictions, so the refresh
+      // that follows confirms this rather than reverting it. Resolve the class
+      // against the palette the response carries, not local `nucleiClasses`:
+      // matching_class_ids index the handler's palette, ordered independently.
+      // #808080 is what the overlay paints unclassified (PALETTE_INDEX_NONE),
+      // so the colour does not shift again when the real data lands — but the
+      // label says "Not <class>", because that is what the user actually told
+      // us. "Unclassified" would read as "nobody has said anything about this
+      // cell", which is the opposite of having just marked it.
+      const responseClassNames: string[] = responseData?.class_names ?? [];
+      const matchingClassIds: number[] = responseData?.matching_class_ids ?? [];
+      const excludedClassId = responseClassNames.indexOf(item.name);
+      const contradicted = excludedClassId < 0
+        ? []
+        : matching_indices.filter(
+            (_idx: any, i: number) => matchingClassIds[i] === excludedClassId,
+          );
+      const rollback = contradicted.length
+        ? applyOptimisticAnnotationTypes(
+            contradicted.map((idx: any) => ({
+              id: idx.toString(),
+              classIndex: -1,
+              color: '#808080',
+              category: `Not ${item.name}`,
+            })),
+          )
+        : () => {};
+      if (contradicted.length && annotatorInstance?.viewer) {
+        annotatorInstance.viewer.raiseEvent('update-viewport');
+        annotatorInstance.viewer.raiseEvent('animation');
+        annotatorInstance.viewer.raiseEvent('animation-finish');
+      }
+
+      // Selection consumed by the mark — see markTissue.
+      discardRegion();
+      try {
+        annotatorInstance?.viewer?.forceRedraw?.();
+      } catch {}
+      // Omit matching_indices: backend re-queries from region_geometry / polygon_vertices
       const savePayload: any = {
         path: getDefaultOutputPath(formattedPath),
         region_geometry: { x1: bboxX1, y1: bboxY1, x2: bboxX2, y2: bboxY2 },
-        matching_indices,
         classification: null,
         exclude_classes: [item.name],
         color: '#aaaaaa',
         method: 'negative selection',
-        annotator: 'Unknown',
+        annotator: annotatorLabelRef.current,
         ui_nuclei_classes: nucleiClasses.map((c) => c.name),
         ui_nuclei_colors: nucleiClasses.map((c) => c.color),
         ui_organ: currentOrgan,
       };
-      const headers: any = {};
-      if (instanceIdProp) headers['X-Instance-ID'] = instanceIdProp;
-      void apiFetch(`${AI_SERVICE_API_ENDPOINT}/tasks/v1/save_annotation`, {
-        method: 'POST',
+      // Send the drawn polygon vertices for a negative selection too, so the
+      // stored geometry is the real lasso shape, not just its 4-corner bbox.
+      if (polygonRawPoints) savePayload.polygon_vertices = polygonRawPoints;
+      void segFetch(instanceIdProp, `${AI_SERVICE_API_ENDPOINT}/tasks/v1/save_annotation`, {method: 'POST',
         body: JSON.stringify(savePayload),
-        headers,
-        returnAxiosFormat: true,
-      })
+        returnAxiosFormat: true})
         .then(() => {
-          EventBus.emit('refresh-annotations');
-          EventBus.emit('refresh-websocket-path', { path: formattedPath, forceReload: true });
+          eventBus.emit('refresh-annotations');
+          eventBus.emit('refresh-websocket-path', { path: formattedPath, skipViewportRefresh: true });
           toast.success(`Marked region as not "${item.name}"`);
-          refreshGtHighlightIndices();
+          refreshGtHighlightIndices(currentPath);
 
           if (updateAfterEveryAnnotation && currentPath && nucleiClasses.length > 0) {
             const zarrPath = getDefaultOutputPath(formattedPath);
-            EventBus.emit('trigger-nuclei-update', { zarrPath, source: 'auto-selection-exclude' });
+            scheduleCoalescedClassificationAfterAnnotation(() => ({
+              zarrPath,
+              source: 'auto-selection-exclude',
+            }));
           }
         })
         .catch((err) => {
           console.error('POST save_annotation (exclude) error:', err);
-          const msg = getErrorMessage(err, '');
-          if (msg.includes('sample directories')) toast.error(getRestrictedDirectoryMessage('annotate nuclei'));
-          else toast.error(getErrorMessage(err, 'Failed to save nuclei exclusion.'));
-          EventBus.emit('refresh-websocket-path', { path: formattedPath, forceReload: true });
+          rollback();
+          if (!toastIfDenied(err, 'annotate nuclei', 'Failed to save nuclei exclusion. Reverted to previous state.')) {
+            toast.error(getErrorMessage(err, 'Failed to save nuclei exclusion. Reverted to previous state.'));
+          }
+          eventBus.emit('refresh-websocket-path', { path: formattedPath, skipViewportRefresh: true });
         });
     } catch (e) {
       console.error('markNucleiExclude error:', e);
       toast.error(getErrorMessage(e, 'Unable to mark nuclei exclude for this region.'));
     }
-  }, [
-    currentPath,
-    shapeCoords,
-    annotation,
-    nucleiClasses,
-    formattedPath,
-    currentOrgan,
-    instanceIdProp,
-    onCancel,
-    updateAfterEveryAnnotation,
-    dispatch,
-    refreshGtHighlightIndices,
-  ]);
+  }, [assertWritable, toastIfDenied, currentPath, shapeCoords, annotation, nucleiClasses, applyOptimisticAnnotationTypes, formattedPath, currentOrgan, instanceIdProp, annotatorInstance, onCancel, discardRegion, updateAfterEveryAnnotation, dispatch, refreshGtHighlightIndices]);
 
   const markTissue = useCallback(async (classId: number) => {
     // Check if in samples directory first
-    if (isPublicReadOnlyPath(currentPath ?? undefined)) {
-      toast.error(getRestrictedDirectoryMessage('annotate tissue'));
+    if (!assertWritable('annotate tissue')) {
       onCancel();
       return;
     }
 
-    if (!shapeCoords) {
-      console.error('[MarkTissue] Shape coordinates (Raw BBox) not found in Redux state.');
+    const liveTissue = getLiveAnnotation(annotatorInstance, annotation);
+    const bboxTissue = getBBoxFromAnnotation(liveTissue, shapeCoords);
+    if (!bboxTissue) {
+      console.error('[MarkTissue] Shape coordinates not found.');
       toast.error('Unable to mark tissue: Missing region coordinates.');
       return;
     }
-    const { x1: rawBBoxX1, y1: rawBBoxY1, x2: rawBBoxX2, y2: rawBBoxY2 } = shapeCoords;
+    const { x1: rawBBoxX1, y1: rawBBoxY1, x2: rawBBoxX2, y2: rawBBoxY2 } = bboxTissue;
 
     if (!reduxPatchClassificationData) {
       toast.error('Patch classification metadata is not available.');
@@ -490,22 +652,18 @@ export default function SelectionContent({
     const colorHex = reduxPatchClassificationData.class_hex_color[classId] || '#FFFF00';
 
     let polygonRawPoints: number[][] | null = null;
-    const selector = annotation.target.selector;
+    const selector = getAnnotationSelector(liveTissue);
     const selectorType = selector?.type;
-
-    if (selectorType === 'POLYGON') {
-      const geometry = selector.geometry as any;
-      if (geometry && Array.isArray(geometry.points) && geometry.points.length > 0) {
-        polygonRawPoints = geometry.points;
-        console.log('[MarkTissue] Detected Polygon, raw points obtained:', polygonRawPoints);
-      } else {
-        console.warn('[MarkTissue] Polygon selector detected, but raw points are missing or invalid.', geometry);
-      }
+    polygonRawPoints = getPolygonPointsFromAnnotation(liveTissue);
+    if (polygonRawPoints) {
+      console.log('[MarkTissue] Detected Polygon, raw points obtained:', polygonRawPoints);
+    } else if (selectorType === 'POLYGON') {
+      console.warn('[MarkTissue] Polygon selector detected, but raw points are missing or invalid.', selector?.geometry);
     } else {
       console.log('[MarkTissue] Detected Rectangle or other shape type.');
     }
 
-    const saveUrl = `${AI_SERVICE_API_ENDPOINT}/tasks/v1/save_tissue`;
+    const saveUrl = `${AI_SERVICE_API_ENDPOINT}/tasks/v1/save_patch`;
 
     let method = 'polygon selection';
     if (selectorType === 'RECTANGLE') {
@@ -523,12 +681,18 @@ export default function SelectionContent({
       classification: className,
       color: colorHex,
       method: method,
-      annotator: "Unknown"
+      annotator: annotatorLabelRef.current,
+      // Authoritative global class ordering from the panel. Backend stores int
+      // indices into User-Annotations/patch — without this list it can't know
+      // that "Lymphocytes" is class 1 (not 0) when Patch-Classification was
+      // just reset and no zarr group has the ordering yet.
+      tissue_classes: [...reduxPatchClassificationData.class_name],
+      tissue_colors: [...reduxPatchClassificationData.class_hex_color],
     };
 
     if (polygonRawPoints) {
       payload.polygon_points = polygonRawPoints;
-      console.log('[MarkTissue] Adding polygon_points to save_tissue payload:', payload.polygon_points);
+      console.log('[MarkTissue] Adding polygon_points to save_patch payload:', payload.polygon_points);
     }
 
     const previousColorById = new Map<number, string>();
@@ -559,7 +723,13 @@ export default function SelectionContent({
     }
 
     if (optimisticIds.length) {
-      dispatch(updatePatchOverlayColors({ ids: optimisticIds, color: colorHex, persistOverride: false }));
+      // persistOverride: true → the marked color is stored in patchOverrides so
+      // it SURVIVES the refresh-websocket-path reload below (which otherwise
+      // repaints from the stale prediction). The container drops it again once a
+      // workflow run has finished AND its handler reload has landed — see
+      // shouldDropStaleOverrides. Nothing clears it on a plain re-bind, so the
+      // mark survives leaving and returning to the page.
+      recolorPatchOverlay({ ids: optimisticIds, color: colorHex, persistOverride: true });
     }
 
     const revertGroups = (() => {
@@ -575,50 +745,63 @@ export default function SelectionContent({
 
     const revertOptimisticUpdates = () => {
       revertGroups.forEach(({ color, ids }) => {
-        dispatch(updatePatchOverlayColors({ ids, color, persistOverride: false }));
+        recolorPatchOverlay({ ids, color, persistOverride: false });
       });
     };
 
-    onCancel();
-
     const zarrPath = getDefaultOutputPath(formattedPath);
 
+    if (!instanceIdProp) {
+      console.warn('[SelectionContent] Missing instanceIdProp; aborting save_patch to avoid mismatched session.');
+      revertOptimisticUpdates();
+      onCancel();
+      return;
+    }
+
+    // The drawing was only the selection for this mark — drop it instead of
+    // leaving a manual annotation on the slide. save_patch (below) still writes
+    // the polygon to Zarr as the patch selection geometry.
+    discardRegion();
+
     // Direct API call (same as cell annotation) - no queue
-    void apiFetch(saveUrl, {
-      method: 'POST',
+    void segFetch(instanceIdProp, saveUrl, {method: 'POST',
       body: JSON.stringify(payload),
-      returnAxiosFormat: true,
-    })
+      returnAxiosFormat: true})
       .then((response) => {
         try {
           // Update UI immediately (synchronous)
           const matchingIndices: number[] = response?.data?.data?.matching_indices ?? response?.data?.matching_indices ?? [];
           if (matchingIndices.length > 0) {
             const normalizedIds = matchingIndices.map((idx) => Number(idx));
-            dispatch(updatePatchOverlayColors({ ids: normalizedIds, color: colorHex, persistOverride: false }));
+            // Backend-confirmed marked patches: persist (survive reload) until the
+            // workflow re-predicts; the unconfirmed ones below revert (false).
+            recolorPatchOverlay({ ids: normalizedIds, color: colorHex, persistOverride: true });
             if (optimisticIds.length) {
               const backendIdSet = new Set(normalizedIds);
               revertGroups.forEach(({ color, ids }) => {
                 const missing = ids.filter((id) => !backendIdSet.has(id));
                 if (missing.length) {
-                  dispatch(updatePatchOverlayColors({ ids: missing, color, persistOverride: false }));
+                  recolorPatchOverlay({ ids: missing, color, persistOverride: false });
                 }
               });
             }
-            EventBus.emit('refresh-patches');
+            eventBus.emit('refresh-patches');
           } else if (optimisticIds.length) {
             revertOptimisticUpdates();
           }
 
           // Fire-and-forget: Don't block on query operations
           // Refresh operations are async and don't need to wait
-          EventBus.emit('refresh-websocket-path', { path: zarrPath, forceReload: true });
-          refreshGtHighlightIndices();
+          eventBus.emit('refresh-websocket-path', { path: zarrPath, forceReload: true });
+          refreshGtHighlightIndices(currentPath);
 
           // Route patch auto-update through the panel's manual update handler
           // so payload semantics (including class_operations) stay identical.
           if (updatePatchAfterEveryAnnotation && currentPath && reduxPatchClassificationData) {
-            EventBus.emit('trigger-patch-update', { zarrPath, source: 'auto-selection-mark' });
+            scheduleCoalescedPatchClassificationAfterAnnotation(() => ({
+              zarrPath,
+              source: 'auto-selection-mark',
+            }));
           }
 
           // Refresh counts asynchronously - don't block
@@ -628,14 +811,14 @@ export default function SelectionContent({
         }
       })
       .catch((err) => {
-        console.error('POST /save_tissue error:', err);
+        console.error('POST /save_patch error:', err);
         revertOptimisticUpdates();
         
         // Check for specific error types and provide user-friendly messages
         const errorMessage = getErrorMessage(err, '');
         
-        if (errorMessage.includes('sample directories') || errorMessage.includes('Cannot annotate in sample directories')) {
-          toast.error(getRestrictedDirectoryMessage('annotate tissue'));
+        if (toastIfDenied(err, 'annotate tissue', 'Failed to save tissue annotations.')) {
+          // path ACL denial already toasted
         } else if (errorMessage.includes('Patch coordinates data could not be loaded from Zarr') || 
                    errorMessage.includes('Zarr') || 
                    errorMessage.includes('patch coordinates')) {
@@ -648,48 +831,36 @@ export default function SelectionContent({
           toast.error(getErrorMessage(err, 'Failed to save tissue annotations. Please try again or contact support if the issue persists.'));
         }
         
-        EventBus.emit('refresh-websocket-path', { path: zarrPath, forceReload: true });
+        eventBus.emit('refresh-websocket-path', { path: zarrPath, forceReload: true });
       });
-  }, [
-    currentPath,
-    shapeCoords,
-    reduxPatchClassificationData,
-    annotation,
-    formattedPath,
-    currentPatches,
-    isPointInsidePolygon,
-    dispatch,
-    onCancel,
-    updatePatchAfterEveryAnnotation,
-    refreshPatchCountsFromServer,
-    refreshGtHighlightIndices,
-  ]);
+  }, [assertWritable, toastIfDenied, currentPath, shapeCoords, reduxPatchClassificationData, annotation, formattedPath, currentPatches, isPointInsidePolygon, dispatch, recolorPatchOverlay, annotatorInstance, onCancel, discardRegion, updatePatchAfterEveryAnnotation, refreshPatchCountsFromServer, refreshGtHighlightIndices]);
 
   /** Mark region as "NOT this class" (negative selection): tissue_class=null, exclude_classes=[className] */
   const markTissueExclude = useCallback(async (classId: number) => {
-    if (isPublicReadOnlyPath(currentPath ?? undefined)) {
-      toast.error(getRestrictedDirectoryMessage('annotate tissue'));
+    if (!assertWritable('annotate tissue')) {
       onCancel();
-      return;
-    }
-    if (!shapeCoords) {
-      toast.error('Unable to mark tissue: Missing region coordinates.');
       return;
     }
     if (!reduxPatchClassificationData || classId < 0 || classId >= reduxPatchClassificationData.class_name.length) {
       toast.error('Invalid patch classification selection.');
       return;
     }
-    const { x1: rawBBoxX1, y1: rawBBoxY1, x2: rawBBoxX2, y2: rawBBoxY2 } = shapeCoords;
+    const liveTissueExcl = getLiveAnnotation(annotatorInstance, annotation);
+    const bboxTissueExcl = getBBoxFromAnnotation(liveTissueExcl, shapeCoords);
+    if (!bboxTissueExcl) {
+      toast.error('Unable to mark tissue: Missing region coordinates.');
+      return;
+    }
+    const { x1: rawBBoxX1, y1: rawBBoxY1, x2: rawBBoxX2, y2: rawBBoxY2 } = bboxTissueExcl;
     const className = reduxPatchClassificationData.class_name[classId];
     let polygonRawPoints: number[][] | null = null;
-    const selector = annotation.target.selector;
+    const selector = getAnnotationSelector(liveTissueExcl);
     const selectorType = selector?.type;
     if (selectorType === 'POLYGON') {
       const geometry = selector.geometry as any;
       if (geometry?.points?.length) polygonRawPoints = geometry.points;
     }
-    const saveUrl = `${AI_SERVICE_API_ENDPOINT}/tasks/v1/save_tissue`;
+    const saveUrl = `${AI_SERVICE_API_ENDPOINT}/tasks/v1/save_patch`;
     const payload: any = {
       path: getDefaultOutputPath(formattedPath),
       start_x: rawBBoxX1,
@@ -700,7 +871,9 @@ export default function SelectionContent({
       exclude_classes: [className],
       color: '#aaaaaa',
       method: 'negative selection',
-      annotator: 'Unknown'
+      annotator: annotatorLabelRef.current,
+      tissue_classes: [...reduxPatchClassificationData.class_name],
+      tissue_colors: [...reduxPatchClassificationData.class_hex_color],
     };
     if (polygonRawPoints) payload.polygon_points = polygonRawPoints;
 
@@ -734,15 +907,24 @@ export default function SelectionContent({
     })();
     const revertOptimisticUpdates = () => {
       revertGroups.forEach(({ color, ids }) => {
-        dispatch(updatePatchOverlayColors({ ids, color, persistOverride: false }));
+        recolorPatchOverlay({ ids, color, persistOverride: false });
       });
     };
     if (optimisticIds.length) {
-      dispatch(updatePatchOverlayColors({ ids: optimisticIds, color: '#aaaaaa', persistOverride: false }));
+      recolorPatchOverlay({ ids: optimisticIds, color: '#aaaaaa', persistOverride: false });
     }
-    onCancel();
+    if (!instanceIdProp) {
+      console.warn('[SelectionContent] Missing instanceIdProp; aborting save_patch (exclude).');
+      revertOptimisticUpdates();
+      onCancel();
+      return;
+    }
+    // Selection consumed by the mark — see markTissue.
+    discardRegion();
     const zarrPath = getDefaultOutputPath(formattedPath);
-    void apiFetch(saveUrl, { method: 'POST', body: JSON.stringify(payload), returnAxiosFormat: true })
+    void segFetch(instanceIdProp, saveUrl, {method: 'POST',
+      body: JSON.stringify(payload),
+      returnAxiosFormat: true})
       .then((response) => {
         const matchingIndices: number[] = response?.data?.data?.matching_indices ?? response?.data?.matching_indices ?? [];
         if (matchingIndices.length > 0) {
@@ -752,67 +934,50 @@ export default function SelectionContent({
             const backendIdSet = new Set(normalizedIds);
             revertGroups.forEach(({ color, ids }) => {
               const missing = ids.filter((id) => !backendIdSet.has(id));
-              if (missing.length) dispatch(updatePatchOverlayColors({ ids: missing, color, persistOverride: false }));
+              if (missing.length) recolorPatchOverlay({ ids: missing, color, persistOverride: false });
             });
           }
-          EventBus.emit('refresh-patches');
+          eventBus.emit('refresh-patches');
         } else if (optimisticIds.length) revertOptimisticUpdates();
-        EventBus.emit('refresh-websocket-path', { path: zarrPath, forceReload: true });
+        eventBus.emit('refresh-websocket-path', { path: zarrPath, forceReload: true });
         if (updatePatchAfterEveryAnnotation && currentPath && reduxPatchClassificationData) {
-          EventBus.emit('trigger-patch-update', { zarrPath, source: 'auto-selection-exclude' });
+          scheduleCoalescedPatchClassificationAfterAnnotation(() => ({
+            zarrPath,
+            source: 'auto-selection-exclude',
+          }));
         }
         refreshPatchCountsFromServer().catch(() => {});
-        refreshGtHighlightIndices();
+        refreshGtHighlightIndices(currentPath);
       })
       .catch((err) => {
-        console.error('POST /save_tissue (exclude) error:', err);
+        console.error('POST /save_patch (exclude) error:', err);
         revertOptimisticUpdates();
-        const msg = getErrorMessage(err, '');
-        if (msg.includes('sample directories')) toast.error(getRestrictedDirectoryMessage('annotate tissue'));
-        else toast.error(getErrorMessage(err, 'Failed to save tissue exclusion.'));
-        EventBus.emit('refresh-websocket-path', { path: zarrPath, forceReload: true });
+        if (!toastIfDenied(err, 'annotate tissue', 'Failed to save tissue exclusion.')) {
+          toast.error(getErrorMessage(err, 'Failed to save tissue exclusion.'));
+        }
+        eventBus.emit('refresh-websocket-path', { path: zarrPath, forceReload: true });
       });
-  }, [
-    currentPath,
-    shapeCoords,
-    reduxPatchClassificationData,
-    annotation,
-    formattedPath,
-    currentPatches,
-    isPointInsidePolygon,
-    dispatch,
-    onCancel,
-    updatePatchAfterEveryAnnotation,
-    refreshPatchCountsFromServer,
-    refreshGtHighlightIndices,
-  ]);
+  }, [assertWritable, toastIfDenied, currentPath, shapeCoords, reduxPatchClassificationData, annotation, formattedPath, currentPatches, isPointInsidePolygon, dispatch, recolorPatchOverlay, annotatorInstance, onCancel, discardRegion, updatePatchAfterEveryAnnotation, refreshPatchCountsFromServer, refreshGtHighlightIndices]);
 
   const clearNucleiAnnotations = useCallback(async () => {
     // Check if in samples directory
-    if (isPublicReadOnlyPath(currentPath ?? undefined)) {
-      toast.error(getRestrictedDirectoryMessage('clear annotations'));
+    if (!assertWritable('clear annotations')) {
       onCancel();
       return;
     }
 
-    if (!shapeCoords) {
+    const liveClearNuclei = getLiveAnnotation(annotatorInstance, annotation);
+    const bboxClearNuclei = getBBoxFromAnnotation(liveClearNuclei, shapeCoords);
+    if (!bboxClearNuclei) {
       console.error("Shape coordinates not found. Cannot clear nuclei annotations.");
       toast.error('Unable to clear annotations: Missing region coordinates.');
       return;
     }
 
-    const { x1: bboxX1, y1: bboxY1, x2: bboxX2, y2: bboxY2 } = shapeCoords;
+    const { x1: bboxX1, y1: bboxY1, x2: bboxX2, y2: bboxY2 } = bboxClearNuclei;
 
-    // Get polygon points if available
-    let polygonRawPoints: number[][] | null = null;
-    const selectorType = annotation.target.selector?.type;
-
-    if (selectorType === 'POLYGON') {
-      const geometry = annotation.target.selector.geometry as any;
-      if (geometry && Array.isArray(geometry.points) && geometry.points.length > 0) {
-        polygonRawPoints = geometry.points;
-      }
-    }
+    // Get polygon points if available (live Annotorious — popup props can be stale).
+    let polygonRawPoints = getPolygonPointsFromAnnotation(liveClearNuclei);
 
     try {
       const url = `${AI_SERVICE_API_ENDPOINT}/seg/v1/clear_nuclei_annotations`;
@@ -828,17 +993,14 @@ export default function SelectionContent({
         payload.polygon_points = polygonRawPoints;
       }
 
-      const headers: any = {};
-      if (instanceIdProp) {
-        headers['X-Instance-ID'] = instanceIdProp;
+      if (!instanceIdProp) {
+        console.warn('[SelectionContent] Missing instanceIdProp; aborting request.');
+        return;
       }
 
-      const response = await apiFetch(url, {
-        method: 'POST',
+      const response = await segFetch(instanceIdProp, url, {method: 'POST',
         body: JSON.stringify(payload),
-        headers,
-        returnAxiosFormat: true,
-      });
+        returnAxiosFormat: true});
 
       const clearedCount = response?.data?.data?.cleared_count ?? response?.data?.cleared_count ?? 0;
       
@@ -846,9 +1008,9 @@ export default function SelectionContent({
         toast.success(`Cleared ${clearedCount} nuclei annotation(s)`);
         
         // Refresh annotations
-        EventBus.emit('refresh-annotations');
-        EventBus.emit('refresh-websocket-path', { path: formattedPath, forceReload: true });
-        refreshGtHighlightIndices();
+        eventBus.emit('refresh-annotations');
+        eventBus.emit('refresh-websocket-path', { path: formattedPath, forceReload: true });
+        refreshGtHighlightIndices(currentPath);
       } else {
         toast('No nuclei annotations found in this region.');
       }
@@ -856,49 +1018,31 @@ export default function SelectionContent({
       onCancel();
     } catch (error) {
       console.error('Error clearing nuclei annotations:', error);
-      const errorMessage = getErrorMessage(error, '');
-      if (errorMessage.includes('sample directories')) {
-        toast.error(getRestrictedDirectoryMessage('clear annotations'));
-      } else {
+      if (!toastIfDenied(error, 'clear annotations', 'Failed to clear nuclei annotations.')) {
         toast.error(getErrorMessage(error, 'Failed to clear nuclei annotations.'));
       }
     }
-  }, [
-    currentPath,
-    shapeCoords,
-    annotation,
-    formattedPath,
-    instanceIdProp,
-    onCancel,
-    refreshGtHighlightIndices,
-  ]);
+  }, [assertWritable, toastIfDenied, currentPath, shapeCoords, annotation, formattedPath, instanceIdProp, annotatorInstance, onCancel, refreshGtHighlightIndices]);
 
   const clearTissueAnnotations = useCallback(async () => {
     // Check if in samples directory
-    if (isPublicReadOnlyPath(currentPath ?? undefined)) {
-      toast.error(getRestrictedDirectoryMessage('clear annotations'));
+    if (!assertWritable('clear annotations')) {
       onCancel();
       return;
     }
 
-    if (!shapeCoords) {
+    const liveClearTissue = getLiveAnnotation(annotatorInstance, annotation);
+    const bboxClearTissue = getBBoxFromAnnotation(liveClearTissue, shapeCoords);
+    if (!bboxClearTissue) {
       console.error("Shape coordinates not found. Cannot clear tissue annotations.");
       toast.error('Unable to clear annotations: Missing region coordinates.');
       return;
     }
 
-    const { x1: bboxX1, y1: bboxY1, x2: bboxX2, y2: bboxY2 } = shapeCoords;
+    const { x1: bboxX1, y1: bboxY1, x2: bboxX2, y2: bboxY2 } = bboxClearTissue;
 
-    // Get polygon points if available
-    let polygonRawPoints: number[][] | null = null;
-    const selectorType = annotation.target.selector?.type;
-
-    if (selectorType === 'POLYGON') {
-      const geometry = annotation.target.selector.geometry as any;
-      if (geometry && Array.isArray(geometry.points) && geometry.points.length > 0) {
-        polygonRawPoints = geometry.points;
-      }
-    }
+    // Get polygon points if available (live Annotorious — popup props can be stale).
+    let polygonRawPoints = getPolygonPointsFromAnnotation(liveClearTissue);
 
     try {
       const url = `${AI_SERVICE_API_ENDPOINT}/seg/v1/clear_tissue_annotations`;
@@ -914,17 +1058,14 @@ export default function SelectionContent({
         payload.polygon_points = polygonRawPoints;
       }
 
-      const headers: any = {};
-      if (instanceIdProp) {
-        headers['X-Instance-ID'] = instanceIdProp;
+      if (!instanceIdProp) {
+        console.warn('[SelectionContent] Missing instanceIdProp; aborting request.');
+        return;
       }
 
-      const response = await apiFetch(url, {
-        method: 'POST',
+      const response = await segFetch(instanceIdProp, url, {method: 'POST',
         body: JSON.stringify(payload),
-        headers,
-        returnAxiosFormat: true,
-      });
+        returnAxiosFormat: true});
 
       const clearedCount = response?.data?.data?.cleared_count ?? response?.data?.cleared_count ?? 0;
       
@@ -932,10 +1073,10 @@ export default function SelectionContent({
         toast.success(`Cleared ${clearedCount} tissue annotation(s)`);
         
         // Refresh patches and annotations
-        EventBus.emit('refresh-patches');
-        EventBus.emit('refresh-annotations');
-        EventBus.emit('refresh-websocket-path', { path: formattedPath, forceReload: true });
-        refreshGtHighlightIndices();
+        eventBus.emit('refresh-patches');
+        eventBus.emit('refresh-annotations');
+        eventBus.emit('refresh-websocket-path', { path: formattedPath, forceReload: true });
+        refreshGtHighlightIndices(currentPath);
         
         // Refresh patch counts from server
         await refreshPatchCountsFromServer();
@@ -946,50 +1087,31 @@ export default function SelectionContent({
       onCancel();
     } catch (error) {
       console.error('Error clearing tissue annotations:', error);
-      const errorMessage = getErrorMessage(error, '');
-      if (errorMessage.includes('sample directories')) {
-        toast.error(getRestrictedDirectoryMessage('clear annotations'));
-      } else {
+      if (!toastIfDenied(error, 'clear annotations', 'Failed to clear tissue annotations.')) {
         toast.error(getErrorMessage(error, 'Failed to clear tissue annotations.'));
       }
     }
-  }, [
-    currentPath,
-    shapeCoords,
-    annotation,
-    formattedPath,
-    instanceIdProp,
-    onCancel,
-    refreshPatchCountsFromServer,
-    refreshGtHighlightIndices,
-  ]);
+  }, [assertWritable, toastIfDenied, currentPath, shapeCoords, annotation, formattedPath, instanceIdProp, annotatorInstance, onCancel, refreshPatchCountsFromServer, refreshGtHighlightIndices]);
 
   const markNucleiAsGroundTruth = useCallback(async () => {
     // Check if in samples directory
-    if (isPublicReadOnlyPath(currentPath ?? undefined)) {
-      toast.error(getRestrictedDirectoryMessage('mark as ground truth'));
+    if (!assertWritable('mark as ground truth')) {
       onCancel();
       return;
     }
 
-    if (!shapeCoords) {
+    const liveGtNuclei = getLiveAnnotation(annotatorInstance, annotation);
+    const bboxGtNuclei = getBBoxFromAnnotation(liveGtNuclei, shapeCoords);
+    if (!bboxGtNuclei) {
       console.error("Shape coordinates not found. Cannot mark nuclei as ground truth.");
       toast.error('Unable to mark as ground truth: Missing region coordinates.');
       return;
     }
 
-    const { x1: bboxX1, y1: bboxY1, x2: bboxX2, y2: bboxY2 } = shapeCoords;
+    const { x1: bboxX1, y1: bboxY1, x2: bboxX2, y2: bboxY2 } = bboxGtNuclei;
 
-    // Get polygon points if available
-    let polygonRawPoints: number[][] | null = null;
-    const selectorType = annotation.target.selector?.type;
-
-    if (selectorType === 'POLYGON') {
-      const geometry = annotation.target.selector.geometry as any;
-      if (geometry && Array.isArray(geometry.points) && geometry.points.length > 0) {
-        polygonRawPoints = geometry.points;
-      }
-    }
+    // Get polygon points if available (live Annotorious — popup props can be stale).
+    let polygonRawPoints = getPolygonPointsFromAnnotation(liveGtNuclei);
 
     try {
       const url = `${AI_SERVICE_API_ENDPOINT}/seg/v1/save_annotation/batch`;
@@ -1000,23 +1122,21 @@ export default function SelectionContent({
         y1: bboxY1,
         x2: bboxX2,
         y2: bboxY2,
+        annotator: annotatorLabelRef.current,
       };
 
       if (polygonRawPoints) {
         payload.polygon_points = polygonRawPoints;
       }
 
-      const headers: any = {};
-      if (instanceIdProp) {
-        headers['X-Instance-ID'] = instanceIdProp;
+      if (!instanceIdProp) {
+        console.warn('[SelectionContent] Missing instanceIdProp; aborting request.');
+        return;
       }
 
-      const response = await apiFetch(url, {
-        method: 'POST',
+      const response = await segFetch(instanceIdProp, url, {method: 'POST',
         body: JSON.stringify(payload),
-        headers,
-        returnAxiosFormat: true,
-      });
+        returnAxiosFormat: true});
 
       const markedCount = response?.data?.data?.marked_count ?? response?.data?.marked_count ?? 0;
       
@@ -1024,9 +1144,9 @@ export default function SelectionContent({
         toast.success(`Marked ${markedCount} nuclei annotation(s) as ground truth`);
         
         // Refresh annotations
-        EventBus.emit('refresh-annotations');
-        EventBus.emit('refresh-websocket-path', { path: formattedPath, forceReload: true });
-        refreshGtHighlightIndices();
+        eventBus.emit('refresh-annotations');
+        eventBus.emit('refresh-websocket-path', { path: formattedPath, forceReload: true });
+        refreshGtHighlightIndices(currentPath);
       } else {
         toast('No AI-predicted nuclei annotations found in this region to mark as ground truth.');
       }
@@ -1034,49 +1154,31 @@ export default function SelectionContent({
       onCancel();
     } catch (error) {
       console.error('Error marking nuclei as ground truth:', error);
-      const errorMessage = getErrorMessage(error, '');
-      if (errorMessage.includes('sample directories')) {
-        toast.error(getRestrictedDirectoryMessage('mark as ground truth'));
-      } else {
+      if (!toastIfDenied(error, 'mark as ground truth', 'Failed to mark nuclei as ground truth.')) {
         toast.error(getErrorMessage(error, 'Failed to mark nuclei as ground truth.'));
       }
     }
-  }, [
-    currentPath,
-    shapeCoords,
-    annotation,
-    formattedPath,
-    instanceIdProp,
-    onCancel,
-    refreshGtHighlightIndices,
-  ]);
+  }, [assertWritable, toastIfDenied, currentPath, shapeCoords, annotation, formattedPath, instanceIdProp, annotatorInstance, onCancel, refreshGtHighlightIndices]);
 
   const markTissueAsGroundTruth = useCallback(async () => {
     // Check if in samples directory
-    if (isPublicReadOnlyPath(currentPath ?? undefined)) {
-      toast.error(getRestrictedDirectoryMessage('mark as ground truth'));
+    if (!assertWritable('mark as ground truth')) {
       onCancel();
       return;
     }
 
-    if (!shapeCoords) {
+    const liveGtTissue = getLiveAnnotation(annotatorInstance, annotation);
+    const bboxGtTissue = getBBoxFromAnnotation(liveGtTissue, shapeCoords);
+    if (!bboxGtTissue) {
       console.error("Shape coordinates not found. Cannot mark tissue as ground truth.");
       toast.error('Unable to mark as ground truth: Missing region coordinates.');
       return;
     }
 
-    const { x1: bboxX1, y1: bboxY1, x2: bboxX2, y2: bboxY2 } = shapeCoords;
+    const { x1: bboxX1, y1: bboxY1, x2: bboxX2, y2: bboxY2 } = bboxGtTissue;
 
-    // Get polygon points if available
-    let polygonRawPoints: number[][] | null = null;
-    const selectorType = annotation.target.selector?.type;
-
-    if (selectorType === 'POLYGON') {
-      const geometry = annotation.target.selector.geometry as any;
-      if (geometry && Array.isArray(geometry.points) && geometry.points.length > 0) {
-        polygonRawPoints = geometry.points;
-      }
-    }
+    // Get polygon points if available (live Annotorious — popup props can be stale).
+    let polygonRawPoints = getPolygonPointsFromAnnotation(liveGtTissue);
 
     try {
       const url = `${AI_SERVICE_API_ENDPOINT}/seg/v1/save_annotation/batch`;
@@ -1087,23 +1189,21 @@ export default function SelectionContent({
         y1: bboxY1,
         x2: bboxX2,
         y2: bboxY2,
+        annotator: annotatorLabelRef.current,
       };
 
       if (polygonRawPoints) {
         payload.polygon_points = polygonRawPoints;
       }
 
-      const headers: any = {};
-      if (instanceIdProp) {
-        headers['X-Instance-ID'] = instanceIdProp;
+      if (!instanceIdProp) {
+        console.warn('[SelectionContent] Missing instanceIdProp; aborting request.');
+        return;
       }
 
-      const response = await apiFetch(url, {
-        method: 'POST',
+      const response = await segFetch(instanceIdProp, url, {method: 'POST',
         body: JSON.stringify(payload),
-        headers,
-        returnAxiosFormat: true,
-      });
+        returnAxiosFormat: true});
 
       const markedCount = response?.data?.data?.marked_count ?? response?.data?.marked_count ?? 0;
       
@@ -1111,10 +1211,10 @@ export default function SelectionContent({
         toast.success(`Marked ${markedCount} tissue annotation(s) as ground truth`);
         
         // Refresh patches and annotations
-        EventBus.emit('refresh-patches');
-        EventBus.emit('refresh-annotations');
-        EventBus.emit('refresh-websocket-path', { path: formattedPath, forceReload: true });
-        refreshGtHighlightIndices();
+        eventBus.emit('refresh-patches');
+        eventBus.emit('refresh-annotations');
+        eventBus.emit('refresh-websocket-path', { path: formattedPath, forceReload: true });
+        refreshGtHighlightIndices(currentPath);
         
         // Refresh patch counts from server
         await refreshPatchCountsFromServer();
@@ -1125,23 +1225,11 @@ export default function SelectionContent({
       onCancel();
     } catch (error) {
       console.error('Error marking tissue as ground truth:', error);
-      const errorMessage = getErrorMessage(error, '');
-      if (errorMessage.includes('sample directories')) {
-        toast.error(getRestrictedDirectoryMessage('mark as ground truth'));
-      } else {
+      if (!toastIfDenied(error, 'mark as ground truth', 'Failed to mark tissue as ground truth.')) {
         toast.error(getErrorMessage(error, 'Failed to mark tissue as ground truth.'));
       }
     }
-  }, [
-    currentPath,
-    shapeCoords,
-    annotation,
-    formattedPath,
-    instanceIdProp,
-    onCancel,
-    refreshPatchCountsFromServer,
-    refreshGtHighlightIndices,
-  ]);
+  }, [assertWritable, toastIfDenied, currentPath, shapeCoords, annotation, formattedPath, instanceIdProp, annotatorInstance, onCancel, refreshPatchCountsFromServer, refreshGtHighlightIndices]);
 
   return (
     <div className="grid grid-cols-2 gap-2 h-full">
@@ -1152,30 +1240,101 @@ export default function SelectionContent({
           <div className="space-y-0.5 bg-secondary/20 p-1 rounded-md overflow-y-auto max-h-[160px]">
             {nucleiClasses.map((item, index) => (
               <div key={index} className="flex items-center gap-1.5 py-px">
-                <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: item.color }} />
+                <input
+                  type="color"
+                  value={item.color}
+                  disabled={!pathWritable}
+                  onChange={(e) => dispatch(updateNucleiClass({ index, newClass: { ...item, color: e.target.value } }))}
+                  title={writeBlockTitle || "Change color"}
+                  className="w-3.5 h-3.5 shrink-0 cursor-pointer rounded-full border-0 bg-transparent p-0 disabled:cursor-not-allowed disabled:opacity-40"
+                />
                 <span className="text-xs truncate min-w-0 flex-1">{item.name}</span>
                 <div className="flex gap-0.5 shrink-0">
-                  <Button variant="outline" size="sm" className="h-5 px-1 text-[11px]" onClick={() => markAllNuclei(item)}>Yes</Button>
-                  <Button variant="outline" size="sm" className="h-5 px-1 text-[11px]" onClick={() => markNucleiExclude(item)}>No</Button>
+                  <Button variant="outline" size="sm" className="h-5 px-1 text-[11px]" onClick={() => markAllNuclei(item)} disabled={!pathWritable} title={writeBlockTitle}>Yes</Button>
+                  <Button variant="outline" size="sm" className="h-5 px-1 text-[11px]" onClick={() => markNucleiExclude(item)} disabled={!pathWritable} title={writeBlockTitle}>No</Button>
+                  {item.name !== 'Negative control' && (
+                    <button type="button" title={writeBlockTitle || "Delete class"} disabled={!pathWritable} className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40" onClick={() => removeNucleiClass(index)}>×</button>
+                  )}
                 </div>
               </div>
             ))}
+            {addingNuclei ? (
+              <div className="flex items-center gap-1.5 py-px">
+                <input type="color" value={newNucleiColor} onChange={(e) => setNewNucleiColor(e.target.value)} className="h-4 w-4 shrink-0 cursor-pointer rounded border-0 bg-transparent p-0" title="Class color" />
+                <input
+                  autoFocus
+                  value={newNucleiName}
+                  onChange={(e) => setNewNucleiName(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); } else if (e.key === 'Escape') { setAddingNuclei(false); } }}
+                  onBlur={commitNucleiClass}
+                  placeholder="Class name…"
+                  className="min-w-0 flex-1 rounded border border-border bg-background px-1 py-0.5 text-xs"
+                />
+              </div>
+            ) : (
+              <button type="button" onClick={startAddNuclei} disabled={!pathWritable} title={writeBlockTitle} className="flex w-full items-center gap-1 px-1 py-0.5 text-[11px] text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40">
+                <span className="text-sm leading-none">+</span> Add class
+              </button>
+            )}
           </div>
         </div>
         {reduxPatchClassificationData && (
           <div className="space-y-0.5">
-            <Label className="text-xs font-medium">Annotate tissue as</Label>
+            <Label className="text-xs font-medium">Annotate patch as</Label>
             <div className="space-y-0.5 bg-secondary/20 p-1 rounded-md overflow-y-auto max-h-[160px]">
               {reduxPatchClassificationData.class_name.map((name, index) => (
                 <div key={index} className="flex items-center gap-1.5 py-px">
-                  <div className="w-2.5 h-2.5 rounded shrink-0" style={{ backgroundColor: reduxPatchClassificationData.class_hex_color[index] || '#FFFF00' }} />
+                  <input
+                    type="color"
+                    value={reduxPatchClassificationData.class_hex_color[index] || '#FFFF00'}
+                    onChange={(e) => {
+                      if (!pathWritable) return;
+                      const color = e.target.value;
+                      const data = reduxPatchClassificationData;
+                      // Update the class color definition…
+                      dispatch(setPatchClassificationData({
+                        ...data,
+                        class_hex_color: data.class_hex_color.map((c: string, i: number) => (i === index ? color : c)),
+                      } as any));
+                      // …and recolor patches already annotated as this class on the overlay.
+                      const classId = data.class_id[index];
+                      const ids = currentPatches
+                        .filter((p) => (p.length > 6 ? p[6] : -1) === classId)
+                        .map((p) => p[0]);
+                      if (ids.length) recolorPatchOverlay({ ids, color, persistOverride: true });
+                    }}
+                    title={writeBlockTitle || "Change color"}
+                    disabled={!pathWritable}
+                    className="w-3.5 h-3.5 shrink-0 cursor-pointer rounded border-0 bg-transparent p-0 disabled:cursor-not-allowed disabled:opacity-40"
+                  />
                   <span className="text-xs truncate min-w-0 flex-1">{name}</span>
                   <div className="flex gap-0.5 shrink-0">
-                    <Button variant="outline" size="sm" className="h-5 px-1 text-[11px]" onClick={() => markTissue(index)}>Yes</Button>
-                    <Button variant="outline" size="sm" className="h-5 px-1 text-[11px]" onClick={() => markTissueExclude(index)}>No</Button>
+                    <Button variant="outline" size="sm" className="h-5 px-1 text-[11px]" onClick={() => markTissue(index)} disabled={!pathWritable} title={writeBlockTitle}>Yes</Button>
+                    <Button variant="outline" size="sm" className="h-5 px-1 text-[11px]" onClick={() => markTissueExclude(index)} disabled={!pathWritable} title={writeBlockTitle}>No</Button>
+                    {name.toLowerCase() !== 'negative control' && (
+                      <button type="button" title={writeBlockTitle || "Delete class"} disabled={!pathWritable} className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40" onClick={() => removeTissueClass(index)}>×</button>
+                    )}
                   </div>
                 </div>
               ))}
+              {addingTissue ? (
+                <div className="flex items-center gap-1.5 py-px">
+                  <input type="color" value={newTissueColor} onChange={(e) => setNewTissueColor(e.target.value)} className="h-4 w-4 shrink-0 cursor-pointer rounded border-0 bg-transparent p-0" title="Class color" />
+                  <input
+                    autoFocus
+                    value={newTissueName}
+                    onChange={(e) => setNewTissueName(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); } else if (e.key === 'Escape') { setAddingTissue(false); } }}
+                    onBlur={commitTissueClass}
+                    placeholder="Class name…"
+                    className="min-w-0 flex-1 rounded border border-border bg-background px-1 py-0.5 text-xs"
+                  />
+                </div>
+              ) : (
+                <button type="button" onClick={startAddTissue} disabled={!pathWritable} title={writeBlockTitle} className="flex w-full items-center gap-1 px-1 py-0.5 text-[11px] text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40">
+                  <span className="text-sm leading-none">+</span> Add class
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -1186,11 +1345,11 @@ export default function SelectionContent({
         <div className="space-y-0.5">
           <Label className="text-xs font-medium">Clear this region</Label>
           <div className="space-y-0.5 bg-secondary/20 p-1 rounded-md">
-            <Button variant="outline" size="sm" className="h-7 w-full justify-start text-destructive hover:text-destructive hover:bg-destructive/10 text-xs" onClick={() => clearNucleiAnnotations()}>
+            <Button variant="outline" size="sm" className="h-7 w-full justify-start text-destructive hover:text-destructive hover:bg-destructive/10 text-xs" onClick={() => clearNucleiAnnotations()} disabled={!pathWritable} title={writeBlockTitle}>
               All nuclei annotations
             </Button>
             {reduxPatchClassificationData && (
-              <Button variant="outline" size="sm" className="h-7 w-full justify-start text-destructive hover:text-destructive hover:bg-destructive/10 text-xs" onClick={() => clearTissueAnnotations()}>
+              <Button variant="outline" size="sm" className="h-7 w-full justify-start text-destructive hover:text-destructive hover:bg-destructive/10 text-xs" onClick={() => clearTissueAnnotations()} disabled={!pathWritable} title={writeBlockTitle}>
                 All tissue annotations
               </Button>
             )}
@@ -1199,11 +1358,11 @@ export default function SelectionContent({
         <div className="space-y-0.5">
           <Label className="text-xs font-medium">Mark this region as ground truth</Label>
           <div className="space-y-0.5 bg-secondary/20 p-1 rounded-md">
-            <Button variant="outline" size="sm" className="h-7 w-full justify-start text-primary hover:text-primary hover:bg-primary/10 text-xs" onClick={() => markNucleiAsGroundTruth()}>
+            <Button variant="outline" size="sm" className="h-7 w-full justify-start text-primary hover:text-primary hover:bg-primary/10 text-xs" onClick={() => markNucleiAsGroundTruth()} disabled={!pathWritable} title={writeBlockTitle}>
               All nuclei predictions
             </Button>
             {reduxPatchClassificationData && (
-              <Button variant="outline" size="sm" className="h-7 w-full justify-start text-primary hover:text-primary hover:bg-primary/10 text-xs" onClick={() => markTissueAsGroundTruth()}>
+              <Button variant="outline" size="sm" className="h-7 w-full justify-start text-primary hover:text-primary hover:bg-primary/10 text-xs" onClick={() => markTissueAsGroundTruth()} disabled={!pathWritable} title={writeBlockTitle}>
                 All tissue predictions
               </Button>
             )}
@@ -1217,22 +1376,22 @@ export default function SelectionContent({
 // Footer buttons component for SelectionContent
 export function SelectionContentFooter({
   selectedColor,
-  customText,
   onSave,
-  onCancel,
+  onDelete,
   annotatorInstance,
   shapeCoords
 }: {
   selectedColor: string
-  customText: string
-  onSave: (color: string, customText?: string) => void
-  onCancel: () => void
+  onSave: () => void
+  onDelete: () => void
   annotatorInstance: any
   shapeCoords: { x1: number; y1: number; x2: number; y2: number } | null
 }) {
+  const currentPath = useActiveSlidePath();
+  const { allowed: pathWritable, tooltip: writeBlockTitle } = usePathWriteAccess(currentPath);
   const handleSave = () => {
     if (selectedColor) {
-      onSave(selectedColor, customText);
+      onSave();
     }
   };
 
@@ -1256,13 +1415,14 @@ export function SelectionContentFooter({
         </Button>
       </div>
       <div className="flex gap-2">
-        <Button variant="outline" size="sm" onClick={onCancel}>
+        <Button variant="outline" size="sm" onClick={onDelete}>
           Delete
         </Button>
         <Button
           size="sm"
           onClick={handleSave}
-          disabled={!selectedColor}
+          disabled={!pathWritable || !selectedColor}
+          title={writeBlockTitle || "Save this drawing as a manual annotation"}
         >
           Save
         </Button>

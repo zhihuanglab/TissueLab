@@ -2,7 +2,7 @@
 
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
-import { useUserInfo } from '@/provider/UserInfoProvider'
+import { useUserInfo } from '@/contexts/UserInfoProvider'
 import { CheckCircle, LogOut, Settings, User } from 'lucide-react'
 import React, { useState } from 'react'
 import { createPortal } from 'react-dom'
@@ -185,7 +185,7 @@ const ProfileDropdown: React.FC<ProfileDropdownProps> = ({
           <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[9999] pointer-events-auto">
             <div className="bg-[hsl(var(--success))/10] border border-[hsl(var(--success))/30] rounded-lg shadow-lg p-3 max-w-48 min-w-40">
               <div className="flex items-center gap-2">
-                <CheckCircle className="h-4 w-4 text-[hsl(var(--success))] flex-shrink-0" />
+                <CheckCircle className="h-4 w-4 text-[hsl(var(--success))] shrink-0" />
                 <div className="text-sm font-medium text-[hsl(var(--success))]">{copyToast.message}</div>
               </div>
             </div>

@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 
 from app.core.errors import AppError, AppErrors
 from app.core.logger import logger
-from app.core.response import error_response
+from app.core.response import error_response, permission_denied_response
 
 
 def _detail_to_message(detail: Any) -> str:
@@ -36,7 +36,20 @@ async def error_handler(request: Request, exc: Exception):
     if isinstance(exc, AppError):
         logger.error(f"Caught AppError: {exc.error_code} - {exc.message}")
         if is_api:
-            return error_response(message=exc.message, code=exc.status_code)
+            if exc.status_code in (401, 403):
+                return permission_denied_response(
+                    access_mode="unauthenticated" if exc.status_code == 401 else "forbidden",
+                    operation="access resource",
+                    request_id=request.headers.get("X-Request-ID") or "",
+                    error_code=str(exc.error_code or "ACCESS_DENIED"),
+                )
+            return error_response(
+                message=exc.message,
+                code=exc.status_code,
+                request_id=request.headers.get("X-Request-ID") or "",
+                error_code=str(exc.error_code or "APP_ERROR"),
+                data=getattr(exc, "data", None) or {},
+            )
         return JSONResponse(
             status_code=exc.status_code,
             content={
@@ -50,19 +63,33 @@ async def error_handler(request: Request, exc: Exception):
     if isinstance(exc, StarletteHTTPException):
         logger.error(f"Caught HTTPException: {exc.status_code} - {exc.detail}")
         if is_api:
+            if exc.status_code in (401, 403):
+                return permission_denied_response(
+                    access_mode="unauthenticated" if exc.status_code == 401 else "forbidden",
+                    operation="access resource",
+                    request_id=request.headers.get("X-Request-ID"),
+                    error_code="AUTH_TOKEN_REQUIRED" if exc.status_code == 401 else "ACCESS_DENIED",
+                )
             return error_response(
                 message=_detail_to_message(exc.detail),
                 code=exc.status_code,
+                request_id=request.headers.get("X-Request-ID") or "",
+                error_code="HTTP_%s" % exc.status_code,
             )
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": exc.detail},
         )
 
-    logger.error(f"Caught unknown error: {exc}")
+    logger.error(f"Caught unknown error: {exc}", exc_info=exc)
     error = AppErrors.SERVER_INTERNAL_ERROR()
     if is_api:
-        return error_response(message=error.message, code=error.status_code)
+        return error_response(
+            message=error.message,
+            code=error.status_code,
+            request_id=request.headers.get("X-Request-ID") or "",
+            error_code=str(error.error_code or "SERVER_INTERNAL_ERROR"),
+        )
     return JSONResponse(
         status_code=error.status_code,
         content={

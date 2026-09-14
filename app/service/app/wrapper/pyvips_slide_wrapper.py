@@ -28,6 +28,10 @@ class PyvipsSlideWrapper:
         self.level_dimensions = []
         # Parallel to level_dimensions: 0-based TIFF IFD index for pyvips page=
         self._tif_page_indices = []
+        # Parallel to level_dimensions: pyvips subifd index for levels stored as
+        # SubIFDs of the base page (OME-TIFF / Bio-Formats pyramids); None when
+        # the level is a top-level IFD opened by page= alone.
+        self._tif_subifd_indices = []
 
         if _tifffile is not None:
             try:
@@ -43,19 +47,22 @@ class PyvipsSlideWrapper:
                             p = lvl.pages[0]
                             try:
                                 h, w = p.shape[0], p.shape[1]
-                                entries.append((w, h, p.index))
+                                pi, si = self._page_subifd_for(p)
+                                entries.append((w, h, pi, si))
                             except Exception:
                                 continue
                     else:
                         for page in tf.pages:
                             try:
                                 h, w = page.shape[0], page.shape[1]
-                                entries.append((w, h, page.index))
+                                pi, si = self._page_subifd_for(page)
+                                entries.append((w, h, pi, si))
                             except Exception:
                                 continue
                     entries.sort(key=lambda e: e[0], reverse=True)
-                    self.level_dimensions = [(w, h) for w, h, _ in entries]
-                    self._tif_page_indices = [idx for _, _, idx in entries]
+                    self.level_dimensions = [(w, h) for w, h, _, _ in entries]
+                    self._tif_page_indices = [pi for _, _, pi, _ in entries]
+                    self._tif_subifd_indices = [si for _, _, _, si in entries]
             except Exception:
                 pass
 
@@ -71,10 +78,12 @@ class PyvipsSlideWrapper:
                     max(1, base_w // scale),
                     max(1, base_h // scale),
                     i,
+                    None,
                 ))
             entries.sort(key=lambda e: e[0], reverse=True)
-            self.level_dimensions = [(w, h) for w, h, _ in entries]
-            self._tif_page_indices = [idx for _, _, idx in entries]
+            self.level_dimensions = [(w, h) for w, h, _, _ in entries]
+            self._tif_page_indices = [pi for _, _, pi, _ in entries]
+            self._tif_subifd_indices = [si for _, _, _, si in entries]
 
         self.dimensions = self.level_dimensions[0]
         self.level_count = len(self.level_dimensions)
@@ -137,6 +146,27 @@ class PyvipsSlideWrapper:
         # Per-level image cache: lazily opened on first tile read
         self._level_images = {}
 
+    @staticmethod
+    def _page_subifd_for(p):
+        """Map a tifffile ``TiffPage`` to the ``(pyvips page, pyvips subifd)`` it
+        lives at.
+
+        Bio-Formats / OME-TIFF pyramids often store sub-resolution levels as
+        SubIFDs of the base page rather than as separate top-level IFDs. pyvips's
+        ``page=`` only addresses top-level IFDs, so those levels must be opened
+        with ``page=<base>, subifd=<n>``. ``TiffPage.treeindex`` is ``(page,)``
+        for a top-level IFD and ``(page, k)`` for its k-th child SubIFD (k is
+        1-based in tifffile), which maps to pyvips ``subifd = k - 1``. Falls back
+        to ``page.index`` with no subifd when treeindex is unavailable (older
+        tifffile) — preserving the previous page-based behavior.
+        """
+        ti = getattr(p, "treeindex", None)
+        if isinstance(ti, tuple) and len(ti) >= 2:
+            return int(ti[0]), int(ti[1]) - 1
+        if isinstance(ti, tuple) and len(ti) == 1:
+            return int(ti[0]), None
+        return int(p.index), None
+
     def _get_level_image(self, level: int):
         """Return cached pyvips Image for the given pyramid level (lazy load).
 
@@ -145,23 +175,43 @@ class PyvipsSlideWrapper:
         - TIFF/BTF via TIFF loader → ``page=`` uses the IFD index from
           tifffile (``_tif_page_indices``), not the logical pyramid level.
         """
-        if level not in self._level_images:
-            with self._lock:
-                if level not in self._level_images:
-                    if self._is_openslide:
+        # Fetch by value, not `in` then `[...]`: close() clears this dict, so a
+        # membership test followed by an unlocked subscript can raise KeyError
+        # when a slide is closed while a tile read is between the two. Holding a
+        # reference is safe — libvips keeps the image alive for as long as it.
+        cached = self._level_images.get(level)
+        if cached is not None:
+            return cached
+
+        with self._lock:
+            cached = self._level_images.get(level)
+            if cached is None:
+                if self._is_openslide:
+                    self._level_images[level] = pyvips.Image.new_from_file(
+                        self.path, level=level, access="random"
+                    )
+                else:
+                    page = (
+                        self._tif_page_indices[level]
+                        if level < len(self._tif_page_indices)
+                        else level
+                    )
+                    subifd = (
+                        self._tif_subifd_indices[level]
+                        if level < len(self._tif_subifd_indices)
+                        else None
+                    )
+                    if subifd is not None:
+                        # Sub-resolution level stored as a SubIFD of the base
+                        # page (OME-TIFF) — page= alone can't reach it.
                         self._level_images[level] = pyvips.Image.new_from_file(
-                            self.path, level=level, access="random"
+                            self.path, page=page, subifd=subifd, access="random"
                         )
                     else:
-                        page = (
-                            self._tif_page_indices[level]
-                            if level < len(self._tif_page_indices)
-                            else level
-                        )
                         self._level_images[level] = pyvips.Image.new_from_file(
                             self.path, page=page, access="random"
                         )
-        return self._level_images[level]
+            return self._level_images[level]
 
     def read_region(self, location, level, size, as_array=False, **kwargs):
         """Read a region from the specified pyramid level."""
@@ -219,9 +269,20 @@ class PyvipsSlideWrapper:
         return img.crop(x, y, max(1, w), max(1, h))
 
     def get_best_level_for_downsample(self, downsample):
+        """Pick the coarsest pyramid level usable for ``downsample``.
+
+        OpenSlide-style ``ds <= downsample`` rejects levels whose stored
+        downsample is a hair above the DZI power-of-two target (e.g. image
+        25899px → level downsample 16.007 vs target 16.0). That forces a
+        much finer level and a large residual resize. Allow 1% relative
+        overshoot so the nearest coarser level still wins.
+        """
+        if not self.level_downsamples:
+            return 0
+        limit = max(1.0, float(downsample)) * 1.01
         best = 0
         for i, ds in enumerate(self.level_downsamples):
-            if ds <= downsample:
+            if ds <= limit:
                 best = i
         return best
 

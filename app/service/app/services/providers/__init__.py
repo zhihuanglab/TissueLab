@@ -1,9 +1,9 @@
 """
 LLM Provider Abstraction Layer
 
-Currently exposes only the OpenAI provider; ctrl-service ships a Tinker
-client as well but the local TissueLab build sticks to OpenAI to keep
-dependency surface small.
+The open edition ships the OpenAI-compatible provider. Any endpoint that speaks
+the OpenAI API (a self-hosted server, a proxy) can be used through
+``OPENAI_BASE_URL``.
 """
 
 from .base_provider import LLMProvider, LLMResponse, ToolCall

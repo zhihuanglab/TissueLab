@@ -1,4 +1,4 @@
-import { CTRL_SERVICE_API_ENDPOINT } from '@/constants/config'
+import { COMMUNITY_API_ENDPOINT } from '@/config/api.config'
 import { apiFetch } from '@/utils/common/apiFetch'
 
 export interface CreateClassifierRequest {
@@ -16,7 +16,7 @@ export interface UploadFileRequest {
 }
 
 export class CommunityService {
-  private baseUrl = `${CTRL_SERVICE_API_ENDPOINT}/community`
+  private baseUrl = `${COMMUNITY_API_ENDPOINT}/community`
 
   async createClassifier(data: CreateClassifierRequest): Promise<any> {
     try {

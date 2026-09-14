@@ -42,22 +42,20 @@ import {
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { FileManagerPagination } from './FileManager/FileManagerPagination';
 
-import { validateItemName } from '@/utils/string.utils';
+import { validateItemName } from '@/utils/common/string.utils';
 import { ConversionJobStatus, enqueueH5ToZarr, getConversionJobStatus } from '@/services/data.service';
 import { createInstance, getPreviewAsync, loadFileData, uploadFilePath } from '@/services/file.service';
-import { RootState } from '@/store';
 import { setCurrentImagePath, setSelectedFolder } from '@/store/slices/fileManagerSlice';
-import { setImageLoaded } from '@/store/slices/layoutSlice';
-import { setCurrentPath, setSlideInfo, setTotalChannels } from '@/store/slices/svsPathSlice';
+import { setImageLoaded, setWsiOpening } from '@/store/slices/layoutSlice';
+import { setSlideInfo, setTotalChannels } from '@/store/slices/svsPathSlice';
 import { setOutputPath } from '@/store/slices/chat/workflowSlice';
 import { replaceCurrentInstance } from '@/store/slices/wsiSlice';
-import { PayloadAction } from '@reduxjs/toolkit';
 import { useRouter } from 'next/router';
-import { useDispatch, useSelector } from 'react-redux';
+import { useDispatch } from 'react-redux';
 import { toast } from 'sonner';
 import { FileHeader } from './FileManager/FileHeader';
-import { UploadDialog } from './UploadDialog';
 import ImagePreviewCell from './FileManager/ImagePreviewCell';
+import ZarrBadgesCell from './FileManager/ZarrBadgesCell';
 import { 
   formatBytes, 
   formatFileType, 
@@ -65,9 +63,9 @@ import {
   sortFileTreeData,
   flattenFileTree,
   getAllImageFiles as getAllImageFilesUtil
-} from '@/utils/dashboard/fileManagerUtils';
-import { isWSI, isZarr, isZarrDir, isZarrZip, isH5Convertible, getWSIBaseName } from '@/utils/dashboard/fileTypeUtils';
-import { FileItem, FileTreeNode, SortConfig } from '@/types/fileManagerTypes';
+} from '@/utils/dashboard/fileManager.utils';
+import { isWSI, isZarr, isZarrDir, isZarrZip, isH5Convertible, getWSIBaseName } from '@/utils/dashboard/fileType.utils';
+import { FileItem, FileTreeNode, SortConfig } from '@/types/fileManager.types';
 
 
 
@@ -129,38 +127,10 @@ const LocalFileManager = () => {
   >(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const [electron, setElectron] = useState<any>(null);
-  const [isUploadingToCloud, setIsUploadingToCloud] = useState(false);
-  const webCurrentDirectory = useSelector((state: RootState) => state.fileManager.currentDirectory);
-  const [uploadStatus, setUploadStatus] = useState<Map<string, {
-    progress: number;
-    status: 'Uploading' | 'Paused' | 'Completed' | 'Error' | 'Cancelled';
-    error?: string;
-    uploadTime?: number;
-    estimatedTimeRemaining?: number;
-    retryCount?: number;
-    startTime?: number;
-    fileSize?: number;
-    fileName?: string;
-  }>>(new Map());
-  const [isUploadDialogOpen, setIsUploadDialogOpen] = useState(false);
-  const [overallUploading, setOverallUploading] = useState(false);
-  const [overallProgress, setOverallProgress] = useState(0);
-  const [overwriteDialogOpen, setOverwriteDialogOpen] = useState(false);
-  const [overwriteFileName, setOverwriteFileName] = useState<string | null>(null);
-  const overwriteResolverRef = useRef<((ok: boolean) => void) | null>(null);
 
   const getConversionErrorMessage = useCallback((err: any, fallback: string) => {
     return getErrorMessage(err, fallback);
   }, []);
-
-  const VIRTUAL_ROOT = '__root__';
-
-  const isPersonalRootPath = (p: string | null | undefined) => {
-    if (!p) return false;
-    // Use webCurrentDirectory as the source of truth
-    const personal = webCurrentDirectory || '';
-    return personal !== '' && personal !== VIRTUAL_ROOT && (p === personal || p.startsWith(personal + '/'));
-  };
 
   useEffect(() => {
     if (typeof window !== 'undefined' && window.electron) {
@@ -282,27 +252,30 @@ const LocalFileManager = () => {
 
     // Only count real directory contents in pagination totals.
     const filteredFiles = filterVisibleFiles(navigableFiles);
-    const filteredTotal = filteredFiles.length;
+    // Sort the full filtered set before slicing so switching pages keeps the
+    // global ordering (previously sort ran only on the current page rows).
+    const sortedFiles = sortFileTreeData(filteredFiles, sortConfig);
+    const filteredTotal = sortedFiles.length;
 
     if (pagination.limit === null) {
       // Show all filtered files if limit is null, plus the synthetic parent link.
-      setFileTree([...parentLinks, ...filteredFiles]);
+      setFileTree([...parentLinks, ...sortedFiles]);
       setPagination(prev => ({
         ...prev,
         total: filteredTotal,
         hasMore: false,
       }));
     } else {
-      // Apply pagination to filtered files
-      // Bugfix: clamp offset when the filtered total shrinks (e.g. search/filter/delete)
+      // Apply pagination to sorted files
+      // Bug fix: clamp offset when the filtered total shrinks (e.g. search/filter/delete)
       // so we don't render an empty page.
       const { offset, limit } = pagination;
       const maxOffset = filteredTotal > 0 ? Math.floor((filteredTotal - 1) / limit) * limit : 0;
       const safeOffset = Math.min(Math.max(0, offset), maxOffset);
 
       const startIndex = safeOffset;
-      const endIndex = Math.min(filteredFiles.length, safeOffset + limit);
-      const paginatedFiles = filteredFiles.slice(startIndex, endIndex);
+      const endIndex = Math.min(sortedFiles.length, safeOffset + limit);
+      const paginatedFiles = sortedFiles.slice(startIndex, endIndex);
       setFileTree([...parentLinks, ...paginatedFiles]);
 
       // Update pagination metadata based on filtered files
@@ -310,13 +283,13 @@ const LocalFileManager = () => {
         ...prev,
         offset: safeOffset,
         total: filteredTotal,
-        hasMore: endIndex < filteredFiles.length,
+        hasMore: endIndex < sortedFiles.length,
       }));
     }
     // Only depend on pagination.offset and pagination.limit, not the entire pagination object
     // (total and hasMore are set by this effect, so they shouldn't be dependencies)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allFiles, pagination.offset, pagination.limit, filterVisibleFiles]);
+  }, [allFiles, pagination.offset, pagination.limit, filterVisibleFiles, sortConfig]);
 
   useEffect(() => {
     const activeEntries = Object.entries(conversionJobs).filter(
@@ -417,167 +390,6 @@ const LocalFileManager = () => {
     return () => window.clearInterval(intervalId);
   }, [conversionJobs, currentDirectory, fetchFiles, getConversionErrorMessage]);
 
-  // Temporarily commented out upload to cloud functionality
-  /*
-  const handleUploadToCloud = async (item: FileTreeNode) => {
-    if (!electron) return;
-
-    const auth = getAuth(app);
-    // Use webCurrentDirectory as the source of truth
-    const destPath = webCurrentDirectory || '';
-    const isLoggedIn = !!auth.currentUser;
-
-    // Permission check: Do not allow uploads to virtual root or restricted paths; Must be in personal directory or its subdirectory
-    if (isLoggedIn && (destPath === VIRTUAL_ROOT || isPublicReadOnlyPath(destPath) || !isPersonalRootPath(destPath))) {
-      toast.warning('Please open Personal or its subfolder to upload files.');
-      return;
-    }
-    if (!isLoggedIn && (!destPath || isPublicReadOnlyPath(destPath))) {
-      toast.warning('Upload is not allowed in this path. Please login and enter personal directory.');
-      return;
-    }
-
-    setIsUploadingToCloud(true);
-    setIsUploadDialogOpen(true);
-    setOverallUploading(true);
-    setOverallProgress(0);
-    // Let the dialog render a frame to avoid visual delay
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    try {
-      if (item.is_dir) {
-        toast('Uploading entire folders is not supported directly from local manager. Please use drag and drop in Web File Manager.');
-        return;
-      }
-
-      // Read local file and construct File object
-      const fileBuffer = await electron.readFile(item.path);
-      const file = new File([fileBuffer], item.name, { type: 'application/octet-stream' });
-
-      // Overwrite confirmation: If the cloud target directory exists with the same name, prompt (using custom Dialog)
-      try {
-        const listing = await apiListFiles(destPath);
-        const filesArr: any[] = Array.isArray(listing)
-          ? listing
-          : (listing?.files || listing?.items || []);
-        const exists = filesArr.some((f: any) => (f?.name || f?.filename) === file.name);
-        if (exists) {
-          const ok = await new Promise<boolean>((resolve) => {
-            overwriteResolverRef.current = resolve;
-            setOverwriteFileName(file.name);
-            setOverwriteDialogOpen(true);
-          });
-          if (!ok) {
-            setOverallUploading(false);
-            setIsUploadingToCloud(false);
-            // Let the dialog render a frame to avoid visual delay
-            setTimeout(() => setIsUploadDialogOpen(false), 150);
-            toast('Upload cancelled');
-            return;
-          }
-        }
-      } catch (e) {
-        // list files failed, skip overwrite check, let the backend decide the conflict strategy
-        console.warn('Failed to list files for overwrite check:', e);
-      }
-
-      const fileId = `${file.name}_${Date.now()}`;
-      const startTime = Date.now();
-
-      setUploadStatus(prev => {
-        const next = new Map(prev);
-        next.set(fileId, {
-          progress: 0,
-          status: 'Uploading',
-          startTime,
-          fileSize: file.size,
-          fileName: file.name,
-        });
-        return next;
-      });
-      // status is set when the dialog is opened
-
-      // construct FileList
-      const dt = new DataTransfer();
-      dt.items.add(file);
-      const files = dt.files;
-
-      await apiUploadFiles(destPath, files, (percent) => {
-        setUploadStatus(prev => {
-          const next = new Map(prev);
-          const s = next.get(fileId);
-          if (s) {
-            const elapsed = Date.now() - (s.startTime || startTime);
-            next.set(fileId, {
-              ...s,
-              progress: percent,
-              status: 'Uploading',
-              uploadTime: elapsed,
-              estimatedTimeRemaining: percent > 0 ? (elapsed / percent) * (100 - percent) : undefined,
-            });
-          }
-          return next;
-        });
-        setOverallProgress(percent);
-        setOverallUploading(true);
-      }, true); // pass overwrite=true since user confirmed overwrite
-
-      setUploadStatus(prev => {
-        const next = new Map(prev);
-        const s = next.get(fileId);
-        if (s) next.set(fileId, { ...s, progress: 100, status: 'Completed' });
-        return next;
-      });
-      setOverallProgress(100);
-      setOverallUploading(false);
-
-      toast.success(`Uploaded to cloud: ${file.name}`);
-      // Notify WebFileManager to refresh listing/quota
-      try {
-        if (typeof window !== 'undefined') {
-          const detail = { path: webCurrentDirectory };
-          window.dispatchEvent(new CustomEvent('tissuelab:cloudUploadCompleted', { detail }));
-        }
-      } catch {}
-    } catch (error: any) {
-      console.error('Error uploading to cloud:', error);
-      setUploadStatus(prev => {
-        const next = new Map(prev);
-        // Mark all ongoing tasks as error
-        for (const [k, v] of Array.from(next.entries())) {
-          if (v.status === 'Uploading' || v.status === 'Paused') {
-            next.set(k, { ...v, status: 'Error', error: error?.message || String(error) });
-          }
-        }
-        return next;
-      });
-      setOverallUploading(false);
-      toast.error(getErrorMessage(error, 'Upload failed'));
-    } finally {
-      setIsUploadingToCloud(false);
-    }
-  };
-  */
-
-  // Upload completed automatically close dialog and reset
-  useEffect(() => {
-    if (!isUploadDialogOpen) return;
-    if (overallUploading) return;
-    if (overallProgress !== 100) return;
-
-    // All files are completed or cancelled and no error/pause
-    const statuses = Array.from(uploadStatus.values());
-    const hasActive = statuses.some(s => s.status === 'Uploading' || s.status === 'Paused');
-    const hasError = statuses.some(s => s.status === 'Error');
-    if (!hasActive && !hasError) {
-      const timer = setTimeout(() => {
-        setIsUploadDialogOpen(false);
-        setOverallUploading(false);
-        setOverallProgress(0);
-      }, 400);
-      return () => clearTimeout(timer);
-    }
-  }, [isUploadDialogOpen, overallUploading, overallProgress, uploadStatus]);
-
   useEffect(() => {
     if (dialog?.type === 'create-folder' || dialog?.type === 'rename') {
       setTimeout(() => inputRef.current?.focus(), 100);
@@ -608,6 +420,7 @@ const LocalFileManager = () => {
   }, [rootFolder]);
 
   const handleWsiUpload = async (absolutePath: string) => {
+    dispatch(setWsiOpening(true)); // full-screen loading cover until the viewer renders
     try {
       console.log('LocalFileManager: Starting WSI upload for:', absolutePath);
 
@@ -624,8 +437,7 @@ const LocalFileManager = () => {
       const loadData = await loadFileData(uploadData.fileName);
       console.log('LocalFileManager: loadData:', loadData);
 
-      // Step 4: Set all the necessary data in Redux
-      dispatch(setCurrentPath({ path: absolutePath }) as PayloadAction<{ path: string | null }>);
+      // Step 4: Set slide metadata in Redux (path lives on the WSI instance)
       dispatch(setOutputPath(absolutePath ? absolutePath + '.zarr' : ''));
       dispatch(setSlideInfo({
         dimensions: (uploadData.slideInfo.dimensions ?? null) as [number, number] | null,
@@ -667,6 +479,7 @@ const LocalFileManager = () => {
       router.push('/imageViewer');
     } catch (err) {
       console.error("Error processing WSI file:", err);
+      dispatch(setWsiOpening(false)); // lift the cover so the error is visible
       setError("Failed to load WSI file.");
     }
   };
@@ -747,9 +560,11 @@ const LocalFileManager = () => {
                   >
                     {file.name}
                   </button>
-                  <div className="text-xs text-gray-500 mt-1">
-                    Size: {formatBytes(file.size)}
-                  </div>
+                  {!file.isZarr && (
+                    <div className="text-xs text-gray-500 mt-1">
+                      Size: {formatBytes(file.size)}
+                    </div>
+                  )}
                   <div className="text-xs text-gray-500">
                     Modified: {new Date(file.mtime * 1000).toLocaleDateString()}
                   </div>
@@ -819,7 +634,7 @@ const LocalFileManager = () => {
       handleWsiUpload(item.path);
     } else if (isZarrZip(item.name)) {
       // For .zarr.zip files, show message that extraction is needed
-      toast.warning('Please extract the zip file first before opening the workspace.');
+      toast.warning('Please extract the zip file first before opening the zarr data.');
     } else if (isZarr(item.name)) {
       // For .zarr directories, try to find and open the corresponding WSI file
       const zarrBaseName = getWSIBaseName(item.name);
@@ -962,6 +777,16 @@ const LocalFileManager = () => {
     }
   };
 
+  const requestSort = (key: 'name' | 'mtime' | 'size' | 'type') => {
+    let direction: 'asc' | 'desc' = 'asc';
+    if (sortConfig.key === key && sortConfig.direction === 'asc') {
+      direction = 'desc';
+    }
+    setSortConfig({ key, direction });
+    // Keep page 1 so a new global order is visible from the start.
+    setPagination(prev => ({ ...prev, offset: 0 }));
+  };
+
   const sortData = (data: FileTreeNode[], config: SortConfig) => {
     return sortFileTreeData(data, config);
   };
@@ -1020,16 +845,6 @@ const LocalFileManager = () => {
           <FolderOpen className="h-4 w-4 mr-2" />
           {getOpenInSystemFileManagerMenuLabel()}
         </DropdownMenuItem>
-        {/* Temporarily commented out upload to cloud functionality */}
-        {/*
-            <DropdownMenuItem 
-                onSelect={() => handleUploadToCloud(item)}
-                disabled={isUploadingToCloud}
-            >
-                <UploadCloud className="h-4 w-4 mr-2" /> 
-                {isUploadingToCloud ? 'Uploading...' : 'Upload to Cloud'}
-            </DropdownMenuItem>
-            */}
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -1050,7 +865,7 @@ const LocalFileManager = () => {
           >
             <TableCell className="px-3">
               <div className="flex items-start gap-2">
-                <ChevronRight className="h-5 w-5 mt-0.5 text-muted-foreground flex-shrink-0" />
+                <ChevronRight className="h-5 w-5 mt-0.5 text-muted-foreground shrink-0" />
                 <span className="break-all">{item.name}</span>
               </div>
             </TableCell>
@@ -1077,25 +892,40 @@ const LocalFileManager = () => {
           <TableCell className="px-3">
             <div style={{ paddingLeft: `${item.depth * 24}px` }} className="flex items-start gap-3">
               {item.is_dir && !isZarr(item.name)
-                ? <Folder className="h-5 w-5 text-primary flex-shrink-0" />
+                ? <Folder className="h-5 w-5 text-primary shrink-0" />
                 : isWSI(item.name)
-                  ? <ImageIcon className="h-5 w-5 text-destructive flex-shrink-0" />
+                  ? <ImageIcon className="h-5 w-5 text-destructive shrink-0" />
                   : isZarrZip(item.name)
-                    ? <Archive className="h-4 w-4 text-primary/80 flex-shrink-0" />
+                    ? <Archive className="h-4 w-4 text-primary/80 shrink-0" />
                     : isZarrDir(item.name)
-                      ? <FileIcon className="h-4 w-4 text-primary/60 flex-shrink-0" />
-                      : <FileIcon className="h-5 w-5 text-muted-foreground flex-shrink-0" />}
+                      ? <FileIcon className="h-4 w-4 text-primary/60 shrink-0" />
+                      : <FileIcon className="h-5 w-5 text-muted-foreground shrink-0" />}
               <span className="break-all">{item.name}</span>
             </div>
           </TableCell>
           <TableCell className="text-right px-3 text-muted-foreground">{item.is_dir && !isZarr(item.name) ? 'Folder' : formatFileType(item.name)}</TableCell>
-          <TableCell className="text-right px-3 text-muted-foreground">{item.is_dir ? '—' : formatBytes(item.size)}</TableCell>
+          <TableCell className="text-right px-3 text-muted-foreground">{(item.is_dir || isZarr(item.name)) ? '—' : formatBytes(item.size)}</TableCell>
           <TableCell className="text-right px-3 text-muted-foreground">{new Date(item.mtime * 1000).toLocaleString()}</TableCell>
           <TableCell className="text-right px-3" onClick={(e) => e.stopPropagation()}>
             {renderItemContextMenu(item)}
           </TableCell>
         </TableRow>
       );
+      if (!item.is_dir && isWSI(item.name) && item.attachedZarrPath) {
+        rows.push(
+          <TableRow key={`${item.path}:zarrbadges`} className="align-middle hover:bg-transparent last:border-b">
+            <TableCell colSpan={99} className="px-3 pt-1.5 pb-2">
+              <div
+                style={{ paddingLeft: `${item.depth * 24 + 32}px` }}
+                className="flex flex-wrap items-center gap-1.5"
+              >
+                <span className="-mt-0.5 select-none text-base leading-none text-muted-foreground/50">↳</span>
+                <ZarrBadgesCell zarrPath={item.attachedZarrPath} />
+              </div>
+            </TableCell>
+          </TableRow>
+        );
+      }
       if (item.children && item.children.length > 0) {
         rows = rows.concat(renderFileTableRows(item.children));
       }
@@ -1116,7 +946,7 @@ const LocalFileManager = () => {
             onClick={handleGoUp}
           >
             <div className="flex items-center gap-2">
-              <ChevronRight className="h-5 w-5 text-muted-foreground flex-shrink-0" />
+              <ChevronRight className="h-5 w-5 text-muted-foreground shrink-0" />
               <span className="font-medium">{item.name}</span>
             </div>
             <div className="text-sm text-muted-foreground mt-1">Parent Directory</div>
@@ -1140,22 +970,27 @@ const LocalFileManager = () => {
           <div className="flex items-start justify-between gap-2">
             <div className="flex items-start gap-2 flex-1 min-w-0">
               {item.is_dir && !isZarr(item.name)
-                ? <Folder className="h-5 w-5 text-primary flex-shrink-0 mt-0.5" />
+                ? <Folder className="h-5 w-5 text-primary shrink-0 mt-0.5" />
                 : isWSI(item.name)
-                  ? <ImageIcon className="h-5 w-5 text-destructive flex-shrink-0 mt-0.5" />
+                  ? <ImageIcon className="h-5 w-5 text-destructive shrink-0 mt-0.5" />
                   : isZarr(item.name)
-                    ? <FileIcon className="h-4 w-4 text-primary/70 flex-shrink-0 mt-0.5" />
-                    : <FileIcon className="h-5 w-5 text-muted-foreground flex-shrink-0 mt-0.5" />}
+                    ? <FileIcon className="h-4 w-4 text-primary/70 shrink-0 mt-0.5" />
+                    : <FileIcon className="h-5 w-5 text-muted-foreground shrink-0 mt-0.5" />}
               <div className="flex-1 min-w-0">
                 <div className="font-medium break-all text-sm">{item.name}</div>
+                {!item.is_dir && isWSI(item.name) && item.attachedZarrPath && (
+                  <div className="mt-0.5 flex flex-wrap items-center gap-1">
+                    <ZarrBadgesCell zarrPath={item.attachedZarrPath} />
+                  </div>
+                )}
                 <div className="flex flex-wrap gap-x-3 gap-y-1 mt-1 text-xs text-muted-foreground">
                   <span><span className="font-medium">Type:</span> {item.is_dir && !isZarr(item.name) ? 'Folder' : formatFileType(item.name)}</span>
-                  {!item.is_dir && <span><span className="font-medium">Size:</span> {formatBytes(item.size)}</span>}
+                  {!item.is_dir && !isZarr(item.name) && <span><span className="font-medium">Size:</span> {formatBytes(item.size)}</span>}
                   <span><span className="font-medium">Modified:</span> {new Date(item.mtime * 1000).toLocaleDateString()}</span>
                 </div>
               </div>
             </div>
-            <div onClick={(e) => e.stopPropagation()} className="flex-shrink-0">
+            <div onClick={(e) => e.stopPropagation()} className="shrink-0">
               {renderItemContextMenu(item)}
             </div>
           </div>
@@ -1182,18 +1017,18 @@ const LocalFileManager = () => {
               <TableRow className="text-xs text-muted-foreground/70 last:border-b">
                 <TableHead className="px-3">
                   <div className="flex items-center gap-3">
-                    <span className="cursor-pointer" onClick={() => setSortConfig({ key: 'name', direction: sortConfig.direction === 'asc' ? 'desc' : 'asc' })}>
+                    <span className="cursor-pointer" onClick={() => requestSort('name')}>
                       Name {sortConfig.key === 'name' && (sortConfig.direction === 'asc' ? <ArrowUp className="inline h-4 w-4" /> : <ArrowDown className="inline h-4 w-4" />)}
                     </span>
                   </div>
                 </TableHead>
-                <TableHead className="text-right cursor-pointer px-3" onClick={() => setSortConfig({ key: 'type', direction: sortConfig.direction === 'asc' ? 'desc' : 'asc' })}>
+                <TableHead className="text-right cursor-pointer px-3" onClick={() => requestSort('type')}>
                   Type {sortConfig.key === 'type' && (sortConfig.direction === 'asc' ? <ArrowUp className="inline h-4 w-4" /> : <ArrowDown className="inline h-4 w-4" />)}
                 </TableHead>
-                <TableHead className="text-right cursor-pointer px-3" onClick={() => setSortConfig({ key: 'size', direction: sortConfig.direction === 'asc' ? 'desc' : 'asc' })}>
+                <TableHead className="text-right cursor-pointer px-3" onClick={() => requestSort('size')}>
                   Size {sortConfig.key === 'size' && (sortConfig.direction === 'asc' ? <ArrowUp className="inline h-4 w-4" /> : <ArrowDown className="inline h-4 w-4" />)}
                 </TableHead>
-                <TableHead className="text-right cursor-pointer px-3" onClick={() => setSortConfig({ key: 'mtime', direction: sortConfig.direction === 'asc' ? 'desc' : 'asc' })}>
+                <TableHead className="text-right cursor-pointer px-3" onClick={() => requestSort('mtime')}>
                   Last Modified {sortConfig.key === 'mtime' && (sortConfig.direction === 'asc' ? <ArrowUp className="inline h-4 w-4" /> : <ArrowDown className="inline h-4 w-4" />)}
                 </TableHead>
                 <TableHead className="w-20 text-right px-3">Actions</TableHead>
@@ -1266,7 +1101,7 @@ const LocalFileManager = () => {
   const renderBreadcrumbs = () => (
     <div className="flex items-center text-xs sm:text-sm text-gray-500 overflow-x-auto scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent py-1">
       <span
-        className="cursor-pointer hover:underline p-1 rounded flex items-center gap-1 sm:gap-2 flex-shrink-0"
+        className="cursor-pointer hover:underline p-1 rounded flex items-center gap-1 sm:gap-2 shrink-0"
         onClick={() => fetchFiles(rootFolder)}
       >
         <Folder className="h-3 w-3 sm:h-4 sm:w-4" />
@@ -1274,7 +1109,7 @@ const LocalFileManager = () => {
           {rootFolder ? rootFolder : 'Local Root'}
         </span>
       </span>
-      {currentDirectory && currentDirectory !== rootFolder && <ChevronRight className="h-3 w-3 sm:h-4 sm:w-4 mx-0.5 sm:mx-1 flex-shrink-0" />}
+      {currentDirectory && currentDirectory !== rootFolder && <ChevronRight className="h-3 w-3 sm:h-4 sm:w-4 mx-0.5 sm:mx-1 shrink-0" />}
       {currentDirectory && currentDirectory !== rootFolder && (() => {
         // Normalize paths for consistent handling
         const normalizedCurrent = currentDirectory.replace(/\\/g, '/');
@@ -1288,7 +1123,7 @@ const LocalFileManager = () => {
             return (
               <React.Fragment key={index}>
                 <span
-                  className="cursor-pointer hover:underline p-1 rounded truncate max-w-[100px] sm:max-w-[150px] md:max-w-none flex-shrink-0"
+                  className="cursor-pointer hover:underline p-1 rounded truncate max-w-[100px] sm:max-w-[150px] md:max-w-none shrink-0"
                   title={part}
                   onClick={() => {
                     fetchFiles(pathUntilThisPart);
@@ -1296,7 +1131,7 @@ const LocalFileManager = () => {
                 >
                   {part}
                 </span>
-                {index < arr.length - 1 && <ChevronRight className="h-3 w-3 sm:h-4 sm:w-4 mx-0.5 sm:mx-1 flex-shrink-0" />}
+                {index < arr.length - 1 && <ChevronRight className="h-3 w-3 sm:h-4 sm:w-4 mx-0.5 sm:mx-1 shrink-0" />}
               </React.Fragment>
             );
           });
@@ -1354,79 +1189,6 @@ const LocalFileManager = () => {
         </CardContent>
       </Card>
       {renderDialog()}
-      {/* Overwrite confirmation dialog */}
-      <Dialog open={overwriteDialogOpen} onOpenChange={(open) => {
-        setOverwriteDialogOpen(open);
-        if (!open && overwriteResolverRef.current) {
-          // Default cancel
-          overwriteResolverRef.current(false);
-          overwriteResolverRef.current = null;
-        }
-      }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Overwrite Confirmation</DialogTitle>
-            <DialogDescription className="break-all">
-              {`Already exists file: ${overwriteFileName ? `${overwriteFileName}` : ''}`}
-              <br />
-              {'Do you want to overwrite?'}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <DialogClose asChild>
-              <Button
-                variant="outline"
-                onClick={() => {
-                  if (overwriteResolverRef.current) {
-                    overwriteResolverRef.current(false);
-                    overwriteResolverRef.current = null;
-                  }
-                  setOverwriteDialogOpen(false);
-                }}
-              >
-                Cancel
-              </Button>
-            </DialogClose>
-            <Button
-              onClick={() => {
-                if (overwriteResolverRef.current) {
-                  overwriteResolverRef.current(true);
-                  overwriteResolverRef.current = null;
-                }
-                setOverwriteDialogOpen(false);
-              }}
-            >
-              Overwrite
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-      <UploadDialog
-        isOpen={isUploadDialogOpen}
-        onClose={() => {
-          setIsUploadDialogOpen(false);
-          setOverallUploading(false);
-          setOverallProgress(0);
-        }}
-        onUpload={() => { /* LocalFileManager is triggered by right-click menu, not using this entry */ }}
-        isUploading={overallUploading}
-        uploadProgress={overallProgress}
-        uploadStatus={uploadStatus}
-        hideFileSelection
-        onCancelAllUploads={() => {
-          // Mark all ongoing tasks as cancelled (currently implemented does not support truly interrupting xhr)
-          setUploadStatus(prev => {
-            const next = new Map(prev);
-            next.forEach((v, k) => {
-              if (v.status === 'Uploading' || v.status === 'Paused') {
-                next.set(k, { ...v, status: 'Cancelled' });
-              }
-            });
-            return next;
-          });
-          setOverallUploading(false);
-        }}
-      />
     </div>
   );
 };

@@ -1,6 +1,6 @@
-import { AI_SERVICE_API_ENDPOINT } from '@/constants/config';
+import { AI_SERVICE_API_ENDPOINT } from '@/config/api.config';
 import { apiFetch } from '../utils/common/apiFetch';
-import { shortHashFromString } from '@/utils/string.utils';
+import { shortHashFromString } from '@/utils/common/string.utils';
 
 // Instance management
 export interface CreateInstanceRequest {
@@ -41,6 +41,8 @@ export interface UploadPathResult {
   filePath?: string;
   fileSize?: number | null;
   slideInfo: UploadPathSlideInfo;
+  /** shareMode from FM umbrella when applicable */
+  shareMode?: 'share' | 'collaborate' | 'view' | string;
 }
 
 export const createInstance = async (filePath: string): Promise<CreateInstanceResponse> => {
@@ -225,10 +227,12 @@ export const loadFileData = async (filename: string) => {
   return data;
 };
 
-// New function to reset segmentation data
-export const resetSegmentationData = async () => {
+import { segFetch } from '@/utils/common/segFetch';
+
+// New function to reset segmentation data for a viewer instance
+export const resetSegmentationData = async (instanceId?: string | null) => {
   try {
-    const response = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/seg/v1/reset`, {
+    const response = await segFetch(instanceId, `${AI_SERVICE_API_ENDPOINT}/seg/v1/reset`, {
       method: 'POST',
       returnAxiosFormat: true,
     });
@@ -305,7 +309,7 @@ export const generateBatchPreviews = async (requests: Array<{session_id: string,
   }
 };
 
-// New Celery-based async thumbnail service functions
+// Async thumbnail/preview task submission (backed by a ThreadPool, not Celery)
 export const submitThumbnailTask = async (sessionId: string, size: number = 200, requestId: string) => {
   try {
     if (!requestId) {
@@ -389,6 +393,24 @@ export const getTaskStatus = async (taskId: string) => {
   }
 };
 
+// Which classification overlays a slide supports — drives the slide gallery's
+// per-tile Cell/Patch toggle (disabled when the slide hasn't been classified).
+export const getOverlayAvailable = async (
+  filePath: string,
+): Promise<{ cell: boolean; patch: boolean }> => {
+  try {
+    const response = await apiFetch(
+      `${AI_SERVICE_API_ENDPOINT}/thumbnail/v1/overlay_available?file_path=${encodeURIComponent(filePath)}`,
+      { method: 'GET', returnAxiosFormat: true },
+    );
+    if (response.status !== 200) return { cell: false, patch: false };
+    const data = response.data || {};
+    return { cell: !!data.cell, patch: !!data.patch };
+  } catch {
+    return { cell: false, patch: false };
+  }
+};
+
 export const submitBatchThumbnailTasks = async (sessionIds: string[], size: number = 200) => {
   try {
     console.log('API call - submitBatchThumbnailTasks:', { sessionIds, size });
@@ -437,12 +459,12 @@ export const submitBatchPreviewTasks = async (requests: Array<{session_id: strin
   }
 };
 
-// Async version of getPreview that uses Celery service
+// Async version of getPreview — backed by the thumbnail task queue.
 export const getPreviewAsync = async (filePath: string, previewType: string = 'all', size: number = 200, requestId?: string) => {
   try {
-    console.log('API call - getPreviewAsync (Celery):', { filePath, previewType, size, requestId });
-    
-    // Submit the preview task to Celery using file path directly
+    console.log('API call - getPreviewAsync:', { filePath, previewType, size, requestId });
+
+    // Submit the preview task by file path.
     const taskResult = await submitPreviewTaskByPath(filePath, previewType, size, requestId);
     const taskId = taskResult.task_id;
     

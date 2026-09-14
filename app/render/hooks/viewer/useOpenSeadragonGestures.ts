@@ -1,12 +1,12 @@
 import { useEffect, useRef } from 'react';
 import OpenSeadragon from "openseadragon";
+import { setPointerPosition } from '@/utils/viewer/pointerPositionStore';
 
 interface UseOpenSeadragonGesturesProps {
   viewerRef: any;
   annotatorInstance: any;
   zoomSpeed: number;
   trackpadGesture: boolean;
-  setMousePos: (pos: { x: number; y: number }) => void;
   setImageBounds: (bounds: { x1: number; y1: number; x2: number; y2: number }) => void;
   setImageRotation: (rotation: number) => void;
   setMagnification: (magnification: number) => void;
@@ -18,7 +18,6 @@ export const useOpenSeadragonGestures = ({
   annotatorInstance,
   zoomSpeed,
   trackpadGesture,
-  setMousePos,
   setImageBounds,
   setImageRotation,
   setMagnification
@@ -148,7 +147,9 @@ export const useOpenSeadragonGestures = ({
             const viewportPoint = viewer.viewport.pointFromPixel(webPoint);
             const tiledImage = viewer.world.getItemAt(0);
             const imagePoint = tiledImage ? tiledImage.viewportToImageCoordinates(viewportPoint) : viewer.viewport.viewportToImageCoordinates(viewportPoint);
-            setMousePos({ x: imagePoint.x, y: imagePoint.y });
+            // Straight to the external store — this fires on every mouse move,
+            // so it must not go through React state.
+            setPointerPosition(imagePoint.x, imagePoint.y);
           }
         });
 
@@ -159,28 +160,12 @@ export const useOpenSeadragonGestures = ({
           const topLeft = tiledImage ? tiledImage.viewportToImageCoordinates(bounds.getTopLeft()) : viewer.viewport.viewportToImageCoordinates(bounds.getTopLeft());
           const bottomRight = tiledImage ? tiledImage.viewportToImageCoordinates(bounds.getBottomRight()) : viewer.viewport.viewportToImageCoordinates(bounds.getBottomRight());
 
-          const viewerElement = viewer.element;
-          if (!viewerElement) {
-            return;
-          }
-          const viewerRect = viewerElement.getBoundingClientRect();
+          // Bail during teardown.
+          if (!viewer.element) return;
 
-          const coordinates = {
-            image: {
-              x1: topLeft.x,
-              y1: topLeft.y,
-              x2: bottomRight.x,
-              y2: bottomRight.y
-            },
-            screen: {
-              x: viewerRect.left,
-              y: viewerRect.top,
-              width: viewerRect.width,
-              height: viewerRect.height
-            },
-            dpr: window.devicePixelRatio || 1
-          };
-
+          // A `coordinates` object was assembled here and never read. It cost a
+          // getBoundingClientRect() — a forced layout — on every viewport
+          // change, so once per frame for the whole of a pan or zoom.
           setImageBounds({
             x1: topLeft.x,
             y1: topLeft.y,
@@ -218,7 +203,7 @@ export const useOpenSeadragonGestures = ({
         cleanupGestures();
       };
     }
-  }, [annotatorInstance, viewerRef, zoomSpeed, trackpadGesture, setMousePos, setImageBounds, setImageRotation, setMagnification]);
+  }, [annotatorInstance, viewerRef, zoomSpeed, trackpadGesture, setImageBounds, setImageRotation, setMagnification]);
 
   return {
     tracker: trackerRef.current

@@ -5,8 +5,8 @@ const fssync = require('fs');
 const os = require('os');
 const http = require('http');
 const net = require('net');
-const { performGoogleOAuth, refreshGoogleToken } = require('./ipc/oauth-helpers');
 const { setupProtocolHandlers } = require('./ipc/protocol-helpers');
+const { performGoogleOAuth, refreshGoogleToken } = require('./ipc/oauth-helpers');
 // const ProjectBehaviorRecording = require('./services/recording/projectBehaviorRecording');
 
 let mainWindow;
@@ -20,7 +20,10 @@ const isMac = process.platform === 'darwin';
 
 // Store backend port (default to 5001)
 let backendPort = 5001;
-const NEXTJS_URL = 'http://localhost:3000';
+// Renderer URL. `npm run dev` serves it on :3000; TL_RENDERER_URL lets an
+// external harness (the Playwright electron project) point the shell at a
+// `next dev` instance on another port.
+const NEXTJS_URL = process.env.TL_RENDERER_URL || 'http://localhost:3000';
 
 // Function to get backend port
 function getBackendPort() {
@@ -116,14 +119,6 @@ app.commandLine.appendSwitch('enable-accelerated-2d-canvas'); // Enable 2D canva
 // app.commandLine.appendSwitch('disable-gpu-rasterization'); // Disable GPU rasterization
 app.commandLine.appendSwitch('enable-software-rasterizer'); // Enable software rasterizer as fallback
 
-// macOS Metal compositor occasionally tries to ProduceOverlay against a stale
-// SharedImage mailbox after window resize / focus change, spamming
-// "Invalid mailbox" / "non-existent mailbox" errors. Disabling CoreAnimation
-// layer overlays stops that path without affecting WebGL / 2D canvas.
-if (process.platform === 'darwin') {
-  app.commandLine.appendSwitch('disable-features', 'CALayerOverlays,VideoToolboxVideoDecoder');
-}
-
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1800,
@@ -155,8 +150,10 @@ function createWindow() {
       webgl: true
     },
     icon: process.platform === 'darwin'
-      ? path.join(__dirname, 'assets/icons/icon.icns')  // macOS icon
-      : path.join(__dirname, 'assets/icons/icon.png')   // Windows/Linux icon
+      ? path.join(__dirname, 'assets/icons/icon.icns')
+      : process.platform === 'win32'
+        ? path.join(__dirname, 'assets/icons/TissueLab_logo.ico')
+        : path.join(__dirname, 'assets/icons/icon.png')
   });
 
   // Track the main window as soon as it's created
@@ -400,6 +397,7 @@ ipcMain.handle('save-file-dialog', async (event, options) => {
 });
 
 const { downloadFile, extractAndPersist } = require('./ipc/tasknode-helpers');
+const { getServiceRoot } = require('./ipc/service-root');
 
 // Download a remote URL via Chromium
 ipcMain.handle('download-signed-url', async (event, payload) => {
@@ -409,7 +407,8 @@ ipcMain.handle('download-signed-url', async (event, payload) => {
     filename: payload?.filename,
     showSaveDialog: payload?.showSaveDialog !== false,
     window: win,
-    activeDownloads
+    activeDownloads,
+    serviceRoot: getServiceRoot(app)
   });
 });
 
@@ -421,7 +420,8 @@ ipcMain.handle('extract-zip-and-persist', async (event, payload) => {
     modelName: payload?.modelName,
     factory: payload?.factory,
     window: win,
-    url: payload?.url
+    url: payload?.url,
+    serviceRoot: getServiceRoot(app)
   });
 });
 
@@ -436,6 +436,129 @@ ipcMain.handle('cancel-download', async (event, downloadUrl) => {
   }
 
   return { ok: false, error: 'No active download found' };
+});
+
+// Google OAuth - PKCE-based browser authentication (production-ready, secretless)
+ipcMain.handle('google-oauth', async (event, { clientId }) => {
+  return await performGoogleOAuth({
+    clientId,
+    openExternal: shell.openExternal.bind(shell)
+  });
+});
+
+// Refresh Google OAuth token using refresh_token
+ipcMain.handle('google-refresh-token', async (event, { refreshToken, clientId }) => {
+  return await refreshGoogleToken({
+    refreshToken,
+    clientId
+  });
+});
+
+// Save refresh token securely using Electron's safeStorage
+ipcMain.handle('save-refresh-token', async (event, { token }) => {
+  try {
+    if (!token) {
+      throw new Error('Token is required');
+    }
+    
+    // Use safeStorage to encrypt the token
+    if (safeStorage.isEncryptionAvailable()) {
+      const encrypted = safeStorage.encryptString(token);
+      const tokenPath = path.join(app.getPath('userData'), 'refresh_token.enc');
+      await fs.writeFile(tokenPath, encrypted);
+      console.log('[Auth] Refresh token saved securely');
+      return { success: true };
+    } else {
+      console.warn('[Auth] Encryption not available, storing token in plain text (not recommended)');
+      const tokenPath = path.join(app.getPath('userData'), 'refresh_token.txt');
+      await fs.writeFile(tokenPath, token, 'utf8');
+      
+      // Set restrictive file permissions on Unix-like systems
+      if (process.platform !== 'win32') {
+        await fs.chmod(tokenPath, 0o600);
+        console.log('[Auth] Set file permissions to 0600 (owner read/write only)');
+      }
+      
+      return { success: true, warning: 'Stored in plain text' };
+    }
+  } catch (error) {
+    console.error('[Auth] Failed to save refresh token:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Get refresh token from secure storage
+ipcMain.handle('get-refresh-token', async () => {
+  try {
+    const encryptedPath = path.join(app.getPath('userData'), 'refresh_token.enc');
+    const plainPath = path.join(app.getPath('userData'), 'refresh_token.txt');
+    
+    // Try encrypted file first
+    try {
+      const encrypted = await fs.readFile(encryptedPath);
+      if (safeStorage.isEncryptionAvailable()) {
+        const token = safeStorage.decryptString(encrypted);
+        console.log('[Auth] Retrieved encrypted refresh token');
+        return { success: true, token };
+      } else {
+        console.error('[Auth] Cannot decrypt token - encryption not available');
+        return { success: false, error: 'Encryption not available' };
+      }
+    } catch (encryptedError) {
+      // Encrypted file doesn't exist or can't be read, try plain text
+      if (encryptedError.code !== 'ENOENT') {
+        // Real error, not just file missing
+        throw encryptedError;
+      }
+    }
+    
+    // Try plain text file
+    try {
+      const token = await fs.readFile(plainPath, 'utf8');
+      console.log('[Auth] Retrieved plain text refresh token');
+      return { success: true, token };
+    } catch (plainError) {
+      if (plainError.code === 'ENOENT') {
+        // No token found
+        return { success: false, error: 'No refresh token found' };
+      }
+      throw plainError;
+    }
+  } catch (error) {
+    console.error('[Auth] Failed to get refresh token:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Delete refresh token from storage
+ipcMain.handle('delete-refresh-token', async () => {
+  try {
+    const encryptedPath = path.join(app.getPath('userData'), 'refresh_token.enc');
+    const plainPath = path.join(app.getPath('userData'), 'refresh_token.txt');
+    
+    // Try to delete both files (ignore ENOENT errors if they don't exist)
+    try {
+      await fs.unlink(encryptedPath);
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error; // Re-throw if it's not a "file not found" error
+      }
+    }
+    
+    try {
+      await fs.unlink(plainPath);
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error; // Re-throw if it's not a "file not found" error
+      }
+    }
+    
+    console.log('[Auth] Refresh token deleted');
+    return { success: true };
+  } catch (error) {
+    console.error('[Auth] Failed to delete refresh token:', error);
+    return { success: false, error: error.message };
+  }
 });
 
 // list files in directory
@@ -545,132 +668,6 @@ ipcMain.handle('write-file', async (event, options) => {
     return { success: true };
   } catch (error) {
     throw new Error(`Failed to write file: ${error.message}`);
-  }
-});
-
-// Google OAuth - PKCE-based browser authentication
-// Desktop client "secret" is bundled with the app — not truly confidential per Google's OAuth spec
-ipcMain.handle('google-oauth', async (event, { clientId, clientSecret }) => {
-  return await performGoogleOAuth({
-    clientId,
-    clientSecret,
-    openExternal: shell.openExternal.bind(shell)
-  });
-});
-
-// Refresh Google OAuth token using refresh_token
-ipcMain.handle('google-refresh-token', async (event, { refreshToken, clientId, clientSecret }) => {
-  return await refreshGoogleToken({
-    refreshToken,
-    clientId,
-    clientSecret
-  });
-});
-
-// Save refresh token securely using Electron's safeStorage
-ipcMain.handle('save-refresh-token', async (event, { token }) => {
-  try {
-    if (!token) {
-      throw new Error('Token is required');
-    }
-    
-    // Use safeStorage to encrypt the token
-    if (safeStorage.isEncryptionAvailable()) {
-      const encrypted = safeStorage.encryptString(token);
-      const tokenPath = path.join(app.getPath('userData'), 'refresh_token.enc');
-      await fs.writeFile(tokenPath, encrypted);
-      console.log('[Auth] Refresh token saved securely');
-      return { success: true };
-    } else {
-      console.warn('[Auth] Encryption not available, storing token in plain text (not recommended)');
-      const tokenPath = path.join(app.getPath('userData'), 'refresh_token.txt');
-      await fs.writeFile(tokenPath, token, 'utf8');
-      
-      // Set restrictive file permissions on Unix-like systems
-      if (process.platform !== 'win32') {
-        await fs.chmod(tokenPath, 0o600);
-        console.log('[Auth] Set file permissions to 0600 (owner read/write only)');
-      }
-      
-      return { success: true, warning: 'Stored in plain text' };
-    }
-  } catch (error) {
-    console.error('[Auth] Failed to save refresh token:', error);
-    return { success: false, error: error.message };
-  }
-});
-
-// Get refresh token from secure storage
-ipcMain.handle('get-refresh-token', async () => {
-  try {
-    const encryptedPath = path.join(app.getPath('userData'), 'refresh_token.enc');
-    const plainPath = path.join(app.getPath('userData'), 'refresh_token.txt');
-    
-    // Try encrypted file first
-    try {
-      const encrypted = await fs.readFile(encryptedPath);
-      if (safeStorage.isEncryptionAvailable()) {
-        const token = safeStorage.decryptString(encrypted);
-        console.log('[Auth] Retrieved encrypted refresh token');
-        return { success: true, token };
-      } else {
-        console.error('[Auth] Cannot decrypt token - encryption not available');
-        return { success: false, error: 'Encryption not available' };
-      }
-    } catch (encryptedError) {
-      // Encrypted file doesn't exist or can't be read, try plain text
-      if (encryptedError.code !== 'ENOENT') {
-        // Real error, not just file missing
-        throw encryptedError;
-      }
-    }
-    
-    // Try plain text file
-    try {
-      const token = await fs.readFile(plainPath, 'utf8');
-      console.log('[Auth] Retrieved plain text refresh token');
-      return { success: true, token };
-    } catch (plainError) {
-      if (plainError.code === 'ENOENT') {
-        // No token found
-        return { success: false, error: 'No refresh token found' };
-      }
-      throw plainError;
-    }
-  } catch (error) {
-    console.error('[Auth] Failed to get refresh token:', error);
-    return { success: false, error: error.message };
-  }
-});
-
-// Delete refresh token from storage
-ipcMain.handle('delete-refresh-token', async () => {
-  try {
-    const encryptedPath = path.join(app.getPath('userData'), 'refresh_token.enc');
-    const plainPath = path.join(app.getPath('userData'), 'refresh_token.txt');
-    
-    // Try to delete both files (ignore ENOENT errors if they don't exist)
-    try {
-      await fs.unlink(encryptedPath);
-    } catch (error) {
-      if (error.code !== 'ENOENT') {
-        throw error; // Re-throw if it's not a "file not found" error
-      }
-    }
-    
-    try {
-      await fs.unlink(plainPath);
-    } catch (error) {
-      if (error.code !== 'ENOENT') {
-        throw error; // Re-throw if it's not a "file not found" error
-      }
-    }
-    
-    console.log('[Auth] Refresh token deleted');
-    return { success: true };
-  } catch (error) {
-    console.error('[Auth] Failed to delete refresh token:', error);
-    return { success: false, error: error.message };
   }
 });
 

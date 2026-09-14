@@ -264,11 +264,11 @@ export const DownloadArea: React.FC<DownloadAreaProps> = ({ className = '' }) =>
                 <div className="flex min-w-0 flex-1 items-center gap-2">
                   {getStatusIcon(download.state)}
                   <span className="truncate text-sm font-medium text-foreground">{download.name}</span>
-                  <Badge className={`flex-shrink-0 text-xs ${getStatusColor(download.state)}`}>
+                  <Badge className={`shrink-0 text-xs ${getStatusColor(download.state)}`}>
                     {download.state === 'extracting' ? 'Extracting' : download.type}
                   </Badge>
                 </div>
-                <div className="flex flex-shrink-0 items-center gap-2">
+                <div className="flex shrink-0 items-center gap-2">
                   {download.canCancel && download.state === 'progressing' && (
                     <Button
                       variant="ghost"
@@ -330,7 +330,7 @@ export const DownloadArea: React.FC<DownloadAreaProps> = ({ className = '' }) =>
                   <div className="flex min-w-0 flex-1 items-center gap-2">
                     {getStatusIcon(download.state)}
                     <span className="truncate text-sm text-foreground">{download.name}</span>
-                    <Badge className={`flex-shrink-0 text-xs ${getStatusColor(download.state)}`}>
+                    <Badge className={`shrink-0 text-xs ${getStatusColor(download.state)}`}>
                       {download.type}
                     </Badge>
                   </div>
@@ -338,7 +338,7 @@ export const DownloadArea: React.FC<DownloadAreaProps> = ({ className = '' }) =>
                     variant="ghost"
                     size="sm"
                     onClick={() => handleRemoveDownload(download.id)}
-                    className="flex-shrink-0 h-6 w-6 p-0"
+                    className="shrink-0 h-6 w-6 p-0"
                   >
                     <X className="h-3 w-3" />
                   </Button>
@@ -359,7 +359,7 @@ export const DownloadArea: React.FC<DownloadAreaProps> = ({ className = '' }) =>
                     <div className="flex min-w-0 flex-1 items-center gap-2">
                       {getStatusIcon(download.state)}
                       <span className="truncate text-sm text-foreground">{download.name}</span>
-                      <Badge className={`flex-shrink-0 text-xs ${getStatusColor(download.state)}`}>
+                      <Badge className={`shrink-0 text-xs ${getStatusColor(download.state)}`}>
                         {download.type}
                       </Badge>
                     </div>
@@ -367,7 +367,7 @@ export const DownloadArea: React.FC<DownloadAreaProps> = ({ className = '' }) =>
                       variant="ghost"
                       size="sm"
                       onClick={() => handleRemoveDownload(download.id)}
-                      className="flex-shrink-0 h-6 w-6 p-0"
+                      className="shrink-0 h-6 w-6 p-0"
                     >
                       <X className="h-3 w-3" />
                     </Button>

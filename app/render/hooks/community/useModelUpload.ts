@@ -6,9 +6,9 @@ import { useState } from 'react'
 import { toast } from 'sonner'
 import { apiFetch } from '@/utils/common/apiFetch'
 import { getApiResponseErrorMessage, getErrorMessage } from '@/utils/common/apiResponse'
-import { CTRL_SERVICE_API_ENDPOINT } from '@/constants/config'
-import { uploadFiles } from '@/utils/dashboard/fileManager.service'
-import { formatFileSize } from '@/utils/community.utils'
+import { COMMUNITY_API_ENDPOINT } from '@/config/api.config'
+import { uploadFiles } from '@/services/fileManager.service'
+import { formatFileSize } from '@/utils/community/community.utils'
 import { FACTORY_CATEGORIES } from '@/constants/community.constants'
 import type { ModelData } from '@/types/community.types'
 
@@ -97,7 +97,7 @@ export function useModelUpload(userInfo?: any) {
         const dt = new DataTransfer()
         dt.items.add(uploadFile_)
         const files = dt.files
-        const uploadResponse = await uploadFiles('models', files, () => {} , false)
+        const uploadResponse = await uploadFiles('models', files, () => {}, false, undefined, false, { endpoint: COMMUNITY_API_ENDPOINT })
         const originalFileName = uploadFile_.name.split('\\').pop()?.split('/').pop() || uploadFile_.name
         
         let actualFileName = originalFileName
@@ -176,7 +176,7 @@ export function useModelUpload(userInfo?: any) {
         const originalFileName = uploadFile_.name.split('\\').pop()?.split('/').pop() || uploadFile_.name
         const actualFileName = filePath.split('/').pop() || originalFileName
         
-        const mappingResponse = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/models/register`, {
+        const mappingResponse = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/models/register`, {
           method: 'POST',
           body: JSON.stringify({
             model_id: newModel.id,

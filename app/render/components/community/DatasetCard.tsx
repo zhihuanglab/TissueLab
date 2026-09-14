@@ -6,8 +6,9 @@ import { Badge } from "@/components/ui/badge"
 import { Avatar } from "@/components/ui/avatar"
 import { Star, Download, Database } from "lucide-react"
 import { apiFetch } from '@/utils/common/apiFetch'
-import { CTRL_SERVICE_API_ENDPOINT } from '@/constants/config'
+import { COMMUNITY_API_ENDPOINT } from '@/config/api.config'
 import type { DatasetData } from '@/types/community.types'
+import { useAuthorProfile } from '@/hooks/community/useAuthorProfile'
 
 interface DatasetCardProps {
   dataset: DatasetData
@@ -18,6 +19,10 @@ export default function DatasetCard({ dataset }: DatasetCardProps) {
   const [isStarred, setIsStarred] = useState(false)
   const [starCount, setStarCount] = useState(dataset.stats.stars || 0)
   const [isStarring, setIsStarring] = useState(false)
+  // Author display name + avatar resolved per-uid via the public-profile
+  // endpoint. See useAuthorProfile + ClassifierCard for the full pattern.
+  const ownerId = dataset.author?.user_id || null
+  const authorProfile = useAuthorProfile(ownerId)
   const [authorAvatar, setAuthorAvatar] = useState<string | null>(null)
 
   const handleDatasetStarToggle = async () => {
@@ -33,7 +38,7 @@ export default function DatasetCard({ dataset }: DatasetCardProps) {
       setStarCount(newStarCount)
 
       // Call API
-      const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/datasets/${dataset.id}/star`, {
+      const result = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/datasets/${dataset.id}/star`, {
         method: newIsStarred ? 'POST' : 'DELETE',
         headers: { 'Content-Type': 'application/json' }
       })
@@ -52,27 +57,26 @@ export default function DatasetCard({ dataset }: DatasetCardProps) {
     }
   }
 
-  // Load author avatar from localStorage
+  // Reconcile displayed avatar from backend profile + own-user localStorage
+  // override. See ClassifierCard for the same pattern + reasoning.
   useEffect(() => {
-    const loadAuthorAvatar = () => {
-      if (dataset.author.user_id) {
-        const savedAvatar = localStorage.getItem(`user_avatar_${dataset.author.user_id}`)
-        setAuthorAvatar(savedAvatar)
+    const reconcile = () => {
+      let next: string | null = authorProfile?.avatarUrl || null
+      if (typeof window !== 'undefined' && ownerId) {
+        const ownOverride = localStorage.getItem(`user_avatar_${ownerId}`)
+        if (ownOverride) next = ownOverride
       }
+      setAuthorAvatar(next)
     }
-    loadAuthorAvatar()
-
-    const handleStorageChange = () => {
-      loadAuthorAvatar()
-    }
-    window.addEventListener('storage', handleStorageChange)
-    window.addEventListener('localStorageChanged', handleStorageChange)
-
+    reconcile()
+    if (typeof window === 'undefined') return
+    window.addEventListener('storage', reconcile)
+    window.addEventListener('localStorageChanged', reconcile)
     return () => {
-      window.removeEventListener('storage', handleStorageChange)
-      window.removeEventListener('localStorageChanged', handleStorageChange)
+      window.removeEventListener('storage', reconcile)
+      window.removeEventListener('localStorageChanged', reconcile)
     }
-  }, [dataset.author.user_id])
+  }, [ownerId, authorProfile?.avatarUrl])
 
   const handleAuthorClick = (e: React.MouseEvent) => {
     e.stopPropagation()
@@ -134,13 +138,14 @@ export default function DatasetCard({ dataset }: DatasetCardProps) {
             {authorAvatar ? (
               <Image
                 src={authorAvatar}
-                alt={dataset.author.name}
+                alt={authorProfile?.displayName || dataset.author.name}
                 width={24}
                 height={24}
                 className="w-full h-full object-cover rounded-full"
+                onError={() => setAuthorAvatar(null)}
               />
             ) : (
-              <div className="flex h-full w-full items-center justify-center rounded-full bg-gradient-to-br from-primary/20 via-primary/30 to-primary/40">
+              <div className="flex h-full w-full items-center justify-center rounded-full bg-linear-to-br from-primary/20 via-primary/30 to-primary/40">
                 <Database className="h-3 w-3 text-primary-foreground" />
               </div>
             )}
@@ -149,7 +154,7 @@ export default function DatasetCard({ dataset }: DatasetCardProps) {
             onClick={handleAuthorClick}
             className="cursor-pointer text-sm font-medium transition-colors text-foreground hover:text-primary"
           >
-            {dataset.author.name}
+            {authorProfile?.displayName || dataset.author.name}
           </span>
         </div>
         

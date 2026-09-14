@@ -2,11 +2,10 @@
 
 import React, { useEffect, useCallback, useState, useRef, useMemo } from "react";
 import { createPortal } from "react-dom";
-import Image from "next/image";
 import { ReviewCandidate } from "@/store/slices/reviewSlice";
 import { Button } from "@/components/ui/button";
-import { ChevronLeft, ChevronRight, RotateCcw, ChevronDown, X } from "lucide-react";
-import { AI_SERVICE_API_ENDPOINT } from "@/constants/config";
+import { ChevronLeft, ChevronRight, RotateCcw, ChevronDown, X, Trash2 } from "lucide-react";
+import { AI_SERVICE_API_ENDPOINT } from "@/config/api.config";
 import { apiFetch } from '@/utils/common/apiFetch';
 
 interface CandidateGalleryProps {
@@ -26,19 +25,20 @@ interface CandidateGalleryProps {
     color: string;
   }>;
   targetClassName?: string;
-  showReclassified?: boolean;
+  savedMode?: boolean;
+  pendingRemovals?: Set<string>;
+  onToggleRemoval?: (cellId: string) => void;
   onPageChange: (page: number) => void;
   onLabelCandidate: (cellId: string, label: 1 | 0) => void;
-  onRemoveCandidate: (cellId: string) => void;
-  onReclassifyCandidate?: (cellId: string, newClass: string) => void;
   onRetry: () => void;
   onSortChange?: (sort: 'asc' | 'desc') => void;
   onCandidateClick?: (candidate: ReviewCandidate) => void;
-  onShowReclassifiedChange?: (show: boolean) => void;
   // New: Batch processing related props
   pendingReclassifications?: Map<string, string>; // cellId -> newClassName
   onPendingReclassification?: (cellId: string, newClass: string) => void;
   onCancelPendingReclassification?: (cellId: string) => void;
+  writeDisabled?: boolean;
+  writeDisabledTitle?: string;
 }
 
 const CandidateGallery: React.FC<CandidateGalleryProps> = ({
@@ -54,19 +54,20 @@ const CandidateGallery: React.FC<CandidateGalleryProps> = ({
   slideId, // Extract slideId prop
   availableClasses = [],
   targetClassName,
-  showReclassified = true,
+  savedMode,
+  pendingRemovals,
+  onToggleRemoval,
   onPageChange,
   onLabelCandidate,
-  onRemoveCandidate,
-  onReclassifyCandidate,
   onRetry,
   onSortChange,
   onCandidateClick,
-  onShowReclassifiedChange,
   // New: Batch processing related props
   pendingReclassifications = new Map(),
   onPendingReclassification,
   onCancelPendingReclassification,
+  writeDisabled = false,
+  writeDisabledTitle,
 }) => {
   // Add safety check for candidates - memoize to prevent unnecessary re-renders
   const safeCandidates = useMemo(() => candidates || [], [candidates]);
@@ -77,20 +78,17 @@ const CandidateGallery: React.FC<CandidateGalleryProps> = ({
 
   // Keyboard shortcuts for Y/N labeling
   const handleKeyDown = useCallback((event: KeyboardEvent) => {
-    if (safeCandidates.length === 0 || loading) return;
+    if (writeDisabled || safeCandidates.length === 0 || loading) return;
 
     // Find the first unlabeled candidate
     const unlabeledCandidate = safeCandidates.find(c => c.label === undefined);
     if (!unlabeledCandidate) return;
 
-    if (event.key.toLowerCase() === 'y') {
+    if (!savedMode && event.key.toLowerCase() === 'y') {
       event.preventDefault();
       onLabelCandidate(unlabeledCandidate.cell_id, 1);
-    } else if (event.key.toLowerCase() === 'n') {
-      event.preventDefault();
-      onLabelCandidate(unlabeledCandidate.cell_id, 0);
     }
-  }, [safeCandidates, loading, onLabelCandidate]);
+  }, [safeCandidates, loading, onLabelCandidate, savedMode, writeDisabled]);
 
   useEffect(() => {
     document.addEventListener('keydown', handleKeyDown);
@@ -192,20 +190,6 @@ const CandidateGallery: React.FC<CandidateGalleryProps> = ({
             </>
           )}
           
-          {/* Reclassified filter toggle */}
-          {onShowReclassifiedChange && (
-            <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-              <input
-                type="checkbox"
-                checked={showReclassified}
-                onChange={(e) => onShowReclassifiedChange(e.target.checked)}
-                style={{ width: '14px', height: '14px' }}
-              />
-              <span className="text-xs text-muted-foreground select-none">
-                Show reclassified
-              </span>
-            </label>
-          )}
         </div>
       </div>
 
@@ -221,17 +205,20 @@ const CandidateGallery: React.FC<CandidateGalleryProps> = ({
                 candidate={candidate}
                 zoom={zoom}
                 targetClassName={targetClassName}
+                savedMode={savedMode}
+                isPendingRemoval={pendingRemovals?.has(candidate.cell_id) ?? false}
+                onToggleRemoval={onToggleRemoval}
                 isSelected={selectedCandidateId === candidate.cell_id}
                 slideId={slideId} // Pass slideId to CandidateTile
                 availableClasses={availableClasses}
                 onLabelCandidate={onLabelCandidate}
-                onRemoveCandidate={onRemoveCandidate}
-                onReclassifyCandidate={onReclassifyCandidate}
                 onCandidateClick={onCandidateClick}
                 // New: Batch processing related
                 pendingReclassification={pendingReclassifications.get(candidate.cell_id)}
                 onPendingReclassification={onPendingReclassification}
                 onCancelPendingReclassification={onCancelPendingReclassification}
+                writeDisabled={writeDisabled}
+                writeDisabledTitle={writeDisabledTitle}
               />
             ))}
           </div>
@@ -309,6 +296,8 @@ interface CandidateTileProps {
   candidate: ReviewCandidate;
   zoom: number;
   targetClassName?: string;
+  savedMode?: boolean;
+  isPendingRemoval?: boolean;
   isSelected?: boolean;
   slideId?: string; // Add slideId prop
   availableClasses?: Array<{
@@ -317,30 +306,34 @@ interface CandidateTileProps {
     color: string;
   }>;
   onLabelCandidate: (cellId: string, label: 1 | 0) => void;
-  onRemoveCandidate: (cellId: string) => void;
-  onReclassifyCandidate?: (cellId: string, newClass: string) => void;
+  onToggleRemoval?: (cellId: string) => void;
   onCandidateClick?: (candidate: ReviewCandidate) => void;
   // New: Batch processing related
   pendingReclassification?: string; // Target class name for pending reclassification
   onPendingReclassification?: (cellId: string, newClass: string) => void;
   onCancelPendingReclassification?: (cellId: string) => void;
+  writeDisabled?: boolean;
+  writeDisabledTitle?: string;
 }
 
 const CandidateTile: React.FC<CandidateTileProps> = ({
   candidate,
   zoom,
   targetClassName,
+  savedMode,
+  isPendingRemoval,
   isSelected,
   slideId, // Add slideId parameter
   availableClasses = [],
   onLabelCandidate,
-  onRemoveCandidate,
-  onReclassifyCandidate,
+  onToggleRemoval,
   onCandidateClick,
   // New: Batch processing related
   pendingReclassification,
   onPendingReclassification,
   onCancelPendingReclassification,
+  writeDisabled = false,
+  writeDisabledTitle,
 }) => {
   const { cell_id, prob, crop, label } = candidate;
   const { image, bbox, bounds, contour } = crop;
@@ -349,6 +342,9 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
   const [showDropdown, setShowDropdown] = useState(false);
   const [imageError, setImageError] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
+  // False until the <img> has decoded — drives a per-tile loading spinner so the
+  // tile shows a spinner instead of flashing white while the crop decodes.
+  const [imgLoaded, setImgLoaded] = useState(false);
   
   // Z-stack layer selection
   const [fixedZLayer, setFixedZLayer] = useState<number | null>(null);
@@ -359,9 +355,6 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
   const isZStack = (candidate.crop as any)?.is_zstack === true;
   const numZLayers = (candidate.crop as any)?.num_z_layers || 1;
 
-  // Special classes that don't show probability
-  const specialClasses = new Set(["Other", "Not Sure", "Incorrect Segmentation"]);
-  const isSpecialClass = specialClasses.has(targetClassName || "");
   const [dropdownPosition, setDropdownPosition] = useState({ top: 0, left: 0, width: 0 });
   const buttonRef = useRef<HTMLButtonElement>(null);
 
@@ -377,7 +370,7 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
     }
   }, [retryCount]);
 
-  // Reset error state when image URL changes (for reclassified images)
+  // Reset error state when image URL changes (for saved images)
   useEffect(() => {
     setImageError(false);
     setRetryCount(0);
@@ -432,19 +425,12 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
   const handleClassSelect = (selectedClass: string) => {
     setShowDropdown(false);
     
-    // Batch processing mode: don't call API immediately, cache the selection
+    // Staged: cache the selection; committed to user_annotation on Save.
     if (onPendingReclassification) {
       try {
         onPendingReclassification(cell_id, selectedClass);
       } catch (error) {
         console.error('[AL CandidateGallery] Error in onPendingReclassification:', error);
-      }
-    } else if (onReclassifyCandidate) {
-      // Compatible with old mode: if no batch processing handler, call API immediately
-      try {
-        onReclassifyCandidate(cell_id, selectedClass);
-      } catch (error) {
-        console.error('[AL CandidateGallery] Error in onReclassifyCandidate:', error);
       }
     }
   };
@@ -462,12 +448,6 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
   };
 
   // No longer need click outside handler - dropdown only closes via close button
-
-  const fixedOptions = [
-    { id: "Other", name: "Other", color: "#F3F4F5", isTemporary: true },
-    { id: "Not Sure", name: "Not Sure", color: "#FED7AA", isTemporary: true },
-    { id: "Incorrect Segmentation", name: "Incorrect Segmentation", color: "#FECACA", isTemporary: true }
-  ];
 
   // Calculate red box position based on contour (like nuclei.io-main implementation)
   // Memoize to prevent recalculation on every render and avoid boundary shrinking
@@ -588,6 +568,10 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
   // Determine which image to display: fixed layer image or original (GIF/JPEG)
   const displayImage = (fixedZLayer !== null && layerImage) ? layerImage : image;
   const showLayerLoading = layerLoading && fixedZLayer !== null;
+
+  // Reset the decoded flag whenever the image source changes so the spinner
+  // shows again for the new crop.
+  useEffect(() => { setImgLoaded(false); }, [displayImage]);
   
   // Force unique key to ensure React re-renders when switching between GIF and fixed layer
   const imageKey = fixedZLayer !== null ? `fixed-${cell_id}-${fixedZLayer}` : `gif-${cell_id}`;
@@ -644,20 +628,30 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
           </div>
         ) : displayImage && !imageError ? (
           <>
-            <Image 
+            {/* Plain <img>, NOT next/image: displayImage is an inline base64
+                data: URL. next/image can't optimize a data URI and (Next 16 /
+                Turbopack) fires onError on it, producing a false "Cell image
+                error". A native <img> renders the base64 crop directly. */}
+            {/* Spinner while the crop decodes — avoids a white flash. */}
+            {!imgLoaded && (
+              <div className="absolute inset-0 flex items-center justify-center bg-gray-50">
+                <div className="animate-spin w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full" />
+              </div>
+            )}
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
               key={imageKey} // Use unique key for GIF vs fixed layer
-              src={displayImage} 
+              src={displayImage}
               alt={`Candidate ${cell_id}${fixedZLayer !== null ? ` Layer ${fixedZLayer + 1}` : ''}`}
-              fill
-              className="object-cover"
-              style={{ imageRendering: 'pixelated' }}
+              className="absolute inset-0 h-full w-full object-cover transition-opacity duration-150"
+              style={{ imageRendering: 'pixelated', opacity: imgLoaded ? 1 : 0 }}
               onError={handleImageError}
               onLoad={() => {
                 // Reset error state on successful load
                 setImageError(false);
                 setRetryCount(0);
+                setImgLoaded(true);
               }}
-              unoptimized // Disable optimization for dynamic images
             />
             <div style={redBoxStyle} />
           </>
@@ -686,26 +680,27 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
         )}
       </div>
 
-      {/* Probability or reclassified label */}
+      {/* Probability or saved label */}
       <div className={`absolute top-1 left-1 text-white px-1.5 py-0.5 rounded text-xs font-medium ${
-        (isSpecialClass || (candidate as any).reclassified)
-          ? 'bg-orange-500 bg-opacity-90' 
-          : 'bg-black bg-opacity-60'
+        (candidate as any).saved
+          ? 'bg-orange-500/90'
+          : 'bg-black/60'
       }`}>
-        {(isSpecialClass || (candidate as any).reclassified) 
-          ? 'Reclassified' 
+        {(candidate as any).saved
+          ? 'Saved'
           : `P: ${prob.toFixed(3)}`}
       </div>
 
       {/* Yes/No buttons - compact size */}
       <div className="absolute bottom-1 left-1 right-1 flex space-x-1">
+        {!savedMode && (
         <Button
           size="sm"
-          disabled={label === 0 || !!pendingReclassification}
+          disabled={writeDisabled || label === 0 || !!pendingReclassification}
           className={`flex-1 h-5 text-xs px-1 ${
             label === 1 
               ? 'bg-green-600 text-white' 
-              : (label === 0 || pendingReclassification)
+              : (writeDisabled || label === 0 || pendingReclassification)
               ? 'bg-gray-200 text-gray-400 border border-gray-300 cursor-not-allowed'
               : 'bg-white text-green-600 border border-green-600 hover:bg-green-50'
           }`}
@@ -714,7 +709,9 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
             onLabelCandidate(cell_id, 1);
           }}
           title={
-            label === 0 
+            writeDisabled
+              ? writeDisabledTitle
+              : label === 0 
               ? 'Cannot select YES: NO is already selected. Click NO again to deselect it first.'
               : pendingReclassification
               ? `Cannot select YES: This cell is marked for reclassification to "${pendingReclassification}". Cancel the reclassification first.`
@@ -723,14 +720,16 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
         >
           ✓ Yes
         </Button>
-        
+        )}
+
         {/* No button with dropdown - show target class name for pending reclassification */}
         {pendingReclassification ? (
           <Button
             ref={buttonRef}
             size="sm"
             className="flex-1 h-5 text-xs px-1 bg-orange-500 text-white hover:bg-orange-600"
-            title={`Click to cancel reclassification to ${pendingReclassification}`}
+            disabled={writeDisabled}
+            title={writeDisabled ? writeDisabledTitle : `Click to cancel reclassification to ${pendingReclassification}`}
             onClick={(e) => {
               e.stopPropagation();
               // When clicking the selected reclassification button, cancel the reclassification
@@ -745,21 +744,30 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
           <Button
             ref={buttonRef}
             size="sm"
-            disabled={label === 1}
+            disabled={writeDisabled || label === 1}
             className={`flex-1 h-5 text-xs px-1 ${
               label === 0 
                 ? 'bg-red-600 text-white' 
-                : label === 1
+                : writeDisabled || label === 1
                 ? 'bg-gray-200 text-gray-400 border border-gray-300 cursor-not-allowed'
                 : 'bg-white text-red-600 border border-red-600 hover:bg-red-50'
             }`}
             title={
-              label === 1
+              writeDisabled
+                ? writeDisabledTitle
+                : label === 1
                 ? 'Cannot select NO: YES is already selected. Click YES again to deselect it first.'
+                : label === 0
+                ? 'Click NO again to deselect it'
                 : 'Choose different class'
             }
             onClick={(e) => {
               e.stopPropagation();
+              // NO already selected → toggle it off (mirrors the Yes button)
+              if (label === 0) {
+                onLabelCandidate(cell_id, 0);
+                return;
+              }
               updateDropdownPosition();
               setShowDropdown(!showDropdown);
             }}
@@ -768,6 +776,26 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
           </Button>
         )}
         
+        {/* Remove button — saved view only: stage this annotation for deletion */}
+        {savedMode && onToggleRemoval && (
+          <Button
+            size="sm"
+            disabled={writeDisabled}
+            className={`h-5 px-1.5 text-xs ${
+              isPendingRemoval
+                ? 'bg-red-600 text-white hover:bg-red-700'
+                : 'bg-white text-red-600 border border-red-600 hover:bg-red-50'
+            }`}
+            title={writeDisabled ? writeDisabledTitle : (isPendingRemoval ? 'Staged for removal — click to undo' : 'Remove this saved annotation')}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleRemoval(cell_id);
+            }}
+          >
+            <Trash2 className="h-3 w-3" />
+          </Button>
+        )}
+
         {/* Portal dropdown menu */}
         {showDropdown && createPortal(
             <div 
@@ -812,35 +840,10 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
                   }}
                 >
                   <div 
-                    className="w-2 h-2 rounded border border-border flex-shrink-0 pointer-events-none"
+                    className="w-2 h-2 rounded border border-border shrink-0 pointer-events-none"
                     style={{ backgroundColor: classObj.color }}
                   />
                   <span className="pointer-events-none">{classObj.name}</span>
-                </button>
-              ))}
-              
-              {/* Separator */}
-              {availableClasses.length > 0 && (
-                <div className="border-t border-border my-1" />
-              )}
-              
-              {/* Fixed options */}
-              {fixedOptions.map((option, index) => (
-                <button
-                  key={`fixed-${option.id}-${index}`}
-                  className="w-full flex items-center gap-2 p-1.5 text-left text-xs bg-card border border-border rounded hover:bg-accent"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleClassSelect(option.name);
-                  }}
-                  title="⚠️ Temporary class - will be cleared on reload"
-                >
-                  <div 
-                    className="w-2 h-2 rounded border border-border flex-shrink-0 pointer-events-none"
-                    style={{ backgroundColor: option.color }}
-                  />
-                  <span className="flex-1 pointer-events-none">{option.name}</span>
-                  <span className="text-warning text-[10px] pointer-events-none">⏱️</span>
                 </button>
               ))}
             </div>

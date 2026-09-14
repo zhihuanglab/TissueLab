@@ -1,28 +1,32 @@
-"""Local single-user auth stub.
+"""Route-level auth dependencies.
 
-The desktop build runs the backend on the user's own machine, so token
-verification is delegated to the remote ctrl service. Endpoints still receive
-an ``AuthUser`` for downstream code that wants a uid for path isolation.
+Both dependencies resolve to the local principal (see ``app.core.identity``).
+They keep the same names and return type as the hosted edition so route
+handlers are unchanged.
 """
-
-from dataclasses import dataclass
 from typing import Optional
 
+from fastapi import Request
 
-@dataclass
-class AuthUser:
-    uid: str = "local"
-    email: Optional[str] = "local@tissuelab"
-    is_anonymous: bool = False
-    provider_id: str = "local"
+from app.core.identity import AuthUser, local_user
 
 
-_LOCAL_USER = AuthUser()
+def get_auth_user(request: Request) -> AuthUser:
+    """Current user — always the local principal."""
+    user = getattr(request.state, "user", None)
+    if isinstance(user, dict) and user.get("uid"):
+        return AuthUser(
+            uid=user["uid"],
+            email=user.get("email"),
+            is_anonymous=False,
+            provider_id=user.get("provider_id", "local"),
+        )
+    return local_user()
 
 
-def get_auth_user() -> AuthUser:
-    return _LOCAL_USER
+def get_optional_auth_user(request: Request) -> Optional[AuthUser]:
+    """Best-effort variant kept for signature compatibility."""
+    return get_auth_user(request)
 
 
-def get_optional_auth_user() -> Optional[AuthUser]:
-    return _LOCAL_USER
+__all__ = ["AuthUser", "get_auth_user", "get_optional_auth_user"]

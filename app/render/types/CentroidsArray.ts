@@ -12,6 +12,28 @@ export class CentroidsArray {
     this.numPoints = numPoints;
   }
 
+  /**
+   * Build from nested rows [[id,x,y,classId], ...] or pass through an existing instance.
+   * Prefer binary parsers that already produce Int32Array / CentroidsArray.
+   */
+  static fromPoints(
+    points: CentroidsArray | ArrayLike<ArrayLike<number>> | null | undefined,
+  ): CentroidsArray {
+    if (!points) return new CentroidsArray(new Int32Array(0), 0);
+    if (points instanceof CentroidsArray) return points;
+    const n = points.length;
+    const data = new Int32Array(n * 4);
+    for (let i = 0; i < n; i++) {
+      const p = points[i]!;
+      const j = i << 2;
+      data[j] = p[0] as number;
+      data[j + 1] = p[1] as number;
+      data[j + 2] = p[2] as number;
+      data[j + 3] = p[3] as number;
+    }
+    return new CentroidsArray(data, n);
+  }
+
   get length(): number {
     return this.numPoints;
   }
@@ -21,9 +43,6 @@ export class CentroidsArray {
     return this.data;
   }
 
-  // Index access: centroids[i] returns subarray view [id, x, y, classId]
-  [index: number]: Int32Array | undefined;
-  
   // Access point i: returns subarray view [id, x, y, classId]
   get(i: number): Int32Array {
     if (i < 0 || i >= this.numPoints) return undefined as any;
@@ -122,26 +141,3 @@ Object.defineProperty(CentroidsArray.prototype, Symbol.toStringTag, {
   value: 'Array',
   configurable: true
 });
-
-// Proxy to support index access
-export function createCentroidsArrayProxy(data: Int32Array, numPoints: number): CentroidsArray & { [index: number]: Int32Array } {
-  const centroids = new CentroidsArray(data, numPoints);
-  return new Proxy(centroids, {
-    get(target, prop) {
-      if (typeof prop === 'string' && /^\d+$/.test(prop)) {
-        // Numeric index access
-        const index = parseInt(prop, 10);
-        return target.get(index);
-      }
-      return (target as any)[prop];
-    },
-    has(target, prop) {
-      if (typeof prop === 'string' && /^\d+$/.test(prop)) {
-        const index = parseInt(prop, 10);
-        return index >= 0 && index < numPoints;
-      }
-      return prop in target;
-    }
-  }) as CentroidsArray & { [index: number]: Int32Array };
-}
-

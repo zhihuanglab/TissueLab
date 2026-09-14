@@ -185,14 +185,20 @@ try {
     }
   }
   
-  // Resolve symlinks in node_modules (most common location)
-  const nodeModulesPath = path.join(standaloneDir, 'node_modules');
-  if (fs.existsSync(nodeModulesPath)) {
-    console.log('  Resolving symlinks in node_modules...');
-    resolveSymlinksInDir(nodeModulesPath);
-    console.log('\x1b[32m%s\x1b[0m', '  ✓ Symlinks resolved');
-  } else {
-    console.log('\x1b[33m%s\x1b[0m', '  ⚠ node_modules not found, skipping symlink resolution');
+  // Two places hold links: the traced node_modules, and — since Next 16 /
+  // Turbopack — .next/node_modules, where optimized package imports are
+  // junctions to ABSOLUTE paths inside app/render/node_modules. Left in place
+  // they are dangling on every other machine (the standalone server cannot
+  // load e.g. @radix-ui) and make electron-builder's 7-Zip step fail.
+  for (const rel of ['node_modules', path.join('.next', 'node_modules')]) {
+    const linkRoot = path.join(standaloneDir, rel);
+    if (fs.existsSync(linkRoot)) {
+      console.log(`  Resolving symlinks in ${rel}...`);
+      resolveSymlinksInDir(linkRoot);
+      console.log('\x1b[32m%s\x1b[0m', `  ✓ Symlinks resolved in ${rel}`);
+    } else {
+      console.log('\x1b[33m%s\x1b[0m', `  ⚠ ${rel} not found, skipping symlink resolution`);
+    }
   }
 } catch (error) {
   console.error('\x1b[31m%s\x1b[0m', '✗ Error resolving symlinks:', error.message);

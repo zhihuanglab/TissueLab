@@ -12,7 +12,7 @@ import {
   type FieldValues,
 } from "react-hook-form"
 
-import { cn } from "../../utils/twMerge"
+import { cn } from "../../utils/common/twMerge"
 import { Label } from "./label"
 
 const Form = FormProvider

@@ -13,11 +13,12 @@ import {
   setSidebarUnfoldable,
   setIsMobile,
 } from "@/store/slices/layoutSlice";
-import { cn } from "@/utils/twMerge";
+import { cn } from "@/utils/common/twMerge";
 import {
+  Users,
   FolderOpen,
+  LibraryBig,
   Monitor,
-  Users
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/router";
@@ -30,6 +31,13 @@ const navItems = [
   { name: "Dashboard", icon: FolderOpen, href: "/dashboard" },
   { name: "Image Viewer", icon: Monitor, href: "/imageViewer" },
   { name: "Community", icon: Users, href: "/community" },
+  { name: "Resources", icon: LibraryBig, href: "/datasets" },
+  // { name: "Code Editor", icon: FileCode, href: "/codeEditor" },
+  // TODO: Resources & Tutorials section - commented out for future use
+  // { name: "Resources & Tutorials", icon: LibraryBig, href: "/resources" },
+  //{ name: "Connect", icon: Workflow, href: "/arena" },
+  // { name: "Tutorial", icon: BookOpen, href: "/tutorial" },
+  // { name: "Behavior Analyze", icon: FileChartPie, href: "/behaviorAnalyze" },
 ];
 
 // Get the current date as "YYYY-MM" for version string below the logo

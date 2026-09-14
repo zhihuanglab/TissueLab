@@ -1,6 +1,6 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@import "tw-animate-css";
+@config "../tailwind.config.js";
 
 /* Transition for color changes */
 /* html,
@@ -132,6 +132,76 @@ body,
   }
 }
 
+/* Modal layer: Dialog and AlertDialog share one surface and one motion.
+   Lives here rather than in the components so the animation can be a plain
+   keyframe instead of ten composed utilities. Per-dialog overrides still win:
+   this is the components layer, which Tailwind orders before utilities. */
+@layer components {
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    background-color: rgb(0 0 0 / 0.6);
+  }
+
+  /* Dark mode takes the lighter dim. Its backdrop is already near-black, so a
+     heavier one separates nothing and only hides the slide behind the dialog. */
+  .dark .modal-backdrop {
+    background-color: rgb(0 0 0 / 0.4);
+  }
+
+  /* Surfaced on --card, not --background: in dark mode the page and the
+     background token are the same near-black, which leaves the dialog an
+     outline rather than a raised card. The black shadow is inert there too, so
+     dark-mode elevation rests on this lighter surface plus the border. */
+  .modal-surface {
+    position: fixed;
+    left: 50%;
+    top: 50%;
+    z-index: 50;
+    display: grid;
+    gap: 1rem;
+    width: 100%;
+    max-width: 32rem;
+    padding: 1.5rem;
+    border-width: 1px;
+    border-radius: 0.75rem;
+    background-color: hsl(var(--card));
+    color: hsl(var(--card-foreground));
+    box-shadow: 0 25px 50px -12px rgb(0 0 0 / 0.25);
+    /* Centring lives on `translate` so the keyframes below are free to drive
+       `transform` alone. Writing the offset here in px is what keeps it a 24px
+       drop; a percentage would resolve against the dialog's own size. */
+    translate: -50% -50%;
+  }
+
+  .modal-backdrop[data-state='open'] {
+    animation: modal-backdrop-in 300ms cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  .modal-backdrop[data-state='closed'] {
+    animation: modal-backdrop-out 200ms cubic-bezier(0.32, 0.72, 0, 1) forwards;
+  }
+  .modal-surface[data-state='open'] {
+    animation: modal-surface-in 300ms cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  .modal-surface[data-state='closed'] {
+    animation: modal-surface-out 200ms cubic-bezier(0.32, 0.72, 0, 1) forwards;
+  }
+}
+
+@keyframes modal-backdrop-in {
+  from { opacity: 0; }
+}
+@keyframes modal-backdrop-out {
+  to { opacity: 0; }
+}
+@keyframes modal-surface-in {
+  from { opacity: 0; transform: translateY(-24px); }
+}
+@keyframes modal-surface-out {
+  to { opacity: 0; transform: translateY(-16px); }
+}
+
 /* Electron draggable regions for custom title bar */
 .electron-drag {
   -webkit-app-region: drag;
@@ -150,7 +220,7 @@ body,
 
 /* Login modal button styles */
 .highlight-button {
-  @apply h-fit w-fit rounded-xl bg-gradient-to-br from-blue-500 to-[#83a9ea] px-4 py-2 text-sm text-white hover:bg-gradient-to-br hover:from-blue-500 hover:to-[#739ee8];
+  @apply h-fit w-fit rounded-xl bg-linear-to-br from-blue-500 to-[#83a9ea] px-4 py-2 text-sm text-white hover:bg-linear-to-br hover:from-blue-500 hover:to-[#739ee8];
 }
 
 
@@ -269,12 +339,12 @@ body {
 
 .section-bg {
   @apply h-full w-full bg-[#212124] rounded-3xl flex items-center justify-center
-  border border-white border-opacity-20;
+  border border-white/20;
 }
 
 .section-bg-left {
   @apply h-full w-full bg-[#212124] rounded-md flex items-start justify-start flex-col
-  border border-white border-opacity-20;
+  border border-white/20;
 }
 
 .section-inner{

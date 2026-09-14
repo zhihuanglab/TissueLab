@@ -12,10 +12,11 @@ import { Star, Download, User, Trash2 } from "lucide-react"
 import { toast } from 'sonner'
 import { apiFetch } from '@/utils/common/apiFetch'
 import { getErrorMessage } from '@/utils/common/apiResponse'
-import { CTRL_SERVICE_API_ENDPOINT } from '@/constants/config'
-import { downloadCommunityModel } from '@/utils/dashboard/fileManager.service'
+import { COMMUNITY_API_ENDPOINT } from '@/config/api.config'
+import { downloadCommunityModel } from '@/services/fileManager.service'
 import { FACTORY_CATEGORIES } from '@/constants/community.constants'
 import type { ModelData } from '@/types/community.types'
+import { useAuthorProfile } from '@/hooks/community/useAuthorProfile'
 
 interface ModelCardProps {
   model: ModelData
@@ -42,6 +43,10 @@ export default function ModelCard({
   const [isDownloading, setIsDownloading] = useState(false)
   const [isDeleting, setIsDeleting] = useState(false)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  // Author display name + avatar resolved per-uid via the public-profile
+  // endpoint. See useAuthorProfile + ClassifierCard for full rationale.
+  const ownerId = model.author?.user_id || null
+  const authorProfile = useAuthorProfile(ownerId)
   const [authorAvatar, setAuthorAvatar] = useState<string | null>(null)
   const [showAllTags, setShowAllTags] = useState(false)
   const [showModelDetail, setShowModelDetail] = useState(false)
@@ -49,7 +54,7 @@ export default function ModelCard({
   // Fetch latest data from Firebase
   const fetchLatestData = async () => {
     try {
-      const response = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/models/${model.id}`, {
+      const response = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/models/${model.id}`, {
         method: 'GET'
       })
       
@@ -73,31 +78,26 @@ export default function ModelCard({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model.id])
 
-  // Load author avatar from localStorage
+  // Reconcile displayed avatar from backend profile + own-user localStorage
+  // override. See ClassifierCard for the same pattern + reasoning.
   useEffect(() => {
-    const loadAuthorAvatar = () => {
-      if (typeof window !== 'undefined' && model.author?.user_id) {
-        const savedAvatar = localStorage.getItem(`user_avatar_${model.author.user_id}`)
-        setAuthorAvatar(savedAvatar)
+    const reconcile = () => {
+      let next: string | null = authorProfile?.avatarUrl || null
+      if (typeof window !== 'undefined' && ownerId) {
+        const ownOverride = localStorage.getItem(`user_avatar_${ownerId}`)
+        if (ownOverride) next = ownOverride
       }
+      setAuthorAvatar(next)
     }
-    loadAuthorAvatar()
-
-    const handleStorageChange = () => {
-      loadAuthorAvatar()
-    }
-    if (typeof window !== 'undefined') {
-      window.addEventListener('storage', handleStorageChange)
-      window.addEventListener('localStorageChanged', handleStorageChange)
-    }
-
+    reconcile()
+    if (typeof window === 'undefined') return
+    window.addEventListener('storage', reconcile)
+    window.addEventListener('localStorageChanged', reconcile)
     return () => {
-      if (typeof window !== 'undefined') {
-        window.removeEventListener('storage', handleStorageChange)
-        window.removeEventListener('localStorageChanged', handleStorageChange)
-      }
+      window.removeEventListener('storage', reconcile)
+      window.removeEventListener('localStorageChanged', reconcile)
     }
-  }, [model.author?.user_id])
+  }, [ownerId, authorProfile?.avatarUrl])
 
   // Listen for SSE-driven stats updates
   useEffect(() => {
@@ -131,7 +131,7 @@ export default function ModelCard({
       setIsStarring(true)
       const newIsStarred = !isStarred
 
-      const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/models/${model.id}/star`, {
+      const result = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/models/${model.id}/star`, {
         method: newIsStarred ? 'POST' : 'DELETE',
         headers: { 'Content-Type': 'application/json' }
       })
@@ -184,7 +184,7 @@ export default function ModelCard({
         
         while (Date.now() - startedAt < timeoutMs) {
           try {
-            const result = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/models/${model.id}`, { method: 'GET' })
+            const result = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/models/${model.id}`, { method: 'GET' })
             latest = Number(result?.model?.stats?.downloads ?? latest)
             if (latest > baseline) {
               setDownloadCount(latest)
@@ -299,19 +299,19 @@ export default function ModelCard({
         <div className="flex items-start gap-2 mb-3">
           <Avatar
             onClick={handleAuthorClick}
-            className={`${compact ? 'h-5 w-5' : 'h-6 w-6'} flex-shrink-0 cursor-pointer transition-all hover:ring-2 hover:ring-primary/40`}
+            className={`${compact ? 'h-5 w-5' : 'h-6 w-6'} shrink-0 cursor-pointer transition-all hover:ring-2 hover:ring-primary/40`}
           >
             {authorAvatar ? (
               <Image
                 src={authorAvatar}
-                alt={model.author?.name || 'Unknown Author'}
+                alt={authorProfile?.displayName || model.author?.name || 'Unknown Author'}
                 width={24}
                 height={24}
                 className="w-full h-full object-cover rounded-full"
                 onError={() => setAuthorAvatar(null)}
               />
             ) : (
-              <div className="flex h-full w-full items-center justify-center rounded-full bg-gradient-to-br from-primary/20 via-primary/30 to-primary/40">
+              <div className="flex h-full w-full items-center justify-center rounded-full bg-linear-to-br from-primary/20 via-primary/30 to-primary/40">
                 <User className={`${compact ? 'h-2 w-2' : 'h-3 w-3'} text-primary-foreground`} />
               </div>
             )}
@@ -320,7 +320,7 @@ export default function ModelCard({
             onClick={handleAuthorClick}
             className={`${compact ? 'text-xs' : 'text-sm'} min-w-0 flex-1 break-words cursor-pointer font-medium transition-colors hover:text-primary`}
           >
-            {model.author?.name || 'Unknown Author'}
+            {authorProfile?.displayName || model.author?.name || 'Unknown Author'}
           </span>
         </div>
         
@@ -432,7 +432,7 @@ export default function ModelCard({
               variant="destructive"
               onClick={() => setShowDeleteDialog(true)}
               disabled={isDownloading || isDeleting}
-              className="flex-shrink-0"
+              className="shrink-0"
             >
               {isDeleting ? (
                 <div className="h-3 w-3 animate-spin rounded-full border-b-2 border-current"></div>
@@ -502,7 +502,7 @@ export default function ModelCard({
                 <span className="font-medium">Size:</span> {model.stats.size}
               </div>
               <div className="text-sm text-muted-foreground">
-                <span className="font-medium">Author:</span> {model.author?.name || 'Unknown Author'}
+                <span className="font-medium">Author:</span> {authorProfile?.displayName || model.author?.name || 'Unknown Author'}
               </div>
             </div>
           </div>

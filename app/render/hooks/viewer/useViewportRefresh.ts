@@ -1,239 +1,248 @@
-import { useCallback, useEffect, useRef } from 'react';
-import EventBus from '@/utils/EventBus';
-
+import { useEffect, useRef } from 'react';
+import eventBus from '@/utils/common/eventBus';
+import { stripZarrSuffix, workflowZarrPathsMatch } from '@/utils/agent/workflow/pathNorm';
+import { requireSegInstanceId } from '@/utils/viewer/segWs';
+import type { OverlayPendingRequest } from '@/utils/viewer/overlayRequestNotify';
+import { EMPTY_OVERLAY_PENDING } from '@/utils/viewer/overlayRequestNotify';
+import { clearViewportOverlayCaches } from '@/utils/viewer/viewportOverlayCaches';
 
 interface UseViewportRefreshParams {
   socket: WebSocket | null;
-  viewerInstance: any;
   currentPath: string | null;
-  threshold: number;
-  centroidThreshold: number;
-  classificationEnabled: boolean;
-  showBackendAnnotations: boolean;
-  existAnnotationFile: boolean;
   instanceId?: string | null;
-  setLoadingAnnotations: (loading: boolean) => void;
-  setIsZarrInitializing: (initializing: boolean) => void;
-  setIsRequestPending: (pending: boolean) => void;
-  setCurrentRequestType: (type: 'space' | 'x' | null) => void;
-  zarrInitTimeoutRef: React.MutableRefObject<ReturnType<typeof setTimeout> | null>;
+  isActive?: boolean;
+  setPendingRequest: React.Dispatch<React.SetStateAction<OverlayPendingRequest>>;
   lastHashRef: React.MutableRefObject<string | null>;
   lastSentPathRef: React.MutableRefObject<string | null>;
-  lastWorkflowRefreshTsRef: React.MutableRefObject<number>;
-  ZARR_INIT_TIMEOUT_MS: number;
-  requestPatchesForViewport: () => void;
+  /** set_path just went out — hand the slide-binding machine the new path. */
+  bindPath: (path: string) => void;
+  /** Re-bound to a path we already hold: rebuild the overlay in place. */
+  rebuildOverlay: () => void;
   refreshPatchClassificationData: () => Promise<void>;
+  pathReadyForDataRef?: React.MutableRefObject<boolean>;
+  /** Unified overlay hub */
+  forceOverlaySync: (opts?: {
+    intent?: 'explicit' | 'continuous';
+    refetch?: boolean;
+  }) => void;
+  /** Clear overlay session (gate close / before set_path). */
+  resetOverlay: (opts?: { keepPaint?: boolean }) => void;
+  /** Clear abandon debt after reload gate (see scheduleForceOverlay). */
+  clearAbandonedCellReplies?: () => void;
+  requestPatches: () => void;
+  /**
+   * Render-visible mirror of the binding wire gate (`bound` or `failed`).
+   * A ref cannot be an effect dependency, so this is what a held patch refresh
+   * watches to notice the gate reopening. Required, not optional: omitting it
+   * would silently strand every held refresh instead of failing loudly.
+   */
+  isPathBound: boolean;
 }
 
 /**
- * Hook to handle viewport refresh and WebSocket path refresh events
- * Extracted from OpenSeadragonContainer to improve code organization
+ * Path refresh / set_path only. Viewport overlay pulls go through overlay session.
  */
 export const useViewportRefresh = (params: UseViewportRefreshParams) => {
   const {
     socket,
-    viewerInstance,
     currentPath,
-    threshold,
-    centroidThreshold,
-    classificationEnabled,
-    showBackendAnnotations,
-    existAnnotationFile,
     instanceId,
-    setLoadingAnnotations,
-    setIsZarrInitializing,
-    setIsRequestPending,
-    setCurrentRequestType,
-    zarrInitTimeoutRef,
+    isActive = true,
+    setPendingRequest,
     lastHashRef,
     lastSentPathRef,
-    lastWorkflowRefreshTsRef,
-    ZARR_INIT_TIMEOUT_MS,
-    requestPatchesForViewport,
+    bindPath,
+    rebuildOverlay,
     refreshPatchClassificationData,
+    pathReadyForDataRef,
+    forceOverlaySync,
+    resetOverlay,
+    clearAbandonedCellReplies,
+    requestPatches,
+    isPathBound,
   } = params;
 
-  const requestViewportDataForCounts = useCallback(() => {
-    try {
-      const viewer = viewerInstance;
-      if (!viewer || !viewer.viewport || !socket || socket.readyState !== WebSocket.OPEN) return;
+  const pendingPathRefreshRef = useRef<{
+    path: string;
+    forceReload?: boolean;
+    skipViewportRefresh?: boolean;
+  } | null>(null);
 
-      const viewportBounds = viewer.viewport.getBounds();
-      const tiledImage = viewer.world.getItemAt(0);
-      const topLeft = tiledImage
-        ? tiledImage.viewportToImageCoordinates(viewportBounds.getTopLeft())
-        : viewer.viewport.viewportToImageCoordinates(viewportBounds.getTopLeft());
-      const bottomRight = tiledImage
-        ? tiledImage.viewportToImageCoordinates(viewportBounds.getBottomRight())
-        : viewer.viewport.viewportToImageCoordinates(viewportBounds.getBottomRight());
-      const x1 = Math.round(topLeft.x);
-      const y1 = Math.round(topLeft.y);
-      const x2 = Math.round(bottomRight.x);
-      const y2 = Math.round(bottomRight.y);
-
-      const zoom = viewer.viewport.getZoom();
-      const isImageFile =
-        currentPath &&
-        (currentPath.toLowerCase().endsWith('.png') ||
-          currentPath.toLowerCase().endsWith('.jpg') ||
-          currentPath.toLowerCase().endsWith('.jpeg') ||
-          currentPath.toLowerCase().endsWith('.bmp'));
-
-      let requestType: 'annotations' | 'all_annotations' | 'centroids' = 'annotations';
-      if (isImageFile) {
-        requestType = 'annotations';
-      } else if (zoom >= threshold) {
-        requestType = 'annotations';
-      } else if (zoom >= centroidThreshold) {
-        requestType = 'all_annotations';
-      } else {
-        requestType = 'centroids';
+  useEffect(() => {
+    const sendSetPath = (
+      normalizedIncoming: string,
+      forceReload?: boolean,
+      skipViewportRefresh?: boolean,
+    ) => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        return false;
+      }
+      lastHashRef.current = null;
+      const normalizedCurrent = stripZarrSuffix(currentPath || '');
+      if (!forceReload && (lastSentPathRef.current === normalizedIncoming || normalizedIncoming === normalizedCurrent)) {
+        if (!skipViewportRefresh) {
+          // Already bound to this path — just rebuild the overlay for it.
+          rebuildOverlay();
+        }
+        return true;
       }
 
-      if (showBackendAnnotations) setLoadingAnnotations(true);
+      if (!requireSegInstanceId(instanceId, 'set_path refresh')) {
+        return false;
+      }
+
+      if (forceReload && typeof instanceId === 'string' && instanceId) {
+        clearViewportOverlayCaches(instanceId);
+      }
+      if (forceReload) {
+        // Same path does not hit the overlay path-change reset — clear the flight
+        // or a dropped pre-reload response can wedge cellFlight forever.
+        // `keepPaint`: this is the slide already on screen, and the backend rebind
+        // that follows can take seconds. Blanking here is what made a finished run
+        // look like the overlay had been switched off until the new frame landed;
+        // the frame that replaces it repaints unconditionally.
+        resetOverlay({ keepPaint: true });
+        clearAbandonedCellReplies?.();
+        setPendingRequest(EMPTY_OVERLAY_PENDING);
+      }
+
       socket.send(
         JSON.stringify({
-          x1,
-          y1,
-          x2,
-          y2,
-          type: requestType,
-          use_classification: classificationEnabled,
+          type: 'set_path',
+          path: normalizedIncoming,
           instance_id: instanceId,
+          // A forced rebind must not be dropped as a duplicate of a same-path
+          // bind already in flight: that one may have read the zarr before the
+          // run that triggered this refresh finished writing it.
+          ...(forceReload ? { force_reload: true } : {}),
         })
       );
-      socket.send(JSON.stringify({ x1, y1, x2, y2, type: 'patches', instance_id: instanceId }));
-    } catch (err) {
-      console.error('Failed to send viewport request:', err);
-    }
-  }, [
-    socket,
-    viewerInstance,
-    currentPath,
-    threshold,
-    centroidThreshold,
-    classificationEnabled,
-    showBackendAnnotations,
-    setLoadingAnnotations,
-    instanceId,
-  ]);
-
-  // Coalesce viewport WS bursts (e.g. refresh-websocket-path + handler-reload-complete in quick succession).
-  const viewportDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const debouncedRequestViewportDataForCounts = useCallback(() => {
-    if (viewportDebounceRef.current) clearTimeout(viewportDebounceRef.current);
-    viewportDebounceRef.current = setTimeout(() => {
-      viewportDebounceRef.current = null;
-      requestViewportDataForCounts();
-    }, 80);
-  }, [requestViewportDataForCounts]);
-
-  // After set_path completes (including "Path already set"), WS handler emits this — viewport refetch is event-driven (no fixed delay).
-  useEffect(() => {
-    const onHandlerReloadComplete = () => {
-      debouncedRequestViewportDataForCounts();
+      // Shuts the wire gate, records the path and arms the shared no-ack
+      // deadline; the container owns what happens when it expires.
+      bindPath(normalizedIncoming);
+      return true;
     };
-    EventBus.on('handler-reload-complete', onHandlerReloadComplete);
-    return () => {
-      EventBus.off('handler-reload-complete', onHandlerReloadComplete);
-    };
-  }, [debouncedRequestViewportDataForCounts]);
 
-  useEffect(() => {
-    return () => {
-      if (viewportDebounceRef.current) {
-        clearTimeout(viewportDebounceRef.current);
-        viewportDebounceRef.current = null;
+    const flushPendingPathRefresh = () => {
+      const pending = pendingPathRefreshRef.current;
+      if (!pending) return;
+      if (sendSetPath(pending.path, pending.forceReload, pending.skipViewportRefresh)) {
+        pendingPathRefreshRef.current = null;
       }
     };
-  }, []);
 
-  // Handle refresh-websocket-path event
-  useEffect(() => {
     const handleRefreshWebSocketPath = ({
       path,
       forceReload,
-      patchesOnly: _patchesOnly,
+      skipViewportRefresh,
     }: {
       path: string;
       forceReload?: boolean;
-      patchesOnly?: boolean;
+      skipViewportRefresh?: boolean;
     }) => {
-      // Mark last workflow-related refresh time for brief retry window on Space/X
-      lastWorkflowRefreshTsRef.current = Date.now();
-      if (socket && socket.readyState === WebSocket.OPEN && path) {
-        // Clear hash when refreshing WebSocket path
-        lastHashRef.current = null;
-        // If the path hasn't changed, avoid reloading the Zarr; just ask for counts
-        const normalizedIncoming = (path || '').replace(/\.(zarr)$/i, '');
-        const normalizedCurrent = (currentPath || '').replace(/\.(zarr)$/i, '');
-        // Force reload if the flag is set (e.g., after workflow completion)
-        if (!forceReload && (lastSentPathRef.current === normalizedIncoming || normalizedIncoming === normalizedCurrent)) {
-          debouncedRequestViewportDataForCounts();
-        } else {
-          // Clear any existing timeout
-          if (zarrInitTimeoutRef.current) {
-            clearTimeout(zarrInitTimeoutRef.current);
-            zarrInitTimeoutRef.current = null;
-          }
-
-          setLoadingAnnotations(true);
-          setIsZarrInitializing(true); // Mark Zarr as initializing
-
-          // Set timeout for Zarr initialization
-          zarrInitTimeoutRef.current = setTimeout(() => {
-            console.log(
-              `[Zarr Init Timeout] No response after ${ZARR_INIT_TIMEOUT_MS / 1000} seconds during force reload, assuming no Zarr file`,
-            );
-            setIsZarrInitializing(false);
-            setLoadingAnnotations(false);
-            setIsRequestPending(false);
-            setCurrentRequestType(null);
-            zarrInitTimeoutRef.current = null;
-          }, ZARR_INIT_TIMEOUT_MS);
-
-          socket.send(
-            JSON.stringify({
-              type: 'set_path',
-              path: normalizedIncoming,
-              instance_id: instanceId,
-            })
-          );
-          // Viewport refetch: debounced path above, or handler-reload-complete after set_path ack (handleZarrLoadedSuccess).
-        }
+      if (!path) {
+        return;
       }
+      const normalizedIncoming = stripZarrSuffix(path);
+      const normalizedMine = stripZarrSuffix(currentPath || '');
+      // Emitters decide "this reload is for the open slide" with
+      // workflowZarrPathsMatch (see runWorkflowCompletionShared). Re-checking it
+      // here with raw string equality dropped every reload whose path was an
+      // equivalent-but-different form of ours — Windows `\` vs `/` from
+      // formatPath, storage-relative vs absolute, case — so a finished
+      // classification never refreshed the overlay at all.
+      if (normalizedMine && !workflowZarrPathsMatch(normalizedIncoming, normalizedMine)) {
+        return;
+      }
+      if (!normalizedMine && !isActive) {
+        return;
+      }
+      // Bind our own form of the path, not the emitter's. boundPathRef is what
+      // the container compares against `currentPath` to decide whether it still
+      // needs a set_path; binding a different spelling of the same slide would
+      // make it fire a second, redundant bind on the next render.
+      const targetPath = normalizedMine || normalizedIncoming;
+      if (sendSetPath(targetPath, forceReload, skipViewportRefresh)) {
+        pendingPathRefreshRef.current = null;
+        return;
+      }
+      // Wait for socket `open` (or effect re-run when socket becomes OPEN).
+      pendingPathRefreshRef.current = {
+        path: targetPath,
+        forceReload,
+        skipViewportRefresh,
+      };
     };
 
-    EventBus.on('refresh-websocket-path', handleRefreshWebSocketPath);
+    if (isActive) {
+      flushPendingPathRefresh();
+    }
+
+    const onSocketOpen = () => {
+      flushPendingPathRefresh();
+    };
+    socket?.addEventListener('open', onSocketOpen);
+
+    eventBus.on('refresh-websocket-path', handleRefreshWebSocketPath);
     return () => {
-      EventBus.off('refresh-websocket-path', handleRefreshWebSocketPath);
+      eventBus.off('refresh-websocket-path', handleRefreshWebSocketPath);
+      socket?.removeEventListener('open', onSocketOpen);
     };
   }, [
     socket,
-    viewerInstance,
     currentPath,
-    debouncedRequestViewportDataForCounts,
-    setLoadingAnnotations,
-    setIsZarrInitializing,
-    setIsRequestPending,
-    setCurrentRequestType,
-    zarrInitTimeoutRef,
+    setPendingRequest,
     lastHashRef,
     lastSentPathRef,
-    lastWorkflowRefreshTsRef,
-    ZARR_INIT_TIMEOUT_MS,
     instanceId,
+    isActive,
+    pathReadyForDataRef,
+    forceOverlaySync,
+    resetOverlay,
+    clearAbandonedCellReplies,
   ]);
 
-  // Handle refresh-patches event
+  // `refresh-patches` is emitted in the same tick as the `refresh-websocket-path`
+  // that begins a reload (see runWorkflowCompletionShared), so the wire gate is
+  // already shut when it lands: `requestPatches` is dropped by canSendWire
+  // without ever marking a flight, and `refreshPatchClassificationData` reads
+  // HTTP from a handler still serving the pre-run zarr. Both then keep the
+  // pre-run legend/patches on screen. Hold the refresh and replay it when the
+  // gate reopens — see the effect below.
+  const pendingPatchRefreshRef = useRef(false);
+
   useEffect(() => {
-    const handleRefreshPatches = () => {
-      requestPatchesForViewport();
+    const runPatchRefresh = () => {
+      void refreshPatchClassificationData();
+      requestPatches();
     };
 
-    EventBus.on('refresh-patches', handleRefreshPatches);
-    return () => {
-      EventBus.off('refresh-patches', handleRefreshPatches);
+    const handleRefreshPatches = () => {
+      if (!isActive) return;
+      if (pathReadyForDataRef && !pathReadyForDataRef.current) {
+        pendingPatchRefreshRef.current = true;
+        return;
+      }
+      runPatchRefresh();
     };
-  }, [requestPatchesForViewport, refreshPatchClassificationData]);
+
+    eventBus.on('refresh-patches', handleRefreshPatches);
+    return () => {
+      eventBus.off('refresh-patches', handleRefreshPatches);
+    };
+  }, [requestPatches, refreshPatchClassificationData, isActive, pathReadyForDataRef]);
+
+  // The gate reopening is the replay trigger, whichever way it opened: the
+  // set_path ack, the no-ack retry-then-rebuild ladder, or `binding.fail()` (a
+  // backend error, which reopens the wire deliberately so late data is still
+  // accepted). `isPathBound` mirrors that transition into render, because a ref
+  // cannot be an effect dependency.
+  useEffect(() => {
+    if (!isPathBound) return;
+    if (!pendingPatchRefreshRef.current) return;
+    if (!isActive) return;
+    pendingPatchRefreshRef.current = false;
+    void refreshPatchClassificationData();
+    requestPatches();
+  }, [isPathBound, isActive, refreshPatchClassificationData, requestPatches]);
 };

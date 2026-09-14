@@ -11,7 +11,7 @@ import {
 } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/utils/twMerge";
+import { cn } from "@/utils/common/twMerge";
 import { FileText, ChevronRight, ArrowLeft, Info } from "lucide-react";
 import { marked } from "marked";
 
@@ -181,13 +181,13 @@ export const AnnouncementDialog: React.FC<AnnouncementDialogProps> = ({
                     onClick={() => handleAnnouncementClick(item)}
                   >
                     <div className="flex items-start gap-3 flex-1 text-left">
-                      <FileText className="h-5 w-5 text-muted-foreground mt-0.5 flex-shrink-0" />
+                      <FileText className="h-5 w-5 text-muted-foreground mt-0.5 shrink-0" />
                       <div className="flex-1 min-w-0">
                         <div className="font-medium text-foreground">{item.title}</div>
                         <div className="text-sm text-muted-foreground mt-1">{item.date}</div>
                       </div>
                     </div>
-                    <ChevronRight className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                    <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0" />
                   </Button>
                 ))}
               </div>
