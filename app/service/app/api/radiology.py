@@ -1,19 +1,22 @@
 """
-Radiology mask API endpoints
-Provides endpoints for finding and loading segmentation masks from Zarr files for NII volumes
+Radiology mask API endpoints — thin forwarding layer.
+
+Routing + HTTP response shaping only; all discovery/loading logic lives in
+app.services.radiology.
 """
 
 from fastapi import APIRouter, Request, Response, HTTPException, Query, Body
 import zstandard as zstd
 import struct
+from app.core.access import authorize_read_or_response
 from app.core.response import success_response
-from app.services.radiology_service import (
+from app.services.radiology import (
     find_radiology_mask_service,
-    load_radiology_mask_data_service,
+    load_radiology_mask_by_path_service,
     search_radiology_mask_datasets_service,
-    RadiologyMaskFinder
+    auto_find_and_load_radiology_mask_service,
+    list_zarr_files_service,
 )
-from app.utils import resolve_path
 
 radiology_router = APIRouter()
 
@@ -48,17 +51,17 @@ def create_success_binary_response(result: dict):
         result['original_size'],        # original_size (4 bytes)
         len(result['dtype'])            # dtype length (4 bytes)
     )
-    
+
     # Add dtype string
     dtype_bytes = result['dtype'].encode('utf-8')
-    
+
     # Combine metadata + dtype + data
     response_data = metadata + dtype_bytes + result['data']
-    
+
     # Compress with zstd
     cctx = zstd.ZstdCompressor(level=1)
     compressed_data = cctx.compress(response_data)
-    
+
     return Response(
         content=compressed_data,
         media_type='application/octet-stream',
@@ -69,85 +72,50 @@ def create_success_binary_response(result: dict):
     )
 
 
+
 @radiology_router.get("/v1/find_mask")
-async def find_radiology_mask(
+def find_radiology_mask(
     request: Request,
     base_path: str = Query(..., description="Base path to search for Zarr files")
 ):
     """Find radiology mask for a given base path"""
     try:
-        # Resolve the base path
-        resolved_path = resolve_path(base_path)
-        
-        result = find_radiology_mask_service(resolved_path)
-        return success_response(result)
-    
+        authorized, denied = authorize_read_or_response(request, base_path, operation="find radiology mask")
+        if denied is not None:
+            return denied
+        return success_response(find_radiology_mask_service(authorized))
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Base path not found")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error finding radiology mask: {str(e)}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid radiology mask request")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Error finding radiology mask")
 
 
 @radiology_router.get("/v1/load_mask_data")
-async def load_radiology_mask_data(
+def load_radiology_mask_data(
     request: Request,
     zarr_file_path: str = Query(..., description="Path to Zarr file"),
 ):
     """Load radiology mask data from Zarr file (automatically detects and merges multiple datasets if found)"""
     try:
-        # Resolve the Zarr file path
-        resolved_path = resolve_path(zarr_file_path)
-        
-        # Check if the path is already an Zarr file
-        if resolved_path.endswith('.zarr'):
-            # Direct Zarr file path - find datasets in this file
-            finder = RadiologyMaskFinder()
-            datasets = finder.find_datasets(resolved_path)
-            if not datasets:
-                raise HTTPException(status_code=404, detail="No datasets found")
-            
-            # Create mask_info for direct Zarr file
-            if len(datasets) == 1:
-                mask_info = datasets[0]
-                mask_info['zarr_file'] = resolved_path
-                mask_info['is_merged'] = False
-            else:
-                mask_info = {
-                    'zarr_file': resolved_path,
-                    'is_merged': True,
-                    'num_datasets': len(datasets),
-                    'datasets': datasets,
-                    'merged_path': 'auto_merged',
-                    'shape': datasets[0]['shape'] if datasets else None,
-                    'dtype': datasets[0]['dtype'] if datasets else None
-                }
-        else:
-            # Original file path - find corresponding Zarr file
-            finder = RadiologyMaskFinder()
-            mask_info = finder.find_radiology_mask(resolved_path)
-            if not mask_info:
-                raise HTTPException(status_code=404, detail="No datasets found")
-        
-        result = load_radiology_mask_data_service(mask_info['zarr_file'], mask_info)
-        
+        authorized, denied = authorize_read_or_response(request, zarr_file_path, operation="load radiology mask")
+        if denied is not None:
+            return denied
+        result = load_radiology_mask_by_path_service(authorized)
         if not result['success']:
             return create_error_binary_response()
-        
-        
         return create_success_binary_response(result)
-    
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Zarr file not found")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error loading radiology mask data: {str(e)}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid radiology mask request")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Error loading radiology mask data")
 
 
 @radiology_router.get("/v1/search_datasets")
-async def search_radiology_mask_datasets(
+def search_radiology_mask_datasets(
     request: Request,
     zarr_file_path: str = Query(..., description="Path to Zarr file"),
     query: str = Query("", description="Search query for dataset names"),
@@ -155,93 +123,53 @@ async def search_radiology_mask_datasets(
 ):
     """Search for radiology mask datasets in Zarr file"""
     try:
-        # Resolve the Zarr file path
-        resolved_path = resolve_path(zarr_file_path)
-        
-        result = search_radiology_mask_datasets_service(resolved_path, query, include_segmentation)
+        authorized, denied = authorize_read_or_response(request, zarr_file_path, operation="search radiology mask datasets")
+        if denied is not None:
+            return denied
+        result = search_radiology_mask_datasets_service(
+            authorized, query, include_segmentation
+        )
         return success_response(result)
-    
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Zarr file not found")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error searching radiology mask datasets: {str(e)}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid radiology mask request")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Error searching radiology mask datasets")
 
 
 @radiology_router.post("/v1/auto_find_and_load")
-async def auto_find_and_load_radiology_mask(
+def auto_find_and_load_radiology_mask(
     request: Request,
     base_path: str = Body(..., embed=True, description="Base path to search for Zarr files"),
 ):
     """Automatically find and load the best radiology mask"""
     try:
-        # Resolve the base path
-        resolved_path = resolve_path(base_path)
-        
-        # First, find the radiology mask
-        find_result = find_radiology_mask_service(resolved_path)
-        
-        if not find_result['found']:
+        authorized, denied = authorize_read_or_response(request, base_path, operation="auto find radiology mask")
+        if denied is not None:
+            return denied
+        result = auto_find_and_load_radiology_mask_service(authorized)
+        if result is None or not result['success']:
             return create_error_binary_response()
-        
-        # Load the data for the selected dataset
-        load_result = load_radiology_mask_data_service(
-            find_result['zarr_file'],
-            find_result['dataset_path']
-        )
-        
-        if not load_result['success']:
-            return create_error_binary_response()
-        
-        return create_success_binary_response(load_result)
-    
+        return create_success_binary_response(result)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Base path not found")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error in auto find and load radiology mask: {str(e)}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid radiology mask request")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Error in auto find and load radiology mask")
 
 
 @radiology_router.get("/v1/list_zarr_files")
-async def list_potential_zarr_files(
+def list_potential_zarr_files(
     request: Request,
     base_path: str = Query(..., description="Base path to search for Zarr files")
 ):
     """List potential Zarr files for radiology masks"""
     try:
-        from app.services.radiology_service import RadiologyMaskFinder
-        
-        # Resolve the base path
-        resolved_path = resolve_path(base_path)
-        
-        finder = RadiologyMaskFinder()
-        zarr_files = finder.find_zarr_files(resolved_path)
-        
-        # Check which files actually exist and have segmentation data
-        file_info = []
-        for zarr_file in zarr_files:
-            try:
-                datasets = finder.find_datasets(zarr_file)
-                file_info.append({
-                    'path': zarr_file,
-                    'exists': True,
-                    'segmentation_datasets_count': len(datasets),
-                    'datasets': datasets
-                })
-            except Exception as e:
-                file_info.append({
-                    'path': zarr_file,
-                    'exists': False,
-                    'error': str(e)
-                })
-        
-        return success_response({
-            'base_path': resolved_path,
-            'zarr_files': file_info,
-            'total_found': len(zarr_files)
-        })
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing Zarr files for radiology masks: {str(e)}")
+        authorized, denied = authorize_read_or_response(request, base_path, operation="list radiology Zarr files")
+        if denied is not None:
+            return denied
+        return success_response(list_zarr_files_service(authorized))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Error listing Zarr files for radiology masks")

@@ -5,8 +5,8 @@ import Image from 'next/image';
 import { Image as ImageIcon } from 'lucide-react';
 import { InlineSpinner } from '@/components/assets/PageLoading';
 import { getPreviewAsync } from '@/services/file.service';
-import { shortHashFromString } from '@/utils/string.utils';
-import { ImagePreviewType } from '@/types/fileManagerTypes';
+import { shortHashFromString } from '@/utils/common/string.utils';
+import { ImagePreviewType } from '@/types/fileManager.types';
 
 interface ImagePreviewCellProps {
   fileName: string;
@@ -20,9 +20,11 @@ const ImagePreviewCell: React.FC<ImagePreviewCellProps> = ({
   imageType,
 }) => {
   const [previewData, setPreviewData] = useState<{
-    thumbnail: string | null;
-    macro: string | null;
-    label: string | null;
+    thumbnail?: string | null;
+    macro?: string | null;
+    label?: string | null;
+    cell_overlay?: string | null;
+    patch_overlay?: string | null;
     filename: string;
     available: string[];
     source_file?: string;
@@ -47,8 +49,13 @@ const ImagePreviewCell: React.FC<ImagePreviewCellProps> = ({
       const pathHash = shortHashFromString(fullPath, 8);
       const requestId = `preview_${pathHash}_${timestamp}_${randomId}`;
 
-      console.log('🚀 Using async Celery service for preview:', { fileName, fullPath, requestId });
-      const data = await getPreviewAsync(fullPath, 'all', 200, requestId);
+      // Overlay variants are fetched by their own preview_type (the backend bakes
+      // classification colors and returns a base64 data URL keyed by that type);
+      // everything else uses the bundled 'all' preview.
+      const previewType =
+        imageType === 'cell_overlay' || imageType === 'patch_overlay' ? imageType : 'all';
+      console.log('🚀 Submitting async preview task:', { fileName, fullPath, requestId, previewType });
+      const data = await getPreviewAsync(fullPath, previewType, 200, requestId);
       console.log('✅ Async preview completed for:', fileName);
 
       console.log('Preview data for', fileName, ':', data);
@@ -70,7 +77,7 @@ const ImagePreviewCell: React.FC<ImagePreviewCellProps> = ({
       setIsLoading(false);
       loadingRef.current = false;
     }
-  }, [fileName, fullPath, previewData, isLoading]);
+  }, [fileName, fullPath, previewData, isLoading, imageType]);
 
   const [elementRef, setElementRef] = useState<HTMLDivElement | null>(null);
 

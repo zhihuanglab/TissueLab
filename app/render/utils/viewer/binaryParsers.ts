@@ -1,240 +1,187 @@
-import { CentroidsArray, createCentroidsArrayProxy } from '@/components/imageViewer/CentroidsArray';
+import { CentroidsArray } from '@/types/centroidsArray';
 
 /**
- * Helper function to read uint32 from arrayBuffer at offset, handling alignment
+ * Reader for the overlay binary frame.
+ * Layout and rationale: app/service/app/websocket/overlay_binary.py
  */
-export function readUint32(arrayBuffer: ArrayBuffer, offset: number): number {
-  if (offset % 4 === 0) {
-    return new Uint32Array(arrayBuffer, offset, 1)[0];
-  } else {
-    // Not aligned, read manually using Uint8Array
-    const bytes = new Uint8Array(arrayBuffer, offset, 4);
-    return bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
+
+const MAGIC = 0x54; // 'T'
+const VERSION = 1;
+
+const KIND_CENTROIDS = 1;
+const KIND_ANNOTATIONS = 2;
+const KIND_ALL_ANNOTATIONS = 3;
+
+const decoder = new TextDecoder();
+
+export type OverlayFrameType = 'centroids' | 'annotations' | 'all_annotations';
+
+export type OverlayContour = {
+  id: string;
+  /** Flat image-space coords [x0, y0, x1, y1, ...]; point count is length / 2. */
+  points: Int32Array;
+  class_id: number;
+};
+
+export type OverlayBinaryFrame = {
+  type: OverlayFrameType;
+  /** Routes the frame — one socket serves every open viewer. */
+  instance_id: string;
+  class_names: string[];
+  class_colors: string[];
+  class_counts_by_id: Record<string, number>;
+  dynamic_class_names: string[];
+  centroids?: CentroidsArray;
+  annotations?: OverlayContour[];
+  all_annotations?: OverlayContour[];
+};
+
+/** True when this buffer is an overlay frame (vs. a JSON payload). */
+export function isOverlayFrame(buffer: Uint8Array): boolean {
+  return buffer.length >= 4 && buffer[0] === MAGIC;
+}
+
+function align4(offset: number): number {
+  const remainder = offset % 4;
+  return remainder ? offset + (4 - remainder) : offset;
+}
+
+/** Normalise to a standalone ArrayBuffer so typed-array views stay aligned. */
+function toArrayBuffer(buffer: Uint8Array): ArrayBuffer {
+  if (buffer.byteOffset === 0 && buffer.byteLength === buffer.buffer.byteLength) {
+    return buffer.buffer as ArrayBuffer;
+  }
+  return buffer.buffer.slice(
+    buffer.byteOffset,
+    buffer.byteOffset + buffer.byteLength,
+  ) as ArrayBuffer;
+}
+
+class FrameCursor {
+  offset = 0;
+
+  constructor(
+    readonly bytes: Uint8Array,
+    readonly view: DataView,
+  ) {}
+
+  u32(): number {
+    const value = this.view.getUint32(this.offset, true);
+    this.offset += 4;
+    return value;
+  }
+
+  /** Length-prefixed utf-8. */
+  str(): string {
+    const length = this.u32();
+    const text = decoder.decode(this.bytes.subarray(this.offset, this.offset + length));
+    this.offset += length;
+    return text;
+  }
+
+  strList(): string[] {
+    const count = this.u32();
+    const values: string[] = new Array(count);
+    for (let i = 0; i < count; i++) values[i] = this.str();
+    return values;
+  }
+
+  /** Aligned int32 block — a view, not a copy. */
+  i32Block(length: number): Int32Array {
+    const block = new Int32Array(this.view.buffer, this.offset, length);
+    this.offset += length * 4;
+    return block;
+  }
+
+  padTo4(): void {
+    this.offset = align4(this.offset);
   }
 }
 
+function readContours(cursor: FrameCursor): OverlayContour[] {
+  const count = cursor.u32();
+  const totalPoints = cursor.u32();
+  const ids = cursor.i32Block(count);
+  const classIds = cursor.i32Block(count);
+  const pointCounts = cursor.i32Block(count);
+  const xy = cursor.i32Block(totalPoints * 2);
+
+  const contours: OverlayContour[] = new Array(count);
+  let offset = 0;
+  for (let i = 0; i < count; i++) {
+    const numPoints = pointCounts[i];
+    contours[i] = {
+      id: ids[i].toString(),
+      // Zero-copy window into the frame. Materialising number[][] here cost ~15 ms
+      // per 20k-cell frame (800k array literals) and ~10x the retained memory;
+      // the frame buffer stays alive instead, which is far cheaper.
+      points: xy.subarray(offset, offset + numPoints * 2),
+      class_id: classIds[i],
+    };
+    offset += numPoints * 2;
+  }
+  return contours;
+}
+
 /**
- * Parse binary segmentation data format
- * Format: 
- * - 4 bytes: type header ('c') + 3 bytes padding (aligned)
- * - uint32: count of points
- * - Points array: each point is [id(uint32), x(int32), y(int32), class_id(int32)]
- * - uint32: count of class names
- * - Class names: each name is [length(uint32), utf-8 bytes]
- * - uint32: count of class colors
- * - Class colors: each color is [length(uint32), utf-8 bytes]
- * - uint32: length of class counts JSON
- * - Class counts: JSON string [utf-8 bytes]
+ * Parse an overlay frame. Returns null when the buffer is not one (the caller
+ * then falls back to JSON) or when the version does not match this client.
  */
-export function parseSegmentationBinary(buffer: Uint8Array): any {
-  // Get the underlying ArrayBuffer from the Uint8Array
-  // Optimize: avoid slice() if buffer is already a complete view (byteOffset = 0)
-  // In practice, Uint8Array from WebSocket/decompression always uses ArrayBuffer, not SharedArrayBuffer
-  let arrayBuffer: ArrayBuffer;
-  if (buffer.byteOffset === 0 && buffer.byteLength === buffer.buffer.byteLength) {
-    // Buffer is already a complete view, use it directly (no copy)
-    arrayBuffer = buffer.buffer as ArrayBuffer;
-  } else {
-    // Buffer is a partial view, need to slice (creates a copy)
-    arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer;
+export function parseOverlayFrame(buffer: Uint8Array): OverlayBinaryFrame | null {
+  if (!isOverlayFrame(buffer)) return null;
+
+  const version = buffer[1];
+  if (version !== VERSION) {
+    console.error(
+      `[Overlay] binary frame v${version} does not match client v${VERSION} — update the service`,
+    );
+    return null;
   }
-  let offset = 4; // Skip type header ('c') + 3 bytes padding (4 bytes total, aligned)
-  
-  // Read points count (using helper to handle alignment)
-  const numPoints = readUint32(arrayBuffer, offset);
-  offset += 4;
-  
-  // Optimized: Use TypedArray views for batch reading
-  // Format: id(uint32), x(int32), y(int32), class_id(int32) = 16 bytes per point
-  // Memory layout per point: [id(4B)][x(4B)][y(4B)][class_id(4B)]
-  const pointsByteLength = numPoints * 16;
-  const pointsStartOffset = offset;
-  
-  // Use Int32Array + CentroidsArray wrapper for efficient access
-  // Format: [id, x, y, classId, id, x, y, classId, ...] - flat array
-  const centroidsData = new Int32Array(arrayBuffer, pointsStartOffset, numPoints * 4);
-  const centroids = createCentroidsArrayProxy(centroidsData, numPoints);
-  
-  offset += pointsByteLength;
-  
-  // Read class names count (using helper to handle alignment)
-  const numClassNames = readUint32(arrayBuffer, offset);
-  offset += 4;
-  
-  // Read class names
-  const classNames: string[] = [];
-  for (let i = 0; i < numClassNames; i++) {
-    const nameLength = readUint32(arrayBuffer, offset);
-    offset += 4;
-    const nameBytes = buffer.slice(offset, offset + nameLength);
-    const name = new TextDecoder().decode(nameBytes);
-    offset += nameLength;
-    classNames.push(name);
-  }
-  
-  // Read class colors count (using helper to handle alignment)
-  const numClassColors = readUint32(arrayBuffer, offset);
-  offset += 4;
-  
-  // Read class colors
-  const classColors: string[] = [];
-  for (let i = 0; i < numClassColors; i++) {
-    const colorLength = readUint32(arrayBuffer, offset);
-    offset += 4;
-    const colorBytes = buffer.slice(offset, offset + colorLength);
-    const color = new TextDecoder().decode(colorBytes);
-    offset += colorLength;
-    classColors.push(color);
-  }
-  
-  // Read class counts JSON (using helper to handle alignment)
-  const countsLength = readUint32(arrayBuffer, offset);
-  offset += 4;
-  const countsBytes = buffer.slice(offset, offset + countsLength);
-  const countsJson = new TextDecoder().decode(countsBytes);
-  const classCountsById = JSON.parse(countsJson);
-  
-  // Return in the same format as JSON version
-  return {
+
+  const kind = buffer[2];
+  const idLength = buffer[3];
+  const arrayBuffer = toArrayBuffer(buffer);
+  const bytes = new Uint8Array(arrayBuffer);
+  const cursor = new FrameCursor(bytes, new DataView(arrayBuffer));
+
+  cursor.offset = 4;
+  const instanceId = idLength
+    ? decoder.decode(bytes.subarray(4, 4 + idLength))
+    : '';
+  cursor.offset = align4(4 + idLength);
+
+  const classNames = cursor.strList();
+  const classColors = cursor.strList();
+  const classCountsById = JSON.parse(cursor.str() || '{}');
+  cursor.padTo4();
+
+  const frame: OverlayBinaryFrame = {
     type: 'centroids',
-    centroids: centroids,
+    instance_id: instanceId,
     class_names: classNames,
     class_colors: classColors,
     class_counts_by_id: classCountsById,
-    dynamic_class_names: classNames
+    dynamic_class_names: classNames,
   };
-}
 
-/**
- * Parse binary annotations/contours data format
- * Format:
- * - 4 bytes: type header ('a' or 'A') + 3 bytes padding (aligned)
- * - uint32: count of annotations
- * - For each annotation:
- *   - uint32: id (nucleus index)
- *   - int32: class_id
- *   - uint32: point count
- *   - Points: [x(int32), y(int32)] * point_count
- * - uint32: count of class names
- * - Class names: each name is [length(uint32), utf-8 bytes]
- * - uint32: count of class colors
- * - Class colors: each color is [length(uint32), utf-8 bytes]
- * - uint32: length of class counts JSON
- * - Class counts: JSON string [utf-8 bytes]
- */
-export function parseAnnotationsBinary(buffer: Uint8Array): any {
-  // Get the underlying ArrayBuffer from the Uint8Array
-  // Optimize: avoid slice() if buffer is already a complete view (byteOffset = 0)
-  // In practice, Uint8Array from WebSocket/decompression always uses ArrayBuffer, not SharedArrayBuffer
-  let arrayBuffer: ArrayBuffer;
-  if (buffer.byteOffset === 0 && buffer.byteLength === buffer.buffer.byteLength) {
-    // Buffer is already a complete view, use it directly (no copy)
-    arrayBuffer = buffer.buffer as ArrayBuffer;
-  } else {
-    // Buffer is a partial view, need to slice (creates a copy)
-    arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer;
+  if (kind === KIND_CENTROIDS) {
+    const count = cursor.u32();
+    frame.centroids = new CentroidsArray(cursor.i32Block(count * 4), count);
+    return frame;
   }
-  let offset = 4; // Skip type header ('a' or 'A') + 3 bytes padding (4 bytes total, aligned)
-  
-  // Read annotations count (using helper to handle alignment)
-  const numAnnotations = readUint32(arrayBuffer, offset);
-  offset += 4;
-  
-  // Read annotations
-  const annotations: any[] = [];
-  let annotationsOffset = offset;
-  
-  for (let i = 0; i < numAnnotations; i++) {
-    const id = readUint32(arrayBuffer, annotationsOffset);
-    annotationsOffset += 4;
-    // Read int32: check alignment
-    const classId = annotationsOffset % 4 === 0 
-      ? new Int32Array(arrayBuffer, annotationsOffset, 1)[0]
-      : (() => {
-          const bytes = new Uint8Array(arrayBuffer, annotationsOffset, 4);
-          return (bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)) | 0;
-        })();
-    annotationsOffset += 4;
-    const numPoints = readUint32(arrayBuffer, annotationsOffset);
-    annotationsOffset += 4;
-    
-    // Optimized: Use TypedArray for batch reading points
-    // Format: [x(int32), y(int32)] = 8 bytes per point
-    if (numPoints > 0) {
-      const pointsByteLength = numPoints * 8;
-      
-      // Header is now 4-byte aligned (type header + 3 bytes padding), so all offsets are aligned
-      // Use Int32Array for fast batch reading
-      const pointsInt32View = new Int32Array(arrayBuffer, annotationsOffset, numPoints * 2);
-      
-      // Pre-allocate points array
-      const points: number[][] = new Array(numPoints);
-      for (let j = 0; j < numPoints; j++) {
-        points[j] = [pointsInt32View[j * 2], pointsInt32View[j * 2 + 1]];
-      }
-      
-      annotations.push({
-        id: id.toString(),
-        points: points,
-        class_id: classId
-      });
-      
-      annotationsOffset += pointsByteLength;
-    } else {
-      annotations.push({
-        id: id.toString(),
-        points: [],
-        class_id: classId
-      });
-    }
-  }
-  offset = annotationsOffset;
-  
-  // Read class names count (using helper to handle alignment)
-  const numClassNames = readUint32(arrayBuffer, offset);
-  offset += 4;
-  
-  // Read class names
-  const classNames: string[] = [];
-  for (let i = 0; i < numClassNames; i++) {
-    const nameLength = readUint32(arrayBuffer, offset);
-    offset += 4;
-    const nameBytes = buffer.slice(offset, offset + nameLength);
-    const name = new TextDecoder().decode(nameBytes);
-    offset += nameLength;
-    classNames.push(name);
-  }
-  
-  // Read class colors count (using helper to handle alignment)
-  const numClassColors = readUint32(arrayBuffer, offset);
-  offset += 4;
-  
-  // Read class colors
-  const classColors: string[] = [];
-  for (let i = 0; i < numClassColors; i++) {
-    const colorLength = readUint32(arrayBuffer, offset);
-    offset += 4;
-    const colorBytes = buffer.slice(offset, offset + colorLength);
-    const color = new TextDecoder().decode(colorBytes);
-    offset += colorLength;
-    classColors.push(color);
-  }
-  
-  // Read class counts JSON (using helper to handle alignment)
-  const countsLength = readUint32(arrayBuffer, offset);
-  offset += 4;
-  const countsBytes = buffer.slice(offset, offset + countsLength);
-  const countsJson = new TextDecoder().decode(countsBytes);
-  const classCountsById = JSON.parse(countsJson);
-  
-  // Return in the same format as JSON version
-  return {
-    type: 'annotations',
-    annotations: annotations,
-    class_names: classNames,
-    class_colors: classColors,
-    class_counts_by_id: classCountsById,
-    dynamic_class_names: classNames
-  };
-}
 
+  if (kind === KIND_ANNOTATIONS) {
+    frame.type = 'annotations';
+    frame.annotations = readContours(cursor);
+    return frame;
+  }
+
+  if (kind === KIND_ALL_ANNOTATIONS) {
+    frame.type = 'all_annotations';
+    frame.all_annotations = readContours(cursor);
+    return frame;
+  }
+
+  console.error('[Overlay] unknown binary frame kind', kind);
+  return null;
+}

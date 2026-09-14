@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Separator } from '@/components/ui/separator'
-import { useUserInfo } from '@/provider/UserInfoProvider'
+import { useUserInfo } from '@/contexts/UserInfoProvider'
 import { RootState } from '@/store'
 import { setHighlightGtAnnotations } from '@/store/slices/viewer/viewerSettingsSlice'
 

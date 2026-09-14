@@ -11,8 +11,10 @@ const nextConfig = {
   env: {
     PUBLIC_AI_SERVICE_SOCKET_ENDPOINT: process.env.PUBLIC_AI_SERVICE_SOCKET_ENDPOINT,
     PUBLIC_AI_SERVICE_API_ENDPOINT: process.env.PUBLIC_AI_SERVICE_API_ENDPOINT,
-    PUBLIC_CTRL_SERVICE_API_ENDPOINT: process.env.PUBLIC_CTRL_SERVICE_API_ENDPOINT,
-    DEBUG_ENV: process.env.DEBUG_ENV,
+    // Hosted TissueLab community (Ctrl Service). Listed here because it does
+    // not carry the NEXT_PUBLIC_ prefix and would otherwise be inlined as
+    // `undefined` at build time.
+    PUBLIC_COMMUNITY_API_ENDPOINT: process.env.PUBLIC_COMMUNITY_API_ENDPOINT,
     NEXT_PUBLIC_APP_VERSION: require('./package.json').version,
   },
   transpilePackages: [

@@ -14,8 +14,8 @@ declare global {
       uploadLocalFiles: (destDir: string, files: string[]) => Promise<any>;
       readFile: (filePath: string) => Promise<Buffer>;
       writeFile: (options: { filePath: string; content: string }) => Promise<{ success: boolean }>;
-      // OAuth APIs (PKCE-based; clientSecret is the non-confidential Desktop OAuth secret)
-      googleOAuth: (credentials: { clientId: string; clientSecret?: string }) => Promise<{
+      // OAuth APIs (PKCE-based, secretless)
+      googleOAuth: (credentials: { clientId: string }) => Promise<{
         success: boolean;
         tokens?: {
           access_token: string;
@@ -25,7 +25,7 @@ declare global {
         };
         error?: string;
       }>;
-      googleRefreshToken: (params: { refreshToken: string; clientId: string; clientSecret?: string }) => Promise<{
+      googleRefreshToken: (params: { refreshToken: string; clientId: string }) => Promise<{
         success: boolean;
         tokens?: {
           access_token: string;

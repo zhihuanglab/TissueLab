@@ -1,20 +1,22 @@
 "use client"
 
+import { usePathWriteAccess } from "@/hooks/usePathWriteAccess"
 import { useEffect, useState, useCallback, useRef } from "react"
-import { useSelector, useDispatch } from "react-redux"
-import { RootState } from "@/store"
+import { useDispatch } from "react-redux"
+import { useInstanceSlidePath } from "@/utils/viewer/slidePath";
 import { setFilterHighlightIndices } from "@/store/slices/viewer/shapeSlice"
 import { Button } from "@/components/ui/button"
-import { apiFetch } from "@/utils/common/apiFetch"
+import { segFetch } from "@/utils/common/segFetch"
 import { getErrorMessage } from "@/utils/common/apiResponse"
-import { AI_SERVICE_API_ENDPOINT } from "@/constants/config"
-import { formatPath } from "@/utils/pathUtils"
-import { getDefaultOutputPath } from "@/utils/workflowUtils"
-import { isPublicReadOnlyPath, getRestrictedDirectoryMessage } from "@/utils/sampleDirectoryUtils"
+import { AI_SERVICE_API_ENDPOINT } from "@/config/api.config"
+import { formatPath } from "@/utils/common/path.utils"
+import { getDefaultOutputPath } from "@/utils/agent/workflow/workflow.utils"
 import { toast } from "sonner"
-import EventBus from "@/utils/EventBus"
+import eventBus from "@/utils/common/eventBus"
 import { Save } from "lucide-react"
 import { useRefreshGtHighlightIndices } from "@/hooks/viewer/useRefreshGtHighlightIndices"
+import { useUserInfo } from "@/contexts/UserInfoProvider"
+import { resolveAnnotatorLabel } from "@/utils/viewer/annotator"
 import type { SelectedClass, ShapeCoords } from "./FilterContent"
 
 export type DistributionControlProps = {
@@ -181,7 +183,9 @@ export default function DistributionControl({
   instanceId?: string | null
 }) {
   const dispatch = useDispatch()
-  const currentPath = useSelector((state: RootState) => state.svsPath.currentPath)
+  const currentPath = useInstanceSlidePath(instanceId)
+  const { assertWritable, toastIfDenied, allowed: pathWritable, tooltip: writeBlockTitle } = usePathWriteAccess(currentPath)
+  const { userInfo } = useUserInfo()
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const isDraggingRef = useRef(false)
@@ -271,7 +275,8 @@ export default function DistributionControl({
     const end_y = shapeCoords.y2
     const class_id = selectedClass.index
     try {
-      const resp = await apiFetch(
+      const resp = await segFetch(
+        instanceId,
         `${AI_SERVICE_API_ENDPOINT}/seg/v1/region_probability_histogram?file_path=${encodeURIComponent(formattedPath)}&start_x=${start_x}&start_y=${start_y}&end_x=${end_x}&end_y=${end_y}&class_id=${class_id}`,
         { method: "GET", returnAxiosFormat: true }
       )
@@ -295,7 +300,7 @@ export default function DistributionControl({
     } finally {
       setLoading(false)
     }
-  }, [selectedClass.source, selectedClass.index, shapeCoords, currentPath])
+  }, [selectedClass.source, selectedClass.index, shapeCoords, currentPath, instanceId])
 
   useEffect(() => {
     if (selectedClass.source === "nuclei" && shapeCoords && selectedClass.index >= -1) {
@@ -328,8 +333,7 @@ export default function DistributionControl({
   const refreshGtHighlightIndices = useRefreshGtHighlightIndices()
 
   const saveHighlightedAsAnnotation = useCallback(async () => {
-    if (isPublicReadOnlyPath(currentPath ?? undefined)) {
-      toast.error(getRestrictedDirectoryMessage("save annotation"))
+    if (!assertWritable("save annotation")) {
       return
     }
     if (!instanceId) {
@@ -358,33 +362,32 @@ export default function DistributionControl({
         x2: shapeCoords.x2,
         y2: shapeCoords.y2,
         cell_indices: highlight,
+        annotator: resolveAnnotatorLabel({ userId: userInfo?.user_id }),
       }
-      const resp = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/seg/v1/save_annotation/batch`, {
+      const resp = await segFetch(instanceId, `${AI_SERVICE_API_ENDPOINT}/seg/v1/save_annotation/batch`, {
         method: "POST",
         body: JSON.stringify(payload),
-        headers: { "X-Instance-ID": instanceId },
         returnAxiosFormat: true,
       })
       const markedCount = resp?.data?.data?.marked_count ?? resp?.data?.marked_count ?? 0
       if (markedCount > 0) {
         toast.success(`Saved ${markedCount} annotation(s) as ground truth`)
-        EventBus.emit("refresh-annotations")
-        EventBus.emit("refresh-websocket-path", { path: formattedPath, forceReload: true })
-        refreshGtHighlightIndices()
+        eventBus.emit("refresh-annotations")
+        eventBus.emit("refresh-websocket-path", { path: formattedPath, forceReload: true })
+        refreshGtHighlightIndices(currentPath)
       } else {
         toast("No new annotations saved (cells may already be user annotations).")
       }
     } catch (err) {
-      const msg = getErrorMessage(err, "")
-      if (msg.includes("sample") || msg.includes("restricted")) {
-        toast.error(getRestrictedDirectoryMessage("save annotation"))
-      } else {
+      if (!toastIfDenied(err, "save annotation", "Failed to save annotations.")) {
         toast.error(getErrorMessage(err, "Failed to save annotations."))
       }
     } finally {
       setSaving(false)
     }
   }, [
+    assertWritable,
+    toastIfDenied,
     currentPath,
     instanceId,
     shapeCoords,
@@ -482,7 +485,8 @@ export default function DistributionControl({
           variant="default"
           size="sm"
           className="text-xs h-7"
-          disabled={saving || regionProbs.length === 0}
+          disabled={saving || regionProbs.length === 0 || !pathWritable}
+          title={writeBlockTitle}
           onClick={() => void saveHighlightedAsAnnotation()}
         >
           <Save className="h-3.5 w-3.5 mr-1" />

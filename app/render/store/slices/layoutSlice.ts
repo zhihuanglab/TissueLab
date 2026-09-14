@@ -5,6 +5,10 @@ interface LayoutState {
   unfoldable: boolean
   imageLoaded: boolean
   isMobile: boolean
+  // True from the moment a slide-open is triggered (dashboard click / file browser)
+  // until the viewer renders it — drives the full-screen "Opening…" cover. Lives in
+  // Redux so it survives the dashboard → /imageViewer route change.
+  wsiOpening: boolean
 }
 
 const initialState: LayoutState = {
@@ -12,6 +16,7 @@ const initialState: LayoutState = {
   unfoldable: false,
   imageLoaded: false,
   isMobile: false,
+  wsiOpening: false,
 }
 
 const layoutSlice = createSlice({
@@ -36,6 +41,9 @@ const layoutSlice = createSlice({
     setIsMobile(state, action: PayloadAction<boolean>) {
       state.isMobile = action.payload
     },
+    setWsiOpening(state, action: PayloadAction<boolean>) {
+      state.wsiOpening = action.payload
+    },
   },
 })
 
@@ -46,6 +54,7 @@ export const {
   toggleSidebarUnfoldable,
   setImageLoaded,
   setIsMobile,
+  setWsiOpening,
 } = layoutSlice.actions
 
 export default layoutSlice.reducer

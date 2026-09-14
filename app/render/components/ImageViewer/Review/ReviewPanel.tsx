@@ -1,5 +1,6 @@
 "use client";
 
+import { usePathWriteAccess } from "@/hooks/usePathWriteAccess"
 import React, { useEffect, useCallback, useState, useMemo, useRef } from "react";
 
 // Extend Window interface for Active Learning globals
@@ -10,16 +11,14 @@ declare global {
   }
 }
 import { useDispatch, useSelector } from "react-redux";
+import { useActiveSlidePath } from "@/utils/viewer/slidePath";
 import { AppDispatch, RootState } from "@/store";
-import { useReview, useNucleiClasses } from "@/hooks/useReview";
-import { useUserInfo } from "@/provider/UserInfoProvider";
+import { useReview, useNucleiClasses } from "@/hooks/review/useReview";
+import { useUserInfo } from "@/contexts/UserInfoProvider";
+import { resolveAnnotatorLabel } from "@/utils/viewer/annotator";
 import {
-  setReviewSession,
   clearReviewSession,
-  setClassFilter,
-  toggleClassInFilter,
   setThreshold,
-  setZoom,
   setSort,
   setPage,
   setCandidatesLoading,
@@ -28,19 +27,23 @@ import {
   labelCandidate,
   ReviewCandidate,
 } from "@/store/slices/reviewSlice";
-import { updateNucleiClass } from "@/store/slices/viewer/annotationSlice";
-import { apiFetch } from '@/utils/common/apiFetch';
+import {
+  updateNucleiClass,
+  clearPatchOverridesForIds,
+  AnnotationClass,
+} from "@/store/slices/viewer/annotationSlice";
+import { useRefreshGtHighlightIndices } from "@/hooks/viewer/useRefreshGtHighlightIndices";
+import { apiFetch, payloadFromAxiosAppResponse } from '@/utils/common/apiFetch'
+import { segFetch } from '@/utils/common/segFetch'
 import { getErrorMessage } from "@/utils/common/apiResponse";
-import { AI_SERVICE_API_ENDPOINT } from "@/constants/config";
-import EventBus from "@/utils/EventBus";
+import { toast } from "sonner";
+import { deleteNucleiAnnotation } from '@/services/data.service'
+import { AI_SERVICE_API_ENDPOINT } from "@/config/api.config";
+import eventBus from "@/utils/common/eventBus";
 
-import ClassList from "./ClassList";
 import ProbabilityCurve from "./ProbabilityCurve";
 import CandidateGallery from "./CandidateGallery";
-import ReclassificationToast from "./ReclassificationToast";
-import { ShuffleCandidatesDialog } from "./ShuffleCandidatesDialog";
-import { Button } from "@/components/ui/button";
-import { Shuffle } from "lucide-react";
+import { MousePointerClick, Sparkles } from "lucide-react";
 
 interface ActiveLearningPanelProps {
   selectedCell: {
@@ -54,15 +57,32 @@ interface ActiveLearningPanelProps {
     centroid: { x: number; y: number };
     slideId: string;
   }) => void;
-  // New: Notify parent component of pending submission count changes 
+  // New: Notify parent component of pending submission count changes
   onPendingCountChange?: (count: number) => void;
+  // Which classification this panel reviews: 'cell' (nuclei, default) or 'patch' (MUSK).
+  // Drives the candidate endpoint, class-list source and save/remove endpoints.
+  kind?: 'cell' | 'patch';
+  // Class list to review. Cell omits it (falls back to nuclei classes); patch
+  // must supply its patch/tissue classes.
+  reviewClasses?: AnnotationClass[];
   // New: ref for exposing internal methods
   ref?: React.Ref<ActiveLearningPanelRef>;
 }
 
+/**
+ * What a Save actually wrote, as reported by the backend — not the staged
+ * count. The backend skips candidates it cannot mark (no AI prediction, or the
+ * label is already the stored one), so the two numbers can differ.
+ * `null` means the save failed; the panel has already shown the error.
+ */
+export interface ReviewSaveResult {
+  marked: number;
+  removed: number;
+}
+
 // Exposed methods interface
 export interface ActiveLearningPanelRef {
-  submitPendingReclassifications: () => Promise<void>;
+  submitPendingReclassifications: () => Promise<ReviewSaveResult | null>;
   getPendingReclassificationsCount: () => number;
 }
 
@@ -71,32 +91,33 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
   isVisible,
   onSelectedCellChange,
   onPendingCountChange,
+  kind = 'cell',
+  reviewClasses: reviewClassesProp,
 }, ref) => {
+  // True when this panel reviews patch (MUSK) classification rather than nuclei.
+  const isPatch = kind === 'patch';
   
   const dispatch = useDispatch<AppDispatch>();
   
   // Redux state using safe hooks
   const nucleiClasses = useNucleiClasses();
+  // The class list under review: patch panels supply their own; cell falls back to nuclei.
+  const reviewClasses = reviewClassesProp ?? nucleiClasses;
   const reviewState = useReview();
-  
-  // Get user info for permission check
-  const { userInfo } = useUserInfo();
-  const currentUserId = userInfo?.user_id || '';
-  const ALLOWED_USER_ID = 'Ws2ZFfBLRZcRrXMtnvlesE2JwS13';
-  const canUseShuffle = currentUserId === ALLOWED_USER_ID;
-  
-  // MULTI-USER ISOLATION: Get activeInstanceId for per-instance storage
+
   const activeInstanceId = useSelector((state: RootState) => state.wsi.activeInstanceId);
+
+  // The real user doing the review — sent as `annotator` so GT/review marks
+  // are attributed to them rather than the backend's "Unknown" fallback.
+  const { userInfo } = useUserInfo();
   
-  // Helper function to generate headers with instance_id for multi-user isolation
-  const getApiHeaders = useCallback(() => {
-    return activeInstanceId ? { 'X-Instance-ID': activeInstanceId } : undefined;
-  }, [activeInstanceId]);
   
   // Batch processing: Cells pending reclassification Map<cellId, newClassName> // Mark cells pending reclassification
   const [pendingReclassifications, setPendingReclassifications] = useState<Map<string, string>>(new Map());
-  // Track confirmed cells (YES button clicked), used to prevent duplicate confirmations 
+  // Track confirmed cells (YES button clicked), used to prevent duplicate confirmations
   const [confirmedCells, setConfirmedCells] = useState<Set<string>>(new Set());
+  // Saved view: cells staged for removal — committed (deleted) on Save
+  const [pendingRemovals, setPendingRemovals] = useState<Set<string>>(new Set());
   
   // Track container width for responsive ProbabilityCurve
   const containerRef = useRef<HTMLDivElement>(null);
@@ -125,8 +146,12 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
     };
   }, [isVisible]);
   
-  // Get current path from Redux (like ClassificationPanelContent does)
-  const currentPath = useSelector((state: RootState) => state.svsPath.currentPath);
+  // Get current path from Redux (like ClassificationPanel does)
+  const currentPath = useActiveSlidePath();
+  const { assertWritable, allowed: pathWritable, tooltip: writeBlockTitle } = usePathWriteAccess(currentPath ?? reviewState.slideId);
+  // GT (yellow-box) indices are not part of the overlay frame — refetch them
+  // after a save or the cells/patches just labelled stay unhighlighted.
+  const refreshGtHighlightIndices = useRefreshGtHighlightIndices();
   
   // Selected candidate state for Target Cell panel
   const [selectedCandidate, setSelectedCandidate] = useState<ReviewCandidate | null>(null);
@@ -145,35 +170,22 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
   // Request cancellation to prevent race conditions
   const abortControllerRef = useRef<AbortController | null>(null);
   
-  // Filter for showing/hiding reclassified cells
-  const [showReclassified, setShowReclassified] = useState(true);
   
   // Track which side of threshold to view: 'left' (prob < threshold) or 'right' (prob >= threshold)
   const [thresholdSide, setThresholdSide] = useState<"left" | "right">("left");
 
-  // Shuffle candidates dialog state
-  const [shuffleDialogOpen, setShuffleDialogOpen] = useState(false);
-  
-  // Toast and undo state
-  const [toastData, setToastData] = useState<{
-    isVisible: boolean;
-    cellId: string;
-    newClassName: string;
-    originalData?: {
-      cellId: string;
-      originalLabel?: number;
-      originalClass?: string;
-    };
-  }>({ isVisible: false, cellId: '', newClassName: '' });
-  
+  // Which view: 'review' = candidates still to review, 'saved' = cells already saved
+  const [reviewMode, setReviewMode] = useState<"review" | "saved">("review");
+
   // Batch processing: Handle pending reclassification selection //new add
   const handlePendingReclassification = useCallback((cellId: string, newClass: string) => {
+    if (!assertWritable("review candidates")) return;
     setPendingReclassifications(prev => {
       const newMap = new Map(prev);
       newMap.set(cellId, newClass);
       return newMap;
     });
-  }, []);
+  }, [assertWritable]);
   
   // Batch processing: Cancel pending reclassification
   const handleCancelPendingReclassification = useCallback((cellId: string) => {
@@ -183,101 +195,192 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
       return newMap;
     });
   }, []);
+
+  // Saved view: stage / un-stage a cell for removal. The actual delete from
+  // user_annotation happens on Save (submitPendingReclassifications).
+  const handleToggleRemoval = useCallback((cellId: string) => {
+    if (!assertWritable("review candidates")) return;
+    setPendingRemovals(prev => {
+      const next = new Set(prev);
+      if (next.has(cellId)) next.delete(cellId);
+      else next.add(cellId);
+      return next;
+    });
+  }, [assertWritable]);
   
   // Notify parent component of pending submission count changes
   useEffect(() => {
     if (onPendingCountChange) {
-      onPendingCountChange(pendingReclassifications.size);
+      onPendingCountChange(pendingReclassifications.size + confirmedCells.size + pendingRemovals.size);
     }
-  }, [pendingReclassifications.size, onPendingCountChange]);
+  }, [pendingReclassifications.size, confirmedCells.size, pendingRemovals.size, onPendingCountChange]);
   
-  // Batch processing: Submit all pending reclassifications in batch
-  const submitPendingReclassifications = useCallback(async () => {
-    if (pendingReclassifications.size === 0 || !reviewState.slideId) return;
-    
-    // Process all pending reclassifications in batch
-    const promises = [];
-    // Use Array.from to avoid TypeScript iterator errors
-    const entries = Array.from(pendingReclassifications.entries());
-    
-    // Count reclassification quantity for each target class, used for updating counts
-    const classChangeCounts = new Map<string, number>();
-    
-    for (const [cellId, newClass] of entries) {
-      const candidate = reviewState.items.find(item => item.cell_id === cellId);
-      if (candidate) {
-        // Count changes for each target class
-        classChangeCounts.set(newClass, (classChangeCounts.get(newClass) || 0) + 1);
-        
-        // Get color for the new class
-        const classObj = nucleiClasses.find(c => c.name === newClass);
-        const finalColor = classObj?.color || '#808080';
-        
-        const payload = {
-          slide_id: reviewState.slideId,
-          cell_id: cellId,
-          original_class: reviewState.className,
-          new_class: newClass,
-          prob: candidate.prob,
-          centroid_x: candidate.centroid?.x,
-          centroid_y: candidate.centroid?.y,
-          cell_color: finalColor,
-          is_manual_reclassification: true
-        };
-        
-        promises.push(
-          apiFetch(`${AI_SERVICE_API_ENDPOINT}/review/v1/reclassify`, {
-            method: 'POST',
-            body: JSON.stringify(payload),
-            headers: getApiHeaders(),
-            returnAxiosFormat: true,
-          })
-        );
-        
-        // Remove this candidate from UI
-        dispatch(labelCandidate({ cell_id: cellId, label: 0 }));
-      }
+  // Batch processing: commit all staged review actions on Save —
+  //   • "Yes" confirmations + "No" reclassifications → one save_annotation/batch call
+  //   • Saved-view removals → delete each from user_annotation
+  const submitPendingReclassifications = useCallback(async (): Promise<ReviewSaveResult | null> => {
+    if (!reviewState.slideId) return null;
+    if (!assertWritable("submit review changes")) {
+      return null;
     }
-    
+    if (pendingReclassifications.size === 0 && confirmedCells.size === 0 && pendingRemovals.size === 0) {
+      return { marked: 0, removed: 0 };
+    }
+
+    const reclassEntries = Array.from(pendingReclassifications.entries());
+
+    // "No" cells carry an explicit target class; "Yes" cells carry none, so the
+    // batch endpoint records them with their existing AI prediction.
+    const cellClasses: Record<string, string> = {};
+    reclassEntries.forEach(([cellId, newClass]) => {
+      cellClasses[cellId] = newClass;
+    });
+
+    const stagedCellIds = [
+      ...Array.from(confirmedCells),
+      ...reclassEntries.map(([cellId]) => cellId),
+    ];
+    const cellIndices = stagedCellIds
+      .map((id) => Number(id))
+      .filter((id) => Number.isInteger(id));
+    const removalIds = Array.from(pendingRemovals);
+
+    const filePath = reviewState.slideId.endsWith('.zarr')
+      ? reviewState.slideId
+      : `${reviewState.slideId}.zarr`;
+
+    // Counted from the backend replies, not from what was staged: the backend
+    // skips candidates with no AI prediction and ones already stored with the
+    // same label, so a staged count would over-report.
+    let markedCount = 0;
+    let removedCount = 0;
+
     try {
-      await Promise.all(promises);
-      
-      // Update class count: target class +n, current class unchanged (because these are predicted cells, not manually annotated)
-      // Note: According to user requirements, when reclassifying from predicted class to other classes, original class count remains unchanged
-      classChangeCounts.forEach((count, className) => {
-        const targetClassIndex = nucleiClasses.findIndex(c => c.name === className);
-        if (targetClassIndex !== -1) {
-          const targetClass = nucleiClasses[targetClassIndex];
-          dispatch(updateNucleiClass({
-            index: targetClassIndex,
-            newClass: {
-              ...targetClass,
-              count: targetClass.count + count
-            }
-          }));
+      // Commit Yes/No labels
+      if (cellIndices.length > 0) {
+        let resp;
+        if (isPatch) {
+          resp = await segFetch(activeInstanceId, `${AI_SERVICE_API_ENDPOINT}/seg/v1/save_patch_annotations`, {
+            method: 'POST',
+            body: JSON.stringify({
+              path: reviewState.slideId,
+              patch_indices: cellIndices,
+              patch_classes: cellClasses,
+              annotator: resolveAnnotatorLabel({ userId: userInfo?.user_id }),
+            }),
+
+            returnAxiosFormat: true,
+          });
+        } else {
+          resp = await segFetch(activeInstanceId, `${AI_SERVICE_API_ENDPOINT}/seg/v1/save_annotation/batch`, {
+            method: 'POST',
+            body: JSON.stringify({
+              path: reviewState.slideId,
+              annotation_type: 'nuclei',
+              cell_indices: cellIndices,
+              cell_classes: cellClasses,
+              annotator: resolveAnnotatorLabel({ userId: userInfo?.user_id }),
+            }),
+
+            returnAxiosFormat: true,
+          });
         }
-      });
-      
-      // Clear pending reclassification list
-      setPendingReclassifications(new Map());
-      
-      // Trigger refresh - both annotations counts and WebSocket data reload
-      EventBus.emit('refresh-annotations');
-      // Trigger WebSocket path refresh to reload annotations and centroids for overlay update
-      if (reviewState.slideId) {
-        const zarrPath = reviewState.slideId.endsWith('.zarr') ? reviewState.slideId : `${reviewState.slideId}.zarr`;
-        EventBus.emit('refresh-websocket-path', { path: reviewState.slideId.replace(/\.zarr$/, ''), forceReload: true });
+        const payload = payloadFromAxiosAppResponse<{ marked_count?: number }>(resp);
+        markedCount = Number(payload?.marked_count ?? 0) || 0;
       }
+
+      // Commit removals — drop each staged cell/patch from user_annotation
+      if (removalIds.length > 0) {
+        if (isPatch) {
+          const resp = await segFetch(activeInstanceId, `${AI_SERVICE_API_ENDPOINT}/seg/v1/remove_patch_annotations`, {
+            method: 'POST',
+            body: JSON.stringify({
+              path: reviewState.slideId,
+              patch_indices: removalIds.map((id) => Number(id)).filter((id) => Number.isInteger(id)),
+            }),
+
+            returnAxiosFormat: true,
+          });
+          const payload = payloadFromAxiosAppResponse<{ removed_count?: number }>(resp);
+          removedCount = Number(payload?.removed_count ?? 0) || 0;
+        } else {
+          // No per-cell count from this endpoint; a rejection aborts the save.
+          await Promise.all(removalIds.map((cellId) =>
+            deleteNucleiAnnotation(filePath, 'User-Annotations/cell', Number(cellId))
+          ));
+          removedCount = removalIds.length;
+        }
+      }
+
+      // Bump nuclei class counts for everything committed (cell only — patch
+      // counts are maintained server-side in patch_class_counts):
+      //   "Yes" confirmations → the current review class
+      //   "No" reclassifications → their chosen target class
+      // A caller-scoped class list (patch panels) must not mutate the shared
+      // cell-class Redux list.
+      if (!isPatch && !reviewClassesProp) {
+        const classChangeCounts = new Map<string, number>();
+        if (reviewState.className && confirmedCells.size > 0) {
+          classChangeCounts.set(reviewState.className, confirmedCells.size);
+        }
+        reclassEntries.forEach(([, newClass]) => {
+          classChangeCounts.set(newClass, (classChangeCounts.get(newClass) || 0) + 1);
+        });
+        classChangeCounts.forEach((count, className) => {
+          const targetClassIndex = nucleiClasses.findIndex(c => c.name === className);
+          if (targetClassIndex !== -1) {
+            const targetClass = nucleiClasses[targetClassIndex];
+            dispatch(updateNucleiClass({
+              index: targetClassIndex,
+              newClass: {
+                ...targetClass,
+                count: targetClass.count + count
+              }
+            }));
+          }
+        });
+      }
+
+      // Clear all staged actions
+      setPendingReclassifications(new Map());
+      setConfirmedCells(new Set());
+      setPendingRemovals(new Set());
+
+      // Refetch — saved cells leave the "To Review" pool and the "Saved"
+      // view reflects the new state. Avoids the stale Yes→No red highlight
+      // that came from optimistically relabelling every staged cell to 0.
+      fetchCandidatesRef.current();
+
+      if (isPatch) {
+        // Optimistic colors written by the region-select tool outrank anything
+        // the backend sends (PatchOverlay checks patchOverrides first), so a
+        // patch relabelled here would keep painting its old class.
+        const touched = [...cellIndices, ...removalIds.map(Number)].filter(Number.isInteger);
+        if (touched.length > 0) {
+          dispatch(clearPatchOverridesForIds(touched));
+        }
+        // Patch labels live in the patches frame; a full set_path reload is not
+        // needed and shuts the wire gate, which drops this very request.
+        eventBus.emit('refresh-patches');
+      } else {
+        eventBus.emit('refresh-annotations');
+        eventBus.emit('refresh-websocket-path', { path: reviewState.slideId.replace(/\.zarr$/, ''), forceReload: true });
+      }
+      refreshGtHighlightIndices(currentPath ?? reviewState.slideId);
+      return { marked: markedCount, removed: removedCount };
     } catch (error) {
-      console.error('[AL] Error submitting reclassifications:', error);
+      console.error('[AL] Error submitting review actions:', error);
+      toast.error(getErrorMessage(error, "Failed to submit review changes."));
+      return null;
     }
-  }, [pendingReclassifications, reviewState.slideId, reviewState.className, reviewState.items, nucleiClasses, dispatch]);
+  }, [pendingReclassifications, confirmedCells, pendingRemovals, reviewState.slideId, reviewState.className, nucleiClasses, reviewClassesProp, isPatch, dispatch, activeInstanceId, currentPath, refreshGtHighlightIndices]);
+
   
   // Expose methods to parent component
   React.useImperativeHandle(ref, () => ({
     submitPendingReclassifications,
-    getPendingReclassificationsCount: () => pendingReclassifications.size
-  }), [submitPendingReclassifications, pendingReclassifications]);
+    getPendingReclassificationsCount: () => pendingReclassifications.size + confirmedCells.size + pendingRemovals.size
+  }), [submitPendingReclassifications, pendingReclassifications, confirmedCells, pendingRemovals]);
   
   // Clean up Active Learning state when slide changes
   useEffect(() => {
@@ -310,12 +413,12 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
     }
   }, [reviewState.className, currentHistogramClass, submitPendingReclassifications]);
 
-  // Get target class from Redux state (set by ClassificationPanelContent)
+  // Get target class from Redux state (set by ClassificationPanel)
   const targetClass = useMemo(() => {
-    if (!reviewState.className || !nucleiClasses || nucleiClasses.length === 0) return null;
-    const classObj = nucleiClasses.find(cls => cls.name === reviewState.className);
+    if (!reviewState.className || !reviewClasses || reviewClasses.length === 0) return null;
+    const classObj = reviewClasses.find(cls => cls.name === reviewState.className);
     return classObj || null;
-  }, [reviewState.className, nucleiClasses]);
+  }, [reviewState.className, reviewClasses]);
 
   // Fetch candidates data
   const fetchCandidates = useCallback(async () => {
@@ -326,7 +429,6 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
     if (!reviewState.className) {
       return;
     }
-
 
     // Cancel any ongoing request
     if (abortControllerRef.current) {
@@ -375,23 +477,21 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
         sort: reviewState.sort || "asc",   // Sort order: "asc" = Low→High, "desc" = High→Low
         limit: reviewState.pageSize,
         offset: reviewState.page * reviewState.pageSize,
-        exclude_reclassified: !showReclassified,  // New parameter to control reclassified cells
+        exclude_saved: true,  // Already-saved cells are excluded from the candidate pool
         side: thresholdSide,  // "left" (prob < threshold) or "right" (prob >= threshold)
+        saved_only: reviewMode === 'saved',  // 'Saved' tab → only cells already saved for this class
       };
 
-      // Get ROI cell IDs if ROI is specified (reuse existing logic)
+      // Pass ROI bbox directly — backend filters spatially (no /query + cell_ids CSV)
       if (reviewState.roi && reviewState.roi.rectangleCoords) {
-        
         try {
           const rect = reviewState.roi.rectangleCoords;
           
-          // Validate rect structure (should have x1, y1, x2, y2 format)
           if (!rect || typeof rect.x1 === 'undefined' || typeof rect.y1 === 'undefined' || 
               typeof rect.x2 === 'undefined' || typeof rect.y2 === 'undefined') {
             throw new Error('Invalid ROI rectangle coordinates - expected x1,y1,x2,y2 format');
           }
           
-          // Convert to numbers if they're strings  
           const rectX1 = parseFloat(rect.x1);
           const rectY1 = parseFloat(rect.y1);
           const rectX2 = parseFloat(rect.x2);
@@ -400,47 +500,35 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
           if (isNaN(rectX1) || isNaN(rectY1) || isNaN(rectX2) || isNaN(rectY2)) {
             throw new Error('ROI coordinates contain invalid numeric values');
           }
-          
-          
-          // Query cells in ROI using the same image coordinates as the viewer / Zarr centroids
-          try {
-            const queryResponse = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/seg/v1/query?${new URLSearchParams({
-              x1: String(rectX1),
-              y1: String(rectY1),
-              x2: String(rectX2),
-              y2: String(rectY2),
-              file_path: reviewState.slideId
-            }).toString()}`, {
-              method: 'GET',
-              returnAxiosFormat: true,
-            });
 
-            const queryData = queryResponse.data?.data || queryResponse.data;
-            const matchingIndices = queryData?.matching_indices || [];
-
-            if (matchingIndices.length > 0) {
-              apiParams.cell_ids = matchingIndices.join(',');
-            }
-          } catch (error) {
+          apiParams.roi = { x1: rectX1, y1: rectY1, x2: rectX2, y2: rectY2 };
+          const poly = reviewState.roi.polygonPoints;
+          if (Array.isArray(poly) && poly.length >= 3) {
+            apiParams.polygon_points = poly;
           }
-          
         } catch (roiError) {
         }
       } else if (reviewState.roi && reviewState.roi.polygonPoints) {
-      } else {
+        const poly = reviewState.roi.polygonPoints;
+        if (Array.isArray(poly) && poly.length >= 3) {
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          for (const p of poly) {
+            const px = Number(p[0]); const py = Number(p[1]);
+            if (px < minX) minX = px; if (py < minY) minY = py;
+            if (px > maxX) maxX = px; if (py > maxY) maxY = py;
+          }
+          if (Number.isFinite(minX) && Number.isFinite(minY) && Number.isFinite(maxX) && Number.isFinite(maxY)) {
+            apiParams.roi = { x1: minX, y1: minY, x2: maxX, y2: maxY };
+            apiParams.polygon_points = poly;
+          }
+        }
       }
 
-      const fullUrl = `${AI_SERVICE_API_ENDPOINT}/review/v1/candidates`;
-      const urlWithParams = new URL(fullUrl);
-      Object.entries(apiParams).forEach(([key, value]) => {
-        urlWithParams.searchParams.append(key, String(value));
-      });
-      
-      const response = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/review/v1/candidates`, {
+      const response = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/review/v1/candidates/${kind}`, {
         method: 'POST',
         body: JSON.stringify(apiParams),
         signal: abortController.signal,
-        headers: getApiHeaders(),
+        
         returnAxiosFormat: true,
       });
       
@@ -456,8 +544,6 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
         total = actualData.total;
         hist = actualData.hist || actualData.histogram_bins || [];
         items = actualData.items || actualData.candidates || [];
-
-
 
         // SIMPLIFIED: No double request, backend cache handles everything
         // Cache histogram if this is a new class
@@ -493,18 +579,11 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
       requestingThresholdRef.current = null; // Clear requesting threshold on error
       setThresholdLoading(false);
     }
-  }, [reviewState.slideId, reviewState.className, reviewState.threshold, reviewState.sort, reviewState.page, reviewState.pageSize, reviewState.roi, dispatch, hasFullHistogram, currentHistogramClass, cachedHistogram, showReclassified, thresholdSide]); // eslint-disable-line react-hooks/exhaustive-deps
-
-
+  }, [reviewState.slideId, reviewState.className, reviewState.threshold, reviewState.sort, reviewState.page, reviewState.pageSize, reviewState.roi, dispatch, hasFullHistogram, currentHistogramClass, cachedHistogram, thresholdSide, reviewMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Fetch candidates when dependencies change - using ref to avoid infinite loop
   const fetchCandidatesRef = useRef(fetchCandidates);
   fetchCandidatesRef.current = fetchCandidates;
-  
-  // Clear confirmed cells when page changes
-  useEffect(() => {
-    setConfirmedCells(new Set());
-  }, [reviewState.page]);
   
   // Cleanup abort controller on unmount
   useEffect(() => {
@@ -534,13 +613,16 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
       
       fetchCandidatesRef.current();
     }
-  }, [isVisible, reviewState.slideId, reviewState.className, reviewState.threshold, reviewState.sort, reviewState.page, reviewState.roi, showReclassified, thresholdSide]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isVisible, reviewState.slideId, reviewState.className, reviewState.threshold, reviewState.sort, reviewState.page, reviewState.roi, thresholdSide, reviewMode]); // eslint-disable-line react-hooks/exhaustive-deps
   // Note: currentHistogramClass removed from deps to prevent double-fetch when class changes
 
   // Label a candidate
   const handleLabelCandidate = async (cellId: string, label: 1 | 0) => {
 
     if (!reviewState.slideId) {
+      return;
+    }
+    if (!assertWritable("review candidates")) {
       return;
     }
 
@@ -585,36 +667,9 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
           
           // Update UI to remove the label
           dispatch(labelCandidate({ cell_id: cellId, label: undefined }));
-          
-          // Decrement the class count since we're cancelling the confirmation
-          const targetClassIndex = nucleiClasses.findIndex(c => c.name === reviewState.className);
-          if (targetClassIndex !== -1) {
-            const targetClass = nucleiClasses[targetClassIndex];
-            dispatch(updateNucleiClass({
-              index: targetClassIndex,
-              newClass: {
-                ...targetClass,
-                count: Math.max(0, targetClass.count - 1) // Ensure count doesn't go negative
-              }
-            }));
-          }
-          
-          // Call API to remove the reclassification from backend
-          // Use reclassify API to move it back (this will remove it from _reclassified_cells)
-          await apiFetch(`${AI_SERVICE_API_ENDPOINT}/review/v1/reclassify`, {
-            method: 'POST',
-            body: JSON.stringify({
-              slide_id: reviewState.slideId,
-              cell_id: cellId,
-              original_class: reviewState.className,  // It's currently in this class
-              new_class: 'unclassified',  // Move back to unclassified (special marker for removal)
-              prob: candidate?.prob || 0,
-              is_manual_reclassification: false  // Mark as cancellation
-            }),
-            headers: getApiHeaders(),
-            returnAxiosFormat: true,
-          });
-          
+
+          // Nothing was sent to the backend yet — Yes is committed only on
+          // Save — so cancelling a confirmation is purely local state.
           return;
         } else {
           // Add to confirmed cells set
@@ -647,68 +702,11 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
         }
       }
 
-      // Optimistically update UI
+      // Optimistically update the tile label only. YES/NO are deferred — the
+      // cell is staged (confirmedCells / pendingReclassifications) and
+      // committed to user_annotation on Save. Class counts are bumped on Save
+      // too, so closing the panel without saving leaves counts untouched.
       dispatch(labelCandidate({ cell_id: cellId, label }));
-
-      // For YES (label=1), confirm the classification
-      // For NO (label=0), use the label API as before
-      if (label === 1) {
-        // YES button - confirm this cell belongs to the current class
-        // Since label API has backend bug with 'is_original_manual', use reclassify API
-        // Use a special marker to indicate this is a YES confirmation
-        const targetClassObj = nucleiClasses.find(c => c.name === reviewState.className);
-        
-        const response = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/review/v1/reclassify`, {
-          method: 'POST',
-          body: JSON.stringify({
-            slide_id: reviewState.slideId,
-            cell_id: cellId,
-            original_class: 'unclassified', // Use 'unclassified' as a special marker
-            new_class: reviewState.className,
-            prob: candidate?.prob || 0,
-            centroid_x: candidate.centroid?.x,
-            centroid_y: candidate.centroid?.y,
-            cell_color: targetClassObj?.color || '#808080',
-            is_manual_reclassification: true
-          }),
-          headers: getApiHeaders(),
-          returnAxiosFormat: true,
-        });
-
-        // For YES, manually increment the class count without triggering full refresh
-        // This avoids the flickering issue with other classes
-        const targetClassIndex = nucleiClasses.findIndex(c => c.name === reviewState.className);
-        if (targetClassIndex !== -1) {
-          const targetClass = nucleiClasses[targetClassIndex];
-          dispatch(updateNucleiClass({
-            index: targetClassIndex,
-            newClass: {
-              ...targetClass,
-              count: targetClass.count + 1
-            }
-          }));
-        }
-      } else {
-        // NO button - use original label API
-        const apiPayload = {
-          slide_id: reviewState.slideId,
-          class_name: reviewState.className,
-          cell_id: cellId,
-          label,
-          prob: candidate?.prob || 0
-        };
-
-        const response = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/review/v1/label`, {
-          method: 'POST',
-          body: JSON.stringify(apiPayload),
-          headers: getApiHeaders(),
-          returnAxiosFormat: true,
-        });
-
-        // For NO, trigger full refresh as it may involve reclassification
-        EventBus.emit('refresh-annotations');
-        EventBus.emit('refresh-websocket-path', { path: currentPath, forceReload: true });
-      }
 
     } catch (error: any) {
       // Revert optimistic update on error
@@ -719,188 +717,6 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
           label: candidate.label === 1 ? 0 : 1 // Revert to opposite
         }));
       }
-    }
-  };
-
-  // Handle reclassification with Toast and undo support
-  const handleReclassifyCandidate = async (cellId: string, newClass: string) => {
-
-    if (!reviewState.slideId) {
-      return;
-    }
-
-    try {
-
-      // Get candidate data
-      const candidate = reviewState.items.find(item => item.cell_id === cellId);
-      if (!candidate) {
-        return;
-      }
-
-      // Store original data for undo including the original class name
-      const originalData = {
-        cellId: cellId,
-        originalLabel: candidate.label,
-        originalClass: reviewState.className || undefined // Store the original class name
-      };
-
-      // Get color for the new class
-      const newClassObj = nucleiClasses.find(cls => cls.name === newClass);
-      const newClassColor = newClassObj?.color || '#808080';
-
-      // Debug: Log candidate data
-      console.log('[AL Frontend] Candidate data:', {
-        cellId,
-        centroid: candidate.centroid,
-        centroid_x: candidate.centroid?.x,
-        centroid_y: candidate.centroid?.y,
-        color: newClassColor
-      });
-
-      // Send reclassification to backend
-      const payload = {
-        slide_id: reviewState.slideId,
-        cell_id: cellId,
-        original_class: reviewState.className,
-        new_class: newClass,
-        prob: candidate.prob,
-        // Pass centroid and color from frontend to avoid reading zarr again
-        centroid_x: candidate.centroid?.x,
-        centroid_y: candidate.centroid?.y,
-        cell_color: newClassColor,
-        // Add flag to indicate this is a manual reclassification action
-        is_manual_reclassification: true
-      };
-
-      console.log('[AL Frontend] Sending payload:', payload);
-
-      const response = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/review/v1/reclassify`, {
-        method: 'POST',
-        body: JSON.stringify(payload),
-        headers: getApiHeaders(),
-        returnAxiosFormat: true,
-      });
-
-      console.log('[AL] Reclassification response:', response.data);
-
-      // Remove from current candidate pool
-      dispatch(labelCandidate({ cell_id: cellId, label: 0 }));
-
-      // Show toast notification with undo option
-      setToastData({
-        isVisible: true,
-        cellId: cellId,
-        newClassName: newClass,
-        originalData: originalData
-      });
-
-      // Trigger refresh after successful reclassification
-      // Only emit refresh-annotations which will be handled by ClassificationPanelContent
-      EventBus.emit('refresh-annotations');
-      
-      // Refresh candidates after reclassification to remove the cell from current pool
-      // This is necessary because the cell has moved to a different class
-      setTimeout(() => {
-        fetchCandidatesRef.current();
-      }, 150);
-
-    } catch (error: any) {
-
-      // Check if this is a 404 - API might not exist yet, fallback to label=0
-      if (error.response?.status === 404) {
-        dispatch(labelCandidate({ cell_id: cellId, label: 0 }));
-
-        // Show toast for fallback behavior too
-        setToastData({
-          isVisible: true,
-          cellId: cellId,
-          newClassName: newClass,
-          originalData: { cellId: cellId, originalLabel: 0, originalClass: reviewState.className || undefined }
-        });
-
-      } else {
-        // For any other error, still mark as label=0 to remove from pool
-        dispatch(labelCandidate({ cell_id: cellId, label: 0 }));
-      }
-    }
-  };
-
-  // Handle toast dismiss
-  const handleToastDismiss = useCallback(() => {
-    setToastData(prev => ({ ...prev, isVisible: false }));
-    // Don't refresh candidates immediately - let the Redux state change persist
-    // The backend will handle filtering reclassified cells when candidates are next fetched
-  }, []);
-
-  // Handle undo reclassification
-  const handleUndoReclassification = async () => {
-    if (!toastData.originalData || !reviewState.slideId) return;
-
-    try {
-      const { cellId, originalLabel, originalClass } = toastData.originalData as any;
-
-
-      // Restore to original label in Redux
-      dispatch(labelCandidate({
-        cell_id: cellId,
-        label: (originalLabel !== undefined ? originalLabel : 0) as 0 | 1
-      }));
-
-      // Send undo to backend (restore to original class)
-      const undoResponse = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/review/v1/reclassify`, {
-        method: 'POST',
-        body: JSON.stringify({
-          slide_id: reviewState.slideId,
-          cell_id: cellId,
-          original_class: toastData.newClassName,
-          new_class: originalClass || reviewState.className, // Restore to original class
-          prob: 0, // Probability doesn't matter for undo
-          is_manual_reclassification: true
-        }),
-        headers: getApiHeaders(),
-        returnAxiosFormat: true,
-      });
-
-      console.log('[AL] Undo reclassification response:', undoResponse.data);
-
-      // Trigger backend refresh after undo
-      EventBus.emit('refresh-annotations');
-
-      // Refresh candidates but keep the cached histogram
-      fetchCandidates();
-      
-    } catch (error: any) {
-      
-      // If undo API fails, still restore the UI optimistically
-      if (toastData.originalData) {
-        dispatch(labelCandidate({ 
-          cell_id: toastData.originalData.cellId, 
-          label: (toastData.originalData.originalLabel !== undefined ? toastData.originalData.originalLabel : 0) as 0 | 1
-        }));
-      }
-    }
-  };
-
-  // Remove a candidate from the class
-  const handleRemoveCandidate = async (cellId: string) => {
-    if (!reviewState.slideId) return;
-
-    try {
-      // Send remove request to backend
-      await apiFetch(`${AI_SERVICE_API_ENDPOINT}/review/v1/remove`, {
-        method: 'POST',
-        body: JSON.stringify({
-          slide_id: reviewState.slideId,
-          cell_id: cellId
-        }),
-        headers: getApiHeaders(),
-        returnAxiosFormat: true,
-      });
-
-      // Refresh candidates after removal
-      fetchCandidates();
-    } catch (error: any) {
-      // Silent error handling
     }
   };
 
@@ -943,48 +759,63 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
     return null;
   }
 
-  if (!Array.isArray(nucleiClasses) || !reviewState) return null;
+  if (!Array.isArray(reviewClasses) || !reviewState) return null;
 
   return (
-    <div ref={containerRef} className="flex-1 p-2 sm:p-3 lg:p-4 border-l border-gray-200 h-full flex flex-col relative">
+    <div ref={containerRef} className="flex-1 p-2 sm:p-3 lg:p-4 border-l border-border h-full flex flex-col relative">
       <div className="flex flex-col gap-2 sm:gap-3 flex-1 min-h-0">
         {/* Header */}
         <div>
-          <div className="flex items-center justify-between mb-1 sm:mb-2">
-            <h5 className="font-medium text-base sm:text-lg">🔄 Active Learning</h5>
-            {/* Shuffle button - only visible for authorized user, uses currentPath instead of reviewState.slideId */}
-            {currentPath && canUseShuffle && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setShuffleDialogOpen(true)}
-                className="flex items-center gap-2"
-                title="Shuffle candidates and get AI suggestions"
-              >
-                <Shuffle className="w-4 h-4" />
-                <span className="hidden sm:inline">Shuffle Candidates</span>
-                <span className="sm:hidden">Shuffle</span>
-              </Button>
-            )}
-          </div>
-          <p className="text-xs sm:text-sm text-gray-600 mb-1 leading-tight">
-            Active learning enhances nuclei classification by identifying cells with the most uncertain predictions. 
-            Review and correct these prioritized candidates to improve model performance and reduce annotation workload.
+          <h5 className="flex items-center gap-1.5 font-medium text-base sm:text-lg mb-1 sm:mb-1.5">
+            <Sparkles className="h-4 w-4 text-muted-foreground" />
+            Active Learning
+          </h5>
+          <p className="text-xs sm:text-sm text-muted-foreground leading-relaxed">
+            Active learning surfaces the cells with the most uncertain predictions.
+            Review and correct them to improve the model with less annotation effort.
           </p>
         </div>
 
         {/* Show message when no class is selected */}
         {!reviewState.className ? (
-          <div className="flex items-center justify-center flex-1 bg-gray-50 rounded-lg border-2 border-dashed border-gray-300">
-            <div className="text-center">
-              <p className="text-gray-500 text-lg mb-2">No class selected</p>
-              <p className="text-gray-400 text-sm">Please select a cell class from the classification panel to view Active Learning candidates</p>
+          <div className="flex flex-1 items-center justify-center rounded-lg border-2 border-dashed border-border bg-muted/40 p-6">
+            <div className="flex max-w-xs flex-col items-center gap-3 py-6 text-center">
+              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted">
+                <MousePointerClick className="h-6 w-6 text-muted-foreground" />
+              </div>
+              <div className="space-y-1">
+                <p className="text-base font-medium text-foreground">No class selected</p>
+                <p className="text-sm leading-relaxed text-muted-foreground">
+                  Select a cell class from the classification panel to start reviewing.
+                </p>
+              </div>
             </div>
           </div>
         ) : (
           <>
-            {/* Probability Threshold Panel - responsive */}
-            <div className="flex-shrink-0 w-full">
+            {/* To Review / Saved tab */}
+            <div className="flex gap-1 bg-muted rounded-lg p-1 shrink-0">
+              {([["review", "To Review"], ["saved", "Saved"]] as const).map(([mode, label]) => (
+                <button
+                  key={mode}
+                  onClick={() => {
+                    setReviewMode(mode);
+                    dispatch(setPage(0));
+                  }}
+                  className={`flex-1 px-3 py-1 text-xs rounded-md transition-colors ${
+                    reviewMode === mode
+                      ? "bg-card shadow-sm font-medium text-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {/* Probability Threshold Panel - only relevant when reviewing candidates */}
+            {reviewMode === "review" && (
+            <div className="shrink-0 w-full">
               <div className="w-full overflow-x-auto">
                 <ProbabilityCurve
                   data={cachedHistogram.length > 0 ? cachedHistogram : (reviewState?.hist || [])}
@@ -997,16 +828,16 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
               </div>
               {/* Threshold Side Toggle */}
               <div className="flex items-center justify-center gap-2 mt-2">
-                <span className="text-xs text-gray-600">View:</span>
-                <div className="flex gap-1 bg-gray-100 rounded-md p-1">
+                <span className="text-xs text-muted-foreground">View:</span>
+                <div className="flex gap-1 bg-muted rounded-lg p-1">
                   <button
                     onClick={() => {
                       setThresholdSide("left");
                     }}
-                    className={`px-3 py-1 text-xs rounded transition-colors ${
+                    className={`px-3 py-1 text-xs rounded-md transition-colors ${
                       thresholdSide === "left"
-                        ? "bg-white shadow-sm font-medium text-gray-900"
-                        : "text-gray-600 hover:text-gray-900"
+                        ? "bg-card shadow-sm font-medium text-foreground"
+                        : "text-muted-foreground hover:text-foreground"
                     }`}
                   >
                     Left (prob &lt; threshold)
@@ -1015,10 +846,10 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
                     onClick={() => {
                       setThresholdSide("right");
                     }}
-                    className={`px-3 py-1 text-xs rounded transition-colors ${
+                    className={`px-3 py-1 text-xs rounded-md transition-colors ${
                       thresholdSide === "right"
-                        ? "bg-white shadow-sm font-medium text-gray-900"
-                        : "text-gray-600 hover:text-gray-900"
+                        ? "bg-card shadow-sm font-medium text-foreground"
+                        : "text-muted-foreground hover:text-foreground"
                     }`}
                   >
                     Right (prob &gt;= threshold)
@@ -1026,28 +857,35 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
                 </div>
               </div>
             </div>
+            )}
 
             {/* Candidate Gallery - takes remaining space */}
             <div className="flex-1 min-h-0">
               <CandidateGallery
                 candidates={
-                  // Show candidates if class matches AND (data is current OR loading OR requesting)
-                  (currentHistogramClass === reviewState.className && 
-                   (lastLoadedThreshold === reviewState.threshold || 
-                    requestingThresholdRef.current === reviewState.threshold ||
-                    reviewState?.loading || 
-                    thresholdLoading))
+                  reviewMode === 'saved'
                     ? (reviewState?.items || [])
-                    : []
+                    // Show candidates if class matches AND (data is current OR loading OR requesting)
+                    : (currentHistogramClass === reviewState.className &&
+                       (lastLoadedThreshold === reviewState.threshold ||
+                        requestingThresholdRef.current === reviewState.threshold ||
+                        reviewState?.loading ||
+                        thresholdLoading))
+                      ? (reviewState?.items || [])
+                      : []
                 }
-                loading={reviewState?.loading || thresholdLoading || (currentHistogramClass !== reviewState.className)}
+                loading={reviewMode === 'saved'
+                  ? (reviewState?.loading || false)
+                  : (reviewState?.loading || thresholdLoading || (currentHistogramClass !== reviewState.className))}
                 error={reviewState?.error || null}
                 total={
-                  // Show total if class matches AND (data is current OR loading OR requesting)
-                  (currentHistogramClass === reviewState.className && 
-                   (lastLoadedThreshold === reviewState.threshold || requestingThresholdRef.current === reviewState.threshold || reviewState?.loading || thresholdLoading))
-                    ? (reviewState?.total || 0) 
-                    : 0
+                  reviewMode === 'saved'
+                    ? (reviewState?.total || 0)
+                    // Show total if class matches AND (data is current OR loading OR requesting)
+                    : (currentHistogramClass === reviewState.className &&
+                       (lastLoadedThreshold === reviewState.threshold || requestingThresholdRef.current === reviewState.threshold || reviewState?.loading || thresholdLoading))
+                      ? (reviewState?.total || 0)
+                      : 0
                 }
                 page={reviewState?.page || 0}
                 selectedCandidateId={selectedCandidate?.cell_id}
@@ -1055,19 +893,18 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
                 pageSize={reviewState?.pageSize || 12}
                 zoom={1}
                 sort={reviewState?.sort || 'asc'}
-                showReclassified={showReclassified}
-                availableClasses={nucleiClasses ? nucleiClasses.filter(cls => cls.name !== reviewState.className).map(cls => ({
+                availableClasses={reviewClasses ? reviewClasses.filter(cls => cls.name !== reviewState.className).map(cls => ({
                   id: cls.name,
                   name: cls.name,
                   color: cls.color
                 })) : []}
                 targetClassName={reviewState?.className}
+                savedMode={reviewMode === 'saved'}
+                pendingRemovals={pendingRemovals}
+                onToggleRemoval={handleToggleRemoval}
                 onPageChange={(page) => dispatch(setPage(page))}
                 onSortChange={(sort) => dispatch(setSort(sort))}
-                onShowReclassifiedChange={setShowReclassified}
                 onLabelCandidate={handleLabelCandidate}
-                onRemoveCandidate={handleRemoveCandidate}
-                onReclassifyCandidate={handleReclassifyCandidate}
                 onRetry={() => {
                   fetchCandidates();
                 }}
@@ -1076,33 +913,17 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
                 pendingReclassifications={pendingReclassifications}
                 onPendingReclassification={handlePendingReclassification}
                 onCancelPendingReclassification={handleCancelPendingReclassification}
+                writeDisabled={!pathWritable}
+                writeDisabledTitle={writeBlockTitle}
               />
             </div>
           </>
         )}
       </div>
       
-      {/* Reclassification Toast */}
-      <ReclassificationToast
-        isVisible={toastData.isVisible}
-        cellId={toastData.cellId}
-        newClassName={toastData.newClassName}
-        onUndo={handleUndoReclassification}
-        onDismiss={handleToastDismiss}
-      />
-
-      {/* Shuffle Candidates Dialog */}
-      {currentPath && (
-        <ShuffleCandidatesDialog
-          open={shuffleDialogOpen}
-          onOpenChange={setShuffleDialogOpen}
-          slideId={currentPath}
-        />
-      )}
     </div>
   );
 });
-
 
 // Add displayName for debugging purposes
 ActiveLearningPanel.displayName = 'ActiveLearningPanel';

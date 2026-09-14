@@ -79,7 +79,7 @@ class PresenceManager:
             try:
                 await ws.send_json(message)
             except Exception as e:
-                logger.error(f"Error broadcasting presence: {e}")
+                logger.error(f"Error broadcasting presence: {e}", exc_info=e)
                 failed_sockets.append(ws)
         for ws in failed_sockets:
             await self.disconnect(ws)

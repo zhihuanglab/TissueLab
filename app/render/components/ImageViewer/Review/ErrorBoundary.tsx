@@ -5,6 +5,8 @@ import React, { Component, ErrorInfo, ReactNode } from "react";
 interface Props {
   children: ReactNode;
   fallback?: ReactNode;
+  /** Label used in the console log (which boundary caught it). */
+  name?: string;
 }
 
 interface State {
@@ -22,7 +24,8 @@ class ErrorBoundary extends Component<Props, State> {
   }
 
   public componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    console.error('Active Learning Error:', error, errorInfo);
+    const boundary = this.props.name ?? 'unknown';
+    console.error(`${boundary} Error:`, error, errorInfo);
   }
 
   public render() {
@@ -32,10 +35,10 @@ class ErrorBoundary extends Component<Props, State> {
           <div className="flex-1 p-4 border-l border-gray-200">
             <div className="bg-red-50 border border-red-200 rounded p-4">
               <h6 className="text-red-800 font-medium mb-2">
-                Active Learning Error
+                Something went wrong
               </h6>
               <p className="text-red-600 text-sm mb-2">
-                An error occurred while loading the Active Learning panel.
+                This section failed to load. Please retry.
               </p>
               {this.state.error && (
                 <details className="text-xs text-red-500">

@@ -8,8 +8,8 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
 import { deleteUserAvatarEndpoint, updateUserProfileEndpoint, uploadUserAvatarEndpoint } from '@/config/endpoints'
-import { useUserInfo } from '@/provider/UserInfoProvider'
-import { setUserAvatarUrl } from '@/store/slices/userSlice'
+import { useUserInfo } from '@/contexts/UserInfoProvider'
+import { setCustomTitle as setCustomTitleAction, setOrganization as setOrganizationAction, setPreferredName as setPreferredNameAction, setUserAvatarUrl } from '@/store/slices/userSlice'
 import { apiFetch } from '@/utils/common/apiFetch'
 import { getFirestoreDb } from '@/config/firebaseFirestore'
 import { doc, setDoc } from 'firebase/firestore'
@@ -198,7 +198,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
       }
       try {
         // Also clear avatar in backend profile so API returns empty URL
-        apiFetch(updateUserProfileEndpoint, {
+        apiFetch(updateUserProfileEndpoint(), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -328,7 +328,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
         try {
           // send profile update to backend
           
-          const response = await apiFetch(updateUserProfileEndpoint, {
+          const response = await apiFetch(updateUserProfileEndpoint(), {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -375,7 +375,13 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
           // Don't break the flow if Firestore sync fails
         }
         
-        // Step 3: Update parent components
+        // Step 3: Push updates into Redux so every consumer (sidebar avatar,
+        // chat box, etc.) reflects the new profile immediately instead of
+        // waiting for the Firestore onSnapshot round-trip. Optional callbacks
+        // are kept for legacy callers but are now redundant.
+        dispatch(setPreferredNameAction(preferredName || null))
+        dispatch(setCustomTitleAction(customTitle || null))
+        dispatch(setOrganizationAction(organization || null))
         onTitleUpdate?.(customTitle)
         onPreferencesUpdate?.({
           customTitle,
@@ -383,7 +389,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
           organization,
           avatarPreview
         })
-        
+
         toast.success('Settings saved', {
           description: 'Your preferences have been saved successfully.'
         })

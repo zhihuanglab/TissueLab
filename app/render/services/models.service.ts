@@ -1,5 +1,5 @@
 import { apiFetch } from "@/utils/common/apiFetch";
-import { CTRL_SERVICE_API_ENDPOINT } from "@/constants/config";
+import { COMMUNITY_API_ENDPOINT } from "@/config/api.config";
 
 export interface ModelDataResponse {
   id: string;
@@ -32,7 +32,7 @@ export interface ModelsResponse {
 }
 
 export class ModelsService {
-  private baseUrl = `${CTRL_SERVICE_API_ENDPOINT}/community`
+  private baseUrl = `${COMMUNITY_API_ENDPOINT}/community`
 
   /**
    * Get all public models from Firebase

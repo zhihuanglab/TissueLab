@@ -1,11 +1,11 @@
 'use client'
 
-import { Cloud } from "lucide-react"
+import { HardDrive } from "lucide-react"
 import * as React from "react"
 
-import { useUserInfo } from "@/provider/UserInfoProvider"
-import { getConfig } from "@/utils/dashboard/fileManager.service"
-import { cn } from "@/utils/twMerge"
+import { useUserInfo } from "@/contexts/UserInfoProvider"
+import { getConfig } from "@/services/fileManager.service"
+import { cn } from "@/utils/common/twMerge"
 
 interface StorageUsageCardProps {
   usageBytes?: number | null
@@ -20,18 +20,17 @@ export const StorageUsageCard: React.FC<StorageUsageCardProps> = ({
   usageBytes,
   quotaBytes,
   className,
-  title = "Cloud Storage",
+  title = "Local Storage",
   showUpgradeButton = true,
   withFrame = true,
 }) => {
   const [internalUsage, setInternalUsage] = React.useState<number | null>(null)
   const [internalQuota, setInternalQuota] = React.useState<number | null>(null)
-  const { userIdentity, isLoadingUser } = useUserInfo()
+  const { isLoadingUser } = useUserInfo()
 
-  const fetchStorageInfo = React.useCallback(async () => {
-    if (userIdentity !== 3) return
+  const fetchStorageInfo = React.useCallback(async (forceRefresh: boolean = false) => {
     try {
-      const cfg = await getConfig()
+      const cfg = await getConfig(forceRefresh)
       if (typeof cfg?.storageUsage === "number") {
         setInternalUsage(cfg.storageUsage)
       } else {
@@ -47,28 +46,28 @@ export const StorageUsageCard: React.FC<StorageUsageCardProps> = ({
       // keep previous values on failure
       console.warn("Failed to fetch storage info", error)
     }
-  }, [userIdentity])
+  }, [])
 
-  React.useEffect(() => {
-    fetchStorageInfo()
-  }, [fetchStorageInfo])
-
+  // Single fetch driver. Previous version had two near-identical useEffects
+  // both watching `fetchStorageInfo` — every identity flip ran getConfig
+  // twice, which was part of the "two loadings in a row" the user noticed
+  // on login.
   React.useEffect(() => {
     if (isLoadingUser) return
     fetchStorageInfo()
-  }, [fetchStorageInfo, isLoadingUser, userIdentity])
+  }, [fetchStorageInfo, isLoadingUser])
 
+  // Manual refresh trigger (used after uploads / quota-relevant operations).
   React.useEffect(() => {
     const handler = () => {
-      fetchStorageInfo()
+      // Quota-relevant operation just finished — bypass the shared
+      // `/fm/v1/config` cache so the bar reflects the new usage.
+      fetchStorageInfo(true)
     }
-    if (typeof window !== "undefined") {
-      window.addEventListener("tissuelab:cloudUsageRefresh", handler)
-    }
+    if (typeof window === "undefined") return
+    window.addEventListener("tissuelab:cloudUsageRefresh", handler)
     return () => {
-      if (typeof window !== "undefined") {
-        window.removeEventListener("tissuelab:cloudUsageRefresh", handler)
-      }
+      window.removeEventListener("tissuelab:cloudUsageRefresh", handler)
     }
   }, [fetchStorageInfo])
 
@@ -97,7 +96,7 @@ export const StorageUsageCard: React.FC<StorageUsageCardProps> = ({
       <div className={cn("flex flex-col gap-3 rounded-sm", withFrame ? "p-3" : "")}
       >
         <div className="flex items-center gap-2">
-          <Cloud className="h-4 w-4 text-muted-foreground" />
+          <HardDrive className="h-4 w-4 text-muted-foreground" />
           <p className="text-sm font-medium">{title}</p>
         </div>
 

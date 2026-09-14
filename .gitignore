@@ -5,6 +5,7 @@ __pycache__/
 
 # Custom
 .DS_Store
+TaskNodeManager/
 *.log
 .idea
 .vscode
@@ -15,12 +16,6 @@ dist
 #package.json
 #package-lock.json
 libopenjpeg*
-
-# Firebase admin SDK service account keys (never commit)
-app/service/credentials/
-
-# Runtime agent state (discovery sessions, etc.) — created by users at runtime
-app/service/app/services/storage/discovery_sessions/
 
 # Distribution / packaging
 .Python
@@ -44,6 +39,10 @@ MANIFEST
 example_WSI/eye-tracking-experiment/
 example_WSI/**/*.h5
 
+# Zarr files and directories
+**/*.zarr/
+**/*.zarr
+
 # H5 modification tracking files
 **/h5_modification_counts.json
 
@@ -54,3 +53,17 @@ example_WSI/**/*.h5
 
 # cludecode
 .history/
+app/electron/assets/TissueLab_AI/
+.claude/
+app/electron/assets/TissueLab_AI/
+BEHAVIOR_LOGGING.md
+IMPLEMENTATION_SUMMARY.md
+
+# Debug outputs
+debug/
+
+# Local environment
+.env.local
+app/service/.env.local
+
+package-lock.json

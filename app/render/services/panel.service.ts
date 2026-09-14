@@ -1,4 +1,4 @@
-import { AI_SERVICE_API_ENDPOINT } from '@/constants/config';
+import { AI_SERVICE_API_ENDPOINT } from '@/config/api.config';
 import { apiFetch, payloadFromAxiosAppResponse, requireAxiosAppPayload } from '@/utils/common/apiFetch';
 
 export interface PanelConfig {

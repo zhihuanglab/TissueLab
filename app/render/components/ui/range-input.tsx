@@ -1,4 +1,4 @@
-import { cn } from "@/utils/twMerge"
+import { cn } from "@/utils/common/twMerge"
 import * as React from "react"
 
 interface RangeInputProps extends Omit<React.InputHTMLAttributes<HTMLInputElement>, 'type' | 'onChange'> {

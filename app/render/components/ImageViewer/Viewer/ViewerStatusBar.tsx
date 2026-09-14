@@ -2,9 +2,12 @@
 
 import { FileText, Monitor, Mouse, Search } from "lucide-react";
 
+import { useEffect, useRef } from "react";
+
+import { bindPointerPositionText } from "@/utils/viewer/pointerPositionStore";
+
 
 interface ViewerStatusBarProps {
-  mousePos: { x: number; y: number };
   imageBounds: { x1: number; y1: number; x2: number; y2: number };
   imageRotation: number;
   magnification: number;
@@ -15,7 +18,6 @@ interface ViewerStatusBarProps {
 }
 
 export default function ViewerStatusBar({
-  mousePos,
   imageBounds,
   imageRotation,
   magnification,
@@ -24,6 +26,16 @@ export default function ViewerStatusBar({
   loadingMask = false,
   allTilesLoaded,
 }: ViewerStatusBarProps) {
+  // The coordinate readout is written straight into these two nodes. Going
+  // through React state would re-render on the sync lane inside the animation
+  // frame — a full reconciliation pass to change two text nodes.
+  const mouseXRef = useRef<HTMLSpanElement>(null);
+  const mouseYRef = useRef<HTMLSpanElement>(null);
+  useEffect(
+    () => bindPointerPositionText(mouseXRef.current, mouseYRef.current),
+    [],
+  );
+
   return (
     <div style={{
       position: 'absolute',
@@ -59,12 +71,12 @@ export default function ViewerStatusBar({
           fontWeight: '500',
           whiteSpace: 'nowrap'
         }}>
-          <span style={{ display: 'inline-block', textAlign: 'right', minWidth: '40px' }}>
-            {Math.round(mousePos.x)}
+          <span ref={mouseXRef} style={{ display: 'inline-block', textAlign: 'right', minWidth: '40px' }}>
+            0
           </span>
           ,{' '}
-          <span style={{ display: 'inline-block', textAlign: 'right', minWidth: '40px' }}>
-            {Math.round(mousePos.y)}
+          <span ref={mouseYRef} style={{ display: 'inline-block', textAlign: 'right', minWidth: '40px' }}>
+            0
           </span>
         </span>
       </div>

@@ -1,6 +1,6 @@
 import React from 'react';
 import { X } from 'lucide-react';
-import { cn } from '@/utils/twMerge';
+import { cn } from '@/utils/common/twMerge';
 
 interface CloseButtonProps {
   onClose: () => void;

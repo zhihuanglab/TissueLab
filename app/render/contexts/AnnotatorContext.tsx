@@ -1,11 +1,11 @@
-import React, { createContext, useContext, useMemo, useState, ReactNode } from 'react';
+import React, { createContext, useContext, useMemo, useState, ReactNode, Dispatch, SetStateAction } from 'react';
 import type OpenSeadragon from 'openseadragon';
 
 interface AnnotatorContextType {
   annotatorInstance: any;
   setAnnotatorInstance: (instance: any) => void;
   viewerInstance: OpenSeadragon.Viewer | null;
-  setViewerInstance: (instance: OpenSeadragon.Viewer | null) => void;
+  setViewerInstance: Dispatch<SetStateAction<OpenSeadragon.Viewer | null>>;
   instanceId: string | null;
   setInstanceId: (id: string | null) => void;
 }

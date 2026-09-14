@@ -5,7 +5,7 @@ import {
   saveWorkflowHistory,
   fetchWorkflowHistoryList,
   deleteWorkflowHistoryEntry,
-} from '@/utils/workflowHistoryApi';
+} from '@/services/workflowHistory.service';
 
 const MAX_ENTRIES = 50;
 
@@ -59,7 +59,7 @@ type WorkflowHistoryState = {
 };
 
 type WorkflowHistoryAction = {
-  /** Save a new entry locally and sync to Firebase (fire-and-forget) */
+  /** Save a new entry locally and sync to the service (fire-and-forget) */
   addEntry: (name: string, panels: WorkflowPanel[], outputPath: string, zarrPath: string) => void;
   updateEntry: (id: string, panels: WorkflowPanel[], outputPath: string) => void;
   removeEntry: (id: string) => void;
@@ -69,7 +69,7 @@ type WorkflowHistoryAction = {
   stashLivePanels: (panels: WorkflowPanel[], outputPath: string) => void;
   /** Rename an existing entry */
   renameEntry: (id: string, name: string) => void;
-  /** Fetch all entries from Firebase and populate the store */
+  /** Fetch all entries from the service and populate the store */
   loadFromCloud: () => Promise<void>;
 };
 
@@ -105,7 +105,7 @@ const workflowHistoryActions = (
     const newEntries = [entry, ...state.entries].slice(0, MAX_ENTRIES);
     set({ entries: newEntries, nextNumber: number + 1 });
 
-    // Sync to Firebase (fire-and-forget — UI is already updated)
+    // Sync to the service (fire-and-forget — UI is already updated)
     saveWorkflowHistory({
       id,
       name,
@@ -114,7 +114,7 @@ const workflowHistoryActions = (
       output_path: outputPath,
       color,
       number,
-    }).catch((err) => console.error('[workflowHistory] Firebase save failed:', err));
+    }).catch((err) => console.error('[workflowHistory] history save failed:', err));
   },
   updateEntry: (id, panels, outputPath) => {
     const state = get();
@@ -135,7 +135,7 @@ const workflowHistoryActions = (
         output_path: outputPath,
         color: existing.color,
         number: existing.number,
-      }).catch((err) => console.error('[workflowHistory] Firebase update failed:', err));
+      }).catch((err) => console.error('[workflowHistory] history update failed:', err));
     }
   },
   removeEntry: (id) => {
@@ -148,14 +148,14 @@ const workflowHistoryActions = (
     });
 
     deleteWorkflowHistoryEntry(id).catch((err) =>
-      console.error('[workflowHistory] Firebase delete failed:', err)
+      console.error('[workflowHistory] history delete failed:', err)
     );
   },
   clearAll: () => {
     const { entries } = get();
     set({ entries: [], nextNumber: 1, selectedHistoryId: null, stashedPanels: null, stashedOutputPath: null });
 
-    // Delete all from Firebase (fire-and-forget)
+    // Delete all from the service (fire-and-forget)
     entries.forEach((e) =>
       deleteWorkflowHistoryEntry(e.id).catch(() => {})
     );
@@ -189,7 +189,7 @@ const workflowHistoryActions = (
       output_path: existing.outputPath,
       color: existing.color,
       number: existing.number,
-    }).catch((err) => console.error('[workflowHistory] Firebase rename failed:', err));
+    }).catch((err) => console.error('[workflowHistory] history rename failed:', err));
   },
   loadFromCloud: async () => {
     try {

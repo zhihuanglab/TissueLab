@@ -1,6 +1,11 @@
 import { apiFetch, requireAxiosAppPayload } from '@/utils/common/apiFetch';
 import { isApiResponse } from '@/utils/common/apiResponse';
-import { AI_SERVICE_API_ENDPOINT } from '@/constants/config';
+import { AI_SERVICE_API_ENDPOINT, CTRL_SERVICE_API_ENDPOINT } from '@/config/api.config';
+import { getAuthToken } from '@/utils/common/authToken';
+import { getOrCreateDeviceId } from '@/utils/common/device.utils';
+import { assertCanWrite } from '@/utils/common/pathAccess.utils';
+import { ChunkedUploadManager } from '@/services/fileManager.service';
+import { CHUNK_UPLOAD_MIN_BYTES } from '@/services/chunkedUpload.utils';
 
 // ============================================================================
 // H5 to Zarr Conversion
@@ -61,6 +66,12 @@ const mapJobPayload = (payload: RawConversionJob): ConversionJobInfo => ({
 export const enqueueH5ToZarr = async (
   payload: H5ToZarrRequestPayload
 ): Promise<ConversionJobInfo> => {
+  // In-place convert writes the source; otherwise only the destination is written.
+  if (payload.target_path) {
+    assertCanWrite(payload.target_path, 'convert data');
+  } else {
+    assertCanWrite(payload.source_path, 'convert data');
+  }
   const response = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/data/v1/convert`, {
     method: 'POST',
     body: JSON.stringify(payload),
@@ -166,6 +177,7 @@ const addPath = (url: string, filePath: string, extraQS?: string) => {
 export const getZarrFileInfo = async (
   filePath: string
 ): Promise<ZarrFileInfo> => {
+  // View metadata — allowed on Samples/Viewer (BE authorize_read only).
   const response = await apiFetch(
     addPath(`${AI_SERVICE_API_ENDPOINT}/data/v1/info`, filePath),
     {
@@ -186,12 +198,18 @@ export const getZarrStructure = async (
   filePath: string,
   path: string = '/',
   includeAttributes: boolean = true,
-  maxDepth: number = -1
+  maxDepth: number = -1,
+  // Off by default: the server computes it by stat-ing every chunk file of
+  // every array, which is most of the request. Ask for it only where a size
+  // is actually rendered.
+  includeDiskSize: boolean = false
 ): Promise<ZarrStructure> => {
+  // View metadata — allowed on Samples/Viewer (badges / sidebar structure).
   const qs = new URLSearchParams({
     path,
     include_attributes: includeAttributes.toString(),
     max_depth: maxDepth.toString(),
+    include_disk_size: includeDiskSize.toString(),
   }).toString();
 
   const response = await apiFetch(
@@ -291,6 +309,7 @@ export const deleteNucleiAnnotation = async (
   arrayPath: string,
   cellId: number
 ): Promise<{ success: boolean; message: string }> => {
+  assertCanWrite(filePath, 'delete annotation');
   const cleanPath = arrayPath.startsWith('/') ? arrayPath.slice(1) : arrayPath;
 
   const response = await apiFetch(
@@ -319,6 +338,7 @@ export const updateNucleiAnnotationClass = async (
   cellId: number,
   newClassName: string
 ): Promise<{ success: boolean; message: string }> => {
+  assertCanWrite(filePath, 'update annotation');
   const cleanPath = arrayPath.startsWith('/') ? arrayPath.slice(1) : arrayPath;
 
   const response = await apiFetch(
@@ -527,6 +547,281 @@ export const validateZarrFile = async (
   return requireAxiosAppPayload(response) as any;
 };
 
+// ── Whole-.zarr replacement (upload your own preprocessing, incl. nuclei seg) ──
+
+export interface ZarrReplacementValidation {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+  summary: {
+    top_level_groups?: string[];
+    counts?: Record<string, number>;
+    nuclei_count?: number | null;
+    centroid_min?: number[];
+    centroid_max?: number[];
+    slide_dimensions?: number[] | null;
+  };
+}
+
+const STAGING_BATCH_MAX_BYTES = 5 * 1024 * 1024;
+const STAGING_BATCH_MAX_FILES = 500;
+const STAGING_UPLOAD_MAX_RETRIES = 3;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableStagingUploadError(error: unknown): boolean {
+  const err = error as { message?: string; status?: number };
+  const msg = String(err?.message ?? '').toLowerCase();
+  if (msg.includes('cancelled') || msg.includes('canceled')) return false;
+  const status = err?.status;
+  if (status === 400 || status === 401 || status === 403) return false;
+  if (status == null || status === 0) return true;
+  return status === 408 || status === 429 || status >= 500;
+}
+
+/** POST FormData via XHR so we get real byte-level upload progress (fetch can't). */
+function xhrUploadOnce(
+  url: string,
+  form: FormData,
+  onProgress?: (fraction: number) => void
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const fail = (message: string, status?: number) => {
+      const err: Error & { status?: number } = new Error(message);
+      if (status != null) err.status = status;
+      reject(err);
+    };
+    getAuthToken()
+      .then((token) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url);
+        xhr.timeout = 10 * 60 * 1000;
+        xhr.setRequestHeader('X-Device-Id', getOrCreateDeviceId());
+        if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+        xhr.upload.onprogress = (e) => {
+          if (onProgress && e.lengthComputable) onProgress(e.loaded / e.total);
+        };
+        xhr.onload = () => {
+          let data: any = null;
+          try {
+            data = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+          } catch {
+            data = xhr.responseText;
+          }
+          if (typeof data === 'object' && data && typeof data.code === 'number' && data.code !== 0) {
+            fail(data.message || data.detail || `Upload failed (${data.code})`, data.code);
+            return;
+          }
+          if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+          else fail(data?.detail || data?.message || `Upload failed (${xhr.status})`, xhr.status);
+        };
+        xhr.onerror = () => fail('Network error during upload', 0);
+        xhr.ontimeout = () => fail('Upload timed out. Please try again.', 0);
+        xhr.send(form);
+      })
+      .catch(reject);
+  });
+}
+
+async function xhrUpload(
+  url: string,
+  buildForm: () => FormData,
+  onProgress?: (fraction: number) => void
+): Promise<any> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= STAGING_UPLOAD_MAX_RETRIES; attempt++) {
+    try {
+      return await xhrUploadOnce(url, buildForm(), onProgress);
+    } catch (error) {
+      lastErr = error;
+      if (attempt >= STAGING_UPLOAD_MAX_RETRIES || !isRetryableStagingUploadError(error)) {
+        throw error;
+      }
+      await sleep(700 * 2 ** attempt);
+    }
+  }
+  throw lastErr;
+}
+
+function buildStagingUploadForm(
+  uploadPath: string,
+  files: File[],
+  relativePaths: string[]
+): FormData {
+  const fd = new FormData();
+  fd.append('path', uploadPath);
+  for (const f of files) fd.append('files', f);
+  fd.append('relative_paths', JSON.stringify(relativePaths));
+  fd.append('overwrite', 'true');
+  return fd;
+}
+
+/** Upload one batch of candidate files into a staging folder via the file-manager
+ *  upload. Files land at `<stagingRel>/<relativePath>`. */
+export const uploadZarrStagingBatch = async (
+  uploadPath: string,
+  files: File[],
+  relativePaths: string[],
+  onProgress?: (fraction: number) => void
+): Promise<void> => {
+  assertCanWrite(uploadPath, 'upload Zarr data');
+  await xhrUpload(
+    `${CTRL_SERVICE_API_ENDPOINT}/fm/v1/files/upload`,
+    () => buildStagingUploadForm(uploadPath, files, relativePaths),
+    onProgress
+  );
+};
+
+async function uploadStagingFileChunked(
+  uploadPath: string,
+  file: File,
+  relativePath: string,
+  onProgress?: (fraction: number) => void
+): Promise<void> {
+  const manager = new ChunkedUploadManager(
+    file.name,
+    file,
+    uploadPath,
+    (progress) => onProgress?.(Math.min(1, progress / 100)),
+    undefined,
+    undefined,
+    undefined,
+    true,
+    relativePath,
+    false
+  );
+  await manager.start();
+}
+
+/** Upload a replacement candidate into staging. Large files use chunked upload;
+ *  small files go in retried multipart batches. */
+export const uploadZarrStaging = async (
+  uploadPath: string,
+  files: File[],
+  relativePaths: string[],
+  onProgress?: (fraction: number) => void
+): Promise<void> => {
+  assertCanWrite(uploadPath, 'upload Zarr data');
+  const totalBytes = files.reduce((sum, f) => sum + (f.size || 0), 0) || 1;
+  const small: Array<{ file: File; relativePath: string }> = [];
+  const large: Array<{ file: File; relativePath: string }> = [];
+  for (let i = 0; i < files.length; i++) {
+    const entry = { file: files[i], relativePath: relativePaths[i] };
+    if ((files[i].size || 0) >= CHUNK_UPLOAD_MIN_BYTES) large.push(entry);
+    else small.push(entry);
+  }
+
+  const batches: Array<{ file: File; relativePath: string }[]> = [];
+  let current: Array<{ file: File; relativePath: string }> = [];
+  let currentBytes = 0;
+  for (const entry of small) {
+    const size = entry.file.size || 0;
+    const wouldExceed =
+      current.length > 0 &&
+      (currentBytes + size > STAGING_BATCH_MAX_BYTES || current.length >= STAGING_BATCH_MAX_FILES);
+    if (wouldExceed) {
+      batches.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(entry);
+    currentBytes += size;
+  }
+  if (current.length) batches.push(current);
+
+  let bytesDone = 0;
+  const report = (extra: number) => onProgress?.(Math.min(1, (bytesDone + extra) / totalBytes));
+
+  for (const entry of large) {
+    const size = entry.file.size || 0;
+    await uploadStagingFileChunked(uploadPath, entry.file, entry.relativePath, (f) => report(f * size));
+    bytesDone += size;
+    report(0);
+  }
+  for (const batch of batches) {
+    const size = batch.reduce((sum, e) => sum + (e.file.size || 0), 0);
+    await uploadZarrStagingBatch(
+      uploadPath,
+      batch.map((e) => e.file),
+      batch.map((e) => e.relativePath),
+      (f) => report(f * size)
+    );
+    bytesDone += size;
+    report(0);
+  }
+};
+
+function _fmPayload(response: any): any {
+  const d = response?.data;
+  return d && typeof d === 'object' && 'data' in d && !('ok' in d) ? d.data : d;
+}
+
+/** Validate a staged candidate .zarr against the slide (dimensions passed from the
+ *  viewer). Errors block; warnings are advisory. */
+export const validateZarrReplacement = async (
+  candidatePath: string,
+  targetSlidePath: string,
+  slideWidth?: number | null,
+  slideHeight?: number | null
+): Promise<ZarrReplacementValidation> => {
+  assertCanWrite(targetSlidePath, 'validate Zarr replacement');
+  const response = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/fm/v1/zarr/validate_replacement`, {
+    method: 'POST',
+    body: JSON.stringify({
+      candidate_path: candidatePath,
+      target_slide_path: targetSlidePath,
+      slide_width: slideWidth ?? null,
+      slide_height: slideHeight ?? null,
+    }),
+    returnAxiosFormat: true,
+  });
+  if (response.status !== 200) {
+    throw new Error(response.data?.detail || 'Failed to validate replacement');
+  }
+  return _fmPayload(response) as ZarrReplacementValidation;
+};
+
+/** Replace the slide's sidecar .zarr with the staged candidate (crash-safe swap;
+ *  the backend re-validates, refuses on error, and deletes the staging folder). */
+export const replaceZarr = async (
+  candidatePath: string,
+  targetSlidePath: string,
+  slideWidth?: number | null,
+  slideHeight?: number | null
+): Promise<{ ok: boolean; target_zarr: string; nuclei_count?: number | null; warnings?: string[] }> => {
+  assertCanWrite(targetSlidePath, 'replace Zarr data');
+  const response = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/fm/v1/zarr/replace`, {
+    method: 'POST',
+    body: JSON.stringify({
+      candidate_path: candidatePath,
+      target_slide_path: targetSlidePath,
+      slide_width: slideWidth ?? null,
+      slide_height: slideHeight ?? null,
+    }),
+    returnAxiosFormat: true,
+  });
+  if (response.status !== 200) {
+    throw new Error(response.data?.detail || 'Failed to replace Zarr');
+  }
+  return _fmPayload(response);
+};
+
+/** Delete a staging folder (best-effort, on cancel). */
+export const deleteZarrStaging = async (stagingRel: string): Promise<void> => {
+  if (!stagingRel) return;
+  try {
+    await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/fm/v1/files/delete`, {
+      method: 'POST',
+      body: JSON.stringify({ items: [stagingRel] }),
+      returnAxiosFormat: true,
+    });
+  } catch {
+    /* best effort */
+  }
+};
+
 // Endpoints that don't depend on a specific file
 export const getZarrVersion = async (): Promise<Record<string, string>> => {
   const response = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/data/v1/version`, {
@@ -616,6 +911,8 @@ export const exportZarrStructure = async (
   total_groups: number;
   total_arrays: number;
 }> => {
+  assertCanWrite(filePath, 'export Zarr structure');
+  assertCanWrite(exportPath, 'export Zarr structure');
   const response = await apiFetch(
     addPath(`${AI_SERVICE_API_ENDPOINT}/data/v1/export/structure`, filePath),
     {
@@ -828,7 +1125,7 @@ export const loadSegmentationMask = async (
   filePath: string,
   targetWidth?: number,
   targetHeight?: number,
-  maskKey?: string | null
+  maskKey?: string | null,
 ): Promise<{
   success: boolean;
   data?: Uint8Array;
@@ -865,6 +1162,7 @@ export const loadSegmentationMask = async (
     
     const url = `${AI_SERVICE_API_ENDPOINT}/seg/v1/mask?${params.toString()}`;
     
+    // Path-only: do not attach X-Instance-ID
     const res = await apiFetch(url, {
       method: 'GET',
       headers: {
@@ -974,15 +1272,15 @@ export const loadSegmentationMask = async (
       offset: [offsetX, offsetY] as [number, number],
       full_shape: [fullShape0, fullShape1] as [number, number]
     };
-    
+
     if (regionSize) {
       result.region_size = regionSize;
     }
-    
+
     if (tissueClass) {
       result.tissue_class = tissueClass;
     }
-    
+
     return result;
   } catch (error: any) {
     return {

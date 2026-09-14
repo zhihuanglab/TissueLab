@@ -1,22 +1,22 @@
 import "@/styles/globals.css";
-// import '@coreui/coreui/dist/css/coreui.min.css';
-import type { NextPage } from 'next';
+
+import type { NextPage } from "next";
 import type { AppProps } from "next/app";
+import { Inter } from "next/font/google";
 import Head from "next/head";
-import type { ReactElement } from 'react';
+import React, { useEffect, type ReactElement } from "react";
 import { Provider } from "react-redux";
-// Removed PersistGate - following tissuelab.org lightweight approach
+import { GoogleOAuthProvider } from "@react-oauth/google";
+import { Toaster } from "sonner";
+
+import { PreRunProgressWidget } from "@/components/dashboard/PreRunProgressWidget";
+import ErrorBoundary from "@/components/imageViewer/review/ErrorBoundary";
 import AppHeader from "@/components/layouts/AppHeader";
 import AppSidebar from "@/components/layouts/AppSidebar";
-import VersionNotice from "@/components/layouts/VersionNotice";
 import { AnnotatorProvider } from "@/contexts/AnnotatorContext";
-import { ThemeProvider } from "@/provider/theme/ThemeProvider";
-import { UserInfoProvider } from "@/provider/UserInfoProvider";
+import { ThemeProvider } from "@/contexts/theme/ThemeProvider";
+import { UserInfoProvider } from "@/contexts/UserInfoProvider";
 import { store } from "@/store";
-import { GoogleOAuthProvider } from "@react-oauth/google";
-import { Inter } from "next/font/google";
-import React, { useEffect } from "react";
-import { Toaster } from "sonner";
 
 
 const inter = Inter({
@@ -43,6 +43,7 @@ function App({ Component, pageProps }: AppPropsWithLayout) {
   // Apply font variable to document.documentElement so Portal-rendered components can access it
   useEffect(() => {
     document.documentElement.classList.add(inter.variable);
+    // Batch restore runs once auth uid is ready (UserInfoProvider), not on bare mount.
   }, []);
 
   return (
@@ -62,15 +63,36 @@ function App({ Component, pageProps }: AppPropsWithLayout) {
                 onLoad={() => console.log('Google Identity Services script loaded')}
               /> */}
               <ThemeProvider>
-                {/*@ts-ignore*/}
-                {getLayout(<Component {...pageProps} />)}
-                <VersionNotice />
+                {/* Top-level boundary so render crashes on ANY page are caught
+                    here (before Next's own boundary) and reported. */}
+                <ErrorBoundary name="app-root" fallback={<AppCrashFallback />}>
+                  {/*@ts-ignore*/}
+                  {getLayout(<Component {...pageProps} />)}
+                </ErrorBoundary>
+                <PreRunProgressWidget />
                 <Toaster position="bottom-left" toastOptions={{ style: { insetInlineStart: 2, insetBlockEnd: 2 } }} />
               </ThemeProvider>
             </AnnotatorProvider>
           </UserInfoProvider>
         </Provider>
       </GoogleOAuthProvider>
+    </div>
+  );
+}
+
+function AppCrashFallback() {
+  return (
+    <div className="flex h-screen w-full flex-col items-center justify-center gap-4 bg-background p-8 text-center">
+      <h1 className="text-xl font-semibold text-gray-900 dark:text-white">Something went wrong</h1>
+      <p className="max-w-md text-sm text-gray-500 dark:text-gray-400">
+        The page hit an unexpected error. Please reload to continue.
+      </p>
+      <button
+        onClick={() => window.location.reload()}
+        className="rounded-lg bg-[#6352A2] px-4 py-2 text-sm font-medium text-white hover:brightness-110"
+      >
+        Reload
+      </button>
     </div>
   );
 }

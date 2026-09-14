@@ -8,7 +8,7 @@ import { ColorTag, getTagColor } from '@/components/ui/color-tag'
 import { ExpandableSearch } from '@/components/ui/ExpandableSearch'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import type { BaseModelItem, ClassifierData, SortOption } from '@/types/community.types'
-import { getFilterTagColor } from '@/utils/community.utils'
+import { getFilterTagColor } from '@/utils/community/community.utils'
 import type { LucideIcon } from "lucide-react"
 import { ArrowUpDown, Upload } from "lucide-react"
 import * as React from "react"
@@ -140,7 +140,7 @@ export function ClassifiersHeader({
               <ColorTag
                 key={tag}
                 color={tagColor}
-                className="flex items-center gap-1 whitespace-nowrap flex-shrink-0 h-6 bg-card"
+                className="flex items-center gap-1 whitespace-nowrap shrink-0 h-6 bg-card"
               >
                 <span className="text-xs">{tag}</span>
                 <button

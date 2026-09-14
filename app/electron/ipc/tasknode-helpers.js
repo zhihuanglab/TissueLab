@@ -11,7 +11,7 @@ const fs = require('fs');
  * @param {Map} params.activeDownloads - Active downloads map
  * @returns {Promise<{ok: boolean, started?: boolean, target?: string, cancelled?: boolean, error?: string}>}
  */
-async function downloadFile({ url, filename, showSaveDialog, window, activeDownloads }) {
+async function downloadFile({ url, filename, showSaveDialog, window, activeDownloads, serviceRoot }) {
   try {
     if (!url) return { ok: false, error: 'Missing URL' };
     
@@ -33,7 +33,7 @@ async function downloadFile({ url, filename, showSaveDialog, window, activeDownl
 
       finalPath = filePath;
     } else {
-      const storagePath = path.join(__dirname, '..', '..', 'service', 'storage', 'tasknodes');
+      const storagePath = path.join(serviceRoot || path.join(__dirname, '..', '..', 'service'), 'storage', 'tasknodes');
       fs.mkdirSync(storagePath, { recursive: true });
 
       finalPath = path.join(storagePath, suggestion);
@@ -100,7 +100,7 @@ async function downloadFile({ url, filename, showSaveDialog, window, activeDownl
  * @param {string} params.url - Download URL for event matching
  * @returns {Promise<{success: boolean, extractedPath?: string, error?: string}>}
  */
-async function extractAndPersist({ zipPath, modelName, factory, window, url }) {
+async function extractAndPersist({ zipPath, modelName, factory, window, url, serviceRoot }) {
   try {
     if (!zipPath || !modelName) {
       return { success: false, error: 'Missing zipPath or modelName' };
@@ -109,7 +109,8 @@ async function extractAndPersist({ zipPath, modelName, factory, window, url }) {
     const { spawn } = require('child_process');
 
     // Extract to storage path
-    const nodesDir = path.join(__dirname, '..', '..', 'service', 'storage', 'nodes', modelName);
+    const root = serviceRoot || path.join(__dirname, '..', '..', 'service');
+    const nodesDir = path.join(root, 'storage', 'nodes', modelName);
     fs.mkdirSync(nodesDir, { recursive: true });
 
     // Emit extraction start event (use download-progress for DownloadArea compatibility)
@@ -157,7 +158,10 @@ async function extractAndPersist({ zipPath, modelName, factory, window, url }) {
           extractErr = res2.stderr || extractErr;
         }
       } else if (isWin) {
-        const psCmd = `Expand-Archive -LiteralPath "${zipPath}" -DestinationPath "${nodesDir}" -Force`;
+        // Expand-Archive reports a corrupt archive as a *non-terminating* error,
+        // which leaves powershell's exit code at 0; escalate it so the failure
+        // is reported as one (and the tar fallback gets its turn).
+        const psCmd = `try { Expand-Archive -LiteralPath "${zipPath}" -DestinationPath "${nodesDir}" -Force -ErrorAction Stop } catch { Write-Error $_; exit 1 }`;
         const res = await extractAsync('powershell.exe', ['-NoProfile', '-Command', psCmd]);
         extractOk = res.success;
         extractErr = res.stderr || '';
@@ -252,7 +256,7 @@ async function extractAndPersist({ zipPath, modelName, factory, window, url }) {
     
     // Save entry point to registry
     try {
-      const registryPath = path.join(__dirname, '..', '..', 'service', 'storage', 'model_registry.json');
+      const registryPath = path.join(root, 'storage', 'model_registry.json');
       let registry = { category_map: {}, nodes: {}, category_display_names: {} };
       
       if (fs.existsSync(registryPath)) {

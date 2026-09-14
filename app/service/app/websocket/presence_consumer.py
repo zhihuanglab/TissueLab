@@ -3,67 +3,66 @@ from fastapi import WebSocket, WebSocketDisconnect
 from .presence_manager import presence_manager
 from app.middlewares.websocket_auth_middleware import websocket_auth_required
 from app.core.logger import logger
-from app.core.auth import AuthUser
-from typing import Optional
+from app.config.path_config import authorize_storage_read_path
+
+
+async def _reject(websocket: WebSocket, reason: str = "") -> None:
+    """Close a connection that was never accepted.
+
+    ``accept()`` happens inside ``presence_manager.connect()``, below every
+    check here, so ``client_state`` is still CONNECTING at this point. Guarding
+    the close with ``client_state.name == "CONNECTED"`` therefore skipped it
+    every time: the endpoint logged the rejection and returned without sending
+    anything, and the browser sat on a socket that was never going to open.
+    Starlette turns a close before accept into a refused handshake, which is
+    what the client is waiting to hear.
+    """
+    try:
+        await websocket.close(code=1008, reason=reason)
+    except RuntimeError:
+        pass  # client already gone
+
 
 async def presence_endpoint(websocket: WebSocket):
-    # 1. OPTIONAL Authentication
-    # The middleware kills the connection if it fails, so we MUST NOT call it
-    # unless we see a token (which indicates an attempt to authenticate).
-    user: Optional[AuthUser] = None
-    token_present = "token" in websocket.query_params
-    
-    if token_present:
-        try:
-            # Only call strict auth if user actually sent a token
-            user = await websocket_auth_required(websocket)
-            if user:
-                logger.info(f"[PRESENCE] Authenticated connection: {user.uid} ({user.email})")
-        except WebSocketDisconnect:
-            # Token was invalid or expired -> connection closed by middleware
-            logger.warning("[PRESENCE] Auth failed (invalid token), connection closed.")
-            return
-        except Exception as e:
-            logger.error(f"[PRESENCE] Auth error: {e}")
-            # If it wasn't a disconnect, we might still be alive, but unsafe to assume identity
-    else:
-        # No token provided -> Explicit Guest Mode (Local Strategy)
-        logger.info("[PRESENCE] No token provided, proceeding as Guest.")
-
-    # 2. Extract params (Guest Fallback)
-    # If user is authenticated, use their real ID. 
-    # If not (Guest), trust the query params from localStorage.
-    file_path = websocket.query_params.get("file_path")
-    
-    # Priority: Authenticated User > Query Param > None
-    uid = user.uid if user else websocket.query_params.get("uid")
-    
-    # Priority: Authenticated Name > Query Param > Guest
-    name_param = websocket.query_params.get("name")
-    if user:
-        name = getattr(user, 'display_name', None) or getattr(user, 'name', None) or name_param
-    else:
-        name = name_param or "Guest"
-
-    email = user.email if user else "local@user"
-
-    # 3. Validation
-    if not file_path or not uid:
-        logger.warning(f"[PRESENCE] Rejected: Missing file_path or uid (User: {user})")
-        # Ensure we close with a policy violation code if we haven't already
-        if websocket.client_state.name == "CONNECTED":
-            await websocket.close(code=1008)
+    # Require authentication — do not accept forged Guest uids.
+    try:
+        user = await websocket_auth_required(websocket)
+    except WebSocketDisconnect:
+        logger.warning("[PRESENCE] Auth failed (invalid token), connection closed.")
+        return
+    except Exception as e:
+        logger.error(f"[PRESENCE] Auth error: {e}", exc_info=e)
+        await _reject(websocket)
         return
 
-    # 4. Construct User Info
+    if user is None or not getattr(user, "uid", None):
+        await _reject(websocket, "Authentication required")
+        return
+
+    file_path = websocket.query_params.get("file_path")
+    if not file_path:
+        logger.warning(f"[PRESENCE] Rejected: Missing file_path (User: {user.uid})")
+        await _reject(websocket)
+        return
+
+    try:
+        authorize_storage_read_path(file_path, user.uid)
+    except PermissionError:
+        logger.warning(f"[PRESENCE] Rejected: path access denied for {user.uid}")
+        await _reject(websocket, "Path access denied")
+        return
+
+    name_param = websocket.query_params.get("name")
+    name = getattr(user, "display_name", None) or getattr(user, "name", None) or name_param or user.uid
+    email = user.email or "unknown@user"
+
     user_info = {
-        "uid": uid,
+        "uid": user.uid,
         "name": name,
-        "email": email, 
-        "color": "#585191" 
+        "email": email,
+        "color": "#585191",
     }
 
-    # 5. Connect & Loop
     try:
         await presence_manager.connect(websocket, file_path, user_info)
         while True:
@@ -74,9 +73,12 @@ async def presence_endpoint(websocket: WebSocket):
             except WebSocketDisconnect:
                 break
             except Exception as e:
-                logger.error(f"[PRESENCE] Loop error for {uid}: {e}")
+                logger.error(f"[PRESENCE] Loop error for {user.uid}: {e}", exc_info=e)
                 break
     except Exception as e:
-        logger.error(f"[PRESENCE] Connection error for {uid}: {e}")
+        logger.error(f"[PRESENCE] Connection error for {user.uid}: {e}", exc_info=e)
     finally:
-        await presence_manager.disconnect(websocket)
+        try:
+            await presence_manager.disconnect(websocket)
+        except Exception:
+            pass

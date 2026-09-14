@@ -7,8 +7,9 @@ const { spawn, execSync } = require('child_process');
 const http = require('http');
 const net = require('net');
 const { downloadFile, extractAndPersist } = require('./ipc/tasknode-helpers');
-const { performGoogleOAuth, refreshGoogleToken } = require('./ipc/oauth-helpers');
+const { getServiceRoot } = require('./ipc/service-root');
 const { setupProtocolHandlers } = require('./ipc/protocol-helpers');
+const { performGoogleOAuth, refreshGoogleToken } = require('./ipc/oauth-helpers');
 
 let mainWindow;
 let splashWindow;
@@ -127,15 +128,6 @@ app.commandLine.appendSwitch('enable-accelerated-2d-canvas'); // Enable 2D canva
 // app.commandLine.appendSwitch('disable-gpu-rasterization'); // Disable GPU rasterization
 app.commandLine.appendSwitch('enable-software-rasterizer'); // Enable software rasterizer as fallback
 
-// macOS Metal compositor occasionally tries to ProduceOverlay against a stale
-// SharedImage mailbox after window resize / focus change, spamming
-// "Invalid mailbox" / "non-existent mailbox" errors and (in worst cases)
-// triggering a black-frame redraw. Disabling CoreAnimation layer overlays
-// stops that path without affecting WebGL / 2D canvas acceleration.
-if (process.platform === 'darwin') {
-  app.commandLine.appendSwitch('disable-features', 'CALayerOverlays,VideoToolboxVideoDecoder');
-}
-
 function createSplashWindow() {
   // Detect screen resolution to determine appropriate splash window size
   const { screen } = require('electron');
@@ -175,7 +167,9 @@ function createSplashWindow() {
     },
     icon: process.platform === 'darwin'
       ? path.join(__dirname, 'assets/icons/icon.icns')
-      : path.join(__dirname, 'assets/icons/icon.png')
+      : process.platform === 'win32'
+        ? path.join(__dirname, 'assets/icons/TissueLab_logo.ico')
+        : path.join(__dirname, 'assets/icons/icon.png')
   });
 
   splashWindow.loadFile(path.join(__dirname, 'splash.html'));
@@ -229,11 +223,18 @@ function createWindow() {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: true,
-      webgl: true
+      webgl: true,
+      // Chromium throttles a hidden window's timers to one tick per minute.
+      // The viewer's WebSocket ping is a 30s setInterval and the service closes
+      // a connection whose last ping is over 60s old, so a minimised window
+      // drifts past the timeout and comes back to "Connection lost".
+      backgroundThrottling: false
     },
     icon: process.platform === 'darwin'
-      ? path.join(__dirname, 'assets/icons/icon.icns')  // macOS icon
-      : path.join(__dirname, 'assets/icons/icon.png')   // Windows/Linux icon
+      ? path.join(__dirname, 'assets/icons/icon.icns')
+      : process.platform === 'win32'
+        ? path.join(__dirname, 'assets/icons/TissueLab_logo.ico')
+        : path.join(__dirname, 'assets/icons/icon.png')
   });
 
   // Track the main window as soon as it's created
@@ -613,6 +614,14 @@ ipcMain.handle('get-backend-port', () => {
   return getBackendPort();
 });
 
+// Screen-space rectangle of the web-content area (the origin that CSS
+// position:fixed and getBoundingClientRect measure from). Used by the
+// eye-tracking hook to map Tobii screen gaze into viewport coordinates without
+// guessing the title-bar / chrome height. Returns DIPs: { x, y, width, height }.
+ipcMain.handle('get-content-bounds', () => {
+  return mainWindow ? mainWindow.getContentBounds() : null;
+});
+
 // Clear buffers
 ipcMain.handle('clear-backend-buffers', () => {
   stdoutBuffer = [];
@@ -648,22 +657,59 @@ ipcMain.handle('write-file', async (event, options) => {
   }
 });
 
-// Google OAuth - PKCE-based browser authentication
-// Desktop client "secret" is bundled with the app — not truly confidential per Google's OAuth spec
-ipcMain.handle('google-oauth', async (event, { clientId, clientSecret }) => {
+// Download a remote URL via Chromium
+ipcMain.handle('download-signed-url', async (event, payload) => {
+  const win = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+  return downloadFile({
+    url: payload?.url,
+    filename: payload?.filename,
+    showSaveDialog: payload?.showSaveDialog !== false,
+    window: win,
+    activeDownloads,
+    serviceRoot: getServiceRoot(app)
+  });
+});
+
+// Extract ZIP and persist to registry
+ipcMain.handle('extract-zip-and-persist', async (event, payload) => {
+  const win = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+  return extractAndPersist({
+    zipPath: payload?.zipPath,
+    modelName: payload?.modelName,
+    factory: payload?.factory,
+    window: win,
+    url: payload?.url,
+    serviceRoot: getServiceRoot(app)
+  });
+});
+
+// Handle download cancellation
+ipcMain.handle('cancel-download', async (event, downloadUrl) => {
+  const downloadItem = activeDownloads.get(downloadUrl);
+
+  if (downloadItem && !downloadItem.isDone()) {
+    downloadItem.cancel();
+    activeDownloads.delete(downloadUrl);
+    console.log('Download cancelled by user');
+    return { ok: true, cancelled: true };
+  }
+
+  return { ok: false, error: 'No active download found' };
+});
+
+// Google OAuth - PKCE-based browser authentication (production-ready, secretless)
+ipcMain.handle('google-oauth', async (event, { clientId }) => {
   return await performGoogleOAuth({
     clientId,
-    clientSecret,
     openExternal: shell.openExternal.bind(shell)
   });
 });
 
 // Refresh Google OAuth token using refresh_token
-ipcMain.handle('google-refresh-token', async (event, { refreshToken, clientId, clientSecret }) => {
+ipcMain.handle('google-refresh-token', async (event, { refreshToken, clientId }) => {
   return await refreshGoogleToken({
     refreshToken,
-    clientId,
-    clientSecret
+    clientId
   });
 });
 
@@ -772,45 +818,6 @@ ipcMain.handle('delete-refresh-token', async () => {
     console.error('[Auth] Failed to delete refresh token:', error);
     return { success: false, error: error.message };
   }
-});
-
-
-// Download a remote URL via Chromium
-ipcMain.handle('download-signed-url', async (event, payload) => {
-  const win = BrowserWindow.fromWebContents(event.sender) || mainWindow;
-  return downloadFile({
-    url: payload?.url,
-    filename: payload?.filename,
-    showSaveDialog: payload?.showSaveDialog !== false,
-    window: win,
-    activeDownloads
-  });
-});
-
-// Extract ZIP and persist to registry
-ipcMain.handle('extract-zip-and-persist', async (event, payload) => {
-  const win = BrowserWindow.fromWebContents(event.sender) || mainWindow;
-  return extractAndPersist({
-    zipPath: payload?.zipPath,
-    modelName: payload?.modelName,
-    factory: payload?.factory,
-    window: win,
-    url: payload?.url
-  });
-});
-
-// Handle download cancellation
-ipcMain.handle('cancel-download', async (event, downloadUrl) => {
-  const downloadItem = activeDownloads.get(downloadUrl);
-  
-  if (downloadItem && !downloadItem.isDone()) {
-    downloadItem.cancel();
-    activeDownloads.delete(downloadUrl);
-    console.log('Download cancelled by user');
-    return { ok: true, cancelled: true };
-  }
-  
-  return { ok: false, error: 'No active download found' };
 });
 
 // Handle application menu display (registered once at module level)
@@ -1192,11 +1199,13 @@ async function spawnBackendService() {
         ...envWithoutPort,
         PYTHONIOENCODING: 'utf-8',
         PYTHONUTF8: '1',
-        _MEIPASS: path.dirname(backendServicePath),
         PYTHONUNBUFFERED: '1',
         PYTHONDONTWRITEBYTECODE: '1',
         PYTHONNOUSERSITE: '1',
-        // TL_SERVICE_ROOT will be read from .env.prod file (don't override here)
+        // TL_SERVICE_ROOT is NOT set here: the packaged service is launched with
+        // `--env desktop --service-root <userData>` below. .env.desktop supplies
+        // the static desktop config; the per-user storage root has to come from
+        // Electron because no file can know it.
         // Fix home directory path issue
         HOME: os.homedir()
       }
@@ -1211,8 +1220,12 @@ async function spawnBackendService() {
       spawnAttempts++;
       console.log(`[ELECTRON] Attempting to spawn backend service on port ${detectedPort} (attempt ${spawnAttempts}/${maxSpawnAttempts})`);
       
-      // Only pass --port argument in packaged app (development uses default port 5001)
-      const spawnArgs = app.isPackaged ? ['--port', detectedPort.toString()] : [];
+      // Packaged app: select the bundled .env.desktop and point the service at a
+      // writable per-user root. Without --service-root it would fall back to the
+      // server path baked into .env.prod (/data/prod-env) and fail to start.
+      const spawnArgs = app.isPackaged
+        ? ['--port', detectedPort.toString(), '--env', 'desktop', '--service-root', getServiceRoot(app)]
+        : [];
       backendServiceProcess = spawn(backendServicePath, spawnArgs, spawnOptions);
       
       // Set up timeout for first startup (PyInstaller can be slow)
@@ -1473,6 +1486,152 @@ app.on('activate', () => {
   }
 });
 
+// `before-quit` gives us no chance to await, so the wait between SIGTERM and
+// SIGKILL has to block. Atomics.wait is a real sleep on the main thread —
+// no process spawn, no busy loop.
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function pidExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    // EPERM means it exists but belongs to someone else — still alive.
+    return e.code === 'EPERM';
+  }
+}
+
+// Which of `pids` are actually still running.
+//
+// signal 0 alone is not enough: it also succeeds for a ZOMBIE — a child that
+// has already exited but has not been reaped. cleanupProcesses() runs
+// synchronously and blocks the event loop, so libuv cannot reap the backend
+// while we wait on it. Counting a zombie as alive made every quit sit out the
+// whole grace period and then SIGKILL a corpse. One `ps` answers for the whole
+// set, so this stays a single spawn per poll rather than one per pid.
+function livingPids(pids) {
+  if (!pids.length) return [];
+  if (isWindows) return pids.filter(pidExists);
+
+  let out = '';
+  try {
+    out = execSync(`ps -o pid=,stat= -p ${pids.join(',')}`, {
+      encoding: 'utf8',
+      timeout: 2000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch (e) {
+    return []; // ps exits non-zero when none of the pids exist
+  }
+
+  const living = [];
+  for (const line of out.split('\n')) {
+    const match = line.trim().match(/^(\d+)\s+(\S+)/);
+    if (!match) continue;
+    if (match[2].startsWith('Z')) continue; // exited, just not reaped yet
+    living.push(Number(match[1]));
+  }
+  return living;
+}
+
+// Every descendant of `rootPid`, deepest last. `pkill -P` reaches only one
+// level, so a tasknode that spawned its own workers used to survive app quit
+// and keep the backend port bound against the next launch.
+function collectDescendantPidsSync(rootPid) {
+  const found = [];
+  const walk = (pid, depth) => {
+    if (depth > 8) return; // guard against a pathological tree / pid reuse cycle
+    let out = '';
+    try {
+      out = execSync(`pgrep -P ${pid}`, {
+        encoding: 'utf8',
+        timeout: 2000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch (e) {
+      return; // pgrep exits non-zero when there are no children
+    }
+    for (const line of out.split('\n')) {
+      const child = Number.parseInt(line.trim(), 10);
+      if (Number.isInteger(child) && child > 0 && !found.includes(child)) {
+        found.push(child);
+        walk(child, depth + 1);
+      }
+    }
+  };
+  walk(rootPid, 0);
+  return found;
+}
+
+// Terminate a process tree and VERIFY it is gone.
+//
+// The previous version sent SIGTERM and moved on. A backend blocked in a C
+// extension (zarr / OpenSlide IO) does not run its signal handler, so it
+// outlived the app, held the port, and the next launch either failed to bind
+// or attached to a stale backend.
+const PROCESS_TREE_GRACE_MS = 2500;
+
+function killProcessTreeSync(rootPid) {
+  if (!rootPid) return;
+
+  if (isWindows) {
+    // taskkill /t /f is already a forced whole-tree kill.
+    try {
+      execSync(`chcp 65001 >nul && taskkill /f /t /pid ${rootPid}`, {
+        encoding: 'utf8',
+        timeout: 5000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      console.log('[ELECTRON] Process tree killed (taskkill /t /f)');
+    } catch (killError) {
+      console.error(`[ELECTRON] taskkill failed: ${killError.message}`);
+    }
+    return;
+  }
+
+  // Children first so a parent cannot re-parent or respawn them while it dies.
+  const tree = [...collectDescendantPidsSync(rootPid).reverse(), rootPid];
+  console.log(`[ELECTRON] Process tree for ${rootPid}: ${tree.join(', ')}`);
+
+  for (const pid of tree) {
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch (e) {
+      /* already gone */
+    }
+  }
+
+  const deadline = Date.now() + PROCESS_TREE_GRACE_MS;
+  let alive = livingPids(tree);
+  while (alive.length > 0 && Date.now() < deadline) {
+    sleepSync(100);
+    alive = livingPids(alive);
+  }
+
+  if (alive.length === 0) {
+    console.log('[ELECTRON] Process tree exited on SIGTERM');
+    return;
+  }
+
+  console.warn(`[ELECTRON] SIGTERM ignored by ${alive.join(', ')} — sending SIGKILL`);
+  for (const pid of alive) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch (e) {
+      /* already gone */
+    }
+  }
+  sleepSync(200);
+  const survivors = livingPids(alive);
+  if (survivors.length > 0) {
+    console.error(`[ELECTRON] Processes survived SIGKILL: ${survivors.join(', ')}`);
+  } else {
+    console.log('[ELECTRON] Process tree killed');
+  }
+}
+
 // Function to cleanup all processes
 function cleanupProcesses() {
   console.log('[ELECTRON] Starting cleanup process...');
@@ -1506,67 +1665,14 @@ function cleanupProcesses() {
   // Kill backend service process and all its children (including tasknode processes)
   if (backendServiceProcess) {
     console.log(`[ELECTRON] Killing backend service process tree (PID: ${backendServiceProcess.pid})...`);
-    // Platform-specific process tree killing
-    let killCommand;
-    if (isWindows) {
-      // Windows: use taskkill to kill process tree
-      killCommand = `chcp 65001 >nul && taskkill /f /t /pid ${backendServiceProcess.pid}`;
-      console.log(`[ELECTRON] Executing Windows taskkill command...`);
-    } else if (isMac) {
-      // macOS: Try to kill children first, then parent
-      console.log(`[ELECTRON] Executing macOS process termination...`);
-      
-      // First try to kill children (may not exist)
-      try {
-        execSync(`pkill -TERM -P ${backendServiceProcess.pid}`, { 
-          encoding: 'utf8', 
-          timeout: 2000,
-          stdio: 'pipe' 
-        });
-        console.log(`[ELECTRON] Children processes terminated`);
-      } catch (e) {
-        console.log(`[ELECTRON] No children processes found or already terminated`);
-      }
-      
-      // Then kill parent process
-      try {
-        execSync(`kill -TERM ${backendServiceProcess.pid}`, { 
-          encoding: 'utf8', 
-          timeout: 2000,
-          stdio: 'pipe' 
-        });
-        console.log(`[ELECTRON] Parent process terminated`);
-      } catch (e) {
-        console.log(`[ELECTRON] Parent process already terminated or not found`);
-      }
-    } else {
-      // Linux: use pkill to kill process tree
-      killCommand = `pkill -TERM -P ${backendServiceProcess.pid} && kill -TERM ${backendServiceProcess.pid}`;
-      console.log(`[ELECTRON] Executing Linux pkill command...`);
-    }
-    
-    if (killCommand) {
-      try {
-        const result = execSync(killCommand, { 
-          encoding: 'utf8',
-          timeout: 5000 
-        });
-        if (result.trim()) {
-          console.log(`[ELECTRON] Process tree kill result: ${result.trim()}`);
-        } else {
-          console.log(`[ELECTRON] Process tree kill completed successfully (no output)`);
-        }
-      } catch (killError) {
-        console.error(`[ELECTRON] Process tree kill failed: ${killError.message}`);
-      }
-    }
-    
+    killProcessTreeSync(backendServiceProcess.pid);
+
     // Monitor process exit
     backendServiceProcess.once('exit', (code, signal) => {
       console.log(`[ELECTRON] Backend service process terminated (code: ${code}, signal: ${signal})`);
     });
   }
-  
+
   // Next.js standalone server runs in main process, no need to kill
   // The server will be cleaned up when the app quits
   if (nextjsStandaloneProcess) {
@@ -1604,17 +1710,32 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
-// Handle uncaught exceptions
+// Handle uncaught exceptions.
+//
+// These used to call process.exit(1). The main process makes plenty of
+// fire-and-forget async calls (downloads, tasknode helpers), so one
+// rejected promise from a network blip took the whole app down mid-session
+// with no window, no message and nothing saved — it read as a random crash.
+// Log it, surface it in the renderer if there is one, and keep running; an
+// isolated failure is not a reason to destroy the user's session.
+function reportMainProcessFault(kind, error) {
+  const message = error instanceof Error ? (error.stack || error.message) : String(error);
+  console.error(`[ELECTRON] ${kind}:`, message);
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('main-process-error', { kind, message });
+    }
+  } catch (e) {
+    /* renderer may be tearing down */
+  }
+}
+
 process.on('uncaughtException', (error) => {
-  console.error('[ELECTRON] Uncaught Exception:', error);
-  cleanupProcesses();
-  process.exit(1);
+  reportMainProcessFault('Uncaught Exception', error);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('[ELECTRON] Unhandled Rejection at:', promise, 'reason:', reason);
-  cleanupProcesses();
-  process.exit(1);
+process.on('unhandledRejection', (reason) => {
+  reportMainProcessFault('Unhandled Rejection', reason);
 });
 
 // Handle quitting the app

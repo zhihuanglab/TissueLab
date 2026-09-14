@@ -11,7 +11,7 @@ export interface ReviewCandidate {
     contour?: { x: number; y: number }[]; // Cell contour points
   };
   label?: 1 | 0; // 1=Yes, 0=No, undefined=unlabeled
-  reclassified?: boolean; // Whether this cell has been reclassified
+  saved?: boolean; // Whether this cell has been saved
   original_class?: string; // Original class before reclassification
 }
 
@@ -44,6 +44,7 @@ export interface ReviewState {
   // Current review session
   slideId: string | null;
   className: string | null;
+  scopeKey: string | null;
   
   // UI state
   isReviewOpen: boolean;
@@ -71,6 +72,7 @@ const initialState: ReviewState = {
   error: null,
   slideId: null,
   className: null,
+  scopeKey: null,
   isReviewOpen: false,
   probDistCache: null,
 };
@@ -108,11 +110,25 @@ const reviewSlice = createSlice({
     clearReviewSession: (state) => {
       state.slideId = null;
       state.className = null;
+      state.scopeKey = null;
       state.items = [];
       state.page = 0;
       state.total = 0;
       state.error = null;
       state.hist = Array(20).fill(0);
+    },
+
+    setReviewScope: (state, action: PayloadAction<string>) => {
+      if (state.scopeKey === action.payload) return;
+      state.scopeKey = action.payload;
+      state.className = null;
+      state.selectedClass = null;
+      state.items = [];
+      state.page = 0;
+      state.total = 0;
+      state.error = null;
+      state.hist = Array(20).fill(0);
+      state.probDistCache = null;
     },
 
     // UI state
@@ -259,6 +275,7 @@ const reviewSlice = createSlice({
 export const {
   setReviewSession,
   clearReviewSession,
+  setReviewScope,
   setIsReviewOpen,
   setClassFilter,
   toggleClassInFilter,

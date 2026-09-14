@@ -1,7 +1,7 @@
 "use client";
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { useRouter } from 'next/router'
-import { useUserInfo } from '@/provider/UserInfoProvider'
+import { useUserInfo } from '@/contexts/UserInfoProvider'
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -19,13 +19,15 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
-import { ChevronRight, Database, GitBranch, Home, Boxes, Package, PlayCircle, Trash2, Workflow, X } from "lucide-react"
+import { ChevronDown, ChevronRight, Database, GitBranch, Boxes, Circle, PlayCircle, Square, Trash2, Workflow, X } from "lucide-react"
 import Image from "next/image"
-import { AI_SERVICE_API_ENDPOINT } from '@/constants/config'
-import { classifiersService } from '@/services/classifiers.service'
+import { AI_SERVICE_API_ENDPOINT } from '@/config/api.config'
+import { classifiersService } from '@/services/classifier/community'
+import { deleteCommunityWorkflow } from '@/services/communityWorkflows.service'
 import { modelsService } from '@/services/models.service'
-import NodeLogsDialog from '@/components/imageViewer/AgentZoo/NodeLogsDialog'
+import NodeLogsDialog from '@/components/imageViewer/sidebar/agent/graph/NodeLogsDialog'
 import DownloadArea from '@/components/community/DownloadArea'
+import WorkflowAnatomy from '@/components/community/WorkflowAnatomy'
 import { getErrorMessage } from '@/utils/common/apiResponse'
 import { toast } from 'sonner'
 
@@ -35,24 +37,23 @@ import {
   DatasetCard,
   FactoryTaskNodeCard,
   FactoryClassifierDetail,
-  ModelsSection,
   UploadClassifierDialog,
   UploadModelDialog
 } from '@/components/community'
 import { useFactoryNodes, useClassifiers, useClassifierFilter } from '@/hooks/community/useCommunityData'
-import { useNodeInstallation } from '@/hooks/useNodeInstallation'
-import { useNodeActivation } from '@/hooks/useNodeActivation'
+import { useAuthorProfile } from '@/hooks/community/useAuthorProfile'
+import { useNodeInstallation } from '@/hooks/community/useNodeInstallation'
+import { useNodeActivation } from '@/hooks/community/useNodeActivation'
 import { useClassifierUpload } from '@/hooks/community/useClassifierUpload'
 import { useModelUpload } from '@/hooks/community/useModelUpload'
 import { apiFetch } from '@/utils/common/apiFetch'
-import { CTRL_SERVICE_API_ENDPOINT } from '@/constants/config'
+import { COMMUNITY_API_ENDPOINT } from '@/config/api.config'
 import {
   ITEMS_PER_PAGE,
   INSTALL_STEPS_INITIAL,
   FACTORY_WHITELIST_CONFIG
 } from '@/constants/community.constants'
-import { firebaseModelsFallback } from '@/constants/communityFallback'
-import { deleteNode, downloadNodeForElectron } from '@/utils/nodeManagement.utils'
+import { deleteNode, downloadNodeForElectron } from '@/utils/agent/nodeManagement.utils'
 import type { 
   ActiveTab, 
   FactoriesView,
@@ -66,7 +67,7 @@ import type { CommunityWorkflow } from "@/constants/communityWorkflowsDefault"
 import {
   communityWorkflowToSerializedSnapshot,
   loadMergedCommunityWorkflowPresets,
-} from "@/utils/workflow/communityWorkflowPresets"
+} from "@/utils/agent/workflow/communityPresets"
 import {
   importWorkflowSnapshotToLocalLibrary,
   loadAllSavedWorkflows,
@@ -75,9 +76,43 @@ import {
   WORKFLOW_GRAPH_SAVED_STORAGE_KEY,
   WORKFLOW_LOCAL_STORAGE_CHANGED_EVENT,
   type SerializedWorkflow,
-} from "@/utils/workflow/serializedWorkflow"
+} from "@/utils/agent/workflow/serializedWorkflow"
 
 const mockDatasets: DatasetData[] = []
+
+// Preferred display order for factory categories on the Community page.
+// Categories not listed keep their original (backend) order, after these.
+const FACTORY_ORDER = ["NucleiClassify", "NucleiSeg", "TissueSeg", "TissueClassify"]
+const factoryRank = (key: string) => {
+  const i = FACTORY_ORDER.indexOf(key)
+  return i === -1 ? FACTORY_ORDER.length : i
+}
+const orderFactoryKeys = (keys: string[]) =>
+  [...keys].sort((a, b) => factoryRank(a) - factoryRank(b))
+const orderFactoryEntries = (entries: [string, string[]][]) =>
+  [...entries].sort((a, b) => factoryRank(a[0]) - factoryRank(b[0]))
+
+// ── Official (TissueLab-authored) classifiers ─────────────────────────────
+// Shown under a model via a Community / Official filter; official ones are
+// grouped by organ, derived from the seeded id `tissuelab-<organ>-<slug>`.
+const ORGAN_LABELS: Record<string, string> = {
+  skin: "Skin", prostate: "Prostate", breast: "Breast", colon: "Colon / Rectum",
+  lung: "Lung", lymph_node: "Lymph node", bladder: "Bladder", gastric: "Stomach / GI",
+  pancreas: "Pancreas", liver: "Liver", kidney: "Kidney", agnostic: "General",
+}
+const ORGAN_ORDER = ["skin", "prostate", "breast", "colon", "lung", "lymph_node", "bladder", "gastric", "pancreas", "liver", "kidney", "agnostic"]
+// Official classifiers are TissueLab-owned. The community-page merge maps
+// ownerId into author.user_id (not a top-level ownerId), so check all shapes;
+// the id prefix `tissuelab-…` (seeded ids; user uploads are `uploaded-…`) is
+// the most reliable signal.
+const isOfficialClassifier = (c: any) =>
+  c?.ownerId === "tissuelab" ||
+  c?.author?.user_id === "tissuelab" ||
+  String(c?.id || "").startsWith("tissuelab-")
+const organOfClassifier = (id: string) => {
+  const m = /^tissuelab-([a-z_]+)-/.exec(id || "")
+  return m ? m[1] : "agnostic"
+}
 
 type CommunityWorkflowModelNode = CommunityWorkflow["nodes"][number] & { kind: "model" }
 
@@ -97,12 +132,38 @@ function countSerializedModelNodes(wf: SerializedWorkflow): number {
 }
 
 function CommunityWorkflowsPanel() {
+  const { userInfo } = useUserInfo()
   const [workflows, setWorkflows] = useState<CommunityWorkflow[]>([])
   const [loading, setLoading] = useState(true)
   const [selectedWorkflow, setSelectedWorkflow] = useState<CommunityWorkflow | null>(null)
+  // Resolve the selected workflow's author display name per-uid (browser-
+  // cached). Falls back to the legacy denormalized `author` string when no
+  // profile is found (e.g. for community presets that have no ownerId).
+  const selectedAuthorProfile = useAuthorProfile(selectedWorkflow?.ownerId)
   const [importing, setImporting] = useState(false)
   const [libraryTick, setLibraryTick] = useState(0)
   const [libraryDeleteKey, setLibraryDeleteKey] = useState<string | null>(null)
+  const [pendingWorkflowDelete, setPendingWorkflowDelete] = useState<CommunityWorkflow | null>(null)
+  const [workflowDeleteInFlight, setWorkflowDeleteInFlight] = useState(false)
+
+  const performWorkflowDelete = useCallback(async (wf: CommunityWorkflow) => {
+    setWorkflowDeleteInFlight(true)
+    try {
+      const resp = await deleteCommunityWorkflow(wf.id)
+      if (!resp?.success) {
+        toast.error("Workflow deletion did not complete cleanly.")
+        return
+      }
+      setWorkflows((prev) => prev.filter((w) => w.id !== wf.id))
+      setSelectedWorkflow((cur) => (cur?.id === wf.id ? null : cur))
+      toast.success(`Deleted "${wf.name}" from community.`)
+    } catch (e) {
+      toast.error(getErrorMessage(e, "Failed to delete community workflow"))
+    } finally {
+      setWorkflowDeleteInFlight(false)
+      setPendingWorkflowDelete(null)
+    }
+  }, [])
 
   const refreshLibrary = useCallback(() => {
     setLibraryTick((t) => t + 1)
@@ -279,7 +340,7 @@ function CommunityWorkflowsPanel() {
             </div>
 
             <div className="mt-4 border-t border-border pt-3">
-              <div className="mb-2 text-[10px] text-muted-foreground">By {selectedWorkflow.author}</div>
+              <div className="mb-2 text-[10px] text-muted-foreground">By {selectedAuthorProfile?.displayName || selectedWorkflow.author}</div>
               <Button
                 size="sm"
                 className="w-full"
@@ -288,6 +349,18 @@ function CommunityWorkflowsPanel() {
               >
                 {importing ? "Importing…" : "Import to My Library"}
               </Button>
+              {/* Owner-only delete. Built-in/offline presets have no ownerId so this stays hidden for them. */}
+              {!!selectedWorkflow.ownerId && userInfo?.user_id === selectedWorkflow.ownerId && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="mt-2 w-full border-destructive/40 text-destructive hover:bg-destructive/10"
+                  onClick={() => setPendingWorkflowDelete(selectedWorkflow)}
+                >
+                  <Trash2 className="mr-1 h-3.5 w-3.5" />
+                  Delete from community
+                </Button>
+              )}
               <p className="mt-2 text-[10px] text-muted-foreground">
                 Same storage as Agentic AI → Save workflow in the image viewer.
               </p>
@@ -354,6 +427,42 @@ function CommunityWorkflowsPanel() {
     </div>
 
     <AlertDialog
+      open={pendingWorkflowDelete !== null}
+      onOpenChange={(open) => {
+        if (!open && !workflowDeleteInFlight) setPendingWorkflowDelete(null)
+      }}
+    >
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Delete community workflow?</AlertDialogTitle>
+          <AlertDialogDescription>
+            {pendingWorkflowDelete ? (
+              <>
+                Permanently remove <span className="font-medium text-foreground">&quot;{pendingWorkflowDelete.name}&quot;</span>
+                {" "}from the community. Anyone who already imported it keeps their local copy, but no one will be able
+                to discover or import it again. Classifiers it references are NOT deleted.
+              </>
+            ) : null}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={workflowDeleteInFlight}>Cancel</AlertDialogCancel>
+          <AlertDialogAction
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            disabled={workflowDeleteInFlight}
+            onClick={(e) => {
+              e.preventDefault()
+              if (!pendingWorkflowDelete) return
+              void performWorkflowDelete(pendingWorkflowDelete)
+            }}
+          >
+            {workflowDeleteInFlight ? "Deleting…" : "Delete"}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+
+    <AlertDialog
       open={libraryDeleteKey !== null}
       onOpenChange={(open) => {
         if (!open) setLibraryDeleteKey(null)
@@ -388,6 +497,7 @@ function CommunityWorkflowsPanel() {
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
+
     </>
   )
 }
@@ -407,8 +517,7 @@ export default function Community() {
       (tabParam === "home" ||
         tabParam === "workflows" ||
         tabParam === "factories" ||
-        tabParam === "datasets" ||
-        tabParam === "custom-models")
+        tabParam === "datasets")
     ) {
       setActiveTab(tabParam as ActiveTab)
     }
@@ -417,6 +526,10 @@ export default function Community() {
   // Home tab: three-layer browser state (factory → model → classifiers)
   const [homeFactory, setHomeFactory] = useState<string>('')
   const [homeModel, setHomeModel] = useState<string>('')
+  // Community / Official filter tab inside a model's classifier detail.
+  const [homeClassTab, setHomeClassTab] = useState<'community' | 'official'>('official')
+  // Collapsed organ groups in the Official tab (organ key -> collapsed).
+  const [collapsedOrgans, setCollapsedOrgans] = useState<Record<string, boolean>>({})
   const [homeSidebarSort, setHomeSidebarSort] = useState<'stars' | 'classifiers' | 'uses'>('stars')
   const [showHomeTutorial, setShowHomeTutorial] = useState(false)
   
@@ -569,7 +682,7 @@ export default function Community() {
 
   // Models state
   const [userUploadedModels, setUserUploadedModels] = useState<ModelData[]>([])
-  const [firebaseModels, setFirebaseModels] = useState<any[]>(firebaseModelsFallback)
+  const [firebaseModels, setFirebaseModels] = useState<any[]>([])
   const [loadingModels, setLoadingModels] = useState(false)
   const [modelSearch, setModelSearch] = useState('')
   const [selectedModelTags, setSelectedModelTags] = useState<string[]>([])
@@ -803,7 +916,7 @@ export default function Community() {
       if (classifierId.startsWith('uploaded-')) {
         try {
           const deleteResponse = await classifiersService.deleteClassifier(classifierId)
-          
+
           if (deleteResponse.success) {
             setFirebaseClassifiers(prev => prev.filter(c => c.id !== classifierId))
           } else {
@@ -814,20 +927,21 @@ export default function Community() {
           toast.warning(getErrorMessage(error, 'Firebase deletion failed'))
         }
       }
-      
+
       setUserUploadedClassifiers(prev => prev.filter(c => c.id !== classifierId))
       setRealClassifiers(prev => prev.filter(c => c.id !== classifierId))
       setFirebaseClassifiers(prev => prev.filter(c => c.id !== classifierId))
-      
+
       const updatedUserClassifiers = userUploadedClassifiers.filter(c => c.id !== classifierId)
       localStorage.setItem('userUploadedClassifiers', JSON.stringify(updatedUserClassifiers))
       window.dispatchEvent(new CustomEvent('localStorageChanged', { detail: { key: 'userUploadedClassifiers' } }))
-      
+
     } catch (error) {
       console.error('Error in handleDeleteClassifier:', error)
       toast.error(getErrorMessage(error, 'Failed to delete classifier'))
     }
   }
+
 
   const handleStatsUpdate = (classifierId: string, stats: { downloads?: number; stars?: number }) => {
     setUserUploadedClassifiers(prev =>
@@ -1052,7 +1166,7 @@ export default function Community() {
           // Fetch user profiles for all owners
           await Promise.all(ownerIds.map(async (uid) => {
             try {
-              const p = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/users/v1/public_profile/${uid}`, { method: 'GET' })
+              const p = await apiFetch(`${COMMUNITY_API_ENDPOINT}/users/v1/public_profile/${uid}`, { method: 'GET' })
               ownerProfiles[uid] = p || {}
               
               // Cache preferred name
@@ -1277,7 +1391,7 @@ export default function Community() {
 
   // Default-select first factory + first model when categories load
   useEffect(() => {
-    const factoryKeys = Object.keys(categories)
+    const factoryKeys = orderFactoryKeys(Object.keys(categories))
     if (!factoryKeys.length) return
     if (!homeFactory || !categories[homeFactory]) {
       const firstFactory = factoryKeys[0]
@@ -1291,7 +1405,20 @@ export default function Community() {
   // Classifiers filtered for the model selected in the Home browser
   const homeClassifiersForSelectedModel = useMemo(() => {
     if (!homeModel) return []
-    return allClassifiersForFactories.filter((c: any) => c.node === homeModel || c.model === homeModel)
+    // Official (TissueLab) classifiers are browsed under the dedicated "Official"
+    // category, so keep them out of the per-model community list.
+    return allClassifiersForFactories.filter(
+      (c: any) => (c.node === homeModel || c.model === homeModel) && !isOfficialClassifier(c)
+    )
+  }, [allClassifiersForFactories, homeModel])
+
+  // ── Official (TissueLab) classifiers for the selected model ─────────────
+  // Shown under the model detail via a Community / Official filter tab.
+  const officialForModel = useMemo(() => {
+    if (!homeModel) return []
+    return allClassifiersForFactories.filter(
+      (c: any) => (c.node === homeModel || c.model === homeModel) && isOfficialClassifier(c)
+    )
   }, [allClassifiersForFactories, homeModel])
 
   // Per-model metrics aggregated from classifiers (stars / classifier count / downloads-as-uses)
@@ -1367,6 +1494,7 @@ export default function Community() {
   }
 
   return (
+    <>
     <div className="box-border h-full w-full overflow-auto bg-background font-sans">
       <div className="w-full px-2.5 pt-3 pb-6 md:px-5">
         {/* Header */}
@@ -1382,24 +1510,25 @@ export default function Community() {
           <DownloadArea />
         </div>
 
+        {/* Workflow anatomy: at-a-glance explainer of workflow / tools / classifier */}
+        <div className="mb-4">
+          <WorkflowAnatomy />
+        </div>
+
         {/* Main Navigation Tabs */}
         <Tabs value={activeTab} onValueChange={(value: any) => setActiveTab(value)} className="h-full">
-          <TabsList className="mb-4 grid w-full max-w-2xl grid-cols-4">
+          <TabsList className="mb-4 grid w-full max-w-2xl grid-cols-3">
             <TabsTrigger value="home" className="flex items-center gap-2">
-              <Home className="w-4 h-4" />
+              <Circle className="w-4 h-4" />
               Models
             </TabsTrigger>
             <TabsTrigger value="workflows" className="flex items-center gap-2">
-              <Workflow className="w-4 h-4" />
+              <Square className="w-4 h-4" />
               Workflows
             </TabsTrigger>
             <TabsTrigger value="factories" className="flex items-center gap-2">
               <Boxes className="w-4 h-4" />
               Factories
-            </TabsTrigger>
-            <TabsTrigger value="custom-models" className="flex items-center gap-2">
-              <Package className="w-4 h-4" />
-              Custom Models
             </TabsTrigger>
           </TabsList>
 
@@ -1423,7 +1552,7 @@ export default function Community() {
                   <div className="text-sm text-muted-foreground">No factories available.</div>
                 ) : (
                   <div className="grid auto-cols-fr grid-flow-col gap-2">
-                    {Object.keys(categories).map((factory) => {
+                    {orderFactoryKeys(Object.keys(categories)).map((factory) => {
                       const firstNode = categories[factory]?.[0]
                       const factoryMeta: any = firstNode ? (nodesExtended as any)?.[firstNode] : null
                       const iconUrl: string | undefined = factoryMeta?.icon
@@ -1462,7 +1591,7 @@ export default function Community() {
               {/* Layers 2 & 3: model sidebar + classifier canvas */}
               <div className="flex gap-4">
                 {/* Layer 2: Model sidebar */}
-                <div className="w-56 flex-shrink-0 border-r border-border pr-4">
+                <div className="w-56 shrink-0 border-r border-border pr-4">
                   <div className="mb-2 text-sm font-medium text-muted-foreground">
                     {categoryDisplayNames[homeFactory] || homeFactory || 'Models'}
                   </div>
@@ -1494,7 +1623,7 @@ export default function Community() {
                               : 'text-muted-foreground hover:bg-accent/40 hover:text-foreground'
                           }`}
                         >
-                          <div className="flex h-6 w-6 flex-shrink-0 items-center justify-center overflow-hidden rounded-sm bg-muted">
+                          <div className="flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-sm bg-muted">
                             {modelIconUrl ? (
                               <Image src={modelIconUrl} alt={label} width={24} height={24} className="h-full w-full object-cover" />
                             ) : (
@@ -1502,7 +1631,7 @@ export default function Community() {
                             )}
                           </div>
                           <span className="min-w-0 flex-1 truncate" title={label}>{label}</span>
-                          <span className="flex-shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                          <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
                             {metricValue}
                           </span>
                         </button>
@@ -1516,89 +1645,105 @@ export default function Community() {
 
                 {/* Layer 3: Classifier canvas */}
                 <div className="min-w-0 flex-1">
-                  <div className="mb-3 flex items-center justify-between">
-                    <div className="text-sm font-medium text-muted-foreground">
-                      Classifiers
-                      {homeModel && (
-                        <span className="ml-2 text-xs">
-                          ({homeClassifiersForSelectedModel.length})
-                        </span>
-                      )}
-                    </div>
-                    <Button variant="outline" size="sm" onClick={() => setUploadDialogOpen(true)}>
-                      Upload Classifier
-                    </Button>
-                  </div>
-                  {homeClassifiersForSelectedModel.length === 0 ? (
-                    <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border py-12 text-center">
-                      <Database className="mb-3 h-10 w-10 text-muted-foreground/60" />
-                      <div className="text-sm text-muted-foreground">
-                        {homeModel
-                          ? 'No classifiers available for this model yet.'
-                          : 'Pick a model to see its classifiers.'}
+                  {(() => {
+                    const community = homeClassifiersForSelectedModel
+                    const official = officialForModel
+                    // Auto-pick a non-empty tab so the canvas is never blank when
+                    // only one side has content.
+                    const tab = official.length === 0 ? 'community' : (community.length === 0 ? 'official' : homeClassTab)
+                    const renderCard = (classifier: any) => (
+                      <ClassifierCard
+                        key={classifier.id}
+                        classifier={classifier}
+                        onDelete={handleDeleteClassifier}
+                        canDelete={
+                          !!userInfo?.user_id && (
+                            firebaseClassifiers.some(c => c.id === classifier.id && c.ownerId === userInfo.user_id) ||
+                            userUploadedClassifiers.some(c => c.id === classifier.id && c.author?.user_id === userInfo.user_id)
+                          )
+                        }
+                        onTagClick={(tag) => {
+                          handleTagClick(tag)
+                          setClassifierSearch('')
+                        }}
+                        onStatsUpdate={handleStatsUpdate}
+                      />
+                    )
+                    const tabBtn = (key: 'official' | 'community', label: string, n: number) => (
+                      <button
+                        type="button"
+                        onClick={() => setHomeClassTab(key)}
+                        className={`rounded-[4px] px-3 py-1 text-xs font-medium transition-colors ${
+                          tab === key ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'
+                        }`}
+                      >
+                        {label} <span className="tabular-nums opacity-70">({n})</span>
+                      </button>
+                    )
+                    const emptyState = (msg: string, spinning = false) => (
+                      <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border py-12 text-center">
+                        {spinning ? (
+                          <div className="mb-3 h-10 w-10 animate-spin rounded-full border-b-2 border-primary"></div>
+                        ) : (
+                          <Database className="mb-3 h-10 w-10 text-muted-foreground/60" />
+                        )}
+                        <div className="text-sm text-muted-foreground">{msg}</div>
                       </div>
-                    </div>
-                  ) : (
-                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                      {homeClassifiersForSelectedModel.map((classifier: any) => (
-                        <ClassifierCard
-                          key={classifier.id}
-                          classifier={classifier}
-                          onDelete={handleDeleteClassifier}
-                          canDelete={
-                            !!userInfo?.user_id && (
-                              firebaseClassifiers.some(c => c.id === classifier.id && c.ownerId === userInfo.user_id) ||
-                              userUploadedClassifiers.some(c => c.id === classifier.id && c.author?.user_id === userInfo.user_id)
-                            )
-                          }
-                          onTagClick={(tag) => {
-                            handleTagClick(tag)
-                            setClassifierSearch('')
-                          }}
-                          onStatsUpdate={handleStatsUpdate}
-                        />
-                      ))}
-                    </div>
-                  )}
+                    )
+                    return (
+                      <>
+                        <div className="mb-3 flex items-center justify-between">
+                          <div className="inline-flex items-center gap-0.5 rounded-md border border-border bg-muted/40 p-0.5">
+                            {tabBtn('official', 'Official', official.length)}
+                            {tabBtn('community', 'Community', community.length)}
+                          </div>
+                          <Button variant="outline" size="sm" onClick={() => setUploadDialogOpen(true)}>
+                            Upload Classifier
+                          </Button>
+                        </div>
+                        {!homeModel ? (
+                          emptyState('Pick a model to see its classifiers.')
+                        ) : tab === 'official' ? (
+                          official.length === 0 ? (
+                            emptyState('No official classifiers for this model yet.')
+                          ) : (
+                            <div className="space-y-4">
+                              {ORGAN_ORDER.filter((o) => official.some((c: any) => organOfClassifier(c.id) === o)).map((o) => {
+                                const rows = official.filter((c: any) => organOfClassifier(c.id) === o)
+                                const collapsed = !!collapsedOrgans[o]
+                                return (
+                                  <div key={o}>
+                                    <button
+                                      type="button"
+                                      onClick={() => setCollapsedOrgans((p) => ({ ...p, [o]: !p[o] }))}
+                                      className="mb-2 flex w-full items-center gap-1.5 text-[11px] font-medium text-muted-foreground/80 hover:text-foreground"
+                                    >
+                                      {collapsed ? <ChevronRight className="h-3 w-3 shrink-0" /> : <ChevronDown className="h-3 w-3 shrink-0" />}
+                                      <span>{ORGAN_LABELS[o] || o}</span>
+                                      <span className="tabular-nums opacity-60">({rows.length})</span>
+                                    </button>
+                                    {!collapsed && (
+                                      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">{rows.map(renderCard)}</div>
+                                    )}
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          )
+                        ) : (
+                          community.length === 0 ? (
+                            emptyState(loadingFirebaseClassifiers ? 'Loading classifiers…' : 'No community classifiers for this model yet.', loadingFirebaseClassifiers)
+                          ) : (
+                            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                              {community.map(renderCard)}
+                            </div>
+                          )
+                        )}
+                      </>
+                    )
+                  })()}
                 </div>
               </div>
-            </div>
-          </TabsContent>
-
-          {/* Custom Models Tab */}
-          <TabsContent value="custom-models" className="h-[calc(100%-120px)] bg-background">
-            <div className="pb-16">
-              <ModelsSection
-                models={getPaginatedModels()}
-                loading={loadingModels}
-                search={modelSearch}
-                onSearchChange={(value) => {
-                  setModelSearch(value)
-                  setModelCurrentPage(1)
-                }}
-                selectedTags={selectedModelTags}
-                onTagClick={handleModelTagClick}
-                sort={modelSort}
-                onSortChange={(value) => {
-                  setModelSort(value)
-                  setModelCurrentPage(1)
-                }}
-                currentPage={modelCurrentPage}
-                totalPages={getModelTotalPages()}
-                onPageChange={setModelCurrentPage}
-                onUploadClick={() => setModelUploadDialogOpen(true)}
-                onDeleteModel={handleDeleteModel}
-                canDelete={(model) =>
-                  !!userInfo?.user_id && (
-                    firebaseModels.some(m => m.id === model.id && m.ownerId === userInfo.user_id) ||
-                    userUploadedModels.some(m => m.id === model.id && m.author?.user_id === userInfo.user_id)
-                  )
-                }
-                onStatsUpdate={handleModelStatsUpdate}
-                userInfo={userInfo}
-                firebaseModels={firebaseModels}
-                userUploadedModels={userUploadedModels}
-              />
             </div>
           </TabsContent>
 
@@ -1648,7 +1793,7 @@ export default function Community() {
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                    {Object.entries(categories).map(([factory, nodes]) => (
+                    {orderFactoryEntries(Object.entries(categories)).map(([factory, nodes]) => (
                       <FactoryTaskNodeCard
                         key={factory}
                         factory={factory}
@@ -1987,5 +2132,7 @@ export default function Community() {
         </Dialog>
       </div>
     </div>
+
+    </>
   )
 }

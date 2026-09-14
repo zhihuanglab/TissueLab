@@ -1,12 +1,12 @@
 'use client';
 
-import { zodResolver } from '@hookform/resolvers/zod';
-import { motion } from 'framer-motion';
-import { Loader2, Mail } from 'lucide-react';
+import { motion, useAnimation } from 'framer-motion';
+import { GraduationCap, Loader2, Mail } from 'lucide-react';
 import Image from 'next/image';
 import React from 'react';
-import { useForm } from 'react-hook-form';
+import { useForm, type Resolver } from 'react-hook-form';
 import { Button } from '../../ui/button';
+import { Checkbox } from '../../ui/checkbox';
 import {
   DialogDescription,
   DialogHeader,
@@ -27,8 +27,10 @@ interface LeftPaneEmailProps {
   email: string;
   setEmail: (email: string) => void;
   isGooglePending: boolean;
+  isUPennPending: boolean;
   isEmailPending: boolean;
   onGoogleClick: () => void;
+  onUPennClick: () => void;
   onSendCode: () => void;
   signupModalContext?: {
     description?: string;
@@ -40,14 +42,53 @@ export default function LeftPaneEmail({
   email,
   setEmail,
   isGooglePending,
+  isUPennPending,
   isEmailPending,
   onGoogleClick,
+  onUPennClick,
   onSendCode,
   signupModalContext,
   errorTip,
 }: LeftPaneEmailProps) {
-  const form = useForm({
-    resolver: zodResolver(EmailSchema),
+  // UPenn SSO uses a browser popup — desktop (Electron) is out of scope, so
+  // only offer it on the web app.
+  const isWeb = typeof window !== 'undefined' && !(window as any).electron;
+  const [agreed, setAgreed] = React.useState(false);
+  const consentControls = useAnimation();
+  // Buttons stay enabled visually so users don't read the disabled
+  // greys as "this site is broken". When they click without ticking
+  // the box we shake the consent row + the highlighted card draws
+  // their eye, rather than silently bouncing the click.
+  const ensureConsent = React.useCallback(
+    (run: () => void) => {
+      if (!agreed) {
+        consentControls.start({
+          x: [0, -8, 8, -6, 6, -3, 3, 0],
+          transition: { duration: 0.45 },
+        });
+        return;
+      }
+      run();
+    },
+    [agreed, consentControls]
+  );
+  const form = useForm<{ email: string }>({
+    // Hand-written safeParse resolver instead of zodResolver: the installed
+    // @hookform/resolvers (v3, zod-v3 era) mishandles zod v4's error shape and
+    // rethrows the ZodError, which escaped as an unhandledrejection (raw issue
+    // array). safeParse never throws, so validation stays inside the form.
+    resolver: (async (values: { email: string }) => {
+      const result = EmailSchema.safeParse(values);
+      if (result.success) return { values: result.data, errors: {} };
+      const errors: Record<string, { type: string; message: string }> = {};
+      for (const issue of result.error.issues) {
+        const key = String(issue.path[0] ?? '');
+        if (key && !errors[key]) {
+          errors[key] = { type: issue.code ?? 'validation', message: issue.message };
+        }
+      }
+      return { values: {}, errors };
+    }) as Resolver<{ email: string }>,
     defaultValues: { email: '' },
   });
 
@@ -80,7 +121,7 @@ export default function LeftPaneEmail({
         )}
 
         <Button
-          onClick={onGoogleClick}
+          onClick={() => ensureConsent(onGoogleClick)}
           variant="outline"
           className={`flex h-11 w-full items-center justify-center gap-3 rounded-md border-2 text-sm font-bold hover:shadow ${isGooglePending ? 'pointer-events-none opacity-70' : ''}`}
           disabled={isGooglePending}
@@ -102,6 +143,27 @@ export default function LeftPaneEmail({
           )}
         </Button>
 
+        {isWeb && (
+          <Button
+            onClick={() => ensureConsent(onUPennClick)}
+            variant="outline"
+            className={`flex h-11 w-full items-center justify-center gap-3 rounded-md border-2 text-sm font-bold hover:shadow ${isUPennPending ? 'pointer-events-none opacity-70' : ''}`}
+            disabled={isUPennPending}
+          >
+            {isUPennPending ? (
+              <>
+                <Loader2 className="animate-spin" size={16} />
+                Processing...
+              </>
+            ) : (
+              <>
+                <GraduationCap className="mr-2 h-10 w-10" />
+                Continue with UPenn
+              </>
+            )}
+          </Button>
+        )}
+
         {/* Email Login Form */}
         <div className="w-full">
           <div className="relative">
@@ -117,7 +179,10 @@ export default function LeftPaneEmail({
         </div>
 
         <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSendCode)} className="space-y-6">
+          <form
+            onSubmit={form.handleSubmit(() => ensureConsent(onSendCode))}
+            className="space-y-6"
+          >
             <div className="space-y-4">
               <FormField
                 control={form.control}
@@ -165,28 +230,42 @@ export default function LeftPaneEmail({
           </form>
         </Form>
 
-        {/* Terms */}
-        <p className="mt-6 text-xs text-muted-foreground">
-          By continuing up, you agree to our{' '}
-          <a
-            href="https://tissuelab.org/"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="underline hover:text-blue-600"
-          >
-            Terms of Service
-          </a>{' '}
-          and our{' '}
-          <a
-            href="https://tissuelab.org/"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="underline hover:text-blue-600"
-          >
-            Privacy Policy
-          </a>
-          .
-        </p>
+        {/* Terms — active consent. Buttons stay enabled visually so
+            they don't read as "the site is broken"; clicking before
+            ticking shakes this row (via `consentControls`) so the
+            user notices what's missing. */}
+        <motion.label
+          animate={consentControls}
+          className="mt-6 flex cursor-pointer items-start gap-2 text-xs text-muted-foreground"
+        >
+          <Checkbox
+            checked={agreed}
+            onCheckedChange={(v) => setAgreed(v === true)}
+            className="mt-0.5"
+            aria-label="I agree to the Terms of Service and Privacy Policy"
+          />
+          <span className="leading-5">
+            I agree to the{' '}
+            <a
+              href="/legal#terms"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline hover:text-blue-600"
+            >
+              Terms of Service
+            </a>{' '}
+            and{' '}
+            <a
+              href="/legal#privacy"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline hover:text-blue-600"
+            >
+              Privacy Policy
+            </a>
+            .
+          </span>
+        </motion.label>
       </div>
     </motion.div>
   );

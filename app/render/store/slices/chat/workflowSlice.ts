@@ -1,4 +1,8 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
+import type { WorkflowRuntimeStatus } from '@/utils/agent/workflow/runtimeStatus';
+import { WorkflowStatus } from '@/utils/agent/workflow/runtimeStatus';
+
+export type { WorkflowRuntimeStatus };
 
 const sameNumberRecord = (a: Record<string, number>, b: Record<string, number>) => {
   const aKeys = Object.keys(a);
@@ -32,6 +36,7 @@ export type ContentItem = {
   value: string | any[];
   label?: string;
   placeholder?: string;
+  readOnly?: boolean;
 };
 
 export type WorkflowPanel = {
@@ -49,18 +54,23 @@ export type GraphWorkflowOverlaySnapshot = {
   showBackendAnnotations: boolean;
   showPatches: boolean;
   showMask: boolean;
-  showUserAnnotations: boolean;
 };
 
 // This will be imported and used by the component directly
-import { panelMap } from '@/components/imageViewer/RightSidebar/Agent/Workflow/constants'
+import { panelMap } from '@/constants/workflow.constants'
 
 export const generatePanelsFromWorkflow = (workflow: any[]): WorkflowPanel[] => {
-  return workflow.map((step: any) => {
+  return workflow.flatMap((step: any): WorkflowPanel[] => {
     const panelConfig = panelMap[step.model];
+    // The planner output is LLM-generated; skip steps whose `model` is not a
+    // known panel category instead of crashing on `panelConfig.title`.
+    if (!panelConfig) {
+      console.warn(`[generatePanelsFromWorkflow] Unknown model category, skipping step: ${step?.model}`);
+      return [];
+    }
     const joinedValue = Array.isArray(step.input) ? step.input.join(", ") : step.input;
-    
-    return {
+
+    return [{
       id: step.step.toString(),
       title: panelConfig.title,
       type: (step.impl && typeof step.impl === 'string' && step.impl.trim()) ? step.impl : (step.type || panelConfig.defaultType),
@@ -71,13 +81,13 @@ export const generatePanelsFromWorkflow = (workflow: any[]): WorkflowPanel[] => 
       })),
       ui: (step?.ui && typeof step.ui === 'object') ? step.ui : null,
       stepName: step.model, // Save step name (e.g., "NucleiSeg") for factory matching
-    };
+    }];
   });
 };
 
 type WorkflowState = {
   panels: WorkflowPanel[];
-  nodeStatus: Record<string, number>; // 0=not started, 1=running, 2=complete, -1=failed, -2=stopped
+  nodeStatus: Record<string, number>; // 0=not started, 1=running, 2=complete, -1=failed
   nodePorts: Record<string, { port: number; running: boolean }>;
   isRunning: boolean;
   // Store the highest progress value for each node type
@@ -96,7 +106,7 @@ type WorkflowState = {
   patchClassifierPath: string | null;
   patchClassifierSavePath: string | null;
   // Queue status
-  workflowStatus: 'idle' | 'queued' | 'running' | 'completed' | 'error';
+  workflowStatus: WorkflowRuntimeStatus;
   queuePosition: number;
   queueTotal: number;
   updateClassifier: boolean;
@@ -134,7 +144,7 @@ const initialState: WorkflowState = {
   patchClassifierPath: null,
   patchClassifierSavePath: null,
   // Queue status
-  workflowStatus: 'idle',
+  workflowStatus: WorkflowStatus.Idle,
   queuePosition: 0,
   queueTotal: 0,
   updateClassifier: false,
@@ -242,6 +252,12 @@ const workflowSlice = createSlice({
       // Don't clear nodeLogsMeta - static node info (log paths, ports) and needed for viewing logs after cancellation
       // state.nodeLogsMeta = {};
       state.isRunning = false;
+      // Must return to idle — otherwise active workflowStatus keeps
+      // the graph thinking a run is active after Redux progress was wiped, and
+      // `refreshPreProcessedSubstages` skips (`workflowStatus !== idle`).
+      state.workflowStatus = WorkflowStatus.Idle;
+      state.queuePosition = 0;
+      state.queueTotal = 0;
       state.highestProgress = {};
       state.nodeProgress = {};
       state.workflowStageProgress = {};
@@ -259,6 +275,9 @@ const workflowSlice = createSlice({
       state.nodeStatus = {};
       state.nodePorts = {};
       state.isRunning = false;
+      state.workflowStatus = WorkflowStatus.Idle;
+      state.queuePosition = 0;
+      state.queueTotal = 0;
       state.highestProgress = {};
       state.nodeProgress = {};
       state.workflowStageProgress = {};
@@ -320,7 +339,7 @@ const workflowSlice = createSlice({
     },
 
     // Queue status reducers
-    setWorkflowStatus: (state, action: PayloadAction<'idle' | 'queued' | 'running' | 'completed' | 'error'>) => {
+    setWorkflowStatus: (state, action: PayloadAction<WorkflowRuntimeStatus>) => {
       state.workflowStatus = action.payload;
     },
 

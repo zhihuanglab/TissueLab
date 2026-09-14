@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { ArrowLeft } from "lucide-react"
-import { AI_SERVICE_API_ENDPOINT } from '@/constants/config';
+import { AI_SERVICE_API_ENDPOINT } from '@/config/api.config';
 import { apiFetch, payloadFromAxiosAppResponse } from '@/utils/common/apiFetch';
 import { getErrorMessage } from '@/utils/common/apiResponse';
 import { 
@@ -17,7 +17,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Folder } from "lucide-react"
-import { VisualSchemaEditorDialog } from "@/components/imageViewer/RightSidebar/Agent/Workflow/VisualSchemaEditorDialog"
+import { VisualSchemaEditorDialog } from "@/components/imageViewer/sidebar/agent/workflow/VisualSchemaEditorDialog"
 import { WorkflowPanel, ContentItem } from "@/store/slices/chat/workflowSlice"
 
 interface RegisterCustomNodeRequest {
@@ -64,7 +64,7 @@ export default function CreateCustomNodePage() {
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
-  const [pythonVersion, setPythonVersion] = useState("3.9")
+  const [pythonVersion, setPythonVersion] = useState("3.11")
   const [description, setDescription] = useState<string>("")
   const [envName, setEnvName] = useState<string>("")
   const [step, setStep] = useState<number>(0)
@@ -99,7 +99,7 @@ export default function CreateCustomNodePage() {
     }
     statusCancelRef.current = true
     setNodeName("")
-    setPythonVersion("3.9")
+    setPythonVersion("3.11")
     setServicePath("")
     setDependencyPath("")
     setDescription("")
@@ -567,15 +567,7 @@ export default function CreateCustomNodePage() {
                 </div>
                 <div className="grid grid-cols-4 items-center gap-4">
                   <Label htmlFor="python-version" className="text-right">Python Version</Label>
-                  <Select onValueChange={setPythonVersion} value={pythonVersion}>
-                    <SelectTrigger className="w-full"><SelectValue placeholder="Select a Python version" /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="3.9">3.9</SelectItem>
-                      <SelectItem value="3.10">3.10</SelectItem>
-                      <SelectItem value="3.11">3.11</SelectItem>
-                      <SelectItem value="3.12">3.12</SelectItem>
-                    </SelectContent>
-                  </Select>
+                  <Input id="python-version" value="3.11" className="col-span-3" disabled />
                 </div>
                 {!enableRemote && (
                   <div className="grid grid-cols-4 items-center gap-4">

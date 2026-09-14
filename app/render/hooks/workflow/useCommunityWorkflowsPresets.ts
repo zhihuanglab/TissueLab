@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import { communityWorkflowsDefault, type CommunityWorkflow } from "@/constants/communityWorkflowsDefault"
-import { loadMergedCommunityWorkflowPresets } from "@/utils/workflow/communityWorkflowPresets"
+import { loadMergedCommunityWorkflowPresets } from "@/utils/agent/workflow/communityPresets"
 
 export function useCommunityWorkflowsPresets() {
   const [presets, setPresets] = useState<CommunityWorkflow[]>(() => [...communityWorkflowsDefault])

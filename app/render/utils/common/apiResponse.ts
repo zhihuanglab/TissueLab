@@ -1,28 +1,83 @@
 /**
- * Mirrors the backend AppResponse envelope: { code, message, data?, request_id? }
- * code === 0 means success; any other value is a business error.
+ * Stable app envelope shared by AI Service and Ctrl-Service.
+ *
+ * Always present (never null / never omitted):
+ *   { code: number, message: string, data: T, request_id: string }
+ *
+ * code === 0 means success. Permission denials put structured fields in data:
+ *   data.error_code, data.access_mode, data.operation
  */
+import { isPathAccessDenied, noticeFromDeniedError } from '@/utils/common/pathAccess.utils';
+
 export interface ApiResponse<T = unknown> {
   code: number;
   message: string;
-  data?: T;
-  request_id?: string;
+  data: T;
+  request_id: string;
+}
+
+export interface ApiErrorDetails {
+  error_code: string;
+  access_mode: string;
+  operation: string;
+  [key: string]: unknown;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function asString(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+/** Normalize any backend-ish body into the stable ApiResponse shape. */
+export function normalizeApiResponse(raw: unknown): ApiResponse {
+  const body = asRecord(raw);
+  const details = asRecord(body.data);
+  return {
+    code: typeof body.code === 'number' ? body.code : 500,
+    message: asString(body.message, 'Request failed'),
+    data: (body.data ?? {}) as ApiResponse['data'],
+    request_id: asString(body.request_id ?? details.request_id),
+  };
+}
+
+export function readApiErrorDetails(response: ApiResponse): ApiErrorDetails {
+  const details = asRecord(response.data);
+  return {
+    ...details,
+    error_code: asString(details.error_code ?? (response as any).error_code),
+    access_mode: asString(details.access_mode ?? (response as any).access_mode),
+    operation: asString(details.operation ?? (response as any).operation),
+  };
 }
 
 /**
  * Thrown when the backend returns a business-level error (code !== 0) on HTTP 200.
+ * Structured fields are always strings ("" when absent) — never undefined/null.
  */
 export class ApiError extends Error {
   code: number;
-  data?: unknown;
-  requestId?: string;
+  data: Record<string, unknown>;
+  requestId: string;
+  errorCode: string;
+  accessMode: string;
+  operation: string;
 
-  constructor(response: ApiResponse) {
-    super(response.message);
+  constructor(response: Partial<ApiResponse> & { code: number; message: string }) {
+    const normalized = normalizeApiResponse(response);
+    const details = readApiErrorDetails(normalized);
+    super(normalized.message);
     this.name = 'ApiError';
-    this.code = response.code;
-    this.data = response.data;
-    this.requestId = response.request_id;
+    this.code = normalized.code;
+    this.data = asRecord(normalized.data);
+    this.requestId = normalized.request_id;
+    this.errorCode = details.error_code;
+    this.accessMode = details.access_mode;
+    this.operation = details.operation;
   }
 
   /** Mirrors HTTP status when backend uses unified HTTP 200 + numeric body.code */
@@ -78,6 +133,10 @@ export function getBackendDefinedErrorMessage(error: unknown): string | undefine
 }
 
 export function getErrorMessage(error: unknown, fallback: string): string {
+  if (isPathAccessDenied(error)) {
+    const notice = noticeFromDeniedError(error);
+    return `${notice.title}. ${notice.description}`;
+  }
   return (
     getBackendDefinedErrorMessage(error) ??
     (typeof (error as { response?: { data?: { message?: unknown } } })?.response?.data?.message === 'string'
@@ -90,7 +149,7 @@ export function getErrorMessage(error: unknown, fallback: string): string {
 
 /**
  * With `returnAxiosFormat: true`, `response.data` is the **full** JSON body.
- * AI AppResponse is `{ code, message, data }` on HTTP 200 — extract inner `data` when `code === 0`.
+ * AI AppResponse is `{ code, message, data, request_id }` on HTTP 200 — extract inner `data` when `code === 0`.
  * Returns `undefined` when `code !== 0`. For legacy bodies without `code`, returns the body as `T`.
  */
 export function payloadFromAxiosAppResponse<T = unknown>(axiosResponse: { data: unknown }): T | undefined {
@@ -113,11 +172,7 @@ export function requireAxiosAppPayload<T = unknown>(axiosResponse: { data: unkno
   const b = body as Record<string, unknown>;
   if (typeof b.code === 'number') {
     if (b.code !== 0) {
-      throw new ApiError({
-        code: b.code,
-        message: String(b.message ?? 'Request failed'),
-        data: b.data,
-      });
+      throw new ApiError(normalizeApiResponse(b));
     }
     return (b.data ?? {}) as T;
   }

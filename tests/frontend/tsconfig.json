@@ -1,0 +1,13 @@
+{
+  "extends": "../../app/render/tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": "../../app/render",
+    "paths": {
+      "@/*": ["./*"],
+      "*": ["./node_modules/@types/*", "./node_modules/*"]
+    },
+    "incremental": false,
+    "noEmit": true
+  },
+  "include": ["./**/*.ts", "./**/*.tsx", "../../app/render/types/**/*.d.ts"]
+}

@@ -5,7 +5,7 @@ import { Moon, Sun } from "lucide-react"
 import { useTheme } from "next-themes"
 
 import { Button } from "@/components/ui/button"
-import { cn } from "@/utils/twMerge"
+import { cn } from "@/utils/common/twMerge"
 
 const DEFAULT_THEME = "dark"
 
@@ -19,6 +19,8 @@ export function ModeToggle() {
     }
   }, [resolvedTheme, pendingTheme])
 
+  // Prefer CSS `dark:` for the resting state so SSR HTML matches the client
+  // (resolvedTheme is undefined on the server and would flip opacity classes).
   const isDark =
     pendingTheme !== null
       ? pendingTheme === "dark"
@@ -50,21 +52,26 @@ export function ModeToggle() {
       aria-label="switch theme"
       onClick={handleToggle}
     >
-      <span
-        className="relative block h-5 w-5 shrink-0"
-        suppressHydrationWarning
-      >
+      <span className="relative block h-5 w-5 shrink-0">
         <Sun
           className={cn(
             "absolute inset-0 m-auto h-5 w-5 transition-opacity duration-200 ease-out",
-            isDark ? "opacity-0" : "opacity-100"
+            pendingTheme === null
+              ? "opacity-100 dark:opacity-0"
+              : isDark
+                ? "opacity-0"
+                : "opacity-100"
           )}
           aria-hidden
         />
         <Moon
           className={cn(
             "absolute inset-0 m-auto h-5 w-5 transition-opacity duration-200 ease-out",
-            isDark ? "opacity-100" : "opacity-0"
+            pendingTheme === null
+              ? "opacity-0 dark:opacity-100"
+              : isDark
+                ? "opacity-100"
+                : "opacity-0"
           )}
           aria-hidden
         />

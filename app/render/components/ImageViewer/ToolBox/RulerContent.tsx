@@ -3,15 +3,11 @@
 import { useCallback, useState, useEffect } from "react"
 import { ImageAnnotation } from "@annotorious/react"
 import { useSelector } from "react-redux"
+import { useInstanceSlidePath } from "@/utils/viewer/slidePath";
 import { RootState } from "@/store"
 import { Label } from "@/components/ui/label"
 import { Input } from "@/components/ui/input"
-import { formatMppDisplay } from "@/utils/mppFormat"
-
-interface RulerContentProps {
-  annotation: ImageAnnotation
-}
-
+import { formatMppDisplay } from "@/utils/common/mppFormat"
 
 // Function to convert microns to appropriate unit
 const convertToAppropriateUnit = (microns: number) => {
@@ -40,9 +36,14 @@ const isValidMPP = (mpp: any): boolean => {
   return !isNaN(num) && num > 0 && isFinite(num);
 };
 
-export default function RulerContent({ annotation }: RulerContentProps) {
+interface RulerContentProps {
+  annotation: ImageAnnotation
+  instanceId?: string | null
+}
+
+export default function RulerContent({ annotation, instanceId }: RulerContentProps) {
   const slideInfo = useSelector((state: RootState) => state.svsPath.slideInfo);
-  const currentPath = useSelector((state: RootState) => state.svsPath.currentPath);
+  const currentPath = useInstanceSlidePath(instanceId);
   const [customMPP, setCustomMPP] = useState<string>("");
   const [mppError, setMppError] = useState<string>("");
 
@@ -182,7 +183,7 @@ export default function RulerContent({ annotation }: RulerContentProps) {
 
       <div className="space-y-1">
         <Label className="text-sm">Distance</Label>
-        <div className="p-3 border rounded-md bg-gradient-to-br from-blue-50/50 to-indigo-50/50 dark:from-blue-950/20 dark:to-indigo-950/20">
+        <div className="p-3 border rounded-md bg-linear-to-br from-blue-50/50 to-indigo-50/50 dark:from-blue-950/20 dark:to-indigo-950/20">
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-4 text-xs">
               <span className="font-mono">Length:</span>

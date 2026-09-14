@@ -1,5 +1,5 @@
 import CloseButton from '@/components/ui/closeButton';
-import useRouteLogin from '@/hooks/useRouteLogin';
+import useRouteLogin from '@/hooks/auth/useRouteLogin';
 
 interface ModalProps {
   isOpen: boolean;
@@ -20,7 +20,7 @@ const GoLoginModal: React.FC<ModalProps> = ({ isOpen, onClose }) => {
       ></div>
       <div className='relative flex max-h-[600px] w-10/12 flex-col items-center gap-1 rounded-md bg-white px-8 py-12 shadow-lg lg:w-1/3'>
         <CloseButton onClose={onClose} />
-        <p className='mb-4 w-full bg-gradient-to-r from-blue-600 to-cyan-500 bg-clip-text text-left text-3xl font-semibold text-transparent'>
+        <p className='mb-4 w-full bg-linear-to-r from-blue-600 to-cyan-500 bg-clip-text text-left text-3xl font-semibold text-transparent'>
           Want to use more features?
         </p>
         <p className='w-full text-left text-base text-gray-600'>

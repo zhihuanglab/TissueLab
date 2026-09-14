@@ -4,17 +4,16 @@
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { apiFetch, payloadFromAxiosAppResponse } from '@/utils/common/apiFetch'
-import { AI_SERVICE_API_ENDPOINT, CTRL_SERVICE_API_ENDPOINT } from '@/constants/config'
+import { AI_SERVICE_API_ENDPOINT, COMMUNITY_API_ENDPOINT } from '@/config/api.config'
 import { communityService } from '@/services/community.service'
-import { classifiersService, ClassifierData as FirebaseClassifierData } from '@/services/classifiers.service'
-import { toISOString } from '@/utils/community.utils'
+import { classifiersService, ClassifierData as FirebaseClassifierData } from '@/services/classifier/community'
+import { toISOString } from '@/utils/community/community.utils'
 import type { ClassifierData, NodeInfo, NodeExtended, SortOption, BackendNodeInfo } from '@/types/community.types'
 import {
   factoryCategoriesFallback,
   factoryCategoryDisplayNamesFallback,
   factoryNodesExtendedFallback,
   factoryNodeInfoFallback,
-  firebaseClassifiersFallback,
 } from '@/constants/communityFallback'
 
 /**
@@ -171,9 +170,10 @@ export function useFactoryNodes() {
 export function useClassifiers(userInfo?: any) {
   const [realClassifiers, setRealClassifiers] = useState<ClassifierData[]>([])
   const [userUploadedClassifiers, setUserUploadedClassifiers] = useState<ClassifierData[]>([])
-  const [firebaseClassifiers, setFirebaseClassifiers] = useState<FirebaseClassifierData[]>(firebaseClassifiersFallback)
+  // Start empty so the tab shows loading then real classifiers (no demo placeholders).
+  const [firebaseClassifiers, setFirebaseClassifiers] = useState<FirebaseClassifierData[]>([])
   const [loadingClassifiers, setLoadingClassifiers] = useState(false)
-  const [loadingFirebaseClassifiers, setLoadingFirebaseClassifiers] = useState(false)
+  const [loadingFirebaseClassifiers, setLoadingFirebaseClassifiers] = useState(true)
 
   // Load Firebase classifiers
   const loadFirebaseClassifiers = useCallback(async () => {
@@ -188,7 +188,7 @@ export function useClassifiers(userInfo?: any) {
           
           await Promise.all(ownerIds.map(async (uid) => {
             try {
-              const p = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/users/v1/public_profile/${uid}`, { method: 'GET' })
+              const p = await apiFetch(`${COMMUNITY_API_ENDPOINT}/users/v1/public_profile/${uid}`, { method: 'GET' })
               ownerProfiles[uid] = p || {}
               if (p?.preferred_name) {
                 try { 
@@ -212,7 +212,7 @@ export function useClassifiers(userInfo?: any) {
           const detailed = await Promise.all(
             baseList.map(async (c: any) => {
               try {
-                const detail = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/classifiers/${c.id}`, { method: 'GET' })
+                const detail = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/classifiers/${c.id}`, { method: 'GET' })
                 const stars = detail?.star_count ?? c?.stats?.stars ?? 0
                 const downloads = detail?.classifier?.stats?.downloads ?? c?.stats?.downloads ?? 0
                 const isStarred = detail?.is_starred ?? false
@@ -269,7 +269,7 @@ export function useClassifiers(userInfo?: any) {
 
         for (const classifier of parsedClassifiers) {
           try {
-            const details = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/classifiers/${classifier.id}`, {
+            const details = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/classifiers/${classifier.id}`, {
               method: 'GET'
             })
             

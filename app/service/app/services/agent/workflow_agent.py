@@ -1,42 +1,37 @@
 """
-Workflow Agent for the local TissueLab service.
+Workflow Agent with Provider Abstraction
 
-Adapted from the ctrl-service workflow agent. The training-data collection,
-per-user Firestore knowledge base, and Tinker provider have all been
-removed for the local build — only the OpenAI provider remains, and the
-agent runs without user context.
+All LLM calls go through the provider abstraction. Blocking provider calls are
+pushed off the event loop because this agent runs inside the same process that
+serves slide tiles and websocket overlays.
 """
 
+import asyncio
 import os
 from typing import Dict, Any, Optional, List, Tuple, Iterator
 import json
-import numpy as np
 from openai import OpenAI
 import copy
 import threading
 from datetime import datetime, timezone
-from app.services.model_store import model_store
+from app.utils.workflow.model_store import model_store
 from app.services.providers import LLMProvider, OpenAIProvider
+from app.services import llm_config
+from app.services.agent.knowledge_store import get_knowledge_store
+from app.repos.schema.knowledge import KnowledgeItem
 import aiohttp
 
-
-class _NoOpTrainingCollector:
-    """Stub replacement for the cloud training-data collector.
-
-    Every collect_* method is a no-op so the rest of the agent code can stay
-    structurally identical to the upstream version without touching Firestore.
-    """
-
-    def __getattr__(self, name: str):
-        def _noop(*_args, **_kwargs):
-            return None
-        return _noop
+# PROMPTS_DIR is in parent directory (app/services/prompts)
+PROMPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts")
+# Public script library (pre-written, tested analysis scripts the coding agent may reuse).
+SCRIPTS_GCS_BASE_URL = os.getenv(
+    "TL_SCRIPTS_BASE_URL",
+    "https://storage.googleapis.com/tissuelab-2025.firebasestorage.app/scripts",
+)
 
 
-# PROMPTS_DIR points at sibling `prompts/` (workflow_agent.py lives in
-# app/services/agent/, prompts live in app/services/agent/prompts/).
-PROMPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
-SCRIPTS_GCS_BASE_URL = "https://storage.googleapis.com/tissuelab-2025.firebasestorage.app/scripts"
+class AgentNotConfigured(RuntimeError):
+    """Raised when the LLM agent cannot run because no API key is configured."""
 
 def _read_text(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
@@ -46,32 +41,32 @@ def _read_text(path: str) -> str:
 def _extract_code_from_markdown(raw_text: str) -> str:
     """
     Extract Python code from markdown code blocks.
-    
+
     Looks for code blocks marked with ```python, ```py, or just ```.
     If multiple code blocks are found, returns the longest one (most likely the main code).
     If no code blocks are found, returns the original text (fallback for edge cases).
-    
+
     Args:
         raw_text: Raw response text that may contain markdown code blocks
-        
+
     Returns:
         Extracted Python code string
     """
     if not raw_text:
         return ""
-    
+
     import re
-    
+
     # Pattern to match markdown code blocks: ```python, ```py, or just ```
     # Uses non-greedy matching with DOTALL to capture multi-line code
     code_block_pattern = r'```(?:python|py)?\s*\n?(.*?)```'
     matches = re.findall(code_block_pattern, raw_text, re.DOTALL | re.IGNORECASE)
-    
+
     if matches:
         # If multiple code blocks found, return the longest one (most likely the main code)
         code = max(matches, key=len).strip()
         return code
-    
+
     # Fallback: if no code blocks found, return original text
     # This handles edge cases where LLM returns code without markdown fences
     return raw_text.strip()
@@ -81,17 +76,18 @@ class WorkflowAgent:
     def __init__(self):
         # Legacy OpenAI client (for web search)
         self.client = OpenAI()
-        
+
         # Initialize providers
         self._init_providers()
-        
+
         # Model configuration (with provider routing)
-        self.model_router = os.getenv("OPENAI_MODEL_ROUTER", "gpt-5.2")
-        self.model_chat = os.getenv("CHAT_MODEL", "gpt-5.2")
-        self.model_workflow = os.getenv("WORKFLOW_MODEL", "gpt-5.2")
-        self.model_code = os.getenv("CODE_MODEL", "gpt-5.2")
-        self.model_ranking = os.getenv("RANKING_MODEL", "gpt-5.2")
-        
+        # Per-role models; LLM_MODEL is the shared default (see llm_config).
+        self.model_router = llm_config.model_for("OPENAI_MODEL_ROUTER")
+        self.model_chat = llm_config.model_for("CHAT_MODEL")
+        self.model_workflow = llm_config.model_for("WORKFLOW_MODEL")
+        self.model_code = llm_config.model_for("CODE_MODEL")
+        self.model_ranking = llm_config.model_for("RANKING_MODEL")
+
         # Load prompts
         self.prompt_workflow = _read_text(os.path.join(PROMPTS_DIR, "workflow_system_prompt.txt"))
         self.prompt_code = _read_text(os.path.join(PROMPTS_DIR, "code_system_prompt.txt"))
@@ -105,26 +101,29 @@ class WorkflowAgent:
         )
         router_path = os.path.join(PROMPTS_DIR, "router_system_prompt.txt")
         self.prompt_router = _read_text(router_path) if os.path.exists(router_path) else None
-        
+
         # Cache for scripts metadata (refreshed periodically)
         self._scripts_metadata_cache = None
         self._scripts_cache_timestamp = 0
-        
-        # Training collection disabled in the local build (no Firestore writes).
-        self.training_collector = _NoOpTrainingCollector()
-        self.enable_training_collection = False
-    
+
+        # Knowledge base cache
+        self._knowledge_cache: Dict[str, List[KnowledgeItem]] = {}
+        self._knowledge_lock = threading.Lock()
+
     def _init_providers(self):
-        """Initialize the OpenAI provider (Tinker dropped in local build)."""
+        """Initialize LLM providers based on environment configuration"""
+        # OpenAI-compatible provider (OPENAI_BASE_URL for self-hosted servers)
         self.openai_provider = OpenAIProvider(self.client)
-        self.router_provider_name = "openai"
-        self.chat_provider_name = "openai"
-        self.workflow_provider_name = "openai"
-        self.code_provider_name = "openai"
-        self.ranking_provider_name = "openai"
+
+        # Provider routing configuration
+        self.router_provider_name = os.getenv("ROUTER_PROVIDER", "openai")
+        self.chat_provider_name = os.getenv("CHAT_PROVIDER", "openai")
+        self.workflow_provider_name = os.getenv("WORKFLOW_PROVIDER", "openai")
+        self.code_provider_name = os.getenv("CODE_PROVIDER", "openai")
+        self.ranking_provider_name = os.getenv("RANKING_PROVIDER", "openai")
 
     def _get_provider(self, provider_name: str) -> LLMProvider:
-        """Local build only supports OpenAI."""
+        """Get provider by name (only the OpenAI-compatible provider ships)."""
         return self.openai_provider
 
     async def _fetch_scripts_metadata(self) -> List[Dict[str, Any]]:
@@ -134,12 +133,12 @@ class WorkflowAgent:
         Caches result for 1 hour to avoid excessive fetches.
         """
         import time
-        
+
         # Check cache (1 hour TTL)
         current_time = time.time()
         if self._scripts_metadata_cache and (current_time - self._scripts_cache_timestamp) < 3600:
             return self._scripts_metadata_cache
-        
+
         try:
             metadata_url = f"{SCRIPTS_GCS_BASE_URL}/metadata.json"
             async with aiohttp.ClientSession() as session:
@@ -150,7 +149,6 @@ class WorkflowAgent:
                         # Update cache
                         self._scripts_metadata_cache = scripts
                         self._scripts_cache_timestamp = current_time
-                        print(f"[agent_service] Loaded {len(scripts)} scripts from GCS metadata")
                         return scripts
                     else:
                         print(f"[agent_service] Failed to fetch scripts metadata: HTTP {resp.status}")
@@ -162,10 +160,10 @@ class WorkflowAgent:
     async def _fetch_script_from_gcs(self, script_id: str) -> Optional[str]:
         """
         Fetch a script's Python code from GCS.
-        
+
         Args:
             script_id: The script ID (e.g., "depth_of_invasion")
-            
+
         Returns:
             Python code as string, or None if fetch failed
         """
@@ -175,7 +173,6 @@ class WorkflowAgent:
                 async with session.get(script_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         code = await resp.text()
-                        print(f"[agent_service] Successfully fetched script: {script_id}")
                         return code
                     else:
                         print(f"[agent_service] Failed to fetch script {script_id}: HTTP {resp.status}")
@@ -187,16 +184,16 @@ class WorkflowAgent:
     def _format_scripts_for_prompt(self, scripts: List[Dict[str, Any]]) -> str:
         """
         Format scripts metadata for inclusion in system prompt.
-        
+
         Args:
             scripts: List of script metadata dicts
-            
+
         Returns:
             Formatted string for prompt
         """
         if not scripts:
             return "No pre-written scripts available."
-        
+
         lines = ["AVAILABLE PRE-WRITTEN SCRIPTS:", ""]
         for script in scripts:
             lines.append(f"ID: {script.get('id')}")
@@ -209,24 +206,28 @@ class WorkflowAgent:
             if required:
                 lines.append(f"Required datasets: {', '.join(required)}")
             lines.append("")
-        
+
         lines.append("You can use fetch_script(script_id) to retrieve a pre-written script when it matches the user's request.")
         lines.append("Only use fetch_script if the script clearly matches the task and required datasets are available.")
         lines.append("Otherwise, generate new code as usual.")
         lines.append("")
-        
+
         return "\n".join(lines)
 
     def _fetch_guidelines(self, query_text: str, always_search: bool = False) -> str:
         """
         Attempt to fetch medical guideline info via OpenAI web_search_preview tool.
         Returns empty string on failure.
-        
+
         Args:
             query_text: The query to search for
             always_search: If True, always return search results regardless of specificity
         """
         if not query_text:
+            return ""
+        # The hosted web_search tool exists only on OpenAI's Responses API; a
+        # self-hosted OpenAI-compatible server simply gets no guideline block.
+        if not llm_config.web_search_available():
             return ""
         try:
             # Adjust prompt based on always_search flag
@@ -245,10 +246,10 @@ class WorkflowAgent:
                     "Only return yes or no\n"
                     "If yes provide the exact criteria"
                 )
-            
+
             # New Responses API with web_search_preview tool
             response = self.client.responses.create(
-                model=os.getenv("OPENAI_MODEL_SEARCH", "gpt-5.2"),
+                model=llm_config.model_for("OPENAI_MODEL_SEARCH"),
                 tools=[{"type": "web_search"}],
                 input=search_prompt,
             )
@@ -293,11 +294,7 @@ class WorkflowAgent:
                         messages.append({"role": role, "content": content})
             # Current user query last
             messages.append({"role": "user", "content": query or ""})
-            try:
-                print(f"[router.history] count={len(history) if isinstance(history, list) else 0} used={len(messages)-1}")
-            except Exception:
-                pass
-            
+
             # Use provider abstraction
             provider = self._get_provider(self.router_provider_name)
             json_schema = {
@@ -316,13 +313,13 @@ class WorkflowAgent:
                 },
                 "strict": True
             }
-            
-            response = provider.infer(
+
+            response = await asyncio.to_thread(provider.infer, 
                 messages=messages,
                 model=self.model_router,
                 json_schema=json_schema,
             )
-            
+
             label = None
             try:
                 parsed = json.loads(response.text or "{}")
@@ -344,7 +341,26 @@ class WorkflowAgent:
         History format (optional): list of { role: "user"|"assistant", content: str }
         """
         try:
-            # Knowledge base / correction detection removed in local build.
+            # Detect if user is correcting the agent (if history and user_id are available)
+            # At least 1 history record (assistant response) is needed to detect correction
+            if user_id and history and isinstance(history, list) and len(history) >= 1:
+                try:
+                    knowledge_id = await asyncio.to_thread(
+                    self._extract_knowledge_from_correction,
+                        user_id=user_id,
+                        history=history,
+                        current_query=prompt,
+                        data_context=data_context,
+                    )
+                except Exception as kb_error:
+                    # Knowledge extraction failure should not affect main flow
+                    try:
+                        print(f"[workflow_agent.chat] ❌ Failed to extract knowledge: {kb_error}")
+                        import traceback
+                        print(f"[workflow_agent.chat] Traceback: {traceback.format_exc()}")
+                    except Exception:
+                        pass
+
             # Build data context string
             dc_text = ""
             try:
@@ -383,8 +399,23 @@ class WorkflowAgent:
             except Exception:
                 chat_capabilities_text = ""
 
-            # User-knowledge base load skipped in local build.
+            # Load and apply user knowledge if history is empty or only contains welcome/system messages
             knowledge_text = ""
+            # Check if history is effectively empty (no real user question yet)
+            # Consider empty if: no history, empty list, or only assistant/system messages
+            is_history_empty = (
+                not history or
+                not isinstance(history, list) or
+                len(history) == 0 or
+                all(turn.get("role") in ("assistant", "system") for turn in history)
+            )
+            if user_id and is_history_empty:
+                try:
+                    all_knowledge = self._load_user_knowledge(user_id)
+                    if all_knowledge:
+                        knowledge_text = self._format_knowledge_for_prompt(all_knowledge)
+                except Exception as e:
+                    print(f"[KnowledgeBase] Failed to load knowledge: {e}")
 
             sys_content = (
                 self.prompt_chat
@@ -395,13 +426,13 @@ class WorkflowAgent:
                 sys_content = sys_content.replace("__DATA_CONTEXT__", dc_text)
             else:
                 sys_content = sys_content.replace("__DATA_CONTEXT__", "")
-            
+
             # Append knowledge if available
             if knowledge_text:
                 sys_content += knowledge_text
-            
+
             messages = [{"role": "system", "content": sys_content}]
-            
+
             # Append prior turns if provided
             if isinstance(history, list):
                 # Keep only the last ~10 messages to control token usage
@@ -411,7 +442,7 @@ class WorkflowAgent:
                     content = turn.get("content")
                     if role in ("user", "assistant") and isinstance(content, str) and content.strip():
                         messages.append({"role": role, "content": content})
-            
+
             # Current user prompt last
             messages.append({"role": "user", "content": prompt or ""})
 
@@ -423,45 +454,22 @@ class WorkflowAgent:
             # Fetch guidelines if web search is enabled
             if web_search_enabled:
                 frontend_requested = isinstance(data_context, dict) and data_context.get("web_search_enabled")
-                guidelines = self._fetch_guidelines(prompt, always_search=frontend_requested)
+                guidelines = await asyncio.to_thread(self._fetch_guidelines, prompt, always_search=frontend_requested)
                 if guidelines:
                     # Add guidelines to system message
                     messages[0]["content"] += f"\n\nMEDICAL GUIDELINES REFERENCE:\n{guidelines}"
 
-            try:
-                print(f"[chat.dc] {dc_text if dc_text else 'none'}")
-                print(f"[chat.history] count={len(history) if isinstance(history, list) else 0}")
-                print(f"[chat.web_search] enabled={web_search_enabled}")
-                print(f"[chat.provider] {self.chat_provider_name}")
-            except Exception:
-                pass
-
             # Use provider abstraction
             provider = self._get_provider(self.chat_provider_name)
-            response = provider.infer(
+            response = await asyncio.to_thread(provider.infer, 
                 messages=messages,
                 model=self.model_chat,
             )
-            
+
             response_text = response.text
-            
-            # Collect training data if enabled
-            if self.enable_training_collection:
-                try:
-                    self.training_collector.collect_chat(
-                        prompt=prompt,
-                        response=response_text,
-                        data_context=data_context,
-                        history=history,
-                    )
-                except Exception as e:
-                    try:
-                        print(f"[agent_service] Failed to collect chat training data: {e}")
-                    except:
-                        pass
-            
+
             return response_text
-            
+
         except Exception as e:
             print("Error in chat():", e)
             raise
@@ -469,11 +477,11 @@ class WorkflowAgent:
     async def summary_answer(self, question: str, answer: str) -> str:
         """
         Return natural language summary of the answer
-        
+
         Parameters:
         - question: The original question
         - answer: The answer to summarize
-        
+
         Returns:
         - A natural language summary of the answer
         """
@@ -500,24 +508,43 @@ Rules:
         """
         Get processing steps for medical image analysis (using provider abstraction).
         """
-        # Knowledge base / correction detection removed in local build.
+        # Detect if user is correcting the agent (if history and user_id are available)
+        # At least 1 history record (assistant response) is needed to detect correction
+        if user_id and history and isinstance(history, list) and len(history) >= 2:
+            try:
+                knowledge_id = await asyncio.to_thread(
+                    self._extract_knowledge_from_correction,
+                    user_id=user_id,
+                    history=history,
+                    current_query=query,
+                    data_context=data_context,
+                )
+            except Exception as kb_error:
+                # Knowledge extraction failure should not affect main flow
+                try:
+                    print(f"[workflow_agent.get_processing_steps] ❌ Failed to extract knowledge: {kb_error}")
+                    import traceback
+                    print(f"[workflow_agent.get_processing_steps] Traceback: {traceback.format_exc()}")
+                except Exception:
+                    pass
+
         # Fetch guideline info (optional enrichment)
         web_search_enabled = False
         if os.getenv("ENABLE_GUIDELINE_SEARCH", "0") == "1":
             web_search_enabled = True
         if isinstance(data_context, dict) and data_context.get("web_search_enabled"):
             web_search_enabled = True
-        
+
         if web_search_enabled:
             frontend_requested = isinstance(data_context, dict) and data_context.get("web_search_enabled")
-            fetched = self._fetch_guidelines(query, always_search=frontend_requested)
+            fetched = await asyncio.to_thread(self._fetch_guidelines, query, always_search=frontend_requested)
             try:
                 print(f"[workflow.web_search_response] {fetched}")
             except Exception:
                 pass
         else:
             fetched = ""
-        
+
         if fetched:
             if "NO - NO SPECIFIC" in fetched.upper():
                 guideline_block = (
@@ -531,7 +558,7 @@ Rules:
                 )
         else:
             guideline_block = ""
-        
+
         # Build capability map for model selection
         try:
             nodes = model_store.get_nodes_extended()
@@ -584,7 +611,7 @@ Rules:
                     parts.append(f"Active Zarr: {zarr_path}")
                 if data_context.get("slide_info"):
                     parts.append(f"Slide Info: {json.dumps(data_context.get('slide_info'))}")
-                
+
                 # Add initial workflow if available (for v2 adjustment)
                 initial_workflow = data_context.get("initial_workflow")
                 if initial_workflow:
@@ -599,27 +626,44 @@ Rules:
                                 parts.append(f"  Step {step.get('step', '?')}: {model} ({impl})")
                     except Exception:
                         pass
-                
+
                 # Add ROIs information if available (v2 format)
                 rois_info = data_context.get("rois_info")
                 if rois_info:
                     parts.append(f"\n{rois_info}")
-                
+
                 rois_images = data_context.get("rois_images")
                 if rois_images:
                     parts.append(f"\nROIs Images: {len(rois_images)} image(s) provided for visual analysis")
-                
+
                 # Add ROI workflow hint if available
                 roi_hint = data_context.get("roi_workflow_hint")
                 if roi_hint:
                     parts.append(f"\n{roi_hint}")
-                
+
                 if parts:
                     dc_text = "\n".join(parts)
         except Exception:
             dc_text = ""
 
-        # User-knowledge load skipped in local build.
+        # Load and apply user knowledge if history is empty or only contains welcome/system messages
+        knowledge_text = ""
+        # Check if history is effectively empty (no real user question yet)
+        # Consider empty if: no history, empty list, or only assistant/system messages
+        is_history_empty = (
+            not history or
+            not isinstance(history, list) or
+            len(history) == 0 or
+            all(turn.get("role") in ("assistant", "system") for turn in history)
+        )
+        if user_id and is_history_empty:
+            try:
+                all_knowledge = self._load_user_knowledge(user_id)
+                if all_knowledge:
+                    knowledge_text = self._format_knowledge_for_prompt(all_knowledge)
+            except Exception as e:
+                print(f"[KnowledgeBase] Failed to load knowledge: {e}")
+
         system_prompt = (
             self.prompt_workflow
             .replace("__GUIDELINE_INFO__", guideline_block)
@@ -627,6 +671,9 @@ Rules:
             .replace("__DATA_CONTEXT__", dc_text)
         )
 
+        # Append knowledge if available
+        if knowledge_text:
+            system_prompt += knowledge_text
 
         try:
             # Build message list with optional chat history for context
@@ -638,28 +685,27 @@ Rules:
                     content = turn.get("content")
                     if role in ("user", "assistant") and isinstance(content, str) and content.strip():
                         messages.append({"role": role, "content": content})
-            
+
             # Build user message with images if available
             user_content = query or ""
             rois_images = data_context.get("rois_images") if isinstance(data_context, dict) else None
-            
+
             if rois_images and isinstance(rois_images, list) and len(rois_images) > 0:
                 # Build content array with text and images
                 # Use chat.completions format for images (compatible with Responses API input format)
                 content_parts = []
-                
+
                 # Add text content (use input_text for Responses API)
                 if user_content:
                     content_parts.append({
                         "type": "input_text",
                         "text": user_content
                     })
-                
+
                 # Add images (base64 encoded strings) with ROI identification
                 # Get ROI info to match images with ROI indices
                 rois_info_text = data_context.get("rois_info", "") if isinstance(data_context, dict) else ""
-                
-                print(f"[workflow_agent] Sending {len(rois_images)} ROI images to LLM")
+
                 for idx, img_base64 in enumerate(rois_images):
                     if isinstance(img_base64, str):
                         # Clean base64 string (remove data:image/... prefix if present)
@@ -673,16 +719,15 @@ Rules:
                                 mime_type = "image/jpeg"
                             elif "image/png" in img_base64:
                                 mime_type = "image/png"
-                        
+
                         # Add text label before each image to identify which ROI it is (use input_text for Responses API)
                         roi_num = idx + 1
                         roi_label = f"\n[ROI {roi_num} Image - Refer to ROI {roi_num} information above for patch size calculation]"
-                        print(f"[workflow_agent] Adding ROI {roi_num} image (base64 length: {len(clean_base64)})")
                         content_parts.append({
                             "type": "input_text",
                             "text": roi_label
                         })
-                        
+
                         # Use image_url format (compatible with chat.completions API)
                         content_parts.append({
                             "type": "image_url",
@@ -690,9 +735,7 @@ Rules:
                                 "url": f"data:{mime_type};base64,{clean_base64}"
                             }
                         })
-                
-                print(f"[workflow_agent] Total content parts: {len(content_parts)} (text parts + image parts)")
-                print(f"[workflow_agent] ROIs info text length: {len(rois_info_text)} characters")
+
                 messages.append({"role": "user", "content": content_parts})
             else:
                 # No images, just text
@@ -741,19 +784,15 @@ Rules:
 
             # Use provider abstraction
             provider = self._get_provider(self.workflow_provider_name)
-            response = provider.infer(
+            response = await asyncio.to_thread(provider.infer, 
                 messages=messages,
                 model=self.model_workflow,
                 json_schema=json_schema,
             )
-            
+
             out = response.text or "{}"
-            
+
             try:
-                print(f"[workflow.dc] {dc_text if dc_text else 'none'}")
-                print(f"[workflow.history] count={len(history) if isinstance(history, list) else 0}")
-                print(f"[workflow.output_len] {len(out)}")
-                print(f"[workflow.provider] {self.workflow_provider_name}")
                 # Print first 500 chars of response for debugging
                 if out and len(out) > 0:
                     preview = out[:500] if len(out) > 500 else out
@@ -762,31 +801,292 @@ Rules:
                         print(f"[workflow.response_preview] ... (truncated, total {len(out)} chars)")
             except Exception:
                 pass
-            
-            # Collect training data if enabled
-            if self.enable_training_collection:
-                try:
-                    steps_obj = json.loads(out)
-                    steps = steps_obj.get("steps", [])
-                    if steps:
-                        self.training_collector.collect_workflow_planning(
-                            prompt=query,
-                            steps=steps,
-                            data_context=data_context,
-                            history=history,
-                            success=True,
-                        )
-                except Exception as e:
-                    try:
-                        print(f"[agent_service] Failed to collect workflow training data: {e}")
-                    except:
-                        pass
-            
+
             return out
         except Exception as e:
             print("Error in get_processing_steps():", e)
             return "{}"
-    
+
+    def _load_user_knowledge(self, user_id: str) -> List[KnowledgeItem]:
+        """Load all knowledge items for a user (with caching)"""
+        cache_key = f"user:{user_id}"
+        with self._knowledge_lock:
+            cached = self._knowledge_cache.get(cache_key)
+            if cached is not None:
+                return copy.deepcopy(cached)
+
+        knowledge_items = get_knowledge_store().list_items(user_id)
+
+        with self._knowledge_lock:
+            self._knowledge_cache[cache_key] = copy.deepcopy(knowledge_items)
+
+        return knowledge_items
+
+    def _invalidate_knowledge_cache(self, user_id: str):
+        """Invalidate knowledge base cache"""
+        cache_key = f"user:{user_id}"
+        with self._knowledge_lock:
+            self._knowledge_cache.pop(cache_key, None)
+
+    def _format_knowledge_for_prompt(self, knowledge_items: List[KnowledgeItem]) -> str:
+        """Format knowledge items for inclusion in system prompt"""
+        if not knowledge_items:
+            return ""
+
+        lines = ["\n" + "="*80]
+        lines.append("USER PREFERENCES AND CORRECTIONS (from previous interactions):")
+        lines.append("="*80)
+        for idx, item in enumerate(knowledge_items, 1):
+            lines.append(f"\n[{idx}] {item.title}")
+            lines.append(f"   Content: {item.content}")
+            if item.original_query:
+                lines.append(f"   Related to query: {item.original_query}")
+            if item.tags:
+                lines.append(f"   Tags: {', '.join(item.tags)}")
+
+        lines.append("\n" + "="*80)
+        lines.append("CRITICAL: When planning workflow steps, you MUST follow these user preferences.")
+        lines.append("If the current query is similar to any 'Related to query' above, apply the corresponding preference.")
+        lines.append("Do NOT use methods that the user has previously corrected or rejected.")
+        lines.append("="*80 + "\n")
+        return "\n".join(lines)
+
+    def _save_knowledge(
+        self,
+        user_id: str,
+        title: str,
+        content: str,
+        category: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        context_key: Optional[str] = None,
+        source_type: str = "correction",
+        importance_score: float = 1.0,
+        original_query: Optional[str] = None,
+        original_response: Optional[str] = None,
+        correction_context: Optional[str] = None,
+    ) -> str:
+        """Save knowledge item (update if similar item exists, otherwise create new)"""
+        store = get_knowledge_store()
+        existing_knowledge = (
+            store.find_by_query(user_id, original_query, context_key) if original_query else None
+        )
+
+        if existing_knowledge:
+            # Merge content (append new correction info)
+            updated_content = existing_knowledge.content
+            if content and content not in updated_content:
+                updated_content = f"{updated_content}\n\n[Follow-up Correction] {content}"
+
+            merged_tags = list(set((existing_knowledge.tags or []) + (tags or [])))
+
+            updated_correction_context = existing_knowledge.correction_context or ""
+            if correction_context:
+                updated_correction_context = f"{updated_correction_context}\n\n---\n{correction_context}"
+
+            existing_knowledge.content = updated_content
+            existing_knowledge.tags = merged_tags
+            existing_knowledge.correction_context = updated_correction_context
+            existing_knowledge.updated_at = datetime.now(timezone.utc)
+            existing_knowledge.version = existing_knowledge.version + 1
+            if importance_score > existing_knowledge.importance_score:
+                existing_knowledge.importance_score = importance_score
+            if title and title != existing_knowledge.title:
+                existing_knowledge.title = title
+
+            knowledge_id = store.upsert(user_id, existing_knowledge)
+            self._invalidate_knowledge_cache(user_id)
+            return knowledge_id
+
+        knowledge_item = KnowledgeItem(
+            user_id=user_id,
+            title=title,
+            content=content,
+            category=category,
+            tags=tags or [],
+            context_key=context_key,
+            source_type=source_type,
+            importance_score=importance_score,
+            original_query=original_query,
+            original_response=original_response,
+            correction_context=correction_context,
+        )
+        knowledge_id = store.upsert(user_id, knowledge_item)
+        self._invalidate_knowledge_cache(user_id)
+        return knowledge_id
+
+    def _extract_knowledge_from_correction(
+        self,
+        user_id: str,
+        history: List[Dict[str, str]],
+        current_query: str,
+        data_context: Optional[Dict] = None,
+    ) -> Optional[str]:
+        """Detect correction from conversation history and extract knowledge"""
+        try:
+            # Check if history is sufficient: at least 1 history record needed
+            if not history or len(history) < 1:
+                return None
+
+            # Quick check: if current query doesn't look like correction (no correction keywords), skip LLM call
+            correction_keywords = ["wrong", "should be", "prefer", "don't use", "should use", "incorrect", "not", "should", "don't", "avoid",
+                                   "no", "not like", "instead", "rather", "correction", "fix", "change", "different", "actually"]
+            current_query_lower = current_query.lower()
+            has_correction_keyword = any(keyword in current_query_lower for keyword in correction_keywords)
+
+            # Check if recent assistant response exists (indicates conversation history)
+            has_recent_assistant = any(
+                turn.get("role") == "assistant"
+                for turn in history[-3:]  # Check last 3 turns
+            )
+
+            if not has_recent_assistant:
+                return None
+
+            # If no correction keywords and only 1 history item, skip (save LLM calls)
+            # But if history has multiple items, detect even without keywords (might be implicit correction)
+            if not has_correction_keyword and len(history) == 1:
+                return None
+
+            # Build correction detection prompt
+            # Extract recent conversation turns (last 6 turns)
+            recent_history = history[-6:] if len(history) > 6 else history
+
+            # Extract original query and assistant response
+            original_query_text = current_query
+            original_assistant_response = None
+
+            # Extract original query and assistant response from history
+            for turn in reversed(history):
+                if turn.get("role") == "user" and original_query_text == current_query:
+                    original_query_text = turn.get("content", current_query)
+                if turn.get("role") == "assistant" and not original_assistant_response:
+                    original_assistant_response = turn.get("content", "")
+
+            history_text = ""
+            for turn in recent_history:
+                role = turn.get("role", "")
+                content = turn.get("content", "")
+                if role and content:
+                    history_text += f"{role.upper()}: {content}\n"
+
+            context_str = ""
+            context_key = None
+            if isinstance(data_context, dict):
+                zarr_path = data_context.get("zarr_path")
+                if zarr_path:
+                    import os as _os
+                    base = _os.path.basename(zarr_path)
+                    if base.endswith('.zarr'):
+                        context_key = base[:-5]
+                    else:
+                        context_key = base
+                    context_str = f"\nContext: {context_key}"
+
+            detection_prompt = f"""Analyze the following conversation history and strictly determine if the user is correcting the agent's behavior or preferences.
+
+IMPORTANT: Only return is_correction=true when it's clearly a correction. The following situations are NOT corrections:
+- User is just asking questions or requesting new features
+- User is just expressing thanks or confirmation
+- User is just asking for explanations or clarifications
+- User is just continuing the conversation or following up
+
+Conversation History:
+{history_text}
+
+Current Query: {current_query}
+{context_str}
+
+Please strictly determine:
+1. Is the user explicitly correcting the agent? (Must contain clear correction signals such as: "wrong", "should be", "I prefer", "don't use", "should use", "incorrect", "not like this", etc.)
+2. If it's a correction, extract the user's preferences and requirements
+3. Identify the original question (what the user originally wanted)
+
+Return in JSON format:
+{{
+    "is_correction": true/false,
+    "correction_type": "preference|requirement|workflow_change|other",
+    "title": "Brief title (if is_correction is true)",
+    "content": "Detailed knowledge content description (if is_correction is true)",
+    "category": "workflow_preference|analysis_pattern|user_requirement",
+    "tags": ["tag1", "tag2"],
+    "importance_score": 0.8,
+    "original_query": "The original question the user asked"
+}}
+
+IMPORTANT: The "tags" field should contain keywords/topics extracted from the ORIGINAL_QUERY (the user's initial question), NOT from the correction itself. Tags help categorize and retrieve this knowledge based on what question it relates to.
+
+Return only JSON, no other text. If is_correction is false, other fields can be null."""
+
+            # Call LLM to detect correction
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a correction detection assistant. Analyze conversation history to detect if the user is correcting the agent's behavior or preferences. Return only valid JSON. All text fields (title, content, tags, original_query) must be in English."
+                },
+                {"role": "user", "content": detection_prompt}
+            ]
+
+            provider = self._get_provider(self.chat_provider_name)
+            response = provider.infer(messages=messages, model=self.model_chat)
+
+            try:
+                # Parse JSON response
+                response_text = response.text.strip()
+                if response_text.startswith("```"):
+                    # Extract JSON code block content
+                    lines = response_text.split("\n")
+                    json_lines = []
+                    in_json_block = False
+                    for line in lines:
+                        if line.strip().startswith("```"):
+                            if in_json_block:
+                                break
+                            in_json_block = True
+                            continue
+                        if in_json_block:
+                            json_lines.append(line)
+                    response_text = "\n".join(json_lines)
+
+                detection_result = json.loads(response_text)
+
+                # If it's a correction, save knowledge
+                if detection_result.get("is_correction", False):
+                    # Build correction context - only include user's correction statement
+                    # Note: original_response field stores the agent's incorrect response separately
+                    # This avoids confusion when reading correction_context
+                    original_query_for_context = detection_result.get("original_query") or original_query_text
+                    correction_context = f"Original Question: {original_query_for_context}\nUser Correction: {current_query}"
+
+                    # Extract original query (prefer LLM-identified, otherwise use extracted)
+                    original_query = detection_result.get("original_query") or original_query_text
+
+                    knowledge_id = self._save_knowledge(
+                        user_id=user_id,
+                        title=detection_result.get("title", "User Correction"),
+                        content=detection_result.get("content", ""),
+                        category=detection_result.get("category", "workflow_preference"),
+                        tags=detection_result.get("tags", []),
+                        context_key=context_key,
+                        source_type="correction",
+                        importance_score=float(detection_result.get("importance_score", 0.8)),
+                        original_query=original_query,
+                        original_response=original_assistant_response,
+                        correction_context=correction_context,
+                    )
+
+                    return knowledge_id
+
+                return None
+
+            except json.JSONDecodeError as e:
+                print(f"[KnowledgeBase] Failed to parse detection response: {response.text}")
+                return None
+
+        except Exception as e:
+            print(f"[KnowledgeBase] Failed to extract knowledge from correction: {e}")
+            return None
+
+
     async def select_impl_from_candidates(
         self,
         query: str,
@@ -834,35 +1134,18 @@ Rules:
                 },
                 "strict": True,
             }
-            
+
             # Use provider abstraction
             provider = self._get_provider(self.ranking_provider_name)
-            response = provider.infer(
+            response = await asyncio.to_thread(provider.infer, 
                 messages=messages,
                 model=self.model_ranking,
                 json_schema=json_schema,
             )
-            
+
             out = response.text or "{}"
             result = json.loads(out)
-            
-            # Collect training data if enabled
-            if self.enable_training_collection and result:
-                try:
-                    self.training_collector.collect_impl_ranking(
-                        query=query,
-                        step=step,
-                        candidates=candidates,
-                        selected_impl=result.get("selected_impl", ""),
-                        ranking=result.get("ranking", []),
-                        reason=result.get("reason", ""),
-                    )
-                except Exception as e:
-                    try:
-                        print(f"[agent_service] Failed to collect ranking training data: {e}")
-                    except:
-                        pass
-            
+
             return result
         except Exception:
             return None
@@ -887,7 +1170,7 @@ Rules:
         search_enabled = web_search_enabled or (os.getenv("ENABLE_GUIDELINE_SEARCH", "0") == "1")
         if search_enabled:
             frontend_requested = web_search_enabled
-            fetched = self._fetch_guidelines(combined_for_search, always_search=frontend_requested)
+            fetched = await asyncio.to_thread(self._fetch_guidelines, combined_for_search, always_search=frontend_requested)
         else:
             fetched = ""
 
@@ -955,8 +1238,8 @@ Rules:
             ],
             "stream": True,
         }
-        effective_model = self.model_code or ""
-        if "5.2" not in effective_model:
+        # gpt-5 models only accept the default temperature.
+        if not llm_config.is_gpt5(self.model_code or ""):
             kwargs["temperature"] = 1.0
 
         stream = self.client.chat.completions.create(**kwargs)
@@ -975,18 +1258,18 @@ Rules:
     async def get_script(self, script_task: str, zarr_structure: str = None, original_question: str = None, web_search_enabled: bool = False, use_scripts_library: bool = False) -> str:
         """
         Generate or fetch Python code that defines analyze_medical_image(path) (using provider abstraction).
-        
+
         The LLM can either:
         1. Call fetch_script(script_id) tool to retrieve a pre-written script from GCS (when use_scripts_library=True)
         2. Generate new code directly (wrapped in markdown code blocks)
-        
+
         Args:
             script_task: The task description for code generation
             zarr_structure: Input file structure (JSON string; e.g. for analyze_medical_image the input is a path to a JSON file)
             original_question: Original user question
             web_search_enabled: Whether to enable web search for guidelines
             use_scripts_library: If True, load GCS scripts metadata and expose fetch_script; default False（默认不读 knowledge/scripts）
-        
+
         Returns:
             Python code as a string (extracted from markdown code blocks if present).
         """
@@ -1001,7 +1284,7 @@ Rules:
         try:
             # Use provider abstraction
             provider = self._get_provider(self.code_provider_name)
-            response = provider.infer(
+            response = await asyncio.to_thread(provider.infer, 
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -1009,15 +1292,13 @@ Rules:
                 model=self.model_code,
                 tools=tools if tools else None,
             )
-            
+
             # Check if LLM decided to use a tool
             generated_code = None
             if response.tool_calls:
                 for tc in response.tool_calls:
                     if tc.name == "fetch_script":
                         script_id = tc.arguments.get("script_id")
-                        print(f"[get_script] Using library script: {script_id}")
-                        
                         # Fetch the script from GCS
                         fetched_code = await self._fetch_script_from_gcs(script_id)
                         if fetched_code:
@@ -1025,30 +1306,15 @@ Rules:
                             break
                         else:
                             print(f"[get_script] Failed to fetch '{script_id}', generating instead")
-            
+
             # No tool call or fetch failed - extract generated code
             if not generated_code:
                 raw_response = response.text or ""
                 # Extract code from markdown code blocks
                 generated_code = _extract_code_from_markdown(raw_response)
-            
-            # Collect training data if enabled
-            if self.enable_training_collection and generated_code:
-                try:
-                    self.training_collector.collect_code_generation(
-                        script_task=script_task,
-                        original_question=original_question or script_task,
-                        zarr_structure=zarr_structure,
-                        generated_code=generated_code,
-                    )
-                except Exception as e:
-                    try:
-                        print(f"[agent_service] Failed to collect code training data: {e}")
-                    except:
-                        pass
-            
+
             return generated_code
-            
+
         except Exception as e:
             print("Error in get_script():", e)
             raise
@@ -1058,12 +1324,21 @@ Rules:
 _workflow_agent = None
 
 
+def agent_configured() -> bool:
+    return bool(os.getenv("OPENAI_API_KEY"))
+
+
 def get_workflow_agent() -> WorkflowAgent:
     """
     Get singleton instance of WorkflowAgent
     """
     global _workflow_agent
     if _workflow_agent is None:
+        if not agent_configured():
+            raise AgentNotConfigured(
+                "The LLM agent is not configured: set OPENAI_API_KEY in app/service/.env.local "
+                "(an OpenAI-compatible endpoint can be set with OPENAI_BASE_URL)."
+            )
         _workflow_agent = WorkflowAgent()
     return _workflow_agent
 

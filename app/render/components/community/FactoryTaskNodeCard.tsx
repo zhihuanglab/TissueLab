@@ -4,7 +4,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { Settings, SquareTerminal, Trash2 } from "lucide-react"
 import { toast } from 'sonner'
 import type { ClassifierData, NodeInfo, NodeExtended } from '@/types/community.types'
-import type { ClassifierData as FirebaseClassifierData } from '@/services/classifiers.service'
+import type { ClassifierData as FirebaseClassifierData } from '@/services/classifier/community'
 import { CATEGORY_TO_FACTORY_MAP } from '@/constants/community.constants'
 
 interface FactoryTaskNodeCardProps {

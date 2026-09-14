@@ -1,4 +1,4 @@
-import { CTRL_SERVICE_API_ENDPOINT } from '@/constants/config'
+import { CTRL_SERVICE_API_ENDPOINT } from '@/config/api.config'
 import { apiFetch } from '@/utils/common/apiFetch'
 
 export interface UserProfile {

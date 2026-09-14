@@ -35,8 +35,8 @@
     "savedAt": "2026-04-23T12:00:00.000Z",
     "nodes": [
       { "id": "__start__", "kind": "start", "x": 140, "y": 24 },
-      { "id": "nq-seg", "kind": "model", "modelId": "SegmentationNode", "x": 140, "y": 120 },
-      { "id": "nq-clf", "kind": "model", "modelId": "ClassificationNode", "x": 140, "y": 220 },
+      { "id": "nq-seg", "kind": "model", "modelId": "StarDist", "x": 140, "y": 120 },
+      { "id": "nq-clf", "kind": "model", "modelId": "NuClass", "x": 140, "y": 220 },
       { "id": "nq-code", "kind": "model", "modelId": "GPT-4o Agent", "x": 140, "y": 320 },
       { "id": "__end__", "kind": "end", "x": 140, "y": 420 }
     ],

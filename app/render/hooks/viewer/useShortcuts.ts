@@ -1,9 +1,12 @@
 import { useCallback, useEffect } from 'react'
 import { useDispatch, useSelector } from 'react-redux'
 import { RootState } from '@/store'
-import { resetShortcuts, setAllShortcuts, setShortcut, ShortcutActionKey } from '@/store/slices/viewer/shortcutsSlice'
+import { DEFAULT_SHORTCUTS, resetShortcuts, setAllShortcuts, setShortcut, ShortcutActionKey } from '@/store/slices/viewer/shortcutsSlice'
 
-const STORAGE_KEY = 'tissuelab_shortcuts'
+// Bumped to v2 when the default tool shortcuts changed (move→Esc, lasso=1, …).
+// A new key means previously-saved bindings are ignored, so everyone picks up
+// the new defaults; customizations then save under the new key.
+const STORAGE_KEY = 'tissuelab_shortcuts_v2'
 
 const loadFromLocalStorage = (): Record<ShortcutActionKey, string> | null => {
   try {
@@ -25,7 +28,9 @@ export const useShortcuts = () => {
 
   useEffect(() => {
     const loaded = loadFromLocalStorage()
-    if (loaded) dispatch(setAllShortcuts(loaded))
+    // Merge over defaults so any keys missing from a saved set (e.g. a newly
+    // added tool) always resolve to a valid binding.
+    if (loaded) dispatch(setAllShortcuts({ ...DEFAULT_SHORTCUTS, ...loaded }))
   }, [dispatch])
 
   useEffect(() => {

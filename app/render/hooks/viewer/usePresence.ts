@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from "react";
-import { AI_SERVICE_SOCKET_ENDPOINT } from "@/constants/config";
+import { AI_SERVICE_SOCKET_ENDPOINT } from "@/config/api.config";
+import { getAuthToken } from "@/utils/common/authToken";
 
 export interface PresenceUser {
   uid: string;
@@ -7,82 +8,70 @@ export interface PresenceUser {
   color: string;
 }
 
+const PRESENCE_RECONNECT_DELAY_MS = 5000;
+
 export const usePresence = (filePath: string | null) => {
   const [onlineUsers, setOnlineUsers] = useState<PresenceUser[]>([]);
   const socketRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
-    // 1. Basic Validation
     if (!filePath || filePath === "undefined" || filePath === "null") {
       setOnlineUsers([]);
       return;
     }
 
-    // --- IDENTITY RESOLUTION START ---
-    // Step A: Get the UID (The Anchor)
     let finalUid = localStorage.getItem("last_user_id");
-
-    // If no UID exists, generate one and persist it
     if (!finalUid) {
       finalUid = "guest_" + Math.random().toString(36).substring(2, 9);
       localStorage.setItem("last_user_id", finalUid);
     }
 
-    // Step B: Determine the Best Name
     let finalName = "";
-
-    // Priority 1: Check for "preferred_name_{UID}"
-    const preferredKey = `preferred_name_${finalUid}`;
-    const preferredName = localStorage.getItem(preferredKey);
-
+    const preferredName = localStorage.getItem(`preferred_name_${finalUid}`);
     if (preferredName) {
       finalName = preferredName;
     } else {
-      // Priority 2 & 3: Check Firebase Storage for Display Name or Email
       try {
-        // We search for the firebase key because the API key (middle part) might vary
         const firebaseKey = Object.keys(localStorage).find((key) =>
           key.startsWith("firebase:authUser:"),
         );
-
         if (firebaseKey) {
-          const rawData = localStorage.getItem(firebaseKey);
-          if (rawData) {
-            const fbData = JSON.parse(rawData);
-            // Priority 2: Firebase Display Name (e.g., "Shi Rolf")
-            if (fbData.displayName) {
-              finalName = fbData.displayName;
-            }
-            // Priority 3: Firebase Email (e.g., "105...@qq.com")
-            else if (fbData.email) {
-              finalName = fbData.email;
-            }
-          }
+          const fbData = JSON.parse(localStorage.getItem(firebaseKey) || "{}");
+          finalName = fbData.displayName || fbData.email || "";
         }
       } catch (e) {
         console.warn("[Presence Hook] Failed to parse Firebase data", e);
       }
     }
+    if (!finalName) finalName = "User_" + finalUid.substring(0, 4);
 
-    // Priority 4: Fallback to ID
-    if (!finalName) {
-      finalName = "User_" + finalUid.substring(0, 4);
-    }
+    let cancelled = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-    // --- IDENTITY RESOLUTION END ---
+    const connect = async () => {
+      if (cancelled) return;
 
-    const connectToPresence = () => {
-      if (socketRef.current?.readyState === WebSocket.OPEN) {
+      const token = await getAuthToken();
+      if (cancelled) return;
+      if (!token) {
+        setOnlineUsers([]);
+        if (!cancelled) {
+          reconnectTimer = setTimeout(() => {
+            void connect();
+          }, PRESENCE_RECONNECT_DELAY_MS);
+        }
         return;
       }
 
-      // Construct URL
       const baseUrl = String(AI_SERVICE_SOCKET_ENDPOINT).replace(/\/$/, "");
-      const wsUrl = `${baseUrl}/presence?file_path=${encodeURIComponent(filePath)}&uid=${finalUid}&name=${encodeURIComponent(finalName)}`;
-
-      console.log(`[Presence Hook] Connecting as: ${finalName} (${finalUid})`);
-
+      const wsUrl =
+        `${baseUrl}/presence` +
+        `?file_path=${encodeURIComponent(filePath)}` +
+        `&uid=${encodeURIComponent(finalUid)}` +
+        `&name=${encodeURIComponent(finalName)}` +
+        `&token=${encodeURIComponent(token)}`;
       const ws = new WebSocket(wsUrl);
+      socketRef.current = ws;
 
       ws.onmessage = (event) => {
         try {
@@ -91,31 +80,36 @@ export const usePresence = (filePath: string | null) => {
             setOnlineUsers(data.users);
           } else if (data.type === "user_joined") {
             setOnlineUsers((prev) =>
-              prev.find((u) => u.uid === data.user.uid)
-                ? prev
-                : [...prev, data.user],
+              prev.find((u) => u.uid === data.user.uid) ? prev : [...prev, data.user],
             );
           } else if (data.type === "user_left") {
-            setOnlineUsers((prev) =>
-              prev.filter((u) => u.uid !== data.user_id),
-            );
+            setOnlineUsers((prev) => prev.filter((u) => u.uid !== data.user_id));
           }
         } catch (err) {
           console.error("[Presence] Parse error:", err);
         }
       };
-
       ws.onerror = (error) => console.error("[Presence] Error:", error);
-      ws.onclose = () => setOnlineUsers([]);
-
-      socketRef.current = ws;
+      ws.onclose = () => {
+        if (socketRef.current === ws) socketRef.current = null;
+        setOnlineUsers([]);
+        if (!cancelled) {
+          reconnectTimer = setTimeout(() => {
+            void connect();
+          }, PRESENCE_RECONNECT_DELAY_MS);
+        }
+      };
     };
 
-    connectToPresence();
+    void connect();
 
     return () => {
-      if (socketRef.current) {
-        socketRef.current.close();
+      cancelled = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      const ws = socketRef.current;
+      if (ws) {
+        ws.onclose = null;
+        ws.close();
         socketRef.current = null;
       }
     };

@@ -1,51 +1,32 @@
+"""LLM agent routes (planning, chat, code generation, verification).
+
+Ported from the TissueLab control plane. The open edition runs the agent in
+the same process as the viewer; every blocking LLM call is pushed off the
+event loop inside :mod:`app.services.agent.workflow_agent`.
 """
-Local agent endpoints.
-
-Migrated from ctrl-service. All routes are auth-free and do not touch
-Firestore: training-data collection, per-user knowledge base, request
-logging, and usage counting were stripped during the local migration.
-
-Routes:
-- POST /v1/chat
-- POST /v1/entrance_agent
-- POST /v1/get_steps
-- POST /v1/process_script
-- POST /v1/reflect/classification
-- POST /v1/discovery/sessions (create)
-- GET  /v1/discovery/program
-- GET  /v1/discovery/sessions (list)
-- GET  /v1/discovery/sessions/{session_id}
-- GET  /v1/discovery/autoresearch_runs
-- GET  /v1/discovery/autoresearch_runs/load
-- POST /v1/discovery/sessions/{session_id}/run
-- GET  /v1/discovery/sessions/{session_id}/runs/{run_id}/stream
-- POST /v1/discovery/sessions/{session_id}/runs/{run_id}/resume
-- POST /v1/discovery/sessions/{session_id}/runs/resume_from_path
-"""
-
 import ast
-import csv
+import asyncio
 import json
 import os
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.core.auth import AuthUser, get_auth_user
+from app.core.errors import AppErrors
+from app.core.logger import logger
 from app.core.response import error_response, success_response
-from app.services.agent.discovery import (
-    get_discovery_run_manager,
-    get_discovery_session_store,
+from app.services.agent.workflow_agent import (
+    AgentNotConfigured,
+    WorkflowAgent,
+    _extract_code_from_markdown,
+    get_workflow_agent,
 )
-from app.services.agent.reflection_agent import ReflectionAgent, get_reflection_agent
-from app.services.agent.workflow_agent import WorkflowAgent, get_workflow_agent
-from app.services.feedback_service import get_feedback_service
-from app.services.model_store import model_store
-from app.utils import resolve_path
-
+from app.services.agent.verification_agent import get_verification_agent
+from app.services.feedback import get_feedback_service
+from app.utils.workflow.model_store import model_store
 
 agent_router = APIRouter()
 
@@ -58,69 +39,220 @@ class AgentRequest(BaseModel):
     data_context: Optional[Dict[str, Any]] = None
 
 
-class ReflectClassificationRequest(BaseModel):
-    folder_path: str
-    available_classes: List[str]
-    current_class: Optional[str] = None
+class AgentRequestV2(BaseModel):
+    agent_id: str
+    prompt: str
+    parameters: Optional[Dict[str, Any]] = None
+    history: Optional[Any] = None
+    data_context: Optional[Dict[str, Any]] = None
+    rois_info: Optional[str] = None  # ROIs information text description (e.g., JSON string or text description)
+    rois_images: Optional[List[str]] = None  # ROIs image array (base64-encoded string array)
 
 
-# Anonymous local user identifier shared across all endpoints (matches the
-# pattern auth.py uses when DISABLE_AUTH is on).
-_LOCAL_USER_ID = "local-dev"
+class VerifyResultRequest(BaseModel):
+    user_query: str  # Original user query/question
+    workflow_steps: Optional[List[Dict[str, Any]]] = None  # List of workflow steps from planning stage
+    generated_code: Optional[str] = None  # Code generated in coding stage
+    code_execution_result: Optional[Any] = None  # Result from executing the generated code
+    final_result: Optional[Any] = None  # Final result returned to user
+    result_overlay_thumbnail_path: str  # Path to thumbnail with result overlay
+    original_thumbnail_path: str  # Path to original image thumbnail
+    error_message: Optional[str] = None  # Any error message encountered during execution
 
 
-_OPENAI_KEY_MISSING_MSG = (
-    "OPENAI_API_KEY is not configured. Open app/service/.env and replace "
-    "`your-open-ai-key` with a real key from https://platform.openai.com/account/api-keys, "
-    "then restart the backend."
-)
+def get_agent_dependency() -> WorkflowAgent:
+    """FastAPI dependency: the shared agent, or a 501 envelope when no key is set."""
+    try:
+        return get_workflow_agent()
+    except AgentNotConfigured as e:
+        raise AppErrors.NOT_IMPLEMENTED(str(e))
 
 
-def _openai_key_error() -> Optional[str]:
-    """Return a user-facing message if OPENAI_API_KEY is unset or still the placeholder."""
-    key = (os.environ.get("OPENAI_API_KEY") or "").strip()
-    if not key or key == "your-open-ai-key" or key.startswith("your-"):
-        return _OPENAI_KEY_MISSING_MSG
+def _context_key_from(data_context: Optional[Dict[str, Any]]) -> Optional[str]:
+    try:
+        if isinstance(data_context, dict):
+            zarr_path = data_context.get("zarr_path")
+            if zarr_path:
+                base = os.path.basename(zarr_path)
+                return base[:-5] if base.endswith('.zarr') else base
+    except Exception:
+        pass
     return None
 
 
-@agent_router.post("/v1/chat")
-async def agent_chat(
-    request: AgentRequest,
-    workflow_agent: WorkflowAgent = Depends(get_workflow_agent),
-):
-    err = _openai_key_error()
-    if err:
-        return error_response(err)
+def _normalize_steps(steps_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Expecting { "steps": [ { step, model, input: [..], impl, impl_candidates }, ... ] }"""
+    steps_list: List[Dict[str, Any]] = []
+    for idx, item in enumerate(steps_obj.get("steps", [])):
+        impl_val = item.get("impl", "")
+        candidates_val = item.get("impl_candidates") or ([] if not impl_val else [impl_val])
+        if impl_val and impl_val not in candidates_val:
+            candidates_val = [impl_val] + [c for c in candidates_val if c != impl_val]
+        steps_list.append({
+            "step": int(item.get("step", idx + 1)),
+            "model": item.get("model", ""),
+            "input": item.get("input", []),
+            "impl": impl_val,
+            "impl_candidates": candidates_val,
+        })
+    return steps_list
+
+
+async def _select_candidates(
+    workflow_agent: WorkflowAgent,
+    prompt: str,
+    steps_list: List[Dict[str, Any]],
+    data_context: Optional[Dict[str, Any]],
+    user_id: str,
+    tag: str,
+) -> None:
+    """Candidate evaluation driven by the LLM using preference feedback (in place)."""
     try:
-        response_text = await workflow_agent.chat(
-            request.prompt,
-            history=request.history,
-            data_context=request.data_context,
-            user_id=_LOCAL_USER_ID,
+        nodes_meta = model_store.get_nodes_extended()
+        category_map = model_store.get_category_map()
+        ctx_key = _context_key_from(data_context)
+
+        fb = get_feedback_service()
+        categories = [s.get("model") for s in steps_list if s.get("model")]
+        unique_categories = list(set(categories))
+        pref_summary = (
+            fb.get_preference_summary(unique_categories, context_key=ctx_key, limit=0, user_id=user_id)
+            if unique_categories else {}
         )
+        pref_text = (
+            fb.build_feedback_prompt(unique_categories, context_key=ctx_key, user_id=user_id)
+            if unique_categories else ""
+        )
+
+        for s in steps_list:
+            model_cat = s.get("model")
+            candidate_names = [c for c in (s.get("impl_candidates") or []) if isinstance(c, str) and c]
+            # Fallback: fill from category map if workflow agent omitted candidates
+            fallback = category_map.get(model_cat, []) if model_cat else []
+            if fallback:
+                ordered = []
+                seen = set()
+                for name in candidate_names + fallback:
+                    if not name or name in seen:
+                        continue
+                    seen.add(name)
+                    ordered.append(name)
+                candidate_names = ordered
+            if not candidate_names and s.get("impl"):
+                candidate_names = [s.get("impl")]
+
+            candidate_details: List[Dict[str, Any]] = []
+            for name in candidate_names:
+                name = str(name)
+                meta = nodes_meta.get(name, {}) if isinstance(nodes_meta, dict) else {}
+                stats = None
+                cat_summary = pref_summary.get(model_cat, {}) if model_cat else {}
+                for bucket in ("context_likes", "context_dislikes", "global_likes", "global_dislikes"):
+                    for item in cat_summary.get(bucket, []):
+                        if item.get("impl") == name:
+                            stats = {
+                                "score": item.get("score", 0),
+                                "up": item.get("up", 0),
+                                "down": item.get("down", 0),
+                                "bucket": bucket,
+                            }
+                            break
+                    if stats:
+                        break
+                candidate_details.append({
+                    "impl": name,
+                    "display_name": meta.get("displayName", name) if isinstance(meta, dict) else name,
+                    "description": meta.get("description", "") if isinstance(meta, dict) else "",
+                    "source": meta.get("source") if isinstance(meta, dict) else None,
+                    "stats": stats,
+                })
+
+            selection = await workflow_agent.select_impl_from_candidates(
+                prompt, s, candidate_details, feedback_text=pref_text,
+            )
+            if selection and isinstance(selection, dict):
+                chosen = selection.get("selected_impl")
+                if chosen and chosen in [c.get("impl") for c in candidate_details]:
+                    s["impl_selected_via_feedback"] = True
+                    s["impl"] = chosen
+                    s["impl_candidates"] = [c.get("impl") for c in candidate_details]
+                    s["impl_ranking"] = selection.get("ranking")
+                    s["selection_reason"] = selection.get("reason")
+    except Exception as _e:
+        logger.warning(f"[api.{tag}] candidate selection skipped: {_e}")
+
+
+def _merged_data_context(request: AgentRequest, user_id: str) -> Dict[str, Any]:
+    """Merge data_context with the preference hint from the feedback service."""
+    try:
+        pref_text = get_feedback_service().format_preferences_for_prompt(user_id=user_id)
+    except Exception:
+        pref_text = ""
+    merged_dc = getattr(request, 'data_context', None) or {}
+    if isinstance(merged_dc, dict) and pref_text:
+        merged_dc = {**merged_dc, "preference_hint": pref_text}
+    return merged_dc
+
+
+@agent_router.post("/v1/entrance_agent")
+async def entrance_agent(request: AgentRequest,
+                         workflow_agent: WorkflowAgent = Depends(get_agent_dependency),
+                         auth_user: AuthUser = Depends(get_auth_user)):
+    """
+    Determine if the user's query requires a workflow.
+    Returns: { "need_workflow": bool, "label": "1|2|3" }
+    Mapping: 1=general, 2=patch/code, 3=workflow
+    """
+    try:
+        label = await workflow_agent.classify_intent(request.prompt, history=getattr(request, 'history', None))
+        need_workflow = (label.strip() == "3")
         return success_response({
-            "agent_id": request.agent_id,
-            "response": response_text,
-            "parameters": request.parameters,
+            "need_workflow": need_workflow,
+            "label": label
         })
     except Exception as e:
         return error_response(str(e))
 
 
-@agent_router.post("/v1/entrance_agent")
-async def entrance_agent(
-    request: AgentRequest,
-    workflow_agent: WorkflowAgent = Depends(get_workflow_agent),
-):
-    """Classify the user query into 1=chat / 2=code / 3=workflow."""
-    err = _openai_key_error()
-    if err:
-        return error_response(err)
+@agent_router.post("/v1/chat")
+async def agent_chat(request: AgentRequest,
+                     workflow_agent: WorkflowAgent = Depends(get_agent_dependency),
+                     auth_user: AuthUser = Depends(get_auth_user)):
+    """
+    Agent chat endpoint that processes user prompts
+    """
     try:
-        label = await workflow_agent.classify_intent(request.prompt, history=request.history)
-        need_workflow = label.strip() == "3"
-        return success_response({"need_workflow": need_workflow, "label": label})
+        response_text = await workflow_agent.chat(
+            request.prompt,
+            history=getattr(request, 'history', None),
+            data_context=getattr(request, 'data_context', None),
+            user_id=auth_user.uid
+        )
+        return success_response({
+            "agent_id": request.agent_id,
+            "response": response_text,
+            "parameters": request.parameters
+        })
+    except Exception as e:
+        return error_response(str(e))
+
+
+@agent_router.post("/v1/summary_answer")
+async def agent_summary(request: AgentRequest,
+                        workflow_agent: WorkflowAgent = Depends(get_agent_dependency),
+                        auth_user: AuthUser = Depends(get_auth_user)):
+    """
+    Return natural language summary of the answer
+    """
+    try:
+        question = request.prompt
+        answer = (request.parameters or {})["answer"]
+        response_text = await workflow_agent.summary_answer(question, answer)
+        return success_response({
+            "agent_id": request.agent_id,
+            "response": response_text,
+            "parameters": request.parameters
+        })
     except Exception as e:
         return error_response(str(e))
 
@@ -128,194 +260,204 @@ async def entrance_agent(
 @agent_router.post("/v1/get_steps")
 async def get_steps(
     request: AgentRequest,
-    http_request: Request,
-    workflow_agent: WorkflowAgent = Depends(get_workflow_agent),
+    workflow_agent: WorkflowAgent = Depends(get_agent_dependency),
+    auth_user: AuthUser = Depends(get_auth_user),
 ):
-    """Plan a workflow as a list of steps with model/impl per step."""
-    err = _openai_key_error()
-    if err:
-        return error_response(err)
-    steps_str = "{}"
+    """
+    Get processing steps for a given query
+    Returns a list of steps in format:
+    [
+        {"step": 1, "model": "TissueClassify", "input": "lymph_node"},
+        {"step": 2, "model": "TissueClassify", "input": "tumor"},
+        {"step": 3, "model": "CodingAgent", "input": "Calculate overlap..."}
+    ]
+    """
+    # Bound before the try: the fallback handler below parses it, but it is
+    # only assigned once the agent call returns.
+    steps_str = None
     try:
-        user_id = _LOCAL_USER_ID
+        user_id = auth_user.uid
+        merged_dc = _merged_data_context(request, user_id)
 
-        try:
-            fb = get_feedback_service()
-            pref_text = fb.format_preferences_for_prompt(user_id=user_id)
-        except Exception:
-            pref_text = ""
-
-        merged_dc = request.data_context or {}
-        if isinstance(merged_dc, dict) and pref_text:
-            merged_dc = {**merged_dc, "preference_hint": pref_text}
-
+        # Get structured steps (JSON string) from service
         steps_str = await workflow_agent.get_processing_steps(
             request.prompt,
-            history=request.history,
+            history=getattr(request, 'history', None),
             data_context=merged_dc,
-            user_id=user_id,
+            user_id=user_id
         )
         steps_obj = json.loads(steps_str)
+        steps_list = _normalize_steps(steps_obj)
 
-        steps_list: List[Dict[str, Any]] = []
-        for idx, item in enumerate(steps_obj.get("steps", [])):
-            impl_val = item.get("impl", "")
-            candidates_val = item.get("impl_candidates") or ([] if not impl_val else [impl_val])
-            if impl_val and impl_val not in candidates_val:
-                candidates_val = [impl_val] + [c for c in candidates_val if c != impl_val]
-            steps_list.append({
-                "step": int(item.get("step", idx + 1)),
-                "model": item.get("model", ""),
-                "input": item.get("input", []),
-                "impl": impl_val,
-                "impl_candidates": candidates_val,
-            })
-
-        # Candidate evaluation driven by feedback + LLM ranking.
-        try:
-            nodes_meta = model_store.get_nodes_extended()
-            category_map = model_store.get_category_map()
-            ctx_key = None
-            dc = request.data_context or {}
-            if isinstance(dc, dict):
-                zarr_path = dc.get("zarr_path")
-                if zarr_path:
-                    import os as _os
-                    base = _os.path.basename(zarr_path)
-                    ctx_key = base[:-5] if base.endswith(".zarr") else base
-
-            fb = get_feedback_service()
-            unique_categories = list({s.get("model") for s in steps_list if s.get("model")})
-            pref_summary = (
-                fb.get_preference_summary(
-                    unique_categories,
-                    context_key=ctx_key,
-                    limit=0,
-                    user_id=user_id,
-                )
-                if unique_categories
-                else {}
-            )
-            pref_prompt_text = (
-                fb.build_feedback_prompt(
-                    unique_categories,
-                    context_key=ctx_key,
-                    user_id=user_id,
-                )
-                if unique_categories
-                else ""
-            )
-
-            for s in steps_list:
-                model_cat = s.get("model")
-                candidate_names = [c for c in (s.get("impl_candidates") or []) if isinstance(c, str) and c]
-                fallback = category_map.get(model_cat, []) if model_cat else []
-                if fallback:
-                    seen = set()
-                    ordered = []
-                    for name in candidate_names + fallback:
-                        if not name or name in seen:
-                            continue
-                        seen.add(name)
-                        ordered.append(name)
-                    candidate_names = ordered
-                if not candidate_names and s.get("impl"):
-                    candidate_names = [s.get("impl")]
-
-                candidate_details: List[Dict[str, Any]] = []
-                for name in candidate_names:
-                    name = str(name)
-                    meta = nodes_meta.get(name, {}) if isinstance(nodes_meta, dict) else {}
-                    stats = None
-                    cat_summary = pref_summary.get(model_cat, {}) if model_cat else {}
-                    for bucket in ("context_likes", "context_dislikes", "global_likes", "global_dislikes"):
-                        for item in cat_summary.get(bucket, []):
-                            if item.get("impl") == name:
-                                stats = {
-                                    "score": item.get("score", 0),
-                                    "up": item.get("up", 0),
-                                    "down": item.get("down", 0),
-                                    "bucket": bucket,
-                                }
-                                break
-                        if stats:
-                            break
-                    candidate_details.append({
-                        "impl": name,
-                        "display_name": meta.get("displayName", name) if isinstance(meta, dict) else name,
-                        "description": meta.get("description", "") if isinstance(meta, dict) else "",
-                        "source": meta.get("source") if isinstance(meta, dict) else None,
-                        "stats": stats,
-                    })
-
-                selection = await workflow_agent.select_impl_from_candidates(
-                    request.prompt,
-                    s,
-                    candidate_details,
-                    feedback_text=pref_prompt_text,
-                )
-                if selection and isinstance(selection, dict):
-                    chosen = selection.get("selected_impl")
-                    if chosen and chosen in [c.get("impl") for c in candidate_details]:
-                        s["impl_selected_via_feedback"] = True
-                        s["impl"] = chosen
-                        s["impl_candidates"] = [c.get("impl") for c in candidate_details]
-                        s["impl_ranking"] = selection.get("ranking")
-                        s["selection_reason"] = selection.get("reason")
-        except Exception as _e:
-            print(f"[api.get_steps] candidate selection skipped: {_e}")
+        await _select_candidates(
+            workflow_agent, request.prompt, steps_list,
+            getattr(request, 'data_context', None), user_id, "get_steps",
+        )
 
         steps_list.sort(key=lambda x: x["step"])
         return success_response(steps_list)
     except Exception:
-        # Legacy dict-format fallback (older WorkflowAgent versions).
+        # Backward-compatibility fallback to legacy dict-like output
+        if steps_str is None:
+            raise                      # nothing came back; report the real failure
         try:
             steps_dict = ast.literal_eval(steps_str)
-            legacy_list = []
+            steps_list = []
             for step_key, step_value in steps_dict.items():
                 step_num = int(step_key.split()[1])
-                legacy_list.append({
+                steps_list.append({
                     "step": step_num,
                     "model": step_value["model"],
-                    "input": step_value["input"],
+                    "input": step_value["input"]
                 })
-            legacy_list.sort(key=lambda x: x["step"])
-            return success_response(legacy_list)
+            steps_list.sort(key=lambda x: x["step"])
+            return success_response(steps_list)
         except Exception as e2:
             return error_response(str(e2))
+
+
+@agent_router.post("/v2/get_steps")
+async def get_steps_v2(
+    request: AgentRequestV2,
+    workflow_agent: WorkflowAgent = Depends(get_agent_dependency),
+    auth_user: AuthUser = Depends(get_auth_user),
+):
+    """
+    Get processing steps for a given query with ROI-aware workflow selection (v2)
+
+    Compared to v1/get_steps, v2 adds:
+    - rois_info: ROIs information text input (e.g., JSON string)
+    - rois_images: ROIs image array (base64-encoded string array)
+
+    The model determines which workflow to use for each ROI based on the question content, ROIs information, and ROIs images.
+    """
+    try:
+        user_id = auth_user.uid
+        merged_dc = _merged_data_context(request, user_id)
+
+        # Step 1: Generate initial workflow draft (like v1/get_steps) without ROI info
+        initial_dc = merged_dc.copy()
+        initial_steps_str = await workflow_agent.get_processing_steps(
+            request.prompt,
+            history=getattr(request, 'history', None),
+            data_context=initial_dc,
+            user_id=user_id
+        )
+        initial_steps_obj = json.loads(initial_steps_str)
+        initial_steps = initial_steps_obj.get("steps", [])
+
+        # Determine initial workflow type
+        initial_workflow_type = None
+        has_tissue_seg = any(step.get("model") == "TissueSeg" for step in initial_steps)
+        has_tissue_classify = any(step.get("model") == "TissueClassify" for step in initial_steps)
+        has_nuclei_seg = any(step.get("model") == "NucleiSeg" for step in initial_steps)
+        has_nuclei_classify = any(step.get("model") == "NucleiClassify" for step in initial_steps)
+
+        if has_tissue_seg or has_tissue_classify:
+            initial_workflow_type = "tissue-based"
+        elif has_nuclei_seg or has_nuclei_classify:
+            initial_workflow_type = "nuclei-based"
+
+        # Step 2: If ROI info/images provided, analyze and potentially adjust workflow
+        if (request.rois_info or request.rois_images) and initial_workflow_type:
+            roi_adjusted_dc = merged_dc.copy()
+            if request.rois_info:
+                roi_adjusted_dc["rois_info"] = request.rois_info
+            if request.rois_images:
+                roi_adjusted_dc["rois_images"] = request.rois_images
+
+            roi_adjusted_dc["initial_workflow"] = json.dumps(initial_steps_obj, ensure_ascii=False)
+            roi_adjusted_dc["roi_workflow_hint"] = (
+                f"WORKFLOW ADJUSTMENT ANALYSIS: An initial workflow has been generated ({initial_workflow_type}). "
+                "You now have MULTIPLE ROI images and ROI information (including patch size calculations for EACH ROI). "
+                ""
+                "CRITICAL: Each ROI has DIFFERENT dimensions and scale factors. "
+                "You MUST analyze EACH ROI image separately using its specific patch size calculation. "
+                ""
+                "IMPORTANT CONTEXT: "
+                "- 224x224 refers to pixels at ORIGINAL WSI resolution (level 0), NOT the ROI thumbnail resolution. "
+                "- The ROI information provides, for EACH ROI, the calculated pixel size of a 224x224 WSI patch when scaled to that ROI's thumbnail image. "
+                "- Each ROI has a different calculated patch size in pixels (e.g., ROI 1 might be 145x145 pixels, ROI 2 might be 156x156 pixels, etc.). "
+                "- You must examine EACH ROI image individually and assess if that ROI's specific patch size would be appropriate. "
+                ""
+                "ANALYSIS PROCESS - Analyze EACH ROI separately: "
+                "1. If initial workflow is TISSUE-BASED: For EACH ROI image, check if 224x224 patches (at WSI resolution, which corresponds to "
+                "that ROI's calculated pixel size in the thumbnail) would be too large for the target objects (e.g., tumor regions) visible "
+                "in that specific ROI thumbnail image. Specifically, check if a patch of that ROI's calculated size would contain multiple "
+                "SEPARATED target objects that should be distinguished. If ANY ROI shows this issue, ADJUST to nuclei-based workflow. "
+                "2. If initial workflow is NUCLEI-BASED: For EACH ROI image, check if tissue-based workflow (224x224 patches at WSI resolution) "
+                "would be sufficient for the target objects visible in that ROI's thumbnail image. Compare that ROI's calculated patch pixel size "
+                "with the size and distribution of target objects in that ROI image. If ALL ROIs can use tissue-based without merging separated objects, "
+                "ADJUST to tissue-based workflow to reduce annotation cost. "
+                "3. If no adjustment is needed, keep the initial workflow. "
+                ""
+                "VISUALLY examine EACH ROI thumbnail image separately and compare each ROI's calculated patch pixel size with the actual target objects "
+                "present in that specific ROI to make this decision. In your workflow_reason, mention which ROIs you analyzed and what you found."
+            )
+
+            steps_str = await workflow_agent.get_processing_steps(
+                request.prompt,
+                history=getattr(request, 'history', None),
+                data_context=roi_adjusted_dc,
+                user_id=user_id
+            )
+        else:
+            steps_str = initial_steps_str
+
+        steps_obj = json.loads(steps_str)
+        workflow_reason = steps_obj.get("workflow_reason", "")
+        steps_list = _normalize_steps(steps_obj)
+
+        await _select_candidates(
+            workflow_agent, request.prompt, steps_list,
+            getattr(request, 'data_context', None), user_id, "get_steps_v2",
+        )
+
+        steps_list.sort(key=lambda x: x["step"])
+        response_data: Any = steps_list
+        if workflow_reason:
+            response_data = {"steps": steps_list, "workflow_reason": workflow_reason}
+        return success_response(response_data)
+    except Exception as e:
+        logger.error(f"Error in v2/get_steps: {e}", exc_info=True)
+        return error_response(f"Error in v2/get_steps: {e}")
+
+
+def _structure_text(request: AgentRequest) -> Optional[str]:
+    """Best-effort: include the active Zarr file structure so code gen can target the right datasets."""
+    if request.data_context and isinstance(request.data_context, dict):
+        structure_source = request.data_context.get("zarr_structure")
+        if structure_source:
+            if isinstance(structure_source, str):
+                return structure_source
+            try:
+                return json.dumps(structure_source, indent=2)
+            except (TypeError, ValueError):
+                return json.dumps(structure_source)
+    return None
+
+
+def _web_search_enabled(request: AgentRequest) -> bool:
+    if request.data_context and isinstance(request.data_context, dict):
+        return bool(request.data_context.get("web_search_enabled", False))
+    return False
 
 
 @agent_router.post("/v1/process_script")
 async def process_script(
     request: AgentRequest,
-    workflow_agent: WorkflowAgent = Depends(get_workflow_agent),
+    workflow_agent: WorkflowAgent = Depends(get_agent_dependency),
+    auth_user: AuthUser = Depends(get_auth_user),
 ):
-    """Generate a Python script for the user's prompt, optionally given Zarr structure."""
-    err = _openai_key_error()
-    if err:
-        return error_response(err)
+    """
+    Generate Python script for a given query using Zarr file structure.
+    """
     try:
-        file_structure_str: Optional[str] = None
-        if isinstance(request.data_context, dict):
-            structure_source = request.data_context.get("zarr_structure")
-            if structure_source:
-                if isinstance(structure_source, str):
-                    file_structure_str = structure_source
-                else:
-                    try:
-                        file_structure_str = json.dumps(structure_source, indent=2)
-                    except (TypeError, ValueError):
-                        file_structure_str = json.dumps(structure_source)
-
-        web_search_enabled = False
-        if isinstance(request.data_context, dict):
-            web_search_enabled = bool(request.data_context.get("web_search_enabled", False))
-
         script = await workflow_agent.get_script(
             script_task=request.prompt,
-            zarr_structure=file_structure_str,
+            zarr_structure=_structure_text(request),
             original_question=request.prompt,
-            web_search_enabled=web_search_enabled,
+            web_search_enabled=_web_search_enabled(request),
             use_scripts_library=True,
         )
         return success_response(script)
@@ -323,375 +465,86 @@ async def process_script(
         return error_response(str(e))
 
 
-@agent_router.post("/v1/summary_answer")
-async def summary_answer(
+@agent_router.post("/v1/process_script_stream")
+async def process_script_stream(
     request: AgentRequest,
-    workflow_agent: WorkflowAgent = Depends(get_workflow_agent),
+    workflow_agent: WorkflowAgent = Depends(get_agent_dependency),
+    auth_user: AuthUser = Depends(get_auth_user),
 ):
-    """Generate a natural-language summary of a workflow's answer.
-
-    Local replacement for the historical Ctrl-Service /agent/v1/summary_answer
-    endpoint. The backend's /api/tasks/v1/summary_answer self-calls this when
-    ``CTRL_SERVICE_API_ENDPOINT`` is pointed at this service, so the entire
-    summary path stays local and only needs OPENAI_API_KEY.
     """
-    err = _openai_key_error()
-    if err:
-        return error_response(err)
+    Stream Coding Agent assistant output as SSE (`data: {"delta"|"done"|"error"}` JSON lines).
+    Final event includes extracted Python code. Requires Chat Completions streaming (CODE_PROVIDER=openai).
+    """
+    if workflow_agent.code_provider_name != "openai":
+        raise AppErrors.NOT_IMPLEMENTED("Script streaming requires CODE_PROVIDER=openai")
+
     try:
-        parameters = request.parameters or {}
-        answer = parameters.get("answer")
-        if answer is None:
-            return error_response("Missing 'answer' in parameters")
-        response_text = await workflow_agent.summary_answer(
-            question=request.prompt or "",
-            answer=str(answer),
+        system_prompt, user_prompt, _ = await workflow_agent.prepare_script_prompts(
+            script_task=request.prompt,
+            zarr_structure=_structure_text(request),
+            original_question=request.prompt,
+            web_search_enabled=_web_search_enabled(request),
+            use_scripts_library=True,
         )
-        return success_response({"response": response_text, "summary": response_text})
     except Exception as e:
         return error_response(str(e))
 
-
-@agent_router.post("/v1/reflect/classification")
-async def reflect_classification(request: ReflectClassificationRequest):
-    """Reflect cell-classification results against a folder of {id}_{class}.jpeg images."""
-    err = _openai_key_error()
-    if err:
-        return error_response(err)
-    try:
-        agent = get_reflection_agent()
-        result = agent.batch_reflection(
-            folder_path=request.folder_path,
-            available_classes=request.available_classes,
-            current_class=request.current_class,
-        )
-        return success_response(result)
-    except FileNotFoundError as e:
-        return error_response(str(e))
-    except Exception as e:
-        return error_response(f"Error reflecting classification: {str(e)}")
-
-
-# ----------------------------------------------------------------------------
-# Discovery (TL Coscientist) endpoints.
-# Renamed from ctrl-service /v1/coscientist/* to /v1/discovery/* for the
-# local build to match the app/services/agent/discovery package layout.
-# ----------------------------------------------------------------------------
-
-
-class CreateDiscoverySessionRequest(BaseModel):
-    dataset_id: Optional[str] = None
-    context: Optional[Dict[str, Any]] = None
-    template_type: Optional[str] = None
-
-
-class RunDiscoveryRequest(BaseModel):
-    task: str
-    reasoning_effort: Optional[str] = None
-    max_iterations: int = 30
-    template_type: Optional[str] = None
-    context: Optional[Dict[str, Any]] = None
-    history: Optional[List[Dict[str, str]]] = None
-
-
-class ResumeAutoresearchRequest(BaseModel):
-    additional_rounds: Optional[int] = None
-
-
-class ResumeFromPathRequest(BaseModel):
-    run_root_path: str
-    additional_rounds: Optional[int] = None
-
-
-def _workspace_data_dir(workspace_path: str) -> Path:
-    data_dir = Path(workspace_path).expanduser()
-    if not data_dir.is_dir():
-        data_dir = data_dir.parent
-    return data_dir
-
-
-def _load_results_tsv_rows(run_root: Path) -> List[Dict[str, Any]]:
-    results_path = run_root / "results.tsv"
-    if not results_path.exists():
-        return []
-    with results_path.open(encoding="utf-8", newline="") as handle:
-        return list(csv.DictReader(handle, delimiter="\t"))
-
-
-def _load_autoresearch_run_from_disk(run_root: Path) -> Dict[str, Any]:
-    if not run_root.is_dir():
-        raise FileNotFoundError(f"Run folder not found: {run_root}")
-
-    state_path = run_root / "run_state.json"
-    state = json.loads(state_path.read_text()) if state_path.exists() else {}
-    config = state.get("config", {}) or {}
-    next_round_id = int(state.get("next_round_id", 1) or 1)
-
-    program_text = (run_root / "program.md").read_text() if (run_root / "program.md").exists() else ""
-    accepted_panel_path = run_root / "accepted_panel.json"
-    accepted_panel = json.loads(accepted_panel_path.read_text()) if accepted_panel_path.exists() else {
-        "best_panel_score": None,
-        "members": [],
-    }
-
-    result_rows = _load_results_tsv_rows(run_root)
-    total_rounds = int(config.get("rounds", len(result_rows) or 0) or 0)
-    journal_entries = [
-        {
-            "roundId": int(row.get("round_id", 0) or 0),
-            "candidateId": row.get("candidate_id", ""),
-            "decision": row.get("decision", ""),
-            "status": row.get("status", ""),
-            "summary": (
-                json.loads(summary_path.read_text()).get("summary", "")
-                if (summary_path := run_root / f"round_{int(row.get('round_id', 0) or 0):04d}" / "round_summary.json").exists()
-                else ""
-            )
-            or f"{row.get('candidate_id', '')}: {row.get('decision', '')}",
-        }
-        for row in result_rows
-    ]
-
-    final_summary = None
-    findings_path = run_root / "research_findings.md"
-    if findings_path.exists():
-        final_summary = findings_path.read_text()
-    elif total_rounds and len(result_rows) >= total_rounds:
-        final_summary = (
-            f"Accepted panel members: {len(accepted_panel.get('members', []))}\n"
-            f"Best panel score: {accepted_panel.get('best_panel_score')}"
-        )
-
-    updated_ts = datetime.fromtimestamp(run_root.stat().st_mtime, tz=timezone.utc).isoformat()
-    completed = bool(total_rounds and len(result_rows) >= total_rounds)
-
-    return {
-        "run_id": run_root.name,
-        "run_root_path": str(run_root),
-        "updated_at": updated_ts,
-        "program_text": program_text,
-        "journal": journal_entries,
-        "current_round": None,
-        "resume_info": {
-            "next_round_id": next_round_id,
-            "config": config,
-        },
-        "accepted_panel": accepted_panel,
-        "final_summary": final_summary,
-        "status": "completed" if completed else "incomplete",
-    }
-
-
-@agent_router.post("/v1/discovery/sessions")
-async def create_discovery_session(
-    request: CreateDiscoverySessionRequest,
-    http_request: Request,
-):
-    try:
-        store = get_discovery_session_store()
-        dataset_id = request.dataset_id or "default"
-        context = request.context or {}
-        if request.template_type:
-            context["template_type"] = request.template_type
-        device_id = http_request.headers.get("X-Device-Id")
-        session = store.create_session(
-            user_id=_LOCAL_USER_ID,
-            device_id=device_id,
-            dataset_id=dataset_id,
-            context=context,
-        )
-        return success_response(session.to_dict())
-    except Exception as e:
-        return error_response(f"Failed to create session: {str(e)}")
-
-
-@agent_router.get("/v1/discovery/program")
-async def get_discovery_program(data_dir: str):
-    """Read program.md from the given data directory, if it exists."""
-    try:
-        resolved = resolve_path(data_dir)
-        program_path = Path(resolved) / "program.md"
-        if not program_path.exists():
-            return success_response({"found": False, "content": ""})
-        content = program_path.read_text(encoding="utf-8")
-        return success_response({"found": True, "content": content})
-    except Exception as exc:
-        return error_response(str(exc))
-
-
-@agent_router.get("/v1/discovery/sessions")
-async def list_discovery_sessions(http_request: Request, limit: int = 20):
-    try:
-        store = get_discovery_session_store()
-        device_id = http_request.headers.get("X-Device-Id") if http_request else None
-        sessions = store.list_sessions(
-            user_id=_LOCAL_USER_ID,
-            device_id=device_id,
-            limit=limit,
-        )
-        summaries = []
-        for session in sessions:
-            last_run = session.runs[-1] if session.runs else None
-            summaries.append({
-                "session_id": session.session_id,
-                "dataset_id": session.dataset_id,
-                "status": session.status,
-                "created_at": session.created_at,
-                "updated_at": session.updated_at,
-                "last_run_status": last_run.status if last_run else None,
-            })
-        return success_response(summaries)
-    except Exception as e:
-        return error_response(f"Failed to list sessions: {str(e)}")
-
-
-@agent_router.get("/v1/discovery/sessions/{session_id}")
-async def get_discovery_session(session_id: str):
-    try:
-        store = get_discovery_session_store()
-        session = store.get_session(session_id)
-        if not session:
-            return error_response(f"Session {session_id} not found")
-        return success_response(session.to_dict())
-    except Exception as e:
-        return error_response(f"Failed to get session: {str(e)}")
-
-
-@agent_router.get("/v1/discovery/autoresearch_runs")
-async def list_workspace_autoresearch_runs(workspace_path: str):
-    try:
-        data_dir = _workspace_data_dir(workspace_path)
-        runs_dir = data_dir / "autoresearch_runs"
-        if not runs_dir.is_dir():
-            return success_response({"runs": []})
-        runs = []
-        for run_root in sorted(
-            (p for p in runs_dir.iterdir() if p.is_dir() and (p / "run_state.json").exists()),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        ):
-            try:
-                payload = _load_autoresearch_run_from_disk(run_root)
-                runs.append({
-                    "run_id": payload["run_id"],
-                    "run_root_path": payload["run_root_path"],
-                    "updated_at": payload["updated_at"],
-                    "status": payload["status"],
-                    "resume_info": payload["resume_info"],
-                })
-            except Exception:
-                continue
-        return success_response({"runs": runs})
-    except Exception as e:
-        return error_response(f"Failed to list autoresearch runs: {str(e)}")
-
-
-@agent_router.get("/v1/discovery/autoresearch_runs/load")
-async def load_workspace_autoresearch_run(run_root_path: str):
-    try:
-        payload = _load_autoresearch_run_from_disk(Path(run_root_path).expanduser())
-        return success_response(payload)
-    except Exception as e:
-        return error_response(f"Failed to load autoresearch run: {str(e)}")
-
-
-@agent_router.post("/v1/discovery/sessions/{session_id}/run")
-async def start_discovery_run(session_id: str, request: RunDiscoveryRequest):
-    try:
-        store = get_discovery_session_store()
-        session = store.get_session(session_id)
-        if not session:
-            return error_response(f"Session {session_id} not found")
-
-        template_type = request.template_type or (session.context or {}).get("template_type")
-        run_manager = get_discovery_run_manager()
-        run = await run_manager.start_run(
-            session_id=session_id,
-            task=request.task,
-            reasoning_effort=request.reasoning_effort,
-            max_iterations=request.max_iterations,
-            template_type=template_type,
-            history=request.history,
-            context=request.context,
-            auth_user=None,
-        )
-        return success_response({
-            "session_id": session_id,
-            "run_id": run.run_id,
-            "status": run.status,
-        })
-    except Exception as e:
-        return error_response(f"Failed to start run: {str(e)}")
-
-
-@agent_router.get("/v1/discovery/sessions/{session_id}/runs/{run_id}/stream")
-async def stream_discovery_run(session_id: str, run_id: str):
-    async def event_generator():
-        run_manager = get_discovery_run_manager()
-        queue = run_manager.get_event_queue(run_id)
-        if queue is None:
-            yield f"data: {json.dumps({'type': 'error', 'message': 'Run not found'})}\n\n"
-            return
-        while True:
-            event = await queue.get()
-            if event is None:
-                break
-            yield f"data: {json.dumps(event)}\n\n"
+    def sync_sse():
+        # Runs in Starlette's threadpool (sync generator), so the blocking
+        # stream never touches the event loop.
+        try:
+            full_parts: List[str] = []
+            for delta in workflow_agent.iter_script_chat_stream(system_prompt, user_prompt):
+                full_parts.append(delta)
+                yield f"data: {json.dumps({'delta': delta}, ensure_ascii=False)}\n\n"
+            code = _extract_code_from_markdown("".join(full_parts))
+            yield f"data: {json.dumps({'done': True, 'code': code}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
-        event_generator(),
+        sync_sse(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )
 
 
-@agent_router.post("/v1/discovery/sessions/{session_id}/runs/{run_id}/resume")
-async def resume_autoresearch_run(session_id: str, run_id: str, request: ResumeAutoresearchRequest):
-    try:
-        store = get_discovery_session_store()
-        session = store.get_session(session_id)
-        if not session:
-            return error_response(f"Session {session_id} not found")
-        run_manager = get_discovery_run_manager()
-        new_run = await run_manager.resume_run(
-            session_id=session_id,
-            original_run_id=run_id,
-            additional_rounds=request.additional_rounds,
-            auth_user=None,
-        )
-        return success_response({
-            "session_id": session_id,
-            "run_id": new_run.run_id,
-            "resumed_from": run_id,
-            "status": new_run.status,
-        })
-    except Exception as e:
-        return error_response(f"Failed to resume run: {str(e)}")
+@agent_router.post("/v1/verify/result")
+async def verify_result(
+    request: VerifyResultRequest,
+    workflow_agent: WorkflowAgent = Depends(get_agent_dependency),
+    auth_user: AuthUser = Depends(get_auth_user),
+):
+    """
+    Diagnose issues in workflow execution pipeline.
+    Analyzes workflow planning, model outputs, and generated code to identify problems.
 
-
-@agent_router.post("/v1/discovery/sessions/{session_id}/runs/resume_from_path")
-async def resume_autoresearch_from_path(session_id: str, request: ResumeFromPathRequest):
+    Returns:
+        {
+            "issue_stage": "workflow_planning" | "model_prediction" | "coding" | "none",
+            "confidence": "high" | "medium" | "low",
+            "reasoning": str,
+            "suggestions": [str],
+            "stage_details": {...}
+        }
+    """
     try:
-        store = get_discovery_session_store()
-        session = store.get_session(session_id)
-        if not session:
-            return error_response(f"Session {session_id} not found")
-        run_manager = get_discovery_run_manager()
-        new_run = await run_manager.resume_run_from_path(
-            session_id=session_id,
-            run_root_path=request.run_root_path,
-            additional_rounds=request.additional_rounds,
-            auth_user=None,
+        verification_agent = get_verification_agent()
+        result = await asyncio.to_thread(
+            verification_agent.diagnose_result,
+            user_query=request.user_query,
+            result_overlay_thumbnail_path=request.result_overlay_thumbnail_path,
+            original_thumbnail_path=request.original_thumbnail_path,
+            workflow_steps=request.workflow_steps,
+            generated_code=request.generated_code,
+            code_execution_result=request.code_execution_result,
+            final_result=request.final_result,
+            error_message=request.error_message,
         )
-        return success_response({
-            "session_id": session_id,
-            "run_id": new_run.run_id,
-            "resumed_from_path": request.run_root_path,
-            "status": new_run.status,
-        })
-    except Exception as e:
-        return error_response(f"Failed to resume run from path: {str(e)}")
+        return success_response(result)
+    except ValueError as e:
+        return error_response(str(e))

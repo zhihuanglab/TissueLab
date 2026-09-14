@@ -5,6 +5,7 @@ export type ShortcutActionKey =
   | 'togglePatches'
   | 'toggleMask'
   | 'tool.move'
+  | 'tool.lasso'
   | 'tool.polygon'
   | 'tool.rectangle'
   | 'tool.line'
@@ -18,9 +19,10 @@ export const DEFAULT_SHORTCUTS: Record<ShortcutActionKey, string> = {
   toggleNuclei: 'Space',
   togglePatches: 'x',
   toggleMask: 'm',
-  'tool.move': '1',
-  'tool.polygon': '2',
-  'tool.rectangle': '3',
+  'tool.move': 'Escape',
+  'tool.lasso': '1',
+  'tool.rectangle': '2',
+  'tool.polygon': '3',
   'tool.line': '4',
   'tool.filter': '5',
 }

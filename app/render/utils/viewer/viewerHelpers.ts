@@ -1,4 +1,4 @@
-import { AI_SERVICE_API_ENDPOINT } from '@/constants/config';
+import { AI_SERVICE_API_ENDPOINT } from '@/config/api.config';
 
 /**
  * Function to convert microns to appropriate unit
@@ -97,6 +97,7 @@ export function createTileSource(
   getTileUrl: (level: number, x: number, y: number) => string,
   currentInstanceId: string | undefined,
   currentWSIFileInfo: any,
+  authToken: string,
   options?: {
     zLayer?: number;
     channelSignature?: string;
@@ -121,7 +122,10 @@ export function createTileSource(
     minLevel: 0,
     maxLevel,
     getTileUrl: getTileUrl,
-    ajaxHeaders: undefined,
+    ajaxHeaders: {
+      Authorization: `Bearer ${authToken}`,
+      Accept: 'image/jpeg,image/png,image/*,*/*',
+    },
     _key: `${currentInstanceId}_${currentWSIFileInfo?.filePath || ''}_${width}_${height}_${keySuffix}`,
     _instanceId: currentInstanceId,
     _dimensions: { width, height }

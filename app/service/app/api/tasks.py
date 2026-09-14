@@ -1,50 +1,72 @@
-import os
-from fastapi import APIRouter, Request, BackgroundTasks, HTTPException, Body, Depends, Query
-from fastapi.responses import StreamingResponse
-from app.core import logger
-from app.core.response import success_response, error_response
-from typing import Optional, Dict, Any
-from pydantic import BaseModel, ConfigDict
-from app.services.tasks_service import (
-    workflow_run_status,
-    node_execution_status,
-    FACTORY_MODEL_DICT,
-    manager,
-    is_file_locked
-)
-from app.services.register_service import list_available_conda_envs, stop_custom_node_env, stop_custom_node_process
-from app.services.bundles_service import load_catalog as service_load_catalog
-from app.services.bundles_service import filter_catalog_for_current_platform as service_filter_catalog
-from app.services.bundles_service import generate_signed_url as service_generate_signed_url
-from app.services.bundles_service import start_bundle_install as service_start_bundle_install
-from app.services.bundles_service import generate_install_events as service_generate_install_events
-from app.core.auth import get_auth_user, get_optional_auth_user, AuthUser
-from app.services.model_store import model_store
-from app.utils import resolve_path
-from app.config.path_config import is_public_read_only_path, resolve_virtual_path, STORAGE_ROOT
-from app.utils.request import get_client_ip
-from app.core.settings import settings
-from app.services.tasks_service import (
-    post_answer,
-    recommend_viewport,
-    begin_script_summary_wait,
-    end_script_summary_wait,
-)
-from datetime import datetime
-import aiohttp
-
 import asyncio
-import zarr
 import json
-import numpy as np
-import base64
+import os
 import traceback
-import subprocess as sp
-import platform
-import signal
-import sys
-from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
-import requests
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+import aiohttp
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict
+
+from app.config.zarr_compat import as_zarr_path, open_zarr_cm
+from app.core import logger
+from app.core.background import track_background_task
+from app.core.auth import AuthUser, get_auth_user, get_optional_auth_user
+from app.core.access import (
+    authorize_read_or_response,
+    authorize_read_or_response_async,
+    guard_instance_owner,
+    guard_write_path,
+    guard_write_path_async,
+    sanitize_client_path,
+)
+from app.core.response import error_response, success_response
+from app.config.path_config import SERVICE_STORAGE_DIR
+from app.core.identity import LOCAL_USER_ID
+from app.core.settings import settings
+from app.services.batch_orchestrator import (
+    append_batch as service_append_batch,
+    batch_job_snapshot,
+    generate_batch_events,
+    get_active_batch as service_get_active_batch,
+    has_active_batch,
+    start_batch as service_start_batch,
+    stop_batch as service_stop_batch,
+)
+from app.services.tasks import (
+    _generate_simple_summary,
+    _process_node_h5,
+    begin_script_summary_wait,
+    convert_for_json,
+    end_script_summary_wait,
+    manager,
+    post_answer,
+    process_node,
+    recommend_viewport,
+)
+from app.services.manual_annotations import (
+    delete_manual_annotation as service_delete_manual_annotation,
+    load_manual_annotations,
+    save_manual_annotation as service_save_manual_annotation,
+)
+from app.utils import resolve_path
+from app.utils.bundle import filter_catalog_for_current_platform as service_filter_catalog
+from app.utils.bundle import generate_install_events as service_generate_install_events
+from app.utils.bundle import resolve_download_url as service_resolve_download_url
+from app.utils.bundle import find_bundle as service_find_bundle
+from app.utils.bundle import assert_gcs_uri_in_catalog as service_assert_gcs_uri_in_catalog
+from app.utils.bundle import load_catalog as service_load_catalog
+from app.utils.bundle import start_bundle_install as service_start_bundle_install
+from app.utils.common.request import get_client_ip
+from app.utils.workflow.model_store import model_store
+from app.utils.workflow.register import (
+    list_available_conda_envs,
+    stop_custom_node_env,
+    stop_custom_node_process,
+)
 
 try:
     import resource
@@ -59,426 +81,65 @@ try:
 except ImportError:
     h5py = None
 
+
+# ── codeexec concurrency gate ─────────────────────────────────────────────────
+# Serialize sandboxed code runs so concurrent users don't exhaust the host.
+# N=1 (default) = strictly one at a time; raise CODEEXEC_MAX_CONCURRENCY for more.
+# Dedicated thread pool so sandbox runs don't compete with the app's default executor.
+_CODEEXEC_MAX_CONCURRENCY = max(1, int(os.getenv("CODEEXEC_MAX_CONCURRENCY", "1")))
+_codeexec_executor = ThreadPoolExecutor(
+    max_workers=_CODEEXEC_MAX_CONCURRENCY, thread_name_prefix="codeexec")
+_codeexec_semaphore = None
+
+
+def _get_codeexec_semaphore():
+    """Lazily create the semaphore inside the running event loop so it binds to it."""
+    global _codeexec_semaphore
+    if _codeexec_semaphore is None:
+        _codeexec_semaphore = asyncio.Semaphore(_CODEEXEC_MAX_CONCURRENCY)
+    return _codeexec_semaphore
+
+
 tasks_router = APIRouter()
 
 
-# Global dict to keep references to running workflow tasks (prevents garbage collection)
-_active_workflow_tasks = {}
-
 
 def _is_electron_client(request: Request) -> bool:
-    """Detect if the request is coming from the Electron desktop app vs web browser."""
-    # Check for custom header that Electron app sends
-    client_type = (request.headers.get("X-Client-Type", "") or request.headers.get("x-client-type", "")).lower()
-    if client_type == "electron":
-        return True
-    
-    # Check User-Agent for Electron signature
-    user_agent = request.headers.get("User-Agent", "").lower()
-    if "electron" in user_agent:
-        return True
-    
-    # Check for local default token (fallback method)
-    auth_header = request.headers.get("Authorization", "")
-    if "local-default-token" in auth_header.lower():
-        return True
-    
-    return False
+    """True when the desktop shell marks the request with ``X-Client-Type: electron``.
 
-
-def _generate_simple_summary(question: str, answer: str) -> str:
+    The open edition is single-user and local, so the marker is trusted in every
+    environment (the hosted service only trusted it outside production because
+    it disables output sandboxing for other users' data — there are none here).
     """
-    Generate a simple local summary when Control Service is unavailable.
-    This is a fallback mechanism to ensure the feature works even when Ctrl-Service fails.
-    
-    Args:
-        question: The original question
-        answer: The raw answer data (can be string or JSON string)
-    
-    Returns:
-        A simple summary string
-    """
-    try:
-        # Try to parse answer as JSON
-        try:
-            answer_data = json.loads(answer) if isinstance(answer, str) else answer
-            if isinstance(answer_data, dict):
-                # Extract key information from JSON
-                summary_parts = []
-                
-                # Check for common result fields
-                if "result" in answer_data:
-                    summary_parts.append(f"Result: {answer_data['result']}")
-                if "output_path" in answer_data:
-                    summary_parts.append(f"Output saved to: {answer_data['output_path']}")
-                if "count" in answer_data:
-                    summary_parts.append(f"Count: {answer_data['count']}")
-                if "percentage" in answer_data:
-                    summary_parts.append(f"Percentage: {answer_data['percentage']}%")
-                
-                # If we have specific fields, use them
-                if summary_parts:
-                    return ". ".join(summary_parts) + "."
-                
-                # Otherwise, summarize the keys
-                keys = list(answer_data.keys())[:3]  # First 3 keys
-                return f"Analysis completed. Key results: {', '.join(keys)}."
-            elif isinstance(answer_data, (list, tuple)):
-                return f"Analysis completed. Found {len(answer_data)} items."
-            elif isinstance(answer_data, (int, float)):
-                return f"Analysis result: {answer_data}."
-            elif isinstance(answer_data, str):
-                # Already a string, use it directly if short
-                if len(answer_data) < 200:
-                    return answer_data
-                return answer_data[:200] + "..."
-        except (json.JSONDecodeError, TypeError):
-            # Not JSON, treat as plain string
-            pass
-        
-        # Fallback: use answer directly if it's a reasonable string
-        if isinstance(answer, str):
-            if len(answer) == 0:
-                # Empty string - return generic message
-                return f"Analysis completed. {question}"
-            if len(answer) < 300:
-                return answer
-            # For long strings, try to extract first sentence or first 200 chars
-            first_sentence = answer.split('.')[0] if '.' in answer else answer[:200]
-            return first_sentence + ("..." if len(answer) > 200 else "")
-        
-        # Last resort: generic message
-        return f"Analysis completed. {question}"
-    except Exception as e:
-        # If all else fails, return a generic message
-        logger.warning(f"[_generate_simple_summary] Error generating summary: {e}")
-        return f"Analysis completed. (Summary generation failed: {str(e)})"
+    client_type = (
+        request.headers.get("X-Client-Type", "")
+        or request.headers.get("x-client-type", "")
+    ).lower()
+    return client_type == "electron"
 
 
-def process_node(name, obj):
-    """
-    Recursively process groups and datasets in the Zarr file.
-    
-    :param name: The name of the current group or dataset.
-    :param obj: The current Zarr object (Group or Array).
-    :return: A dictionary representing the structure of the current group or dataset.
-    """
-    if isinstance(obj, zarr.Group):
-        return {
-            "type": "Group",
-            "name": name,
-            "children": {
-                key: process_node(key, item)
-                for key, item in obj.items()
-            }
-        }
-    elif isinstance(obj, zarr.Array):
-        # Convert shape tuple to list for JSON serialization
-        shape_list = list(obj.shape) if obj.shape else []
-        dataset_info = {
-            "type": "Dataset",
-            "name": name,
-            "shape": shape_list,
-            "dtype": str(obj.dtype)
-        }
-
-        # Add attributes if available (without reading data)
-        if hasattr(obj, 'attrs') and obj.attrs:
-            try:
-                dataset_info["attributes"] = dict(obj.attrs)
-            except Exception:
-                pass
-
-        # Calculate array size in bytes to determine if we should read it
-        # Only read small arrays (< 1MB estimated) to avoid memory issues
-        MAX_ARRAY_SIZE_BYTES = 1024 * 1024  # 1MB threshold
-        
-        try:
-            # Try to get nbytes directly (available in zarr 2.10+), else calculate from shape and dtype
-            array_size_bytes = getattr(obj, "nbytes", None)
-            if array_size_bytes is None:
-                dtype_obj = np.dtype(obj.dtype)
-                array_size_bytes = int(np.prod(obj.shape)) * dtype_obj.itemsize
-            
-            # Only read array data if it's small enough
-            if array_size_bytes == 0:
-                # Explicitly handle empty arrays
-                dataset_info["content_type"] = "Empty array (0 bytes)"
-                dataset_info["note"] = "Array is empty; no data to load"
-                return dataset_info
-            elif array_size_bytes <= MAX_ARRAY_SIZE_BYTES:
-                try:
-                    raw_data = obj[()]
-                except Exception as e:
-                    # Even small arrays might fail to read (e.g., corrupted chunks)
-                    dataset_info["content_type"] = f"Array metadata only (read failed: {str(e)})"
-                    dataset_info["note"] = "Could not read array data, showing metadata only"
-                    return dataset_info
-            else:
-                # Large array - only include metadata without reading data
-                dataset_info["content_type"] = f"Large array ({array_size_bytes / (1024*1024):.2f} MB) - data not loaded"
-                dataset_info["note"] = "Array too large to load into memory for structure inspection"
-                return dataset_info
-            
-            # Process small arrays that were loaded
-            if isinstance(raw_data, bytes):
-                try:
-                    decoded_str = raw_data.decode('utf-8')
-                    json_data = json.loads(decoded_str)
-                except UnicodeDecodeError:
-                    dataset_info["content_type"] = "Binary data (not UTF-8)"
-                    return dataset_info
-                except json.JSONDecodeError:
-                    dataset_info["content_type"] = "UTF-8 encoded string (not JSON)"
-                    return dataset_info
-                except Exception as e:
-                    dataset_info["content_type"] = f"Error decoding/parsing bytes: {str(e)}"
-                    return dataset_info
-
-                # If we got here, JSON parsing succeeded - now extract structure
-                def get_structure(data, max_depth=3, current_depth=0):
-                    """
-                    Recursively extract structure from JSON data with depth limiting.
-                    
-                    Args:
-                        data: The JSON data to analyze
-                        max_depth: Maximum recursion depth (default allows initial call without specifying)
-                        current_depth: Current recursion depth (tracked internally)
-                    """
-                    if current_depth >= max_depth:
-                        return f"Type: {type(data).__name__} (max depth reached)"
-                    
-                    if isinstance(data, dict):
-                        total_length = len(data)
-                        if total_length > 20:
-                            # Take only first item as sample
-                            first_key, first_value = next(iter(data.items()))
-                            return {
-                                "sample": {
-                                    first_key: get_structure(first_value, max_depth, current_depth + 1)
-                                },
-                                "total_length": total_length,
-                                "value_type": type(first_value).__name__
-                            }
-                        return {
-                            k: get_structure(v, max_depth, current_depth + 1)
-                            for k, v in data.items()
-                        }
-                    elif isinstance(data, list):
-                        def get_array_shape(arr):
-                            shape = [len(arr)]
-                            if shape[0] > 0 and isinstance(arr[0], list):
-                                shape.extend(get_array_shape(arr[0]))
-                            return shape
-
-                        if len(data) > 0:
-                            shape = get_array_shape(data)
-                            def get_deepest_type(arr):
-                                if isinstance(arr, list) and len(arr) > 0:
-                                    return get_deepest_type(arr[0])
-                                return type(arr).__name__
-                            element_type = get_deepest_type(data)
-                            return f"Array{shape} of {element_type}"
-                        return "Empty Array"
-                    else:
-                        return f"Type: {type(data).__name__}"
-
-                try:
-                    dataset_info["structure"] = get_structure(json_data)
-                except Exception as e:
-                    dataset_info["content_type"] = f"JSON structure extraction failed: {str(e)}"
-                    dataset_info["note"] = "Data is valid JSON but structure extraction encountered an error"
-            elif isinstance(raw_data, (int, float)):
-                dataset_info["content_type"] = f"Scalar {type(raw_data).__name__}"
-            elif isinstance(raw_data, np.ndarray):
-                dataset_info["content_type"] = f"Array of {raw_data.dtype}"
-
-                if raw_data.ndim == 1 and len(raw_data) < 10:
-                    # For short 1D arrays, include the actual values
-                    # Handle special data types to ensure JSON serializability
-                    try:
-                        if np.issubdtype(raw_data.dtype, np.integer):
-                            dataset_info["values"] = [int(x) for x in raw_data]
-                        elif np.issubdtype(raw_data.dtype, np.floating):
-                            dataset_info["values"] = [float(x) for x in raw_data]
-                        elif np.issubdtype(raw_data.dtype, np.bool_):
-                            dataset_info["values"] = [bool(x) for x in raw_data]
-                        elif np.issubdtype(raw_data.dtype, np.character):
-                            dataset_info["values"] = [str(x) for x in raw_data]
-                        else:
-                            # For complex types, convert to string representation
-                            dataset_info["values"] = [str(x) for x in raw_data]
-                    except Exception as e:
-                        dataset_info["values_error"] = f"Could not serialize values: {str(e)}"
-            else:
-                dataset_info["content_type"] = str(type(raw_data).__name__)
-        except Exception as e:
-            dataset_info["content_type"] = f"Unknown (error: {str(e)})"
-
-        return dataset_info
+def _authenticate_sse_query(request: Request) -> str:
+    """EventSource cannot set headers; the open edition has one principal anyway."""
+    return LOCAL_USER_ID
 
 
-def convert_for_json(obj):
-    """
-    Recursively convert NumPy types to native Python types for JSON serialization.
-    
-    :param obj: Any object potentially containing NumPy types
-    :return: The same object with NumPy types converted to Python native types
-    """
-    if isinstance(obj, dict):
-        return {k: convert_for_json(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [convert_for_json(item) for item in obj]
-    elif isinstance(obj, tuple):
-        return tuple(convert_for_json(item) for item in obj)
-    elif isinstance(obj, np.integer):
-        return int(obj)
-    elif isinstance(obj, np.floating):
-        return float(obj)
-    elif isinstance(obj, np.ndarray):
-        return convert_for_json(obj.tolist())
-    elif isinstance(obj, np.bool_):
-        return bool(obj)
-    elif isinstance(obj, (bytes, bytearray)):
-        try:
-            return base64.b64encode(obj).decode('ascii')
-        except Exception:
-            return str(obj)
-    else:
-        return obj
 
 
-def script_function(script):
-    namespace = {}
-    try:
-        # Execute the code in the isolated namespace
-        exec(script, namespace)
-        # Return the function object
-        return namespace['analyze_medical_image']
-    except SyntaxError as e:
-        print(f"Syntax error in code: {e}")
-        raise ValueError(f"Invalid syntax: {e}")
-    except Exception as e:
-        print(f"Error executing code: {e}")
-        raise ValueError(f"Error in script: {e}")
 
 
-def _kill_process_tree(pid, timeout=5):
-    """
-    Kill a process and all its children recursively.
-    Returns True if all processes were killed, False otherwise.
-    """
-    if psutil is None:
-        # Fallback: use system commands if psutil is not available
-        try:
-            # Try to kill the process and its children using pkill
-            sp.run(['pkill', '-P', str(pid)], check=False, timeout=timeout)
-            sp.run(['kill', '-9', str(pid)], check=False, timeout=2)
-            return True
-        except Exception:
-            return False
-    
-    try:
-        parent = psutil.Process(pid)
-        children = parent.children(recursive=True)
-        
-        # Kill children first
-        for child in children:
-            try:
-                child.terminate()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        
-        # Wait for children to die
-        gone, still_alive = psutil.wait_procs(children, timeout=timeout)
-        
-        # Force kill any remaining children
-        for child in still_alive:
-            try:
-                child.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        
-        # Finally kill the parent
-        try:
-            parent.terminate()
-            parent.wait(timeout=2)
-        except psutil.TimeoutExpired:
-            try:
-                parent.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        
-        return True
-    except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
-        return False
 
 
-def _execute_with_limits(code_str, zarr_path, max_memory_mb=2048, max_cpu_seconds=60):
-    """
-    Execute the user script in a subprocess with resource limits.
-    This function will be called in a separate process via ProcessPoolExecutor.
-    
-    Args:
-        code_str: The Python code string containing analyze_medical_image function
-        zarr_path: Path to the Zarr file
-        max_memory_mb: Maximum memory in MB (default 2GB)
-        max_cpu_seconds: Maximum CPU time in seconds (default 60s)
-    
-    Returns:
-        The result from analyze_medical_image function
-    """
-    import signal
-    import sys
-    import traceback
-    
-    # Set resource limits (Unix-like systems only)
-    if resource is not None:
-        try:
-            # Memory limit (virtual memory)
-            max_memory_bytes = max_memory_mb * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (max_memory_bytes, max_memory_bytes))
-            
-            # CPU time limit
-            resource.setrlimit(resource.RLIMIT_CPU, (max_cpu_seconds, max_cpu_seconds))
-            
-            # File size limit (prevent huge file writes) - 500MB
-            max_file_size = 500 * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_FSIZE, (max_file_size, max_file_size))
-        except Exception as e:
-            # Resource limits might not work on all platforms (e.g., Windows)
-            print(f"Warning: Could not set resource limits: {e}", file=sys.stderr)
-    else:
-        # On Windows or systems without resource module, we can't set limits
-        print(f"Warning: Resource limits not available on {platform.system()}", file=sys.stderr)
-    
-    # Parse and execute the script
-    namespace = {}
-    try:
-        exec(code_str, namespace)
-        func = namespace.get('analyze_medical_image')
-        if not func:
-            raise ValueError("Script must define 'analyze_medical_image' function")
-        
-        # Execute the function
-        result = func(zarr_path)
-        return result
-        
-    except MemoryError:
-        return {"error": "Script exceeded memory limit (2GB)", "error_type": "MemoryError"}
-    except Exception as e:
-        # Return error as dict so it can be serialized across process boundary
-        return {
-            "error": str(e),
-            "error_type": type(e).__name__,
-            "traceback": traceback.format_exc()
-        }
+
+
+
+
 
 
 @tasks_router.get("/v1/activation/events")
-def activation_events():
+def activation_events(request: Request):
     """Server-Sent Events stream for all models' activation status."""
-    from app.services.tasks_service import generate_all_activation_events
+    from app.services.tasks import generate_all_activation_events
+    _authenticate_sse_query(request)
     try:
         return StreamingResponse(
             generate_all_activation_events(),
@@ -493,7 +154,7 @@ def activation_events():
         return error_response(f"Failed to start activation stream: {e}")
 
 @tasks_router.get("/v1/recommend_viewport")
-async def recommend_viewport_endpoint(
+def recommend_viewport_endpoint(
     request: Request,
     target_class: int = Query(0, description="Target class index for ROI recommendation"),
     selection_mode: str = Query("high_confidence", description="high_confidence | low_confidence"),
@@ -504,32 +165,21 @@ async def recommend_viewport_endpoint(
     """
     try:
         file_path = request.query_params.get("relative_path") or request.query_params.get("file_path")
-        if file_path:
-            file_path = resolve_virtual_path(file_path)
-            if not file_path:
-                return error_response("Invalid path alias", code=400)
-            file_path = resolve_path(file_path)
-        if file_path:
-            if not os.path.isabs(file_path):
-                file_path = os.path.normpath(os.path.join(STORAGE_ROOT, file_path.lstrip("/\\")))
-            if not file_path.startswith(os.path.normpath(STORAGE_ROOT)) and (not os.path.isabs(file_path) or not os.path.exists(file_path)):
-                return error_response("Path not allowed", code=400)
-        if not file_path:
-            try:
-                from app.services.load_service import current_file_path
-                file_path = current_file_path or ""
-            except (ImportError, AttributeError):
-                file_path = ""
         if not file_path:
             return error_response("No file path provided", code=400)
-        zarr_path = file_path if file_path.endswith(".zarr") else f"{file_path}.zarr"
+        authorized_path, denied = authorize_read_or_response(
+            request, file_path, operation="recommend viewport"
+        )
+        if denied is not None:
+            return denied
+        zarr_path = as_zarr_path(authorized_path)
         if not os.path.exists(zarr_path):
             return error_response("Zarr file not found", code=400)
         data = recommend_viewport(zarr_path, target_class=target_class, selection_mode=selection_mode)
         return success_response(data)
     except Exception as e:
         traceback.print_exc()
-        return error_response(str(e))
+        return error_response("Error recommending viewport")
 
 
 @tasks_router.get("/v1/bundles/catalog")
@@ -543,20 +193,54 @@ def get_bundles_catalog():
 
 @tasks_router.post("/v1/bundles/signed_url")
 def get_bundle_signed_url(payload: dict = Body(...)):
+    """Resolve a catalog bundle URI to its public download URL.
+
+    The route name is kept for the renderer; there is no signing in the open
+    edition, the bundle host serves the archives over plain HTTPS.
+    """
     try:
         gcs_uri = payload.get("gcs_uri")
         filename = payload.get("filename")
-        minutes = int(payload.get("ttl_minutes", 30))
         if not gcs_uri:
             raise HTTPException(status_code=400, detail="Missing gcs_uri")
-        res = service_generate_signed_url(gcs_uri, minutes=minutes, filename=filename)
+        denied_reason = service_assert_gcs_uri_in_catalog(gcs_uri)
+        if denied_reason:
+            return error_response(denied_reason, code=403, error_code="BUNDLE_URI_NOT_ALLOWED")
+        res = service_resolve_download_url(gcs_uri, filename=filename)
         if res.get("status") != "success":
-            raise HTTPException(status_code=500, detail=res.get("message", "Failed to sign URL"))
+            raise HTTPException(status_code=500, detail=res.get("message", "Failed to resolve URL"))
         return success_response(res)
     except HTTPException:
         raise
     except Exception as e:
-        return error_response(f"Failed to generate signed URL: {e}")
+        return error_response(f"Failed to resolve bundle URL: {e}")
+
+
+@tasks_router.post("/v1/bundles/download_url")
+def get_bundle_download_url(payload: dict = Body(...)):
+    """Electron download helper: ``{model_name, platform}`` → ``{success, download_url, filename}``.
+
+    Plain JSON (not the app envelope) — the renderer's node installer reads
+    ``download_url`` straight off the body; HTTP 404 when the catalog has no
+    bundle for that platform.
+    """
+    model_name = (payload.get("model_name") or "").strip()
+    platform = (payload.get("platform") or "").strip()
+    if not model_name or not platform:
+        return JSONResponse(status_code=400, content={"success": False, "message": "model_name and platform are required"})
+    bundle = service_find_bundle(model_name, platform)
+    if not bundle:
+        return JSONResponse(status_code=404, content={"success": False, "message": "No bundle available for your platform yet"})
+    res = service_resolve_download_url(bundle.get("gcs_uri", ""), filename=bundle.get("filename"))
+    if res.get("status") != "success":
+        return JSONResponse(status_code=500, content={"success": False, "message": res.get("message", "Failed to resolve URL")})
+    return JSONResponse(content={
+        "success": True,
+        "download_url": res["signed_url"],
+        "filename": bundle.get("filename"),
+        "model_name": model_name,
+        "platform": platform,
+    })
 
 
 class InstallBundleRequest(BaseModel):
@@ -571,6 +255,9 @@ class InstallBundleRequest(BaseModel):
 @tasks_router.post("/v1/bundles/install")
 def install_bundle(payload: InstallBundleRequest):
     try:
+        denied_reason = service_assert_gcs_uri_in_catalog(payload.gcs_uri)
+        if denied_reason:
+            return error_response(denied_reason, code=403, error_code="BUNDLE_URI_NOT_ALLOWED")
         install_id = service_start_bundle_install(
             model_name=payload.model_name,
             gcs_uri=payload.gcs_uri,
@@ -584,7 +271,8 @@ def install_bundle(payload: InstallBundleRequest):
         return error_response(f"Failed to start install: {e}")
 
 @tasks_router.get("/v1/bundles/install/events")
-def install_events(install_id: str):
+def install_events(install_id: str, request: Request):
+    _authenticate_sse_query(request)
     try:
         return StreamingResponse(
             service_generate_install_events(install_id),
@@ -606,90 +294,58 @@ def get_log_tail(path: Optional[str] = None, model_name: Optional[str] = None, n
     Frontend sends model_name; path is for direct use when log_path is known.
     For remote nodes, logs are fetched from the remote node's logs API.
     """
+    from app.services.tasks import get_log_tail_service
     try:
-        # Check if model_name corresponds to a remote node
-        if model_name:
-            from app.services.register_service import CUSTOM_NODE_SERVICE_REGISTRY
-            for registry_key, info in CUSTOM_NODE_SERVICE_REGISTRY.items():
-                is_remote_flag = info.get("is_remote")
-                remote_host = info.get("remote_host")
-                if info.get("model_name") == model_name and (is_remote_flag is True and remote_host):
-                    # Remote node: fetch logs from remote API
-                    remote_host = info["remote_host"]
-                    port = info["port"]
-                    remote_url = f"http://{remote_host}:{port}/logs"
-                    params = {"lines": n}
-                    try:
-                        response = requests.get(remote_url, params=params, timeout=10)
-                        response.raise_for_status()
-                        remote_data = response.json()
-                        # Convert tasknode response format to our format
-                        return success_response({
-                            "path": remote_data.get("log_file", f"remote://{remote_host}:{port}"),
-                            "tail": remote_data.get("content", "")
-                        })
-                    except requests.RequestException as e:
-                        return error_response(f"Failed to fetch logs from remote node: {str(e)}")
-
-        # Local node: read from local file system
-        import os
-        base_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "storage", "tasknode_logs"))
-        target = None
         if path:
-            target = os.path.abspath(path)
-        elif model_name:
-            # Resolve model_name to latest matching log file under tasknode_logs
-            safe = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in model_name)
-            if not safe:
-                raise HTTPException(status_code=422, detail="model_name yields empty safe name")
-            candidates = []
-            for root, _dirs, files in os.walk(base_dir):
-                for f in files:
-                    if f.endswith(".log") and safe.lower() in f.lower():
-                        candidates.append(os.path.join(root, f))
-            if not candidates:
-                raise HTTPException(status_code=404, detail="Log file not found for model_name")
-            target = max(candidates, key=lambda p: os.path.getmtime(p))
-        else:
-            raise HTTPException(status_code=422, detail="Either path or model_name is required")
-        if not target.startswith(base_dir):
-            raise HTTPException(status_code=403, detail="Forbidden path")
-        if not os.path.exists(target):
-            raise HTTPException(status_code=404, detail="Log file not found")
-        # Read last n lines efficiently for small and large files
-        max_n = 1000
-        n = max(1, min(int(n or 200), max_n))
-        with open(target, 'rb') as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            if size <= 128 * 1024:
-                f.seek(0)
-                raw = f.read()
-                text_full = raw.decode('utf-8', errors='ignore')
-                parts = text_full.splitlines()
-                text = "\n".join(parts[-n:])
-            else:
-                # Read blocks from end until we have enough newlines
-                block_size = 4096
-                buffer = bytearray()
-                lines_found = 0
-                pos = size
-                while pos > 0 and lines_found <= n:
-                    read_size = block_size if pos >= block_size else pos
-                    pos -= read_size
-                    f.seek(pos)
-                    chunk = f.read(read_size)
-                    buffer[:0] = chunk
-                    lines_found += chunk.count(b"\n")
-                data = bytes(buffer)
-                text_full = data.decode('utf-8', errors='ignore')
-                parts = text_full.splitlines()
-                text = "\n".join(parts[-n:])
-        return success_response({"path": target, "tail": text})
+            base_dir = os.path.abspath(
+                os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    "..",
+                    "storage",
+                    "tasknode_logs",
+                )
+            )
+            candidate = path if os.path.isabs(path) else os.path.join(base_dir, path)
+            abs_path = os.path.abspath(candidate)
+            if not (abs_path == base_dir or abs_path.startswith(base_dir + os.sep)):
+                raise HTTPException(status_code=403, detail="Forbidden path")
+            path = abs_path
+        result = get_log_tail_service(path, model_name, n)
+        if isinstance(result, dict) and result.get("path"):
+            # Prefer tasknode_logs-relative path; never leak absolute roots.
+            raw = result.get("path") or ""
+            try:
+                base_dir = os.path.abspath(
+                    os.path.join(
+                        os.path.dirname(os.path.dirname(__file__)),
+                        "..",
+                        "storage",
+                        "tasknode_logs",
+                    )
+                )
+                abs_raw = os.path.abspath(raw)
+                if abs_raw == base_dir or abs_raw.startswith(base_dir + os.sep):
+                    result = {
+                        **result,
+                        "path": os.path.relpath(abs_raw, base_dir).replace("\\", "/"),
+                    }
+                else:
+                    result = {**result, "path": sanitize_client_path(raw)}
+            except Exception:
+                result = {**result, "path": sanitize_client_path(raw)}
+        return success_response(result)
+    except RuntimeError:
+        return error_response("Failed to fetch remote logs")
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid log request")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Log file not found")
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Forbidden path")
     except HTTPException:
         raise
-    except Exception as e:
-        return error_response(f"Failed to read log: {str(e)}")
+    except Exception:
+        return error_response("Failed to read log")
 
 # Only keep the API model classes needed for request validation
 class RegisterCustomNodeRequest(BaseModel):
@@ -744,6 +400,27 @@ def patch_paths_recursive(obj):
             patch_paths_recursive(item)
     return obj
 
+
+def _patch_batch_items(raw_items: list, request: Request):
+    """Validate + path-patch start/append batch items. Returns (patched_list, error_response_or_None)."""
+    patched_items = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            return None, error_response("Each batch item must be an object", code=400)
+        path = raw.get("path", "")
+        zarr_path = raw.get("zarr_path") or raw.get("zarrPath") or ""
+        _, denied = guard_write_path(
+            request, path or zarr_path, "batch process workflow"
+        )
+        if denied is not None:
+            return None, denied
+        payload = raw.get("payload")
+        if isinstance(payload, dict):
+            payload = patch_paths_recursive(payload)
+        patched_items.append({"path": path, "zarr_path": zarr_path, "payload": payload})
+    return patched_items, None
+
+
 @tasks_router.post("/v1/start_service/{service_name}")
 def start_service(service_name: str):
     """
@@ -751,7 +428,7 @@ def start_service(service_name: str):
     """
     try:
         # Call service layer's start_service function
-        from app.services.tasks_service import start_service as service_start_service
+        from app.services.tasks import start_service as service_start_service
         
         result = service_start_service(service_name)
         
@@ -770,7 +447,7 @@ def stop_service(service_name: str):
     """
     try:
         # Call service layer's stop_service function
-        from app.services.tasks_service import stop_service as service_stop_service
+        from app.services.tasks import stop_service as service_stop_service
         
         result = service_stop_service(service_name)
         
@@ -789,7 +466,7 @@ def start_all_services():
     """
     try:
         # Call service layer's start_all_services function
-        from app.services.tasks_service import start_all_services as service_start_all_services
+        from app.services.tasks import start_all_services as service_start_all_services
         
         result = service_start_all_services()
         
@@ -805,7 +482,7 @@ def stop_all_services():
     """
     try:
         # Call service layer's stop_all_services function
-        from app.services.tasks_service import stop_all_services as service_stop_all_services
+        from app.services.tasks import stop_all_services as service_stop_all_services
         
         result = service_stop_all_services()
         
@@ -826,7 +503,7 @@ def create_node(req: CreateNodeRequest):
     """
     try:
         # Call service layer's create_node function
-        from app.services.tasks_service import create_node as service_create_node
+        from app.services.tasks import create_node as service_create_node
         
         # Resolve virtual path aliases first (e.g., 'samples/Data' -> '/data/public')
         from app.config.path_config import resolve_virtual_path
@@ -861,7 +538,7 @@ def add_dependency(data: DependencyBody):
     """
     try:
         # Call service layer's _add_dependency_internal function
-        from app.services.tasks_service import _add_dependency_internal as service_add_dependency
+        from app.services.tasks import _add_dependency_internal as service_add_dependency
         
         result = service_add_dependency(data.from_node, data.to_node)
         
@@ -892,7 +569,7 @@ def get_answer(auth_user: AuthUser = Depends(get_auth_user)):
     Get workflow answer for the authenticated user.
     Returns user-specific workflow results to prevent collision across concurrent sessions.
     """
-    from app.services.tasks_service import user_workflow_status
+    from app.services.tasks import user_workflow_status
     
     uid = auth_user.uid
     
@@ -946,9 +623,107 @@ def current_workflow_status(auth_user: AuthUser = Depends(get_auth_user)):
     If user has a running or queued workflow, returns execution_id, status, node_status,
     node_progress, queue_position, queue_total. Otherwise returns active=False.
     """
-    from app.services.tasks_service import get_current_workflow_status as service_get_current
+    from app.services.tasks import get_current_workflow_status as service_get_current
     snapshot = service_get_current(auth_user.uid)
     return success_response(snapshot)
+
+
+@tasks_router.post("/v1/start_batch")
+async def start_batch(frontend_data: dict, request: Request, auth_user: AuthUser = Depends(get_auth_user)):
+    """
+    Start a multi-file workflow batch. Frontend pre-builds per-file start_workflow payloads;
+    the backend runs them serially so closing the browser does not stop the queue.
+    """
+    uid = auth_user.uid
+    raw_items = frontend_data.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        return error_response("items must be a non-empty list", code=400)
+
+    patched_items, err = _patch_batch_items(raw_items, request)
+    if err is not None:
+        return err
+
+    stop_on_first_error = frontend_data.get("stop_on_first_error")
+    if stop_on_first_error is None:
+        stop_on_first_error = frontend_data.get("stopOnFirstError", True)
+
+    source = frontend_data.get("source") or "workflow"
+
+    auth_header = request.headers.get("Authorization")
+    result = await service_start_batch(
+        uid=uid,
+        items=patched_items,
+        stop_on_first_error=bool(stop_on_first_error),
+        auth_header=auth_header,
+        source=str(source),
+    )
+    if not result.get("success"):
+        return error_response(result.get("error", "Failed to start batch"), code=result.get("code", 500))
+    return success_response({"batch": result.get("batch")})
+
+
+@tasks_router.post("/v1/batch/append")
+async def append_batch(frontend_data: dict, request: Request, auth_user: AuthUser = Depends(get_auth_user)):
+    """Append files to the current user's active batch (e.g. more CellCast pre-runs)."""
+    raw_items = frontend_data.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        return error_response("items must be a non-empty list", code=400)
+
+    patched_items, err = _patch_batch_items(raw_items, request)
+    if err is not None:
+        return err
+
+    source = frontend_data.get("source")
+    result = await service_append_batch(
+        uid=auth_user.uid,
+        items=patched_items,
+        source=str(source) if source else None,
+    )
+    if not result.get("success"):
+        return error_response(result.get("error", "Failed to append to batch"), code=result.get("code", 500))
+    return success_response({"batch": result.get("batch"), "added": result.get("added", 0)})
+
+
+@tasks_router.get("/v1/batch/active")
+def get_active_batch(auth_user: AuthUser = Depends(get_auth_user)):
+    """Return the current user's *running* batch snapshot (tab reopen / re-login).
+
+    Finished batches are not returned — the client dismisses completion UI
+    intentionally; refresh must not resurrect it.
+    """
+    job = service_get_active_batch(auth_user.uid)
+    if not job:
+        return success_response({"active": False, "batch": None})
+    return success_response({"active": True, "batch": batch_job_snapshot(job)})
+
+
+@tasks_router.get("/v1/batch/events")
+def batch_events(request: Request):
+    """Push batch snapshots as Server-Sent Events (token query auth, same as get_status)."""
+    uid = _authenticate_sse_query(request)
+
+    return StreamingResponse(
+        generate_batch_events(uid),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@tasks_router.post("/v1/stop_batch")
+async def stop_batch(auth_user: AuthUser = Depends(get_auth_user)):
+    """Stop the current user's active batch (current file + remaining queue)."""
+    result = await service_stop_batch(auth_user.uid)
+    if not result.get("success"):
+        return error_response(result.get("error", "Failed to stop batch"), code=result.get("code", 500))
+    return success_response({
+        "message": result.get("message", "Batch stop requested"),
+        "batch": result.get("batch"),
+        **({"warning": result["warning"]} if result.get("warning") else {}),
+    })
 
 
 @tasks_router.post("/v1/start_workflow")
@@ -959,7 +734,7 @@ async def start_workflow_from_frontend(frontend_data: dict, background_tasks: Ba
     frontend_data format example:
     "zarr_path": "/Users/xxx/Desktop/my_workflow_data.zarr",
       "step1": {
-        "model": "SegmentationNode",
+        "model": "Cell-Segmentation",
         "input": {
           "path": "/Users/xxx/Desktop/example_WSI/CMU-1.svs",
           "read_image_method": "tiffslide",
@@ -969,21 +744,29 @@ async def start_workflow_from_frontend(frontend_data: dict, background_tasks: Ba
       }
     """
     uid = auth_user.uid
+
+    # Block manual single-file starts while a backend batch queue owns this user.
+    if has_active_batch(uid):
+        return error_response("Batch processing in progress", code=409)
+
     # Check public read-only directory restriction BEFORE path processing
     zarr_path = frontend_data.get("zarr_path", "")
-    if is_public_read_only_path(zarr_path):
-        return error_response("Cannot run workflow in sample or data directories. Please use your personal workspace instead.", code=403)
+    _, denied = await guard_write_path_async(request, zarr_path, "run workflow")
+    if denied is not None:
+        return denied
     
     frontend_data = patch_paths_recursive(frontend_data)
     
     # Call service layer's start_workflow_from_frontend function with uid
-    from app.services.tasks_service import start_workflow_from_frontend as service_start_workflow
+    from app.services.tasks import start_workflow_from_frontend as service_start_workflow
     
     auth_header = request.headers.get("Authorization")
     result = await service_start_workflow(frontend_data, uid, auth_header=auth_header)
     
     if not result.get("success", False):
-        return error_response(result.get("error", "Unknown error occurred when starting workflow"))
+        # Honor a service-supplied status code (e.g. 409 for "already running")
+        # so expected business conflicts aren't auto-reported as 500 tickets.
+        return error_response(result.get("error", "Unknown error occurred when starting workflow"), code=result.get("code", 500))
     
     # Get task information
     task_info = result.get("task_info", {})
@@ -992,7 +775,7 @@ async def start_workflow_from_frontend(frontend_data: dict, background_tasks: Ba
     queue_position = result.get("queue_position", 0)
     
     logger.info(f"  Workflow {wf_id} queued for user {uid} at position {queue_position}, execution_id: {execution_id}")
-
+    
     return success_response({
         "message": result.get("message", f"Workflow '{wf_id}' queued for execution"),
         "workflow_id": wf_id,
@@ -1001,30 +784,12 @@ async def start_workflow_from_frontend(frontend_data: dict, background_tasks: Ba
         "user_id": uid
     })
 
-@tasks_router.get("/v1/workflow_status/{wf_id}")
-def get_workflow_status(wf_id: int):
-    """
-    return background task status
-    """
-    if wf_id not in workflow_run_status:
-        return error_response(f"No record of workflow {wf_id}")
-
-    status_info = workflow_run_status[wf_id]
-    payload = {
-        "status": status_info["status"],
-        "result": status_info["result"]  # if done or error
-    }
-    node_status = status_info.get("node_status")
-    if node_status is not None:
-        payload["node_status"] = node_status
-    return success_response(payload)
-
 @tasks_router.post("/v1/register_custom_node")
 def register_custom_node_endpoint(req: RegisterCustomNodeRequest):
     """
     When the frontend calls this interface, it needs to pass in:
     - model_name: The name of the custom node
-    - python_version: The Python version used to create or reuse the conda environment (e.g., 3.9)
+    - python_version: The Python version used to create or reuse the conda environment (e.g., 3.11)
     - service_path: The entry point for starting the node service (e.g., 'custom_node:app')
     - dependency_path: The absolute path of the node dependency file requirements.txt
     - factory: The factory to which the node belongs (e.g., 'TissueClassify/NucleiSeg/Custom/...')
@@ -1036,7 +801,7 @@ def register_custom_node_endpoint(req: RegisterCustomNodeRequest):
     """
     try:
         # Call service layer's register_custom_node_endpoint function
-        from app.services.tasks_service import register_custom_node_endpoint as service_register_custom_node_endpoint
+        from app.services.tasks import register_custom_node_endpoint as service_register_custom_node_endpoint
         
         result = service_register_custom_node_endpoint(
             model_name=req.model_name,
@@ -1105,13 +870,22 @@ class WorkflowStageStatusRequest(BaseModel):
 
 
 @tasks_router.post("/v1/workflow_stage_status")
-def workflow_stage_status(req: WorkflowStageStatusRequest, auth_user: AuthUser = Depends(get_auth_user)):
+def workflow_stage_status(
+    req: WorkflowStageStatusRequest,
+    request: Request,
+    auth_user: AuthUser = Depends(get_auth_user),
+):
     """Return stage-level workflow status from zarr + runtime overrides."""
-    from app.services.tasks_service import get_workflow_stage_status as service_get_workflow_stage_status
+    from app.services.tasks import get_workflow_stage_status as service_get_workflow_stage_status
 
+    resolved_path, denied = authorize_read_or_response(
+        request, req.zarr_path, operation="read workflow stage status"
+    )
+    if denied is not None:
+        return denied
     result = service_get_workflow_stage_status(
         uid=auth_user.uid,
-        zarr_path=req.zarr_path,
+        zarr_path=resolved_path,
         steps=req.steps,
     )
     return success_response(result)
@@ -1122,10 +896,12 @@ async def register_custom_node_async(req: RegisterCustomNodeAsyncRequest):
     """
     Immediately create a log file and return its path, then run registration in background.
     """
+    # Coroutine on purpose, though it never awaits: it schedules the registration
+    # on the event loop with create_task, and a plain `def` route runs in a worker
+    # thread where there is no running loop to schedule onto.
     try:
         # Pre-create a log file name to stream logs immediately
-        from datetime import datetime
-        from app.services.register_service import _resolve_log_path  # type: ignore
+        from app.utils.workflow.register import _resolve_log_path  # type: ignore
         env_name = req.env_name or f"{req.model_name}_tissuelab_ai_service_tasknode"
         log_path = _resolve_log_path(req.model_name, env_name)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1136,7 +912,7 @@ async def register_custom_node_async(req: RegisterCustomNodeAsyncRequest):
         # Run registration in background on a thread to avoid blocking the event loop/worker
         async def _run():
             try:
-                from app.services.tasks_service import register_custom_node_endpoint as service_register_custom_node_endpoint
+                from app.services.tasks import register_custom_node_endpoint as service_register_custom_node_endpoint
                 res = await asyncio.to_thread(
                     service_register_custom_node_endpoint,
                     model_name=req.model_name,
@@ -1172,7 +948,9 @@ async def register_custom_node_async(req: RegisterCustomNodeAsyncRequest):
                 except Exception:
                     pass
 
-        asyncio.create_task(_run())
+        track_background_task(
+            asyncio.create_task(_run()), f"register_tasknode({req.model_name})"
+        )
 
         return success_response({
             "status": "starting",
@@ -1196,7 +974,7 @@ def list_factory_models():
         return error_response(f"API Error: {str(e)}")
 
 @tasks_router.get("/v1/get_status")
-async def get_status(request: Request):
+def get_status(request: Request):
     """
     Return the status of each node in the current workflow as Server-Sent Events (SSE).
     
@@ -1206,14 +984,12 @@ async def get_status(request: Request):
         2 - Completed
     
     This endpoint uses SSE to continuously send status updates to the client.
-    User-specific status is determined by Firebase Auth token.
+    Status is tracked per user id.
     """
-    # Local-only build: no token verification; identify the caller via the
-    # optional ``uid`` query param (defaults to the shared local user).
-    uid = request.query_params.get('uid') or get_auth_user().uid
+    uid = _authenticate_sse_query(request)
     
     # Import the event generator from the service layer
-    from app.services.tasks_service import generate_node_status_events
+    from app.services.tasks import generate_node_status_events
     
     # Return a streaming response using the service layer's event generator
     return StreamingResponse(
@@ -1233,28 +1009,33 @@ def save_annotation(req: dict, background_tasks: BackgroundTasks, request: Reque
     """
     # Check samples and data directory restriction BEFORE path processing
     path = req.get("path", "")
-    if is_public_read_only_path(path):
-        return error_response("Cannot annotate in sample or data directories. Please use your personal workspace instead.", code=403)
+    _, denied = guard_write_path(request, path, "annotate")
+    if denied is not None:
+        return denied
     
     # Get instanceId from header
-    instance_id = request.headers.get('X-Instance-ID')
+    from app.utils.common.request import get_instance_id
+    instance_id = get_instance_id(request)
     if not instance_id:
         return error_response("X-Instance-ID header is required")
-    
+    # The path ACL says nothing about the session: without this a caller could
+    # drive another viewer's handler (and its caches) with their own path.
+    denied = guard_instance_owner(request, instance_id, "save annotation")
+    if denied is not None:
+        return denied
+
     req = _patch_dict_paths(req)
     # Add instanceId to request for service layer
     req['instance_id'] = instance_id
     
     # Call service layer's save_annotation function
-    from app.services.tasks_service import save_annotation as service_save_annotation
+    from app.services.tasks import save_annotation as service_save_annotation
     
-    # Resolve device handler and pass it to service layer
-    from app.utils.request import get_device_id
-    from app.websocket.segmentation_consumer import device_annotation_handlers
-    device_id = get_device_id(request)
-    handler = device_annotation_handlers.get(device_id)
+    # Resolve instance handler (required for annotation writes that update in-memory state)
+    from app.services.seg_registry import get_annotation_handler
+    handler = get_annotation_handler(instance_id)
     if not handler:
-        return error_response("No handler found for device")
+        return error_response("No segmentation handler for instance; open the slide first")
     result = service_save_annotation(handler, req, background_tasks)
     
     # Construct API response based on service layer result
@@ -1263,29 +1044,97 @@ def save_annotation(req: dict, background_tasks: BackgroundTasks, request: Reque
     else:
         return error_response(result.get("error", "Unknown error occurred while saving annotation"))
 
-@tasks_router.post("/v1/save_tissue")
+
+@tasks_router.post("/v1/save_manual_annotation")
+def save_manual_annotation_endpoint(req: dict, request: Request):
+    """Persist one freeform Annotorious drawing into User-Annotations/manual.json."""
+    path = req.get("path", "")
+    _, denied = guard_write_path(request, path, "annotate")
+    if denied is not None:
+        return denied
+
+    req = _patch_dict_paths(req)
+    result = service_save_manual_annotation(req.get("path", ""), req)
+    if result.get("success"):
+        return success_response({
+            "message": result.get("message", "Manual annotation saved"),
+            "id": result.get("id"),
+        })
+    return error_response(result.get("error", "Failed to save manual annotation"))
+
+
+@tasks_router.get("/v1/list_manual_annotations")
+def list_manual_annotations_endpoint(request: Request):
+    """List freeform drawings from User-Annotations/manual.json for a slide sidecar."""
+    path = request.query_params.get("path", "")
+    if not path:
+        return error_response("path is required")
+    # Read ACL only. Viewer hydrate still needs this list.
+    resolved_path, denied = authorize_read_or_response(
+        request, path, operation="list annotations"
+    )
+    if denied is not None:
+        return denied
+    patched = _patch_dict_paths({"path": resolved_path or path})
+    try:
+        # Corrupt manual.json must error — hydrate must not wipe the canvas
+        # by treating a parse failure as an empty list.
+        annotations = load_manual_annotations(patched.get("path", resolved_path or path))
+    except Exception as e:
+        return error_response(f"Failed to read manual annotations: {e}")
+    return success_response({"annotations": annotations, "total": len(annotations)})
+
+
+@tasks_router.post("/v1/delete_manual_annotation")
+def delete_manual_annotation_endpoint(req: dict, request: Request):
+    """Delete one freeform drawing from User-Annotations/manual.json by id."""
+    path = req.get("path", "")
+    _, denied = guard_write_path(request, path, "annotate")
+    if denied is not None:
+        return denied
+
+    req = _patch_dict_paths(req)
+    result = service_delete_manual_annotation(req.get("path", ""), req.get("id", ""))
+    if result.get("success"):
+        return success_response({
+            "message": result.get("message", "Manual annotation deleted"),
+            "id": result.get("id"),
+        })
+    return error_response(result.get("error", "Failed to delete manual annotation"))
+
+
+@tasks_router.post("/v1/save_patch")
 # Keep req: dict if frontend sends polygon_points inside the body
 # Alternatively, define a Pydantic model for the body
-# async def save_tissue(tissue_data: TissueSaveRequest, background_tasks: BackgroundTasks):
-async def save_tissue(req: dict, background_tasks: BackgroundTasks, request: Request):
+# async def save_patch(tissue_data: TissueSaveRequest, background_tasks: BackgroundTasks):
+def save_patch(req: dict, background_tasks: BackgroundTasks, request: Request):
     """
     Receive tissue area coordinates (BBox) and optional polygon points in request body,
     find precise matching patches, and save classification to Zarr file.
     """
     # Check samples and data directory restriction BEFORE path processing
     path = req.get("path", "")
-    if is_public_read_only_path(path):
-        return error_response("Cannot annotate tissue in sample or data directories. Please use your personal workspace instead.", code=403)
+    _, denied = guard_write_path(request, path, "annotate tissue")
+    if denied is not None:
+        return denied
     
     req = _patch_dict_paths(req)
-    from app.services.tasks_service import save_tissue as service_save_tissue
-    from app.utils.request import get_device_id
-    from app.websocket.segmentation_consumer import device_annotation_handlers
-    device_id = get_device_id(request)
-    handler = device_annotation_handlers.get(device_id)
+    from app.utils.common.request import get_instance_id
+    instance_id = get_instance_id(request)
+    if not instance_id:
+        return error_response("X-Instance-ID header is required")
+    # See save_annotation: the path ACL does not cover session ownership.
+    denied = guard_instance_owner(request, instance_id, "save tissue annotation")
+    if denied is not None:
+        return denied
+    req['instance_id'] = instance_id
+
+    from app.services.tasks import save_patch as service_save_patch
+    from app.services.seg_registry import get_annotation_handler
+    handler = get_annotation_handler(instance_id)
     if not handler:
-        return error_response("No handler found for device")
-    result = service_save_tissue(handler, req, background_tasks)
+        return error_response("No segmentation handler for instance; open the slide first")
+    result = service_save_patch(handler, req, background_tasks)
 
     # Construct API response based on service layer result
     if result.get("success", False):
@@ -1299,11 +1148,15 @@ async def save_tissue(req: dict, background_tasks: BackgroundTasks, request: Req
         return error_response(result.get("error", "Unknown error occurred"), code=400 if "coordinate" in result.get("error", "").lower() else 500)
 
 @tasks_router.post("/v1/classification")
-def run_classification(req: dict):
+def run_classification(req: dict, request: Request):
     """ Run classification operation """
+    path = req.get("path") or req.get("zarr_path") or ""
+    _, denied = guard_write_path(request, path, "run classification")
+    if denied is not None:
+        return denied
     req = _patch_dict_paths(req)
     # Call service layer's run_classification function
-    from app.services.tasks_service import run_classification as service_run_classification
+    from app.services.tasks import run_classification as service_run_classification
     
     result = service_run_classification(req)
     
@@ -1321,9 +1174,17 @@ async def get_cell_review_tile(request: Request):
     """
     Get 40x magnification tile crop centered on a specific cell for review.
     Returns cropped image and optional contour data.
+
+    Read ACL only — Viewer/Samples can browse Review tiles. Yes/No persist
+    still goes through write-gated annotation endpoints.
     """
-    from app.services.tasks_service import get_cell_review_tile_data
+    from app.services.tasks import get_cell_review_tile_data
     data = await request.json()
+    _, denied = await authorize_read_or_response_async(
+        request, data.get("slide_id", ""), operation="review tile"
+    )
+    if denied is not None:
+        return denied
     
     # Validate required fields
     required_fields = ["slide_id", "cell_id", "centroid"]
@@ -1340,9 +1201,9 @@ async def get_cell_review_tile(request: Request):
     
     # Patch paths
     data = _patch_dict_paths(data)
-    
-    result = get_cell_review_tile_data(data)
-    
+
+    result = await asyncio.to_thread(get_cell_review_tile_data, data)
+
     if result.get("success", False):
         return success_response(result.get("data", {}))
     else:
@@ -1352,15 +1213,24 @@ async def get_cell_review_tile(request: Request):
 async def reset_classification_data_endpoint(request: Request):
     """
     Resets classification results and user annotations in the specified Zarr file.
-    This involves deleting the 'ClassificationNode' and 'user_annotation' groups.
+    This involves deleting the 'Cell-Classification' and 'User-Annotations' groups.
     """
-    from app.services.tasks_service import reset_zarr_classification_data
+    from app.services.tasks import reset_zarr_classification_data
     data = await request.json()
     zarr_path = data.get("zarr_path")
     if not zarr_path:
         return error_response("zarr_path is required")
+    _, denied = await guard_write_path_async(request, zarr_path, "reset classification")
+    if denied is not None:
+        return denied
 
-    result = reset_zarr_classification_data(resolve_path(zarr_path))
+    # Off the loop: this opens the store for write, so it waits on zarr_lock
+    # (120s timeout) and then deletes a whole classification group — thousands
+    # of chunk files on a real slide. Inline it froze every other request and
+    # websocket message for that entire time.
+    result = await asyncio.to_thread(
+        reset_zarr_classification_data, resolve_path(zarr_path)
+    )
 
     if result["status"] == "error":
         return error_response(result["message"])
@@ -1369,34 +1239,56 @@ async def reset_classification_data_endpoint(request: Request):
 
 @tasks_router.post("/v1/reset_patch_classification", summary="Reset patch classification (tissue_*) and user annotations in Zarr file, preserving MuskNode embeddings")
 async def reset_patch_classification_endpoint(request: Request):
-    from app.services.tasks_service import reset_patch_classification_data
+    from app.services.tasks import reset_patch_classification_data
     data = await request.json()
     zarr_path = data.get("zarr_path")
     if not zarr_path:
         return error_response("zarr_path is required")
-    result = reset_patch_classification_data(resolve_path(zarr_path))
+    _, denied = await guard_write_path_async(request, zarr_path, "reset patch classification")
+    if denied is not None:
+        return denied
+    # Off the loop — same write-mode zarr_lock and group delete as above.
+    result = await asyncio.to_thread(
+        reset_patch_classification_data, resolve_path(zarr_path)
+    )
     if result.get("status") != "success":
         return error_response(result.get("message", "Failed to reset patch classification"))
     return success_response(result)
 
+@tasks_router.post("/v1/reset_tissue_segmentation", summary="Remove VISTA's Tissue-Segmentation group (downstream of patch classification)")
+async def reset_tissue_segmentation_endpoint(request: Request):
+    from app.services.tasks import reset_tissue_segmentation_data
+    data = await request.json()
+    zarr_path = data.get("zarr_path")
+    if not zarr_path:
+        return error_response("zarr_path is required")
+    _, denied = await guard_write_path_async(request, zarr_path, "reset tissue segmentation")
+    if denied is not None:
+        return denied
+    # Off the loop — opens the store for write and deletes a group.
+    result = await asyncio.to_thread(
+        reset_tissue_segmentation_data, resolve_path(zarr_path)
+    )
+    if result.get("status") == "error":
+        return error_response(result.get("message", "Failed to reset tissue segmentation"))
+    return success_response(result)
+
 @tasks_router.post("/v1/clear_workflow")
-def clear_workflow(req: ClearWorkflowRequest):
+def clear_workflow(
+    req: ClearWorkflowRequest,
+    auth_user: Optional[AuthUser] = Depends(get_optional_auth_user),
+):
     """
-    Clear workflow
-    
-    Request body:
-    - workflow_id (int, optional): the workflow id to clear
-    
-    Returns:
-    - success: {"cleared": [...cleared workflow ids...], "reset_only": true/false}
-    - error: {"error": "error message"}
+    Clear TaskNodeManager workflow graph (optional workflow_id).
+    When clearing all, only resets the authenticated user's script flags.
     """
     try:
         # Call service layer's clear_workflow function
-        from app.services.tasks_service import clear_workflow as service_clear_workflow
+        from app.services.tasks import clear_workflow as service_clear_workflow
         
         workflow_id = req.workflow_id
-        result = service_clear_workflow(workflow_id)
+        uid = getattr(auth_user, "uid", None) if auth_user else None
+        result = service_clear_workflow(workflow_id, uid=uid)
         
         # Get result fields
         success = result.get("success", False)
@@ -1434,7 +1326,7 @@ def list_node_ports(skip_health_checks: bool = False):
     """
     try:
         # Call service layer's list_node_ports function
-        from app.services.tasks_service import list_node_ports as service_list_node_ports
+        from app.services.tasks import list_node_ports as service_list_node_ports
         
         result = service_list_node_ports(skip_health_checks=skip_health_checks)
         
@@ -1461,7 +1353,7 @@ def list_node_ports(skip_health_checks: bool = False):
         else:
             return error_response(error_msg)
     except Exception as e:
-        logger.error(f"Error listing node ports: {str(e)}")
+        logger.error(f"Error listing node ports: {str(e)}", exc_info=e)
         return error_response(f"Error listing node ports: {str(e)}")
 
 
@@ -1473,18 +1365,20 @@ def list_conda_envs():
             return success_response({"envs": result.get("envs", [])})
         else:
             msg = result.get("message", "Failed to list conda envs")
-            from app.core import logger
             logger.error(f"list_conda_envs error: {msg}")
             return error_response(msg)
     except Exception as e:
-        from app.core import logger
+        # No local `from app.core import logger`: the module imports it, and a
+        # local import binds the name for the whole function, so the
+        # logger.error above raised UnboundLocalError and this handler reported
+        # that instead of why listing the envs actually failed.
         logger.exception(f"Unhandled error in list_conda_envs: {e}")
         return error_response(f"Error listing conda envs: {str(e)}")
 
 @tasks_router.get("/v1/list_nodes_extended")
 def list_nodes_extended():
     try:
-        model_store.load()
+        model_store.reload()
 
         nodes = model_store.get_nodes_extended() or {}
         category_map = model_store.get_category_map() or {}
@@ -1515,10 +1409,10 @@ def reload_model_registry():
     Use this after external processes (like Electron) modify the registry file.
     """
     try:
-        model_store.load()
+        model_store.reload()
         return success_response({"message": "Model registry reloaded successfully"})
     except Exception as e:
-        logger.error(f"Error reloading model registry: {str(e)}")
+        logger.error(f"Error reloading model registry: {str(e)}", exc_info=e)
         return error_response(f"Error reloading model registry: {str(e)}")
     
 class DeleteNodeRequest(BaseModel):
@@ -1586,31 +1480,42 @@ def get_node_classifier_counts():
         }
         return success_response(classifier_counts)
     except Exception as e:
-        logger.error(f"Error getting node classifier counts: {str(e)}")
+        logger.error(f"Error getting node classifier counts: {str(e)}", exc_info=e)
         return error_response(f"Error getting node classifier counts: {str(e)}")
 
 class StopWorkflowRequest(BaseModel):
     zarr_path: str
 
 @tasks_router.post("/v1/stop_workflow")
-async def stop_workflow(req: StopWorkflowRequest):
+async def stop_workflow(req: StopWorkflowRequest, auth_user: AuthUser = Depends(get_auth_user)):
     """
-    Stop the current workflow execution and rollback files if needed
+    Stop the authenticated user's current workflow (cooperative /cancel only).
     """
     try:
-        # Call service layer's stop_workflow function
-        from app.services.tasks_service import stop_workflow_async
+        from app.services.tasks import stop_workflow_async
 
-        result = await stop_workflow_async(resolve_path(req.zarr_path))
+        result = await stop_workflow_async(
+            resolve_path(req.zarr_path),
+            uid=auth_user.uid,
+        )
 
         # Handle result
         if result.get("success", False):
-            return success_response({
+            payload = {
                 "message": result.get("message", "Workflow stopped successfully"),
-                "data": result.get("data", {})
-            })
+            }
+            if result.get("status") is not None:
+                payload["status"] = result.get("status")
+            if result.get("forced") is not None:
+                payload["forced"] = result.get("forced")
+            return success_response(payload)
         else:
-            return error_response(result.get("error", "Failed to stop workflow"))
+            err = result.get("error", "Failed to stop workflow")
+            code = result.get("code")
+            if code is None:
+                # Prefer 404 for missing run over internal 500.
+                code = 404 if "no running workflow" in str(err).lower() else 409
+            return error_response(err, code=int(code))
     except Exception as e:
         logger.exception(f"[stop_workflow] error: {e}")
         return error_response(f"Error stopping workflow: {str(e)}")
@@ -1625,7 +1530,7 @@ def update_progress(req: UpdateProgressRequest):
     Update the progress of a specific node
     """
     try:
-        from app.services.tasks_service import update_node_progress
+        from app.services.tasks import update_node_progress
         
         # Validate progress value
         if not (0 <= req.progress <= 100):
@@ -1722,58 +1627,23 @@ class GetZarrStructureRequest(BaseModel):
 
 
 class GetH5StructureRequest(BaseModel):
-    """Request for get_h5_structure. Accepts h5_path or prompt (legacy)."""
-    h5_path: Optional[str] = None
-    agent_id: Optional[str] = None
-    prompt: Optional[str] = None  # legacy: used as h5_path when h5_path not set
-
-
-def _process_node_h5(name: str, obj) -> Dict[str, Any]:
-    """
-    Recursively process groups and datasets in an HDF5 file.
-    Returns a structure compatible with the Zarr process_node format for downstream use.
-    """
-    if h5py is None:
-        raise RuntimeError("h5py is not installed")
-    if isinstance(obj, h5py.Group):
-        return {
-            "type": "Group",
-            "name": name,
-            "children": {
-                key: _process_node_h5(key, item)
-                for key, item in obj.items()
-            }
-        }
-    elif isinstance(obj, h5py.Dataset):
-        shape_list = list(obj.shape) if obj.shape else []
-        dataset_info = {
-            "type": "Dataset",
-            "name": name,
-            "shape": shape_list,
-            "dtype": str(obj.dtype)
-        }
-        if hasattr(obj, "attrs") and obj.attrs:
-            try:
-                dataset_info["attributes"] = dict(obj.attrs)
-            except Exception:
-                pass
-        return dataset_info
-    return {"type": "unknown", "name": name}
+    h5_path: str
 
 
 @tasks_router.post("/v1/get_h5_structure")
-async def get_h5_structure_api(request: GetH5StructureRequest):
-    """
-    Retrieve the structure of an HDF5 file (same role as former /agent/v1/get_h5_structure).
-    Request body: { "h5_path": "path/to/file.h5" } or legacy { "agent_id": "...", "prompt": "path/to/file.h5" }.
-    """
+def get_h5_structure_api(payload: GetH5StructureRequest, request: Request):
+    """Retrieve the structure of an HDF5 file."""
     if h5py is None:
         return error_response("h5py is not installed")
-    h5_path = request.h5_path or request.prompt or ""
+    h5_path = payload.h5_path or ""
     if not h5_path:
-        return error_response("h5_path or prompt is required")
+        return error_response("h5_path is required")
+    resolved_path, denied = authorize_read_or_response(
+        request, h5_path, operation="read H5 structure"
+    )
+    if denied is not None:
+        return denied
     try:
-        resolved_path = resolve_path(h5_path)
         if not os.path.exists(resolved_path):
             return error_response(f"H5 file not found: {h5_path}")
         with h5py.File(resolved_path, "r") as h5_file:
@@ -1786,7 +1656,7 @@ async def get_h5_structure_api(request: GetH5StructureRequest):
 
 
 @tasks_router.post("/v1/get_zarr_structure")
-async def get_zarr_structure_api(request: GetZarrStructureRequest):
+def get_zarr_structure_api(payload: GetZarrStructureRequest, request: Request):
     """
     Retrieve the structure of a Zarr file and return it as a nested dictionary,
     including the names of groups and datasets.
@@ -1798,20 +1668,24 @@ async def get_zarr_structure_api(request: GetZarrStructureRequest):
     """
     try:
         # Resolve the path to absolute path
-        resolved_zarr_path = resolve_path(request.zarr_path)
+        resolved_zarr_path, denied = authorize_read_or_response(
+            request, payload.zarr_path, operation="read Zarr structure"
+        )
+        if denied is not None:
+            return denied
         
         # Verify file exists
         if not os.path.exists(resolved_zarr_path):
-            return error_response(f"Zarr file not found: {request.zarr_path}")
+            return error_response(f"Zarr file not found: {payload.zarr_path}")
         
         # Open the Zarr file and retrieve its structure
         try:
-            with zarr.open(resolved_zarr_path, 'r') as zarr_file:
+            with open_zarr_cm(resolved_zarr_path, 'r') as zarr_file:
                 logger.info(f"read zarr file {resolved_zarr_path} successfully")
                 structure = process_node("/", zarr_file)
                 return success_response(structure)
         except Exception as e:
-            logger.error(f"failed to get zarr structure: {str(e)}")
+            logger.error(f"failed to get zarr structure: {str(e)}", exc_info=e)
             return error_response(f"failed to get zarr structure: {str(e)}")
     except Exception as e:
         logger.exception(f"[get_zarr_structure] error: {e}")
@@ -1821,6 +1695,40 @@ async def get_zarr_structure_api(request: GetZarrStructureRequest):
 class ExecuteScriptRequest(BaseModel):
     zarr_path: str
     code_str: str
+
+
+class GenerateScriptRequest(BaseModel):
+    zarr_path: str
+    prompt: str
+
+
+@tasks_router.post("/v1/generate_script")
+async def generate_script(
+    request: GenerateScriptRequest,
+    http_request: Request,
+    auth_user: Optional[AuthUser] = Depends(get_optional_auth_user),
+):
+    """Generate a Python analysis script from a prompt.
+
+    Forwards to the Control Service coding agent (/agent/v1/process_script) via the
+    existing `_generate_script_output`. Standalone — does NOT run the workflow
+    graph; pairs with the standalone /execute_script run.
+    """
+    from app.services.tasks import _generate_script_output
+    resolved_path, denied = await authorize_read_or_response_async(
+        http_request, request.zarr_path, operation="generate script"
+    )
+    if denied is not None:
+        return denied
+    result = await _generate_script_output(
+        request.prompt,
+        resolved_path,
+        auth_header=http_request.headers.get("Authorization"),
+        uid=getattr(auth_user, "uid", None),
+    )
+    if result.get("error"):
+        return error_response(result["error"])
+    return success_response({"generated_script": result.get("generated_script", "")})
 
 
 class SummaryAnswerRequest(BaseModel):
@@ -1848,37 +1756,37 @@ async def execute_script(
     _exec_uid: Optional[str] = None
     try:
         # For authenticated web users (not Electron), prepend TL_EXPORT_DIR to route outputs to their personal folder
+        # The codeexec sandbox mounts the user's own outputs folder
+        # (users/{uid}/outputs) read-write at its real path and points TL_EXPORT_DIR
+        # there — the one place generated code may write. The user's own folder
+        # (users/{uid}) + the shared public data are mounted read-only (read your own
+        # uploads for reference); OTHER users' data is NOT mounted. The input zarr is
+        # read-only too. So the code reads only its own + shared data and writes only
+        # its own outputs.
         code_to_execute = request.code_str
-        
-        # Only inject TL_EXPORT_DIR for authenticated web users (not Electron desktop app)
-        user_export_dir = None  # Initialize to avoid NameError
+        user_export_dir = None
+        absolute_export_path = None
         if auth_user and getattr(auth_user, 'uid', None) and not _is_electron_client(http_request):
             user_export_dir = f"users/{auth_user.uid}/outputs"
             absolute_export_path = resolve_path(user_export_dir)
-            
-            # Prepend environment variable setting at execution time
-            env_injection = f'''import os
-os.environ['TL_EXPORT_DIR'] = {repr(absolute_export_path)}
-
-'''
-            code_to_execute = env_injection + request.code_str
         
         # Convert relative path to absolute path using storage root
-        resolved_zarr_path = resolve_path(request.zarr_path)
+        resolved_zarr_path, denied = await guard_write_path_async(
+            http_request, request.zarr_path, "execute script"
+        )
+        if denied is not None:
+            return denied
         
         # Verify file exists before attempting execution
         if not os.path.exists(resolved_zarr_path):
-            return error_response(
-                f"Zarr file not found. Original path: {request.zarr_path}, "
-                f"Resolved path: {resolved_zarr_path}"
-            )
+            return error_response("Zarr file not found")
 
         _exec_uid = auth_user.uid if auth_user and getattr(auth_user, "uid", None) else None
         
         # Prepare a timestamped log file under storage/tasknode_logs (same as task nodes)
         try:
             # logs_dir relative to this file: app/api/ -> go to project root and into storage/tasknode_logs
-            logs_base_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "storage", "tasknode_logs"))
+            logs_base_dir = os.path.join(SERVICE_STORAGE_DIR, "tasknode_logs")
             os.makedirs(logs_base_dir, exist_ok=True)
             
             # Create date-based subdirectory (e.g., 2025-10-09) to match other task node logs
@@ -1913,180 +1821,94 @@ os.environ['TL_EXPORT_DIR'] = {repr(absolute_export_path)}
             except Exception:
                 pass
 
-            # Validate syntax quickly before spawning process
-            try:
-                lf.write("--- Validating Script ---\n")
-                lf.flush()
-                script_function(code_to_execute)
-                lf.write("Syntax validation passed.\n\n")
-                lf.flush()
-            except ValueError as e:
-                lf.write(f"Validation failed: {str(e)}\n")
-                lf.flush()
-                return error_response(str(e))
-
+            # Run the user/agent code through the codeexec pipeline:
+            #   guard (static) -> LLM review -> sandbox (Docker / subprocess fallback).
+            # The sandbox owns per-user isolation, resource limits and timeout.
             begin_script_summary_wait(_exec_uid)
             script_answer_wait_active = True
-
-            # Execute analysis in isolated process with resource limits and 60-second timeout
             lf.write("--- Execution Started ---\n")
             lf.write(f"Start time: {datetime.now().isoformat()}\n")
             lf.flush()
-            
             execution_start = datetime.now()
-            result = None
-            process_executor = None
-            subprocess_pid = None
-            
-            try:
-                # Use ProcessPoolExecutor - processes can be killed on timeout
-                loop = asyncio.get_event_loop()
-                process_executor = ProcessPoolExecutor(max_workers=1)
-                
-                # Submit task to subprocess with resource limits
-                future = loop.run_in_executor(
-                    process_executor, 
-                    _execute_with_limits,
-                    code_to_execute,
-                    resolved_zarr_path,
-                    8192,  # 8GB memory limit
-                    55     # 55s CPU time limit (slightly less than wall clock timeout)
+
+            from app.services.codeexec import run_user_code, ExecRequest
+            from app.config.path_config import PUBLIC_DATA_PATH
+            # Read-only mounts: the user's OWN folder (their uploaded data, for
+            # reference) + the shared public-data root (samples are symlinked out to
+            # it). NOT other users' data. The code can READ these but only WRITE the
+            # user's own output dir. The input zarr is mounted separately (read-only),
+            # so an opened sample/shared zarr is still readable even if outside these.
+            read_roots = []
+            if absolute_export_path:
+                _user_root = os.path.dirname(absolute_export_path.rstrip("/"))  # users/{uid}
+                if os.path.isdir(_user_root):
+                    read_roots.append(_user_root)
+            if PUBLIC_DATA_PATH and os.path.isdir(PUBLIC_DATA_PATH):
+                read_roots.append(PUBLIC_DATA_PATH)
+            loop = asyncio.get_event_loop()
+            # Concurrency gate: at most CODEEXEC_MAX_CONCURRENCY sandboxes run at once
+            # (default 1 = strictly one at a time); the rest await here, FIFO.
+            async with _get_codeexec_semaphore():
+                exec_result = await loop.run_in_executor(
+                    _codeexec_executor,
+                    run_user_code,
+                    ExecRequest(
+                        code=code_to_execute,
+                        zarr_path=resolved_zarr_path,
+                        output_dir=absolute_export_path,
+                        read_roots=read_roots,
+                        uid=_exec_uid,
+                    ),
                 )
-                
-                # Wait for result with timeout
-                result = await asyncio.wait_for(future, timeout=60.0)
-                
-                execution_end = datetime.now()
-                duration = (execution_end - execution_start).total_seconds()
-                
-                # Log execution result
-                lf.write(f"\nEnd time: {execution_end.isoformat()}\n")
-                lf.write(f"Duration: {duration:.2f} seconds\n")
-                lf.write("\n--- Execution Result ---\n")
-                try:
-                    result_str = json.dumps(result, indent=2) if isinstance(result, dict) else str(result)
-                    lf.write(result_str)
-                    lf.write("\n")
-                except Exception:
-                    lf.write(str(result))
-                    lf.write("\n")
-                lf.write("\n--- Execution Complete ---\n")
-                lf.flush()
-                    
-            except asyncio.TimeoutError:
-                execution_end = datetime.now()
-                duration = (execution_end - execution_start).total_seconds()
-                
-                lf.write(f"\nEnd time: {execution_end.isoformat()}\n")
-                lf.write(f"Duration: {duration:.2f} seconds\n")
-                lf.write("\n--- Execution Timeout (60s limit exceeded) ---\n")
-                lf.write("The script was terminated. Process has been killed.\n")
-                lf.flush()
-                
-                # CRITICAL FIX: Properly terminate the subprocess and all its children
-                try:
-                    # Get the subprocess PID from the executor
-                    if hasattr(process_executor, '_processes') and process_executor._processes:
-                        for process in process_executor._processes.values():
-                            if process and process.is_alive():
-                                subprocess_pid = process.pid
-                                lf.write(f"Terminating subprocess PID: {subprocess_pid}\n")
-                                lf.flush()
-                                
-                                # Use the new process tree killing function
-                                success = _kill_process_tree(subprocess_pid, timeout=5)
-                                if success:
-                                    lf.write(f"Successfully killed process tree for PID: {subprocess_pid}\n")
-                                else:
-                                    lf.write(f"Failed to kill process tree for PID: {subprocess_pid}\n")
-                                    # Fallback: use system kill command
-                                    try:
-                                        sp.run(['kill', '-9', str(subprocess_pid)], check=False)
-                                        lf.write(f"Used system kill -9 for PID: {subprocess_pid}\n")
-                                    except Exception:
-                                        pass
-                                lf.flush()
-                                break
-                except Exception as cleanup_error:
-                    lf.write(f"Error during subprocess cleanup: {cleanup_error}\n")
-                    lf.flush()
-                
-                # Shutdown the executor properly
-                if process_executor:
-                    try:
-                        process_executor.shutdown(wait=True, cancel_futures=True)
-                        lf.write("ProcessPoolExecutor shutdown completed\n")
-                        lf.flush()
-                    except Exception as shutdown_error:
-                        lf.write(f"Error during executor shutdown: {shutdown_error}\n")
-                        lf.flush()
-                
+
+            duration = (datetime.now() - execution_start).total_seconds()
+            lf.write(f"\nDuration: {duration:.2f}s  backend={exec_result.backend or 'rejected'}\n")
+            if exec_result.rejected_by:
+                lf.write(f"--- BLOCKED by {exec_result.rejected_by}: {exec_result.reject_reason} ---\n")
+            lf.write("\n--- Execution Result ---\n")
+            try:
+                lf.write(json.dumps(exec_result.to_payload(), indent=2, default=str))
+            except Exception:
+                lf.write(str(exec_result.to_payload()))
+            lf.write("\n--- Execution Complete ---\n")
+            lf.flush()
+
+        # A safety layer (guard / LLM review) blocked the code -> clear error.
+        if exec_result.rejected_by:
+            if script_answer_wait_active:
                 end_script_summary_wait(
                     _exec_uid,
-                    error_code=4608,
-                    error_message="Script execution timed out after 60 seconds.",
+                    error_code=4403,
+                    error_message=f"Blocked by {exec_result.rejected_by}: {exec_result.reject_reason}",
                 )
                 script_answer_wait_active = False
-                return error_response(
-                    "Script execution timed out after 60 seconds. "
-                    "Please optimize your code or reduce the data size."
+            return error_response(
+                f"Code was blocked by the {exec_result.rejected_by} safety check: {exec_result.reject_reason}"
+            )
+
+        # JSON-safe payload (already JSON-able from the sandbox); include log path.
+        safe_log_path = sanitize_client_path(log_path)
+        try:
+            logs_base = os.path.abspath(
+                os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    "..",
+                    "storage",
+                    "tasknode_logs",
                 )
-                
-            except Exception as exec_error:
-                execution_end = datetime.now()
-                duration = (execution_end - execution_start).total_seconds()
-                
-                lf.write(f"\nEnd time: {execution_end.isoformat()}\n")
-                lf.write(f"Duration: {duration:.2f} seconds\n")
-                lf.write("\n--- Execution Error ---\n")
-                lf.write(str(exec_error) + "\n")
-                lf.write(traceback.format_exc() + "\n")
-                lf.flush()
-                raise
-                
-            finally:
-                # Always cleanup the process executor properly
-                if process_executor:
-                    try:
-                        # Ensure all processes are terminated using process tree killing
-                        if hasattr(process_executor, '_processes') and process_executor._processes:
-                            for process in process_executor._processes.values():
-                                if process and process.is_alive():
-                                    try:
-                                        subprocess_pid = process.pid
-                                        lf.write(f"Cleaning up subprocess PID: {subprocess_pid}\n")
-                                        lf.flush()
-                                        
-                                        # Use process tree killing for thorough cleanup
-                                        success = _kill_process_tree(subprocess_pid, timeout=3)
-                                        if success:
-                                            lf.write(f"Successfully cleaned up process tree for PID: {subprocess_pid}\n")
-                                        else:
-                                            lf.write(f"Failed to clean up process tree for PID: {subprocess_pid}\n")
-                                        lf.flush()
-                                    except Exception as kill_error:
-                                        lf.write(f"Error during process cleanup: {kill_error}\n")
-                                        lf.flush()
-                        
-                        # Shutdown with wait=True to ensure cleanup
-                        process_executor.shutdown(wait=True, cancel_futures=True)
-                        lf.write("ProcessPoolExecutor cleanup completed\n")
-                        lf.flush()
-                    except Exception as cleanup_error:
-                        lf.write(f"Error during final cleanup: {cleanup_error}\n")
-                        lf.flush()
-
-        # JSON-safe result; include log path for frontend consumption
-        result_json = convert_for_json(result)
-        if isinstance(result_json, dict):
-            execution_payload = {**result_json, "log_path": log_path}
-        else:
-            execution_payload = {"result": result_json, "log_path": log_path}
-
-        # Do not post_answer here: frontend calls summary_answer next, which posts once (avoids Chatbox JSON/summary race).
+            )
+            abs_log = os.path.abspath(log_path)
+            if abs_log == logs_base or abs_log.startswith(logs_base + os.sep):
+                safe_log_path = os.path.relpath(abs_log, logs_base).replace("\\", "/")
+        except Exception:
+            pass
+        execution_payload = {
+            **convert_for_json(exec_result.to_payload()),
+            "log_path": safe_log_path,
+        }
 
         return success_response({
-            "zarr_path": resolved_zarr_path,
+            "zarr_path": sanitize_client_path(resolved_zarr_path),
             "execution_result": execution_payload
         })
     except Exception as e:
@@ -2102,7 +1924,7 @@ os.environ['TL_EXPORT_DIR'] = {repr(absolute_export_path)}
             script_answer_wait_active = False
         # Append error/traceback to log file when possible
         try:
-            fallback_logs_base_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "storage", "tasknode_logs"))
+            fallback_logs_base_dir = os.path.join(SERVICE_STORAGE_DIR, "tasknode_logs")
             os.makedirs(fallback_logs_base_dir, exist_ok=True)
             
             # Use date-based subdirectory for error logs too
@@ -2117,9 +1939,7 @@ os.environ['TL_EXPORT_DIR'] = {repr(absolute_export_path)}
                 lf.write(traceback.format_exc() + "\n")
         except Exception:
             pass
-        return error_response(
-            f"Execution failed: {str(e)}" + (f", see log: {locals().get('log_path')}" if 'log_path' in locals() else "")
-        )
+        return error_response("Execution failed")
 
 
 @tasks_router.post("/v1/summary_answer")
@@ -2129,8 +1949,8 @@ async def agent_summary(
     auth_user: Optional[AuthUser] = Depends(get_optional_auth_user),
 ):
     """
-    Return natural language summary of the answer.
-    Delegates to Ctrl-Service for the summary.
+    Return natural language summary of the answer via the in-process agent,
+    falling back to a template summary when the agent is not configured.
     """
     try:
         question = request.prompt
@@ -2142,39 +1962,19 @@ async def agent_summary(
         response_text: Optional[str] = None
         ctrl_error: Optional[str] = None
 
-        # Delegate to Control Service for the summary
+        # In-process LLM agent (formerly a round trip to the control plane)
         try:
-            base_agent_url = settings.CTRL_SERVICE_API_ENDPOINT.rstrip("/")
-            payload = {
-                "agent_id": request.agent_id,
-                "prompt": question,
-                "parameters": parameters,
-            }
-            headers = {"Content-Type": "application/json"}
-            auth_header = http_request.headers.get("Authorization")
-            if auth_header:
-                headers["Authorization"] = auth_header
-
-            async with aiohttp.ClientSession() as session:
-                summary_url = f"{base_agent_url}/agent/v1/summary_answer"
-                async with session.post(summary_url, json=payload, headers=headers, timeout=120) as resp:
-                    resp.raise_for_status()
-                    text = await resp.text()
-                    ctrl_payload = json.loads(text)
-                    if ctrl_payload.get("code") == 0:
-                        response_data = ctrl_payload.get("data") or {}
-                        response_text = response_data.get("response") or response_data.get("summary")
-                    else:
-                        ctrl_error = ctrl_payload.get("message")
+            from app.services.agent.workflow_agent import get_workflow_agent
+            response_text = await get_workflow_agent().summary_answer(question, answer)
         except Exception as exc:
             ctrl_error = str(exc)
 
-        # Fallback to local simple summary if Control Service failed
+        # Fallback to a local template summary if the agent is unavailable
         if not response_text:
             try:
                 # Simple local fallback: generate a basic summary from the answer
                 response_text = _generate_simple_summary(question, answer)
-                logger.warning(f"[summary_answer] Ctrl-Service failed ({ctrl_error}), using local fallback")
+                logger.warning(f"[summary_answer] agent failed ({ctrl_error}), using local fallback")
             except Exception as fallback_exc:
                 # If fallback also fails, set response_text to empty string (matching original behavior)
                 # Original implementation would set response_text = "" and still call post_answer
@@ -2185,7 +1985,7 @@ async def agent_summary(
                     # Include both errors in ctrl_error for logging
                     ctrl_error = f"{ctrl_error}. Local fallback also failed: {fallback_error}"
                 response_text = ""  # Empty string, matching original behavior
-                logger.warning(f"[summary_answer] Both Ctrl-Service and fallback failed: {ctrl_error}")
+                logger.warning(f"[summary_answer] Both agent and fallback failed: {ctrl_error}")
 
         # Ensure Chatbox poller receives the summary (with user-specific state)
         # Always call post_answer, even if response_text is empty (matching original behavior)

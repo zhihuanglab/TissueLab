@@ -6,9 +6,9 @@ import { useState } from 'react'
 import { toast } from 'sonner'
 import { apiFetch } from '@/utils/common/apiFetch'
 import { getErrorMessage } from '@/utils/common/apiResponse'
-import { CTRL_SERVICE_API_ENDPOINT } from '@/constants/config'
-import { uploadFiles } from '@/utils/dashboard/fileManager.service'
-import { formatFileSize, readXGBClasses } from '@/utils/community.utils'
+import { COMMUNITY_API_ENDPOINT } from '@/config/api.config'
+import { uploadFiles } from '@/services/fileManager.service'
+import { formatFileSize, readXGBClasses } from '@/utils/community/community.utils'
 import { FACTORY_CATEGORIES } from '@/constants/community.constants'
 import type { ClassifierData } from '@/types/community.types'
 
@@ -95,7 +95,7 @@ export function useClassifierUpload(userInfo?: any) {
         const dt = new DataTransfer()
         dt.items.add(uploadFile_)
         const files = dt.files
-        const uploadResponse = await uploadFiles('classifiers', files, () => {} , false)
+        const uploadResponse = await uploadFiles('classifiers', files, () => {}, false, undefined, false, { endpoint: COMMUNITY_API_ENDPOINT })
         const originalFileName = uploadFile_.name.split('\\').pop()?.split('/').pop() || uploadFile_.name
         
         let actualFileName = originalFileName
@@ -160,16 +160,15 @@ export function useClassifierUpload(userInfo?: any) {
       }
       
       try {
-        const originalFileName = uploadFile_.name.split('\\').pop()?.split('/').pop() || uploadFile_.name
-        const actualFileName = filePath.split('/').pop() || originalFileName
-        
-        const mappingResponse = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/community/v1/classifiers/register`, {
+        const fallbackName = uploadFile_.name.split('\\').pop()?.split('/').pop() || uploadFile_.name
+        const actualFileName = filePath.split('/').pop() || fallbackName
+
+        const mappingResponse = await apiFetch(`${COMMUNITY_API_ENDPOINT}/community/v1/classifiers/register`, {
           method: 'POST',
           body: JSON.stringify({
             classifier_id: newClassifier.id,
             download_link: downloadLink,
             file_name: actualFileName,
-            original_file_name: originalFileName,
             file_path: filePath,
             title: capitalizedTitle,
             description: uploadDescription || 'User uploaded classifier',
@@ -181,15 +180,18 @@ export function useClassifierUpload(userInfo?: any) {
           })
         })
         
-        if (mappingResponse?.success) {
-          console.log('Classifier successfully saved to Firebase')
-        } else {
-          console.warn('Failed to save classifier to Firebase:', mappingResponse)
+        if (!mappingResponse?.success) {
+          // Don't swallow a failed registration: the file is on disk but with
+          // no Firestore doc it's invisible to the community (and to the
+          // uploader on any other device / after cache clear). Surface it as a
+          // real failure instead of pretending the upload succeeded.
+          throw new Error('Failed to register classifier to the community.')
         }
+        console.log('Classifier successfully saved to Firebase')
       } catch (error) {
-        console.warn('Failed to register classifier to Firebase:', error)
+        throw new Error(getErrorMessage(error, 'Failed to register classifier to the community.'))
       }
-      
+
       // Save to localStorage
       const savedClassifiers = JSON.parse(localStorage.getItem('userUploadedClassifiers') || '[]')
       savedClassifiers.unshift(newClassifier)

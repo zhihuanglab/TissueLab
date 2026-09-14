@@ -1,4 +1,4 @@
-import { cn } from "@/utils/twMerge"
+import { cn } from "@/utils/common/twMerge"
 import { cva, type VariantProps } from "class-variance-authority"
 import * as React from "react"
 

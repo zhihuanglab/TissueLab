@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Query, Body, Request, HTTPException
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, Response
 from typing import Optional, List, Tuple
 import traceback
 import json
@@ -12,7 +12,16 @@ import shutil
 import requests
 from concurrent.futures import ThreadPoolExecutor
 
-from app.core.response import success_response, error_response
+from app.core.response import success_response, error_response, permission_denied_response
+from app.core.executors import slide_metadata_executor
+from app.core.access import (
+    authorize_read_or_response,
+    guard_instance_owner,
+    guard_write_path,
+    guard_write_path_async,
+    sanitize_client_path,
+)
+from app.config.zarr_compat import as_zarr_path
 
 logger = logging.getLogger(__name__)
 
@@ -22,173 +31,296 @@ _MASK_EXECUTOR = ThreadPoolExecutor(
     max_workers=max(4, min(16, os.cpu_count() or 4)),
     thread_name_prefix="MaskWorker"
 )
-from app.services.seg_service import (
+from app.services.seg import (
     get_file_path,
     get_user_annotation_indices,
     query_viewport,
     reload_segmentation_data,
-    reset_segmentation_data,
     set_segmentation_types,
     update_class_color_service,
     update_patch_class_color_service,
     query_patches_in_viewport,
     get_segmentation_mask,
     list_mask_options,
+    clear_nuclei_annotations_in_region,
+    clear_tissue_annotations_in_region,
+    mark_patches_as_ground_truth,
+    remove_patch_annotations,
+    build_mask_binary_response,
+    save_annotation_batch_service,
+    resolve_classifier_tasknode_url,
     SegmentationHandler,
 )
 from app.utils import resolve_path
-from app.utils.request import get_device_id
-from app.websocket.segmentation_consumer import device_annotation_handlers
-from app.config.path_config import is_public_read_only_path
+from app.utils.common.request import get_instance_id
+from app.services.seg_registry import (
+    get_annotation_handler,
+    pop_instance_handlers,
+)
 
 # Create router
 seg_router = APIRouter()
 
 
+_SLIDE_FILE_EXTS = (
+    '.zarr.zip', '.zarr', '.svs', '.tiff', '.tif', '.ndpi', '.mrxs',
+    '.scn', '.bif', '.czi', '.dcm', '.vsi', '.qptiff',
+)
+
+
+def _slide_stem_for_filename(file_path: Optional[str]) -> str:
+    """Derive a short, filename-safe slide name from the handler's current
+    file path — drops directory + known slide extension so exports land as
+    `<slide>_<kind>_<timestamp>.csv`. Returns 'slide' as a generic fallback
+    when no path is available."""
+    import re
+    if not file_path:
+        return 'slide'
+    base = os.path.basename(file_path.rstrip('/').rstrip('\\'))
+    base_lower = base.lower()
+    for ext in _SLIDE_FILE_EXTS:
+        if base_lower.endswith(ext):
+            base = base[:-len(ext)]
+            break
+    base = re.sub(r'[^A-Za-z0-9._-]', '_', base).strip('_')
+    return base or 'slide'
+
+
+def _require_instance_id(request: Request) -> str:
+    """Handler-backed endpoints must identify the viewer session."""
+    instance_id = get_instance_id(request)
+    if not instance_id:
+        raise HTTPException(
+            status_code=400,
+            detail="X-Instance-ID header is required for segmentation handler APIs",
+        )
+    return instance_id
+
+
+def _get_owned_handler(request: Request, operation: str = "access segmentation instance"):
+    """Return ``(handler, None)`` or ``(None, denial_response)``."""
+    instance_id = get_instance_id(request)
+    if not instance_id:
+        return None, error_response(
+            "X-Instance-ID header is required for segmentation handler APIs",
+            code=400,
+        )
+    denied = guard_instance_owner(request, instance_id, operation)
+    if denied is not None:
+        return None, denied
+    handler = get_annotation_handler(instance_id)
+    if handler is None:
+        return None, error_response(
+            "No segmentation handler for this instance. Open a slide first.",
+            code=404,
+        )
+    return handler, None
+
+
+def _same_slide_path(a: Optional[str], b: Optional[str]) -> bool:
+    """True when two paths refer to the same slide (tolerates missing ``.zarr`` suffix)."""
+    if not a or not b:
+        return False
+    if SegmentationHandler._same_zarr_path(a, b):
+        return True
+
+    def _stem(path: str) -> str:
+        try:
+            p = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+        except Exception:
+            p = path
+        p = p.rstrip("/\\")
+        lower = p.lower()
+        if lower.endswith(".zarr.zip"):
+            return p[:-9]
+        if lower.endswith(".zarr"):
+            return p[:-5]
+        return p
+
+    try:
+        return _stem(a) == _stem(b)
+    except Exception:
+        return False
+
+
+def _ensure_handler_bound(
+    handler: SegmentationHandler,
+    file_path: Optional[str],
+    *,
+    need_centroids: bool = False,
+    need_patches: bool = False,
+) -> None:
+    """Load missing in-memory data for the handler's *already bound* slide.
+
+    Does not rebind to a different path. If ``file_path`` is provided and
+    refers to a different slide than ``handler.zarr_file``, raise HTTP 409.
+    """
+    bound = getattr(handler, 'zarr_file', None)
+    if file_path and bound and not _same_slide_path(bound, file_path):
+        raise ValueError(
+            "Request file_path does not match the instance handler's bound slide. "
+            "Re-bind via set_path for this instance first."
+        )
+    target = bound or file_path
+    if not target:
+        return
+    try:
+        handler.ensure_file(
+            target,
+            need_centroids=need_centroids,
+            need_patches=need_patches,
+        )
+    except (NotADirectoryError, PermissionError) as e:
+        # Normalize store-unavailable errors so callers that only catch
+        # FileNotFoundError (viewport query, etc.) degrade to 404 instead of 500.
+        raise FileNotFoundError(str(e)) from e
+
+
+def _parse_polygon_points(polygon_points_json: Optional[str]) -> Optional[List[Tuple[float, float]]]:
+    """Parse a JSON string of polygon vertices into a list of (x, y) tuples.
+
+    Returns None for missing or malformed input (lenient: filtering simply does not apply).
+    """
+    if not polygon_points_json:
+        return None
+    try:
+        parsed_points = json.loads(polygon_points_json)
+    except json.JSONDecodeError:
+        print(f"[WARN] Failed to decode polygon_points JSON: {polygon_points_json}")
+        return None
+    if isinstance(parsed_points, list) and all(
+        isinstance(p, (list, tuple)) and len(p) == 2 and all(isinstance(coord, (int, float)) for coord in p)
+        for p in parsed_points
+    ):
+        return [(float(p[0]), float(p[1])) for p in parsed_points]
+    print(f"[WARN] Invalid format received for polygon_points: {polygon_points_json}")
+    return None
+
+
 @seg_router.get("/v1/query")
-async def query(
+def query(
     request: Request,
     x1: float = Query(..., description="Raw BBox Top-left x"),
     y1: float = Query(..., description="Raw BBox Top-left y"),
     x2: float = Query(..., description="Raw BBox Bottom-right x"),
     y2: float = Query(..., description="Raw BBox Bottom-right y"),
-    # Use alias to match potential frontend param name, receive as JSON string
     polygon_points_json: Optional[str] = Query(None, alias="polygon_points", description="JSON string of polygon vertices [[x,y],...] in raw coordinates"),
     class_name: Optional[str] = Query(None, description="Class name"),
-    color: Optional[str] = Query(None, description="Color")
+    color: Optional[str] = Query(None, description="Color"),
+    with_classes: bool = Query(
+        False,
+        description=(
+            "Also return each matching cell's current class as `matching_class_ids` "
+            "(indices into the returned `class_names`; -1 = unclassified). Off by "
+            "default: the result set is unbounded and plain viewport refreshes do "
+            "not need it."
+        ),
+    ),
 ):
     """Query nuclei within viewport, optionally filtered by polygon"""
     try:
-        # Get file path using service function
-        # Make sure get_file_path correctly handles the request object or its params
         file_path = get_file_path(request)
-        print(f"Debug - query endpoint - Got file path: {file_path}")
-
         if not file_path:
-            # Use HTTPException for standard FastAPI error handling
             raise HTTPException(status_code=400, detail="No file path provided")
 
-        # Parse polygon_points_json if provided
-        polygon_points: Optional[List[Tuple[float, float]]] = None
-        if polygon_points_json:
-            try:
-                parsed_points = json.loads(polygon_points_json)
-                # Validate format: list of lists/tuples with 2 numbers
-                if isinstance(parsed_points, list) and all(
-                    isinstance(p, (list, tuple)) and len(p) == 2 and all(isinstance(coord, (int, float)) for coord in p)
-                    for p in parsed_points
-                ):
-                    polygon_points = [(float(p[0]), float(p[1])) for p in parsed_points]
-                    print(f"Debug - query endpoint - Parsed {len(polygon_points)} polygon vertices.")
-                else:
-                    print(f"[WARN] Invalid format received for polygon_points: {polygon_points_json}")
-                    # Optionally raise an error or proceed without polygon filtering
-                    # raise HTTPException(status_code=400, detail="Invalid format for polygon_points parameter.")
-            except json.JSONDecodeError:
-                print(f"[WARN] Failed to decode polygon_points JSON: {polygon_points_json}")
-
-        # Resolve device-scoped handler and call service with handler first
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            # Auto-create handler if not exists (e.g., after backend restart)
-            print(f"[query] No handler found for device {device_id}, creating one for file: {file_path}")
-            handler = SegmentationHandler()
-            handler.load_file(file_path)
-            device_annotation_handlers[device_id] = handler
-            print(f"[query] Handler created and cached for device {device_id}")
-        result = query_viewport(handler, x1, y1, x2, y2, polygon_points, class_name, color, file_path)
+        polygon_points = _parse_polygon_points(polygon_points_json)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _ensure_handler_bound(handler, file_path, need_centroids=True)
+        result = query_viewport(
+            handler, x1, y1, x2, y2, polygon_points, class_name, color, file_path,
+            with_classes=with_classes,
+        )
 
         return success_response(result)
 
-    # Let the service layer raise specific exceptions like FileNotFoundError, ValueError
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
-        # Use 400 for bad request data/logic errors, 404 if specifically file/resource not found by ID etc.
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
-        # Use 500 for unexpected server errors
         raise HTTPException(status_code=500, detail=f"Error querying data: {str(e)}")
 
 
 @seg_router.get("/v1/user_annotation_indices")
-async def user_annotation_indices(request: Request):
+def user_annotation_indices(request: Request):
     """Return indices of user-annotated (ground truth) nuclei and tissue for the current image.
-    Used when preference 'highlight user annotations (GT)' is on to always highlight these indices.
-    Query params: relative_path or file_path (same as other seg APIs).
+
+    Sync on purpose. This opens the sidecar store and reads the whole
+    User-Annotations/cell array; FastAPI runs a plain ``def`` route in a
+    worker thread, so neither that read nor the path authorization ahead of
+    it holds the event loop. As ``async def`` it froze every other request
+    and websocket message for the length of the read.
     """
     try:
         file_path = get_file_path(request)
         if not file_path:
             raise HTTPException(status_code=400, detail="No file path provided")
-        result = get_user_annotation_indices(file_path)
+        authorized_path, denied = authorize_read_or_response(
+            request, file_path, operation="read annotation indices"
+        )
+        if denied is not None:
+            return denied
+        result = get_user_annotation_indices(authorized_path)
         return success_response(result)
     except HTTPException:
         raise
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error reading annotation indices")
 
 
 @seg_router.get("/v1/query_patches")
-async def query_patches(
+def query_patches(
     request: Request,
     x1: float = Query(..., description="Raw BBox Top-left x"),
     y1: float = Query(..., description="Raw BBox Top-left y"),
     x2: float = Query(..., description="Raw BBox Bottom-right x"),
     y2: float = Query(..., description="Raw BBox Bottom-right y"),
     polygon_points_json: Optional[str] = Query(None, alias="polygon_points", description="JSON string of polygon vertices [[x,y],...] in raw coordinates"),
-    # Add other potential query params for patches if needed (e.g., class_name)
 ):
     """Query patches overlapping the viewport, optionally filtering by polygon containment of patch centroid."""
     try:
         file_path = get_file_path(request)
-        print(f"Debug - query_patches endpoint - Got file path: {file_path}")
         if not file_path:
             raise HTTPException(status_code=400, detail="No file path provided")
+        authorized_path, denied = authorize_read_or_response(
+            request, file_path, operation="query patches"
+        )
+        if denied is not None:
+            return denied
 
-        polygon_points: Optional[List[Tuple[float, float]]] = None
-        if polygon_points_json:
-            try:
-                parsed_points = json.loads(polygon_points_json)
-                if isinstance(parsed_points, list) and all(
-                    isinstance(p, (list, tuple)) and len(p) == 2 and all(isinstance(coord, (int, float)) for coord in p)
-                    for p in parsed_points
-                ):
-                    polygon_points = [(float(p[0]), float(p[1])) for p in parsed_points]
-                    print(f"Debug - query_patches endpoint - Parsed {len(polygon_points)} polygon vertices.")
-                else:
-                    print(f"[WARN] Invalid format received for polygon_points: {polygon_points_json}")
-            except json.JSONDecodeError:
-                print(f"[WARN] Failed to decode polygon_points JSON: {polygon_points_json}")
+        polygon_points = _parse_polygon_points(polygon_points_json)
 
-        # Resolve device-scoped handler and call service with handler first
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            raise HTTPException(status_code=404, detail="No handler found for device")
-        result = query_patches_in_viewport(handler, x1, y1, x2, y2, polygon_points, file_path)
+        # Path-only: reads patch coordinates directly from zarr (no in-memory handler).
+        result = query_patches_in_viewport(None, x1, y1, x2, y2, polygon_points, authorized_path)
 
-        return success_response(result) # Contains matching_patch_indices
+        return success_response(result)  # Contains matching_patch_indices
 
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+    except HTTPException:
+        raise
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Patch data not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error querying patch data: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error querying patch data")
+
 
 @seg_router.get("/v1/tissues")
-async def tissues(request: Request):
+def tissues(request: Request):
     """Get tissue data"""
     try:
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
         file_path = handler.get_current_file_path()
         # Only load if handler doesn't have data
         if handler.centroids is None:
@@ -197,19 +329,20 @@ async def tissues(request: Request):
         tissue_annotations = handler.get_all_tissue_annotations()
         return success_response({
             "tissues": tissues,
-            "tissue_annotations": tissue_annotations,
+            "patch": tissue_annotations,
             "count": len(tissues)
         })
     except ValueError as e:
         return error_response(str(e), code=404)
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(str(e))
 
+
 @seg_router.post("/v1/reload")
-async def reload(
-    request: Request
-):
+async def reload(request: Request):
     """Reload segmentation data"""
     try:
         body_bytes = await request.body()
@@ -221,56 +354,68 @@ async def reload(
         except:
             path = body_str.strip()
 
-        print(f"Debug - reload - Path: {path}")
-
         if not path:
             return error_response("No path provided", code=400)
 
-        # Concatenate to absolute path and verify
         abs_path = resolve_path(path)
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
-        result = reload_segmentation_data(handler, abs_path)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        # load_file is sync/IO — don't block the event loop (WS pings share it).
+        result = await asyncio.get_running_loop().run_in_executor(
+            slide_metadata_executor, reload_segmentation_data, handler, abs_path
+        )
 
         return success_response(result)
 
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(f"Error reloading data: {str(e)}")
 
+
 @seg_router.get("/v1/output_path")
-async def get_output_path(request: Request):
+def get_output_path(request: Request):
     """Get output path"""
     try:
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
         file_path = handler.get_current_file_path()
-        return success_response(file_path)
+        return success_response(sanitize_client_path(file_path))
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
-        return error_response(str(e))
+        return error_response("Error reading output path")
+
 
 @seg_router.post("/v1/reset")
-async def reset(request: Request):
-    """Reset all segmentation data when switching images"""
+def reset(request: Request):
+    """Drop the instance segmentation handler (e.g. leaving the viewer)."""
     try:
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
-        result = reset_segmentation_data(handler)
-        return success_response(result)
+        instance_id = _require_instance_id(request)
+        # Teardown: releasing a handler that is already gone is the goal, not a
+        # violation. Denying it left the handler registered for a viewer that
+        # had closed.
+        denied = guard_instance_owner(
+            request, instance_id, "reset segmentation", teardown=True
+        )
+        if denied is not None:
+            return denied
+        pop_instance_handlers(instance_id)
+        return success_response({"message": "Segmentation handler cleared for instance"})
 
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
-        return error_response(str(e))
+        return error_response("Error resetting segmentation handler")
+
 
 @seg_router.post("/v1/set_types")
-async def set_types(
+def set_types(
     request: Request,
     tissue: Optional[str] = Body(None, description="Tissue segmentation type"),
     nuclei: Optional[str] = Body(None, description="Nuclei segmentation type"),
@@ -278,62 +423,83 @@ async def set_types(
 ):
     """Set segmentation types"""
     try:
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
         result = set_segmentation_types(handler, tissue, nuclei, patch)
         return success_response(result)
 
     except ValueError as e:
         return error_response(str(e), code=400)
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(str(e))
 
 
 @seg_router.get("/v1/classifications")
-async def classifications(request: Request):
+def classifications(request: Request):
     """
     Get cell classification data
-    
+
     Returns:
       {
-        "nuclei_class_id": [...],
-        "nuclei_class_name": [...],
-        "nuclei_class_HEX_color": [...]
+        "class_indices": [...],
+        "class_names": [...],
+        "class_colors": [...]
       }
     """
     try:
-        # Use device-scoped handler and ensure file is loaded if provided
+        # Use instance-scoped handler and ensure file is loaded if provided
         try:
             file_path = get_file_path(request)
         except Exception:
             file_path = None
 
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
-        
-        # Only load file if handler doesn't have data or file path changed
-        if file_path:
-            current_path = getattr(handler, 'zarr_file', None)
-            if current_path != file_path or handler.centroids is None:
-                handler.load_file(file_path, force_reload=False, reload_segmentation_data=False)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
 
-        data = handler.get_cell_classification_data()
-        
+        # The viewer only needs the palette here: the overlay frames already
+        # carry each cell's class_id. Asking for the per-cell class_indices as
+        # well forced a full segmentation-data load — every centroid plus the
+        # KD-tree, measured at 1455 ms on a fresh handler, right in the middle
+        # of a slide switch.
+        #
+        # Sync endpoint on purpose: FastAPI runs it on its own worker threads,
+        # off the event loop and out of the pool the tile reads use.
+        try:
+            _ensure_handler_bound(handler, file_path, need_centroids=False)
+            data = handler.get_cell_classification_palette()
+            if data is None:
+                # Store layouts where the palette only materializes once the
+                # segmentation arrays are read. Pay the full load, but only for
+                # those — not on every slide switch.
+                _ensure_handler_bound(handler, file_path, need_centroids=True)
+                data = handler.get_cell_classification_palette()
+        except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
+            # No companion .zarr yet (or a stray non-directory at that path) —
+            # not an internal error; mirror the empty/missing-data response.
+            logger.warning("classifications: store unavailable: %s", e)
+            return error_response("No classification data in zarr", code=404)
+
+        if data is None:
+            return error_response("No classification data in zarr", code=404)
+
         return success_response(data)
 
     except ValueError as e:
         return error_response("No classification data in zarr", code=404)
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(str(e))
 
+
 @seg_router.get("/v1/total_counts")
-async def total_counts(request: Request):
+def total_counts(request: Request):
     """
     Get global nuclei label counts across the whole slide.
 
@@ -351,24 +517,25 @@ async def total_counts(request: Request):
             file_path = get_file_path(request)
         except Exception:
             file_path = None
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
-        # Only load file if file path changed (centroids check is done inside get_global_nuclei_label_counts if needed)
-        if file_path:
-            current_path = getattr(handler, 'zarr_file', None)
-            if current_path != file_path:
-                handler.load_file(file_path, force_reload=False, reload_segmentation_data=False)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        try:
+            _ensure_handler_bound(handler, file_path)
+        except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
+            logger.warning("total_counts: store unavailable: %s", e)
+            return error_response("No classification data in zarr", code=404)
         data = handler.get_global_nuclei_label_counts()
         return success_response(data)
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(str(e))
 
 
 @seg_router.get("/v1/region_probability_histogram")
-async def region_probability_histogram(
+def region_probability_histogram(
     request: Request,
     start_x: float = Query(..., description="BBox left (RAW scale)"),
     start_y: float = Query(..., description="BBox top (RAW scale)"),
@@ -385,29 +552,32 @@ async def region_probability_histogram(
             file_path = get_file_path(request)
         except Exception:
             file_path = None
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
-        if file_path:
-            current_path = getattr(handler, 'zarr_file', None)
-            if current_path != file_path:
-                handler.load_file(file_path, force_reload=False, reload_segmentation_data=False)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        try:
+            _ensure_handler_bound(handler, file_path)
+        except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
+            logger.warning("region_probability_histogram: store unavailable: %s", e)
+            return error_response("No classification data in zarr", code=404)
         data = handler.get_region_probability_histogram(start_x, start_y, end_x, end_y, class_id)
         return success_response(data)
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(str(e))
 
 
 @seg_router.get("/v1/manual_annotation_counts")
-async def manual_annotation_counts(request: Request):
+def manual_annotation_counts(request: Request):
     """
     Get manual annotation counts only (not including model predictions).
 
     Returns:
       {
-        "class_counts_by_id": {"0": int, ...},
+        "class_counts_by_id": {"0": int, ...},           # cells labelled as the class
+        "negative_class_counts_by_id": {"0": int, ...},  # cells marked "not this type"
         "dynamic_class_names": [str, ...]
       }
     """
@@ -416,44 +586,46 @@ async def manual_annotation_counts(request: Request):
             file_path = get_file_path(request)
         except Exception:
             file_path = None
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
-        # Only load file if file path changed (centroids not needed for class_counts)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        # Read-only counts: bind path if provided; missing store → empty counts.
         if file_path:
-            current_path = getattr(handler, 'zarr_file', None)
-            if current_path != file_path:
-                handler.load_file(file_path, force_reload=False, reload_segmentation_data=False)
+            try:
+                _ensure_handler_bound(handler, file_path)
+            except (FileNotFoundError, NotADirectoryError, PermissionError, ValueError) as e:
+                logger.warning(f"manual_annotation_counts: store unavailable, returning empty counts: {e}")
+                return success_response({"class_counts_by_id": {},
+                                         "negative_class_counts_by_id": {},
+                                         "dynamic_class_names": []})
 
-        # MULTI-USER: Extract instance_id from header for AL reclassifications (REQUIRED)
-        instance_id = request.headers.get("X-Instance-ID")
-        if not instance_id:
-            return error_response("X-Instance-ID header is required for multi-user isolation", code=400)
-        
-        # Get manual annotation counts from user_annotation/class_counts
         # get_all_nuclei_counts() includes AL reclassifications per instance
-        data = handler.get_all_nuclei_counts(instance_id=instance_id)
+        data = handler.get_all_nuclei_counts(instance_id=get_instance_id(request))
 
         return success_response(data)
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(str(e))
 
+
 @seg_router.get("/v1/annotation_colors")
-async def annotation_colors(request: Request):
+def annotation_colors(request: Request):
     """Get annotation colors"""
     try:
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
         colors = handler.get_annotation_colors()
         return success_response(colors)
 
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(str(e))
+
 
 @seg_router.post("/v1/update-class-color")
 async def update_class_color(
@@ -465,18 +637,25 @@ async def update_class_color(
     try:
         file_path = get_file_path(await request.json())
         if not file_path:
-             raise HTTPException(status_code=400, detail="File path is required.")
-        
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            raise HTTPException(status_code=404, detail="No handler found for device")
-        result = update_class_color_service(handler, class_name, new_color, file_path)
+            raise HTTPException(status_code=400, detail="File path is required.")
+
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _, denied = await guard_write_path_async(request, file_path, "update class color")
+        if denied is not None:
+            return denied
+        # zarr write under zarr_lock — off the loop, like delete_class.
+        result = await asyncio.to_thread(
+            update_class_color_service, handler, class_name, new_color, file_path
+        )
         return success_response(result)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error updating class color: {str(e)}")
@@ -492,26 +671,30 @@ async def update_patch_class_color(
     try:
         request_data = await request.json()
         file_path = get_file_path(request_data)
-        logger.info(f"[API] update-patch-class-color called: class_name='{class_name}', new_color='{new_color}', file_path='{file_path}'")
-        
+
         if not file_path:
-             raise HTTPException(status_code=400, detail="File path is required.")
-        
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            raise HTTPException(status_code=404, detail="No handler found for device")
-        result = update_patch_class_color_service(handler, class_name, new_color, file_path)
-        logger.info(f"[API] update-patch-class-color success: {result}")
+            raise HTTPException(status_code=400, detail="File path is required.")
+
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _, denied = await guard_write_path_async(request, file_path, "update patch class color")
+        if denied is not None:
+            return denied
+        result = await asyncio.to_thread(
+            update_patch_class_color_service, handler, class_name, new_color, file_path
+        )
         return success_response(result)
     except FileNotFoundError as e:
-        logger.error(f"[API] update-patch-class-color FileNotFoundError: {e}")
+        logger.error(f"[API] update-patch-class-color FileNotFoundError: {e}", exc_info=e)
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
-        logger.error(f"[API] update-patch-class-color ValueError: {e}")
+        logger.error(f"[API] update-patch-class-color ValueError: {e}", exc_info=e)
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"[API] update-patch-class-color Exception: {e}")
+        logger.error(f"[API] update-patch-class-color Exception: {e}", exc_info=e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error updating patch class color: {str(e)}")
 
@@ -529,45 +712,56 @@ async def delete_class(
         if not file_path:
             raise HTTPException(status_code=400, detail="File path is required.")
 
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            raise HTTPException(status_code=404, detail="No handler found for device")
-        # Only load file if handler doesn't have data or file path changed
-        current_path = getattr(handler, 'zarr_file', None)
-        if current_path != file_path or handler.centroids is None:
-            handler.load_file(file_path, force_reload=False, reload_segmentation_data=False)
-        result = handler.delete_class_in_zarr(class_name, reassign_to or "Negative control")
-        # After deletion, clear handler's cached class data to force reload from zarr file
-        # This ensures get_cell_classification_data() will read the updated colormap
-        handler.class_name = None
-        handler.class_hex_color = None
-        handler.invalidate_user_counts_cache()
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _, denied = await guard_write_path_async(request, file_path, "delete class")
+        if denied is not None:
+            return denied
+        # Binding loads every centroid and the rewrite walks the store. This one
+        # keeps `await request.json()`, so it cannot become a sync endpoint like
+        # its neighbours — hand the blocking part to the slide pool instead.
+        def _delete_class():
+            _ensure_handler_bound(handler, file_path, need_centroids=True)
+            result = handler.delete_class_in_zarr(class_name, reassign_to or "Negative control")
+            # Clear cached class data so the next read reloads from the zarr.
+            handler.class_name = None
+            handler.class_hex_color = None
+            handler.invalidate_user_counts_cache()
+            return result
+
+        result = await asyncio.get_running_loop().run_in_executor(
+            slide_metadata_executor, _delete_class
+        )
         return success_response(result)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error deleting class: {str(e)}")
 
+
 @seg_router.get("/v1/annotations")
-async def annotations(
+def annotations(
     request: Request,
     offset: int = Query(0, description="Start index of annotations"),
     limit: Optional[int] = Query(None, description="Maximum number of annotations to return")
 ):
-    """
-    Get annotations with pagination
-    """
+    """Get annotations with pagination"""
     try:
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        # Read ACL only (Viewer/Samples hydrate/sidebar). Export routes use guard_write_path.
+        path = handler.get_current_file_path() or ""
+        _, denied = authorize_read_or_response(request, path, operation="list annotations")
+        if denied is not None:
+            return denied
         file_path = handler.get_current_file_path()
-        print(f"[Debug] annotations - file_path: {file_path}")
         # Only load if handler doesn't have data
         if handler.centroids is None:
             handler.load_file(file_path, force_reload=False, reload_segmentation_data=False)
@@ -578,27 +772,28 @@ async def annotations(
         })
     except ValueError as e:
         return error_response(str(e), code=404)
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(str(e))
 
+
 @seg_router.get("/v1/annotations/export/csv")
-async def export_annotations_csv(request: Request):
+def export_annotations_csv(request: Request):
     """
     Export all cell annotations as CSV in streaming fashion.
     Optimized for large datasets (300k+ cells) by streaming data in batches.
-
-    Returns:
-        StreamingResponse: CSV file with columns: ID, Centroid_X, Centroid_Y, MinX, MinY, MaxX, MaxY, Contours
     """
     try:
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            raise HTTPException(status_code=404, detail="No handler found for device")
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _, denied = guard_write_path(request, handler.get_current_file_path() or "", "export annotations")
+        if denied is not None:
+            return denied
 
         file_path = handler.get_current_file_path()
-        logger.info(f"[API] export_annotations_csv - file_path: {file_path}")
 
         # Only load if handler doesn't have data
         if handler.centroids is None:
@@ -609,15 +804,16 @@ async def export_annotations_csv(request: Request):
             raise HTTPException(status_code=404, detail="No annotation data available")
 
         total_cells = len(handler.centroids)
-        logger.info(f"[API] Starting CSV export for {total_cells} cells")
 
         # Use the streaming generator from handler
         csv_generator = handler.generate_annotations_csv_stream(batch_size=5000)
 
-        # Generate unique filename with timestamp to avoid browser caching issues
+        # Generate unique filename with timestamp to avoid browser caching issues.
+        # Slide stem in front so multiple exports from different slides sort together.
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"Cell_Classification_Overview_{timestamp}.csv"
+        stem = _slide_stem_for_filename(file_path)
+        filename = f"{stem}_Cell_{timestamp}.csv"
 
         return StreamingResponse(
             csv_generator,
@@ -625,23 +821,23 @@ async def export_annotations_csv(request: Request):
             headers={
                 "Content-Disposition": f"attachment; filename={filename}",
                 "Cache-Control": "no-cache",
-                "X-Total-Cells": str(total_cells)  # Add total count to header for verification
+                "X-Total-Cells": str(total_cells)
             }
         )
 
     except HTTPException:
         raise
     except ValueError as e:
-        logger.error(f"[API] export_annotations_csv ValueError: {e}")
+        logger.error(f"[API] export_annotations_csv ValueError: {e}", exc_info=e)
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        logger.error(f"[API] export_annotations_csv Exception: {e}")
+        logger.error(f"[API] export_annotations_csv Exception: {e}", exc_info=e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error exporting CSV: {str(e)}")
 
 
 @seg_router.get("/v1/annotations/export/geojson")
-async def export_annotations_geojson(
+def export_annotations_geojson(
     request: Request,
     batch_size: int = Query(
         31523,
@@ -652,18 +848,16 @@ async def export_annotations_geojson(
 ):
     """
     Export all cell segmentation/classification annotations as GeoJSON.
-
-    Returns:
-        StreamingResponse: GeoJSON FeatureCollection (QuPath-compatible properties)
     """
     try:
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            raise HTTPException(status_code=404, detail="No handler found for device")
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _, denied = guard_write_path(request, handler.get_current_file_path() or "", "export annotations")
+        if denied is not None:
+            return denied
 
         file_path = handler.get_current_file_path()
-        logger.info(f"[API] export_annotations_geojson - file_path: {file_path}")
 
         if handler.centroids is None:
             handler.load_file(file_path, force_reload=False, reload_segmentation_data=False)
@@ -672,7 +866,6 @@ async def export_annotations_geojson(
             raise HTTPException(status_code=404, detail="No annotation data available")
 
         total_cells = len(handler.centroids)
-        logger.info(f"[API] Starting GeoJSON export for {total_cells} cells")
 
         geojson_generator = handler.generate_annotations_geojson_stream(
             batch_size=batch_size,
@@ -680,7 +873,8 @@ async def export_annotations_geojson(
 
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"Cell_Segmentation_Classification_{timestamp}.geojson"
+        stem = _slide_stem_for_filename(file_path)
+        filename = f"{stem}_Cell_{timestamp}.geojson"
 
         return StreamingResponse(
             geojson_generator,
@@ -695,86 +889,332 @@ async def export_annotations_geojson(
     except HTTPException:
         raise
     except ValueError as e:
-        logger.error(f"[API] export_annotations_geojson ValueError: {e}")
+        logger.error(f"[API] export_annotations_geojson ValueError: {e}", exc_info=e)
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        logger.error(f"[API] export_annotations_geojson Exception: {e}")
+        logger.error(f"[API] export_annotations_geojson Exception: {e}", exc_info=e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error exporting GeoJSON: {str(e)}")
 
+
+@seg_router.get("/v1/annotations/export/user/csv")
+def export_user_annotations_csv(request: Request):
+    """Export USER-set annotations only — manually reclassified nuclei +
+    user-drawn tissue polygons — as CSV. Differs from /export/csv which
+    streams the full cell-classification segmentation output."""
+    try:
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _, denied = guard_write_path(request, handler.get_current_file_path() or "", "export annotations")
+        if denied is not None:
+            return denied
+
+        file_path = handler.get_current_file_path()
+        if handler.centroids is None:
+            handler.load_file(file_path, force_reload=False, reload_segmentation_data=False)
+
+        csv_generator = handler.generate_user_annotations_csv_stream(batch_size=5000)
+
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = _slide_stem_for_filename(file_path)
+        filename = f"{stem}_User_Annotations_{timestamp}.csv"
+        return StreamingResponse(
+            csv_generator,
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Cache-Control": "no-cache",
+            },
+        )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        logger.error(f"[API] export_user_annotations_csv ValueError: {e}", exc_info=e)
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"[API] export_user_annotations_csv Exception: {e}", exc_info=e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error exporting user CSV: {str(e)}")
+
+
+@seg_router.get("/v1/annotations/export/user/geojson")
+def export_user_annotations_geojson(
+    request: Request,
+    batch_size: int = Query(
+        5000,
+        ge=500,
+        le=20000,
+        description="GeoJSON streaming batch size (features per chunk)",
+    ),
+):
+    """Export USER-set annotations as GeoJSON. Features carry a QuPath-style
+    `properties.classification` and a `properties.kind` ('cell' or 'polygon')
+    so the file can be split downstream if needed."""
+    try:
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _, denied = guard_write_path(request, handler.get_current_file_path() or "", "export annotations")
+        if denied is not None:
+            return denied
+
+        file_path = handler.get_current_file_path()
+        if handler.centroids is None:
+            handler.load_file(file_path, force_reload=False, reload_segmentation_data=False)
+
+        geojson_generator = handler.generate_user_annotations_geojson_stream(batch_size=batch_size)
+
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = _slide_stem_for_filename(file_path)
+        filename = f"{stem}_User_Annotations_{timestamp}.geojson"
+        return StreamingResponse(
+            geojson_generator,
+            media_type="application/geo+json",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Cache-Control": "no-cache",
+            },
+        )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        logger.error(f"[API] export_user_annotations_geojson ValueError: {e}", exc_info=e)
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"[API] export_user_annotations_geojson Exception: {e}", exc_info=e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error exporting user GeoJSON: {str(e)}")
+
+
+@seg_router.get("/v1/annotations/user/list")
+def list_user_annotations(request: Request):
+    """Return the user's saved annotations as JSON — one entry per save event
+    (cell + patch), same source as the CSV/GeoJSON export. For the sidebar
+    panel to display the real saved annotations (class / method / datetime)."""
+    try:
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        path = handler.get_current_file_path() or ""
+        _, denied = authorize_read_or_response(request, path, operation="list annotations")
+        if denied is not None:
+            return denied
+        file_path = handler.get_current_file_path()
+        if getattr(handler, 'centroids', None) is None:
+            try:
+                handler.load_file(file_path, force_reload=False, reload_segmentation_data=False)
+            except Exception:
+                pass
+        events = handler._collect_user_annotation_save_events()
+        return success_response({"annotations": events, "total": len(events)})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[API] list_user_annotations Exception: {e}", exc_info=e)
+        traceback.print_exc()
+        return error_response(f"Error listing user annotations: {str(e)}", code=500)
+
+
+@seg_router.get("/v1/classification/metadata")
+def classification_metadata(request: Request):
+    """Return each classifier's last run time — the model-zoo tasknodes write
+    `created_at` (and training/testing times) under
+    `<Cell|Patch-Classification>/metadata.attrs`, refreshed every run. Used by
+    the sidebar to show the most-recent classification time per layer."""
+    try:
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        file_path = handler.get_current_file_path()
+        result = {"cell": None, "patch": None}
+        try:
+            from app.config.zarr_compat import open_zarr
+            zf = open_zarr(file_path, mode='r')
+            for key, grp in (("cell", "Cell-Classification"), ("patch", "Patch-Classification")):
+                try:
+                    if grp in zf and 'metadata' in zf[grp]:
+                        meta = dict(zf[grp]['metadata'].attrs)
+                        result[key] = {
+                            "created_at": meta.get("created_at"),
+                            "training_time_sec": meta.get("training_time_sec"),
+                            "testing_time_sec": meta.get("testing_time_sec"),
+                        }
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                logger.error(f"classification_metadata read failed: {e}", exc_info=True)
+            except Exception:
+                pass
+        return success_response(result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[API] classification_metadata Exception: {e}", exc_info=e)
+        traceback.print_exc()
+        return error_response(f"Error reading classification metadata: {str(e)}", code=500)
+
+
+@seg_router.get("/v1/annotations/export/patch/csv")
+def export_patch_classification_csv(request: Request):
+    """Export per-patch AI classification results as CSV — the patch
+    counterpart of /export/csv (cell classification)."""
+    try:
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _, denied = guard_write_path(request, handler.get_current_file_path() or "", "export annotations")
+        if denied is not None:
+            return denied
+
+        file_path = handler.get_current_file_path()
+        if getattr(handler, 'patch_coordinates', None) is None:
+            handler.load_file(file_path, force_reload=False)
+        csv_generator = handler.generate_patch_classification_csv_stream(batch_size=5000)
+
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = _slide_stem_for_filename(file_path)
+        filename = f"{stem}_Patch_Classification_{timestamp}.csv"
+        return StreamingResponse(
+            csv_generator,
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Cache-Control": "no-cache",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[API] export_patch_classification_csv Exception: {e}", exc_info=e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error exporting patch CSV: {str(e)}")
+
+
+@seg_router.get("/v1/annotations/export/patch/geojson")
+def export_patch_classification_geojson(
+    request: Request,
+    batch_size: int = Query(5000, ge=500, le=20000,
+                            description="GeoJSON streaming batch size (features per chunk)"),
+):
+    """Export per-patch AI classification results as GeoJSON (one rectangle
+    feature per classified patch)."""
+    try:
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _, denied = guard_write_path(request, handler.get_current_file_path() or "", "export annotations")
+        if denied is not None:
+            return denied
+
+        file_path = handler.get_current_file_path()
+        if getattr(handler, 'patch_coordinates', None) is None:
+            handler.load_file(file_path, force_reload=False)
+        geojson_generator = handler.generate_patch_classification_geojson_stream(batch_size=batch_size)
+
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = _slide_stem_for_filename(file_path)
+        filename = f"{stem}_Patch_Classification_{timestamp}.geojson"
+        return StreamingResponse(
+            geojson_generator,
+            media_type="application/geo+json",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Cache-Control": "no-cache",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[API] export_patch_classification_geojson Exception: {e}", exc_info=e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error exporting patch GeoJSON: {str(e)}")
+
+
 @seg_router.get("/v1/patch_classification")
-async def patch_classification(request: Request):
+def patch_classification(request: Request):
     """Get patch classification data"""
     try:
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
         class_id, class_name, class_hex_color, class_counts = handler.get_patch_classification()
-        print("get patch classification data")
-        print(f"class_id: {class_id}, class_name: {class_name}, class_hex_color: {class_hex_color}, class_counts: {class_counts}")
-        
+
         # The data needs to be wrapped in a 'data' key for the frontend
         response_data = {
             "class_id": class_id,
             "class_name": class_name,
             "class_hex_color": class_hex_color,
-            "class_counts": class_counts # Corrected key
+            "class_counts": class_counts
         }
         return success_response(response_data)
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(str(e))
 
+
 @seg_router.post("/v1/export/classifications")
-async def export_classifications(
+def export_classifications(
     request: Request,
     format_data: dict = Body({"format": "json"}, description="Export format, supports json or csv")
 ):
     """Export classification data and return it directly"""
     try:
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
-        
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _, denied = guard_write_path(request, handler.get_current_file_path() or "", "export classifications")
+        if denied is not None:
+            return denied
+
         # Get classification data
         classification_data = handler.get_cell_classification_data()
         if not classification_data:
             return error_response("No classification data available", code=404)
-        
+
         format = format_data.get("format", "json")
-        
+
         if format.lower() == "json":
             return success_response(classification_data)
         else:
             return error_response("Unsupported format. Only 'json' format is supported for complex annotation data", code=400)
-            
+
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
-        import traceback
         error_trace = traceback.format_exc()
         return error_response({
             "message": f"Error exporting classifications: {str(e)}",
             "details": error_trace
         }, code=500)
 
+
 @seg_router.post("/v1/export/patch_classification")
-async def export_patch_classification(
+def export_patch_classification(
     request: Request,
     format_data: dict = Body({"format": "json"}, description="Export format, supports json or csv")
 ):
     """Export patch classification data and return it directly"""
     try:
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
-        
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _, denied = guard_write_path(request, handler.get_current_file_path() or "", "export classifications")
+        if denied is not None:
+            return denied
+
         # Get patch classification data
         class_id, class_name, class_hex_color, class_counts = handler.get_patch_classification()
-        
+
         # Format the data
         patch_data = {
             "class_id": class_id,
@@ -782,24 +1222,26 @@ async def export_patch_classification(
             "class_hex_color": class_hex_color,
             "class_counts": class_counts
         }
-        
+
         format = format_data.get("format", "json")
-        
+
         if format.lower() == "json":
             return success_response(patch_data)
         else:
             return error_response("Unsupported format. Only 'json' format is supported for complex annotation data", code=400)
-            
+
+    except HTTPException:
+        raise
     except Exception as e:
-        import traceback
         error_trace = traceback.format_exc()
         return error_response({
             "message": f"Error exporting patch classification: {str(e)}",
             "details": error_trace
         }, code=500)
 
+
 @seg_router.get("/v1/merged_patches")
-async def merged_patches(
+def merged_patches(
     request: Request,
     x1: float = Query(..., description="Viewport top left x coordinate"),
     y1: float = Query(..., description="Viewport top left y coordinate"),
@@ -808,10 +1250,9 @@ async def merged_patches(
 ):
     """get the merged patches annotations in viewport"""
     try:
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
         # get and load the current file
         file_path = handler.get_current_file_path()
         if not file_path:
@@ -819,7 +1260,6 @@ async def merged_patches(
 
         # Only load if handler doesn't have data
         if handler.centroids is None:
-            print(f"[Debug] merged_patches - Loading file: {file_path}")
             handler.load_file(file_path, force_reload=False, reload_segmentation_data=False)
 
         merged_annotations = handler.merge_patches_in_viewport(x1, y1, x2, y2)
@@ -830,12 +1270,15 @@ async def merged_patches(
             "annotations": list(merged_annotations.values()),
             "count": len(merged_annotations)
         })
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(str(e))
 
+
 @seg_router.get("/v1/merged_patches/query")
-async def patches(
+def patches(
     request: Request,
     x1: float = Query(..., description="Viewport top left x coordinate"),
     y1: float = Query(..., description="Viewport top left y coordinate"),
@@ -844,17 +1287,15 @@ async def patches(
 ):
     """get the merged patches in viewport"""
     try:
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
         file_path = handler.get_current_file_path()
         if not file_path:
             return error_response("No file path available", code=404)
 
         # Only load if handler doesn't have data
         if handler.centroids is None:
-            print(f"[Debug] patches - Loading file: {file_path}")
             handler.load_file(file_path, force_reload=False, reload_segmentation_data=False)
 
         merged_annotations = handler.get_merged_patches_in_viewport(x1, y1, x2, y2)
@@ -868,71 +1309,73 @@ async def patches(
             "annotations": list(merged_annotations.values()),
             "count": len(merged_annotations)
         })
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(str(e))
 
+
 @seg_router.post("/v1/merged_patches/process")
-async def process_patches(request: Request):
+def process_patches(request: Request):
     """process all patches and store the merged patches in cache"""
     try:
-        print(f"[Debug] process_patches - Called")
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
         file_path = handler.get_current_file_path()
         if not file_path:
             return error_response("No file path available", code=404)
 
-        print(f"[Debug] process_patches - Processing file: {file_path}")
         handler.process_and_store_merged_patches()
 
         cache_size = len(handler._merged_patches_cache) if hasattr(handler, '_merged_patches_cache') else 0
-        print(f"[Debug] process_patches - Cache size: {cache_size}")
         return success_response({
             "message": "Successfully processed and cached patches",
             "cache_size": cache_size
         })
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(str(e))
 
 
 @seg_router.get("/v1/patches")
-async def patches(
+def patches(
     request: Request,
     offset: int = Query(0, description="Start index of patch annotations"),
     limit: Optional[int] = Query(
         None, description="Maximum number of patch annotations to return")):
-    """
-    Get patch annotations with pagination
-    """
-    print(f"[Debug] patches is called, offset: {offset}, limit: {limit}")
+    """Get patch annotations with pagination"""
     try:
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            return error_response("No handler found for device", code=404)
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        path = handler.get_current_file_path() or ""
+        _, denied = authorize_read_or_response(request, path, operation="list annotations")
+        if denied is not None:
+            return denied
         file_path = handler.get_current_file_path()
-        #print(f"[Debug] patches - file_path: {file_path}")
         # Only load if handler doesn't have data
         if handler.centroids is None:
             handler.load_file(file_path, force_reload=False, reload_segmentation_data=False)
         annotations, total_count = handler.get_patches(offset, limit)
-        #print(f"[Debug] patches - annotations: {annotations[0]}, total_count: {total_count}")
         return success_response({
             "annotations": annotations,
             "count": total_count
         })
     except ValueError as e:
         return error_response(str(e), code=404)
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(str(e))
 
+
 @seg_router.get("/v1/mask_options")
-async def get_mask_options(request: Request):
+def get_mask_options(request: Request):
     """List available mask datasets for overlay (e.g. Segmentation/mask_tissuename or default)."""
     try:
         file_path = get_file_path(request)
@@ -966,70 +1409,22 @@ async def get_mask(
         file_path = get_file_path(request)
         if not file_path:
             raise HTTPException(status_code=400, detail="No file path provided")
-        
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        if not handler:
-            raise HTTPException(status_code=404, detail="No handler found for device")
-        
+
+        # Path-only: mask is read from zarr by file_path (handler unused when path set).
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             _MASK_EXECUTOR,
             get_segmentation_mask,
-            handler, x1, y1, x2, y2, file_path, target_width, target_height, mask_key
+            None, x1, y1, x2, y2, file_path, target_width, target_height, mask_key
         )
-        
+
         if not result.get("success"):
             raise HTTPException(status_code=404, detail=result.get("error", "Failed to load mask"))
-        
-        # Return binary response similar to radiology mask endpoint
-        from fastapi.responses import Response
-        import struct
-        
-        # Create binary response with metadata header
-        data_bytes = result["data"]
-        shape = result["shape"]
-        offset = result.get("offset", [0, 0])
-        full_shape = result.get("full_shape", shape)
-        tissue_class = result.get("tissue_class")
-        
-        # Encode tissue_class if present
-        tissue_class_bytes = b""
-        if tissue_class:
-            tissue_class_bytes = tissue_class.encode('utf-8')
-        
-        # Header: success(4) + shape0(4) + shape1(4) + offset_x(4) + offset_y(4) + full_shape0(4) + full_shape1(4) + data_len(4) + tissue_class_len(4) = 36 bytes
-        header = struct.pack('<IIIIIIIII',
-            1,  # success
-            shape[0],  # height
-            shape[1],  # width
-            offset[0],  # offset_x
-            offset[1],  # offset_y
-            full_shape[0],  # full_height
-            full_shape[1],  # full_width
-            len(data_bytes),  # data length
-            len(tissue_class_bytes)  # tissue_class length
-        )
-        
-        response_content = header + data_bytes + tissue_class_bytes
-        
-        # Get region_size from result if available (actual region size before downsampling)
-        region_size = result.get("region_size", None)
-        
-        response_headers = {
-            "X-Mask-Shape": f"{shape[0]},{shape[1]}",
-            "X-Mask-Offset": f"{offset[0]},{offset[1]}",
-            "X-Mask-Full-Shape": f"{full_shape[0]},{full_shape[1]}"
-        }
-        
-        if region_size:
-            response_headers["X-Mask-Region-Size"] = f"{region_size[0]},{region_size[1]}"
-        
-        if tissue_class:
-            response_headers["X-Tissue-Class"] = tissue_class
-        
+
+        # Pack the mask into a binary response (header + data + tissue_class)
+        content, response_headers = build_mask_binary_response(result)
         return Response(
-            content=response_content,
+            content=content,
             media_type="application/octet-stream",
             headers=response_headers
         )
@@ -1041,7 +1436,7 @@ async def get_mask(
 
 
 @seg_router.post("/v1/clear_nuclei_annotations")
-async def clear_nuclei_annotations(
+def clear_nuclei_annotations(
     request: Request,
     path: str = Body(..., description="Path to the zarr file"),
     x1: float = Body(..., description="Bounding box x1"),
@@ -1052,37 +1447,34 @@ async def clear_nuclei_annotations(
 ):
     """Clear all nuclei annotations within the specified region"""
     try:
-        from app.services.seg_service import clear_nuclei_annotations_in_region
-        
         abs_path = resolve_path(path)
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        
-        # Auto-create handler if not exists (e.g., after backend restart)
-        if not handler:
-            print(f"[clear_nuclei_annotations] No handler found for device {device_id}, creating one for file: {abs_path}")
-            handler = SegmentationHandler()
-            handler.load_file(abs_path)
-            device_annotation_handlers[device_id] = handler
-            print(f"[clear_nuclei_annotations] Handler created and cached for device {device_id}")
-        
+        _, denied = guard_write_path(request, path, "clear annotations")
+        if denied is not None:
+            return denied
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _ensure_handler_bound(handler, abs_path, need_centroids=True)
+
         result = clear_nuclei_annotations_in_region(
             handler=handler,
             file_path=abs_path,
             x1=x1, y1=y1, x2=x2, y2=y2,
             polygon_points=polygon_points
         )
-        
+
         return success_response(result)
     except ValueError as e:
         return error_response(str(e), code=400)
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(f"Error clearing nuclei annotations: {str(e)}")
 
 
 @seg_router.post("/v1/clear_tissue_annotations")
-async def clear_tissue_annotations(
+def clear_tissue_annotations(
     request: Request,
     path: str = Body(..., description="Path to the zarr file"),
     x1: float = Body(..., description="Bounding box x1"),
@@ -1093,30 +1485,27 @@ async def clear_tissue_annotations(
 ):
     """Clear all tissue annotations within the specified region"""
     try:
-        from app.services.seg_service import clear_tissue_annotations_in_region
-        
         abs_path = resolve_path(path)
-        device_id = get_device_id(request)
-        handler = device_annotation_handlers.get(device_id)
-        
-        # Auto-create handler if not exists (e.g., after backend restart)
-        if not handler:
-            print(f"[clear_tissue_annotations] No handler found for device {device_id}, creating one for file: {abs_path}")
-            handler = SegmentationHandler()
-            handler.load_file(abs_path)
-            device_annotation_handlers[device_id] = handler
-            print(f"[clear_tissue_annotations] Handler created and cached for device {device_id}")
-        
+        _, denied = guard_write_path(request, path, "clear annotations")
+        if denied is not None:
+            return denied
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _ensure_handler_bound(handler, abs_path, need_patches=True)
+
         result = clear_tissue_annotations_in_region(
             handler=handler,
             file_path=abs_path,
             x1=x1, y1=y1, x2=x2, y2=y2,
             polygon_points=polygon_points
         )
-        
+
         return success_response(result)
     except ValueError as e:
         return error_response(str(e), code=400)
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return error_response(f"Error clearing tissue annotations: {str(e)}")
@@ -1124,104 +1513,132 @@ async def clear_tissue_annotations(
 
 @seg_router.post("/v1/save_annotation/batch")
 def save_annotation_batch(req: dict, request: Request):
-    """
-    Batch save annotations (mark as ground truth). Calls seg_service mark_*_in_region.
-    Request body: path, annotation_type ('nuclei'|'tissue'), x1, y1, x2, y2, optional polygon_points.
-    Header: X-Instance-ID.
+    """Batch-mark nuclei/tissue as ground truth; delegates to the seg service
+    (mark_nuclei / mark_patches_as_ground_truth_in_region).
+
+    Request body:
+      - path: zarr file path
+      - annotation_type: 'nuclei' | 'tissue'
+      - Region selection: x1, y1, x2, y2 (+ optional polygon_points) — marks
+        everything inside the bbox / polygon.
+      - Explicit-id selection (nuclei only): cell_indices [int] marks just
+        those cells; optional cell_classes {cell_id: class_name} overrides the
+        AI prediction for listed cells. This is the path the review panel uses
+        — when cell_indices is given the bounding box is unused and not
+        required.
+    Header: X-Instance-ID (required).
     """
     path = req.get("path", "")
-    if is_public_read_only_path(path):
-        return error_response("Cannot annotate in sample or data directories. Please use your personal workspace instead.", code=403)
-    instance_id = request.headers.get("X-Instance-ID")
+    _, denied = guard_write_path(request, path, "annotate")
+    if denied is not None:
+        return denied
+    instance_id = get_instance_id(request)
     if not instance_id:
         return error_response("X-Instance-ID header is required")
-    device_id = get_device_id(request)
-    for key in ["path", "zarr_path", "file_path"]:
-        if key in req and isinstance(req.get(key), str):
-            req[key] = resolve_path(req[key])
-    req["instance_id"] = instance_id
+    # guard_write_path covers the path; this covers the session it runs through.
+    denied = guard_instance_owner(request, instance_id, "save batch annotation")
+    if denied is not None:
+        return denied
+    try:
+        result = save_annotation_batch_service(instance_id, req)
+        return success_response(result)
+    except ValueError as e:
+        return error_response(str(e))
 
-    handler = device_annotation_handlers.get(device_id)
-    if not handler:
-        abs_path = req.get("path") or resolve_path(path)
-        handler = SegmentationHandler()
-        handler.load_file(abs_path)
-        device_annotation_handlers[device_id] = handler
 
-    from app.services.load_service import get_session_data
-    session_data = get_session_data(instance_id)
-    session_path_raw = session_data.get("current_file_path")
-    request_path_raw = req.get("path")
-    if session_path_raw and request_path_raw:
-        session_zarr = session_path_raw if str(session_path_raw).lower().endswith(".zarr") else f"{session_path_raw}.zarr"
-        request_resolved = resolve_path(request_path_raw)
-        request_zarr = request_resolved if str(request_resolved).lower().endswith(".zarr") else f"{request_resolved}.zarr"
-        session_abs = os.path.realpath(resolve_path(session_zarr))
-        request_abs = os.path.realpath(resolve_path(request_zarr))
-        if session_abs != request_abs:
-            return error_response("Session file path and request path must point to the same Zarr file")
-
-    if session_path_raw:
-        wsi_path = session_path_raw
-        zarr_path = wsi_path if str(wsi_path).lower().endswith(".zarr") else f"{wsi_path}.zarr"
-        zarr_path = resolve_path(zarr_path)
-    else:
-        zarr_path = resolve_path(request_path_raw) if request_path_raw else None
-    if not zarr_path or not os.path.exists(zarr_path):
-        return error_response("No Zarr path available or file not found")
-
-    annotation_type = req.get("annotation_type", "nuclei")
-    x1, y1, x2, y2 = req.get("x1"), req.get("y1"), req.get("x2"), req.get("y2")
-    polygon_points = req.get("polygon_points")
-    if x1 is None or y1 is None or x2 is None or y2 is None:
-        return error_response("Bounding box coordinates (x1, y1, x2, y2) are required")
-
-    if annotation_type == "nuclei":
-        from app.services.seg_service import mark_nuclei_as_ground_truth_in_region
-        cell_indices = req.get("cell_indices")  # optional: only mark these cell ids (e.g. filter highlight)
-        result = mark_nuclei_as_ground_truth_in_region(
-            handler=handler, file_path=zarr_path,
-            x1=x1, y1=y1, x2=x2, y2=y2, polygon_points=polygon_points,
-            cell_indices=cell_indices if isinstance(cell_indices, list) else None
+@seg_router.post("/v1/save_patch_annotations")
+def save_patch_annotations(
+    request: Request,
+    path: str = Body(..., description="Path to the zarr file"),
+    patch_indices: List[int] = Body(..., description="Patch ids to mark as ground truth"),
+    patch_classes: Optional[dict] = Body(None, description="{patch_id: class_name} explicit-class overrides (review 'No')"),
+    annotator: str = Body("Unknown", description="The user who marked these patches"),
+):
+    """Mark specific patches as ground-truth user annotations (patch review save)."""
+    try:
+        _, denied = guard_write_path(request, path, "annotate")
+        if denied is not None:
+            return denied
+        abs_path = as_zarr_path(resolve_path(path))
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _ensure_handler_bound(handler, abs_path, need_patches=True)
+        result = mark_patches_as_ground_truth(
+            handler=handler,
+            annotator=annotator,
+            file_path=abs_path,
+            patch_indices=patch_indices,
+            patch_classes=patch_classes,
         )
-    elif annotation_type == "tissue":
-        from app.services.seg_service import mark_tissue_as_ground_truth_in_region
-        result = mark_tissue_as_ground_truth_in_region(
-            handler=handler, file_path=zarr_path,
-            x1=x1, y1=y1, x2=x2, y2=y2, polygon_points=polygon_points
+        return success_response(result)
+    except ValueError as e:
+        return error_response(str(e), code=400)
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        return error_response(f"Error saving patch annotations: {str(e)}")
+
+
+@seg_router.post("/v1/remove_patch_annotations")
+def remove_patch_annotations_endpoint(
+    request: Request,
+    path: str = Body(..., description="Path to the zarr file"),
+    patch_indices: List[int] = Body(..., description="Patch ids to remove"),
+):
+    """Remove specific patches' user annotations (patch review remove)."""
+    try:
+        _, denied = guard_write_path(request, path, "annotate")
+        if denied is not None:
+            return denied
+        abs_path = as_zarr_path(resolve_path(path))
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _ensure_handler_bound(handler, abs_path, need_patches=True)
+        result = remove_patch_annotations(
+            handler=handler,
+            file_path=abs_path,
+            patch_indices=patch_indices,
         )
-    else:
-        return error_response(f"Invalid annotation_type: {annotation_type}. Must be 'nuclei' or 'tissue'")
+        return success_response(result)
+    except ValueError as e:
+        return error_response(str(e), code=400)
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        return error_response(f"Error removing patch annotations: {str(e)}")
 
-    return success_response({
-        "message": result.get("message", "Batch annotation saved"),
-        "marked_count": result.get("marked_count", 0),
-        "marked_classes": result.get("marked_classes", {}),
-    })
 
-
-def _classifier_file_guard_write(path_raw: str):
+def _classifier_file_guard_write(request: Request, path_raw: str):
     if not path_raw or not str(path_raw).strip():
         return error_response("path is required", code=400)
-    if is_public_read_only_path(path_raw):
-        return error_response(
-            "Cannot write classifier into sample or public read-only paths. Use your workspace.",
-            code=403,
-        )
+    _, denied = guard_write_path(request, path_raw, "write classifier")
+    if denied is not None:
+        return denied
     return None
 
 
 @seg_router.get("/v1/classifier_file/load")
 def load_classifier_file(
+    request: Request,
     file_path: str = Query(..., description="Classifier file path (storage-relative or absolute); resolved via resolve_path"),
 ):
     """
     Load classifier file bytes from server storage (stepwise workflows; no JSON metadata).
     Returns raw bytes as application/octet-stream. 404 if file does not exist.
+
+    Read ACL only — Viewer/Samples shared workflows must still be able to open
+    an already-bound ``.tlcls``. Saving back to a shared path stays on
+    ``guard_write_path``.
     """
     if not file_path or not str(file_path).strip():
         return error_response("file_path is required", code=400)
-    abs_path = resolve_path(file_path)
+    abs_path, denied = authorize_read_or_response(request, file_path, operation="load classifier")
+    if denied is not None:
+        return denied
     if not os.path.isfile(abs_path):
         return error_response("Classifier file not found", code=404)
     return FileResponse(
@@ -1232,32 +1649,63 @@ def load_classifier_file(
 
 
 @seg_router.post("/v1/classifier_file/save")
-def save_classifier_file(body: dict = Body(...)):
+def save_classifier_file(request: Request, body: dict = Body(...)):
     """
     Save classifier file on the server (stepwise workflows; no JSON sidecar).
 
     Body (JSON):
       - path | dest_path | classifier_path: destination file path (required)
       - copy_from_path (optional): if set, copy this server-side path to destination.
-          If the source file is missing, creates an empty destination file when
-          empty_if_missing_source is true (default true).
       - content_base64 (optional): raw file bytes; used only when copy_from_path is absent.
-          If null / missing / empty string and no copy_from_path, writes an empty (0-byte) file.
+      - fail_if_exists (optional): if true, return wrapped error code 409 instead of overwriting.
 
     Parent directories are created as needed.
     """
+    auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
     dest_raw = body.get("path") or body.get("dest_path") or body.get("classifier_path")
-    err = _classifier_file_guard_write(dest_raw or "")
+    err = _classifier_file_guard_write(request, dest_raw or "")
     if err is not None:
         return err
 
     dest_abs = resolve_path(dest_raw)
+    if body.get("fail_if_exists") and os.path.isfile(dest_abs):
+        # An empty 0-byte file is the placeholder this same endpoint writes when
+        # the Save flow gets interrupted before training writes the real model.
+        # Treat it as "not there" — the user clicking Save again should be able
+        # to reclaim that name rather than suffixing.
+        try:
+            existing_size = os.path.getsize(dest_abs)
+        except OSError:
+            existing_size = -1
+        if existing_size > 0:
+            # Name taken by a real file: auto-suffix "name(1).tlcls", "name(2)…"
+            # (mirrors the file-upload dedupe) instead of failing. Reflect the
+            # chosen name back into dest_raw so the caller records the real path.
+            base_abs, ext = os.path.splitext(dest_abs)
+            counter = 1
+            while True:
+                cand = f"{base_abs}({counter}){ext}"
+                try:
+                    if (not os.path.isfile(cand)) or os.path.getsize(cand) == 0:
+                        break
+                except OSError:
+                    break
+                counter += 1
+            dest_abs = cand
+            _parent = os.path.dirname(dest_raw)
+            _newname = os.path.basename(dest_abs)
+            dest_raw = f"{_parent}/{_newname}" if _parent else _newname
     parent = os.path.dirname(dest_abs)
     os.makedirs(parent, exist_ok=True)
 
     copy_from = body.get("copy_from_path") or body.get("source_path")
     empty_if_missing = body.get("empty_if_missing_source", True)
     if copy_from:
+        _, denied = authorize_read_or_response(
+            request, str(copy_from), operation="read classifier"
+        )
+        if denied is not None:
+            return denied
         src_abs = resolve_path(str(copy_from))
         if os.path.isfile(src_abs):
             shutil.copy2(src_abs, dest_abs)
@@ -1286,6 +1734,8 @@ def save_classifier_file(body: dict = Body(...)):
         with open(tmp, "wb") as f:
             f.write(data)
         os.replace(tmp, dest_abs)
+    except HTTPException:
+        raise
     except Exception as e:
         try:
             if os.path.isfile(tmp):
@@ -1298,65 +1748,78 @@ def save_classifier_file(body: dict = Body(...)):
     return success_response({"path": dest_raw, "size": len(data), "mode": "bytes"})
 
 
-def _tasknode_base_url_for_classifier_save(model_name: str) -> Optional[str]:
-    """HTTP base URL for NuClass (ClassificationNode) or MUSK (MuskClassification) tasknode."""
-    node_port = None
-    node_remote_host = None
-    try:
-        from app.services.tasks_service import manager
+@seg_router.post("/v1/classifier_file/model_names")
+def classifier_file_model_names(request: Request, body: dict = Body(...)):
+    """Read the `model_name` booster attribute from one or more .tlcls files so
+    the UI can filter local classifiers by the model they were trained on
+    (MuskClassification / HOptimusClassification / VirchowClassification / …).
+    Untagged, empty, or unreadable files map to "" — callers treat that as a
+    placeholder that's loadable on any node.
 
-        if model_name in manager.nodes:
-            node = manager.nodes[model_name]
-            node_port = getattr(node, "port", None)
-            if node_port is not None:
-                is_remote, remote_host, _mnt = manager._is_remote_node(model_name)
-                if is_remote:
-                    node_remote_host = remote_host
-    except Exception as e:
-        logger.warning("classifier_tasknode_save: manager lookup failed: %s", e)
+    Also reads the `inherit_from` attribute (stamped by ctrl-service when a
+    community classifier is downloaded, and preserved across retrain by the
+    tasknodes' save_classifier_params). Surfaced so the UI can recognize a
+    locally-loaded / shared .tlcls as descending from a community model and
+    offer republish — even when it was never loaded through the community list.
 
-    if node_port is None:
+    Body:    {"paths": ["users/.../a.tlcls", ...]}
+    Returns: {"models":  {"<path>": "<model_name or ''>", ...},
+              "inherit": {"<path>": {"community_id": "...", ...} | None, ...}}
+    """
+    paths = body.get("paths")
+    if not isinstance(paths, list):
+        return error_response("paths must be a list", code=400)
+    out: dict = {}
+    inherit: dict = {}
+    for p in paths:
+        if not isinstance(p, str) or not p.strip():
+            continue
+        _, denied = authorize_read_or_response(request, p, operation="load classifier")
+        if denied is not None:
+            return denied
+        model_name = ""
+        inherit_from = None
         try:
-            from app.services.tasks_service import list_node_ports
-
-            snap = list_node_ports(skip_health_checks=True) or {}
-            nodes = snap.get("nodes") or {}
-            info = nodes.get(model_name)
-            if not info and isinstance(nodes, dict):
-                for _k, v in nodes.items():
-                    if isinstance(v, dict) and v.get("model_name") == model_name:
-                        info = v
-                        break
-            if isinstance(info, dict):
-                node_port = info.get("port")
-                if not node_remote_host:
-                    node_remote_host = info.get("remote_host")
-        except Exception as e:
-            logger.warning("classifier_tasknode_save: list_node_ports failed: %s", e)
-
-    if node_port is None:
-        node_port = 8006
-        logger.warning("classifier_tasknode_save: defaulting to port %s for %s", node_port, model_name)
-
-    host = node_remote_host or "127.0.0.1"
-    return f"http://{host}:{node_port}"
+            if p.lower().endswith(".tlcls"):
+                abs_path = resolve_path(p)
+                if (
+                    os.path.isfile(abs_path)
+                    and 0 < os.path.getsize(abs_path) <= 50 * 1024 * 1024
+                ):
+                    import xgboost as xgb
+                    clf = xgb.XGBClassifier()
+                    clf.load_model(abs_path)
+                    _booster = clf.get_booster()
+                    model_name = (_booster.attr("model_name") or "").strip()
+                    _inh = _booster.attr("inherit_from")
+                    if _inh:
+                        try:
+                            inherit_from = json.loads(_inh)
+                        except Exception:
+                            inherit_from = None
+        except Exception:
+            model_name = ""  # untagged / unreadable → treat as placeholder
+            inherit_from = None
+        out[p] = model_name
+        inherit[p] = inherit_from
+    return success_response({"models": out, "inherit": inherit})
 
 
 @seg_router.post("/v1/classifier_tasknode_save")
-def classifier_tasknode_save(body: dict = Body(...)):
+def classifier_tasknode_save(request: Request, body: dict = Body(...)):
     """
-    Ask the NuClass or MUSK tasknode to save its last in-memory trained classifier to disk
-    (POST /classifier/save with mode=save_trained → save_classifier_params / clf.save_model).
+    Ask the NuClass or MUSK tasknode to save its last in-memory trained classifier to disk.
 
     Body JSON:
-      - node_name: "ClassificationNode" | "MuskClassification" (required)
+      - node_name: "Cell-Classification" | "MuskClassification" (required)
       - dest_path | path: destination path, resolved via resolve_path (required)
     """
+    auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
     node_name = (body.get("node_name") or "").strip()
     dest_raw = body.get("dest_path") or body.get("path")
-    if node_name not in ("ClassificationNode", "MuskClassification"):
+    if node_name not in ("Cell-Classification", "MuskClassification"):
         return error_response("node_name must be ClassificationNode or MuskClassification", code=400)
-    err = _classifier_file_guard_write(dest_raw or "")
+    err = _classifier_file_guard_write(request, dest_raw or "")
     if err is not None:
         return err
     dest_abs = resolve_path(dest_raw)
@@ -1364,7 +1827,7 @@ def classifier_tasknode_save(body: dict = Body(...)):
     if parent:
         os.makedirs(parent, exist_ok=True)
 
-    base_url = _tasknode_base_url_for_classifier_save(node_name)
+    base_url = resolve_classifier_tasknode_url(node_name)
     if not base_url:
         return error_response("Could not resolve tasknode base URL", code=503)
 
@@ -1394,4 +1857,3 @@ def classifier_tasknode_save(body: dict = Body(...)):
     return success_response(
         {"path": dest_raw, "size": os.path.getsize(dest_abs), "node_name": node_name}
     )
-

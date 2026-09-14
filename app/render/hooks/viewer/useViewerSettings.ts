@@ -1,5 +1,5 @@
 import { RootState } from '@/store';
-import { setCentroidSize, setOverlayAlpha, setCentroidThreshold, setShowNavigator, setTrackpadGesture, setZoomSpeed, setHighlightGtAnnotations, toggleHighlightGtAnnotations, setEnableMouseTracking, toggleEnableMouseTracking, setEnableViewportHistory, toggleEnableViewportHistory } from '@/store/slices/viewer/viewerSettingsSlice';
+import { setCentroidSize, setOverlayAlpha, setCentroidThreshold, setShowNavigator, setTrackpadGesture, setZoomSpeed, setHighlightGtAnnotations, toggleHighlightGtAnnotations } from '@/store/slices/viewer/viewerSettingsSlice';
 import { useEffect } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 
@@ -65,8 +65,6 @@ export const useViewerSettings = () => {
     const showNavigator = useSelector((state: RootState) => state.viewerSettings.showNavigator);
     const centroidThreshold = useSelector((state: RootState) => state.viewerSettings.centroidThreshold);
     const highlightGtAnnotations = useSelector((state: RootState) => state.viewerSettings.highlightGtAnnotations);
-    const enableMouseTracking = useSelector((state: RootState) => state.viewerSettings.enableMouseTracking);
-    const enableViewportHistory = useSelector((state: RootState) => state.viewerSettings.enableViewportHistory);
 
     // Load settings from localStorage and update Redux store on component mount
     useEffect(() => {
@@ -137,21 +135,11 @@ export const useViewerSettings = () => {
         dispatch(setOverlayAlpha(DEFAULT_SETTINGS.overlayAlpha));
         dispatch(setShowNavigator(DEFAULT_SETTINGS.showNavigator));
         dispatch(setCentroidThreshold(DEFAULT_SETTINGS.centroidThreshold));
-        dispatch(setEnableMouseTracking(false));
-        dispatch(setEnableViewportHistory(false));
         saveToLocalStorage(DEFAULT_SETTINGS);
     };
 
     const toggleHighlightGt = () => {
         dispatch(toggleHighlightGtAnnotations());
-    };
-
-    const toggleMouseTracking = () => {
-        dispatch(toggleEnableMouseTracking());
-    };
-
-    const toggleViewportHistory = () => {
-        dispatch(toggleEnableViewportHistory());
     };
 
     return {
@@ -163,8 +151,6 @@ export const useViewerSettings = () => {
         showNavigator,
         centroidThreshold,
         highlightGtAnnotations,
-        enableMouseTracking,
-        enableViewportHistory,
 
         // Handlers
         handleZoomSpeedChange,
@@ -174,8 +160,6 @@ export const useViewerSettings = () => {
         toggleShowNavigator,
         handleCentroidThresholdChange,
         toggleHighlightGt,
-        toggleMouseTracking,
-        toggleViewportHistory,
         resetToDefaults,
         
         // Utility functions

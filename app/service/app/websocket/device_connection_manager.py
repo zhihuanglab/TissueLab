@@ -1,339 +1,315 @@
 import json
 import asyncio
-from typing import Dict, Any, Optional, Set
-from fastapi import WebSocket, WebSocketDisconnect
+from contextlib import contextmanager
+from typing import Dict, Any, Set, List, Tuple, Iterator
+from fastapi import WebSocket
+from starlette.websockets import WebSocketState
+from app.core.background import track_background_task
 from app.core.logger import logger
-from app.middlewares.websocket_auth_middleware import get_device_id_from_websocket
-from app.core.auth import AuthUser
 
 
 class DeviceConnectionManager:
-    """Manages WebSocket connections isolated by device ID"""
-    
+    """Manages WebSocket connections isolated by device ID.
+
+    Multiple CONNECTED sockets per device are allowed (multi-tab). On connect,
+    already-dead sockets for that device are removed. A health checker closes
+    connections that miss the ping window.
+    """
+
     def __init__(self):
-        # Dictionary to store connections by device_id
         # Structure: {device_id: {connection_id: websocket}}
         self.device_connections: Dict[str, Dict[str, WebSocket]] = {}
         self.connection_lock = asyncio.Lock()
         self.connection_counter = 0
-        self.connection_health: Dict[str, Dict[str, float]] = {}  # Track last ping time
+        self.connection_health: Dict[str, Dict[str, float]] = {}  # last ping time
+        # Connections currently handling a long request (may miss pings during
+        # set_path). Counted, not a set: a bind task and an inline viewport
+        # request overlap on the same connection during a slide switch, and
+        # whichever finished first used to clear the flag out from under the
+        # other, exposing it to the stale sweeper mid-request.
+        self.handling_connections: Dict[Tuple[str, str], int] = {}
         self.health_check_interval = 30  # seconds
         self.connection_timeout = 60  # seconds
-        self.handler_cleanup_timeout = 300  # 5 minutes after disconnection for handler cleanup
-        self.device_last_activity: Dict[str, float] = {}  # Track last activity time per device
-    
+
+    # ── lifecycle ─────────────────────────────────────────────────────
+
     def _generate_connection_id(self) -> str:
-        """Generate unique connection ID"""
         self.connection_counter += 1
         return f"conn_{self.connection_counter}"
-    
+
+    @staticmethod
+    def _is_disconnected(websocket: WebSocket) -> bool:
+        try:
+            return websocket.client_state != WebSocketState.CONNECTED
+        except Exception:
+            return True
+
+    async def _close_quietly(self, websocket: WebSocket) -> None:
+        """Close with 1001 (Going Away) so clients treat it as recoverable.
+
+        Prefer 1001 over Starlette's default 1000 so reconnect logic is not
+        confused with an intentional client teardown.
+        """
+        try:
+            if not self._is_disconnected(websocket):
+                await websocket.close(code=1001)
+        except Exception as e:
+            logger.warning(f"Error closing WebSocket: {e}")
+
     async def connect(self, websocket: WebSocket, device_id: str) -> str:
-        """Connect a new WebSocket for a specific device"""
+        """Connect a new WebSocket for a specific device.
+
+        Cleans up already-dead sockets for this device (true reconnect), but
+        leaves other still-CONNECTED sockets alone so multiple tabs can share
+        the same ``device_id``.
+        """
         await websocket.accept()
         connection_id = self._generate_connection_id()
         current_time = asyncio.get_event_loop().time()
-        
+        stale_to_close: List[WebSocket] = []
+
         async with self.connection_lock:
             if device_id not in self.device_connections:
                 self.device_connections[device_id] = {}
                 self.connection_health[device_id] = {}
-            
-            # Clean up any existing connections for this device (reconnection scenario)
-            if connection_id in self.device_connections[device_id]:
-                logger.info(f"Replacing existing connection {connection_id} for device {device_id}")
-                try:
-                    old_websocket = self.device_connections[device_id][connection_id]
-                    await old_websocket.close()
-                except Exception as e:
-                    logger.warning(f"Error closing old connection: {e}")
-            
+
+            for old_conn_id, old_websocket in list(self.device_connections[device_id].items()):
+                if self._is_disconnected(old_websocket):
+                    logger.info(
+                        f"Removing dead connection {old_conn_id} for device {device_id} "
+                        f"on reconnect ({connection_id})"
+                    )
+                    stale_to_close.append(old_websocket)
+                    self.device_connections[device_id].pop(old_conn_id, None)
+                    self.handling_connections.pop((device_id, old_conn_id), None)
+                    if device_id in self.connection_health:
+                        self.connection_health[device_id].pop(old_conn_id, None)
+
             self.device_connections[device_id][connection_id] = websocket
             self.connection_health[device_id][connection_id] = current_time
-            self.device_last_activity[device_id] = current_time  # Update last activity time
-        
-        # Check if this is a reconnection and try to restore handlers
-        await self._try_restore_handlers(device_id)
-        
-        logger.info(f"WebSocket connected for device {device_id} with connection {connection_id}")
+
+        for old_websocket in stale_to_close:
+            await self._close_quietly(old_websocket)
+
         return connection_id
-    
+
     async def disconnect(self, device_id: str, connection_id: str):
         """Disconnect specific WebSocket connection for a device"""
+        self.handling_connections.pop((device_id, connection_id), None)
         async with self.connection_lock:
             if device_id in self.device_connections:
                 if connection_id in self.device_connections[device_id]:
                     del self.device_connections[device_id][connection_id]
-                    # Clean up health tracking
-                    if device_id in self.connection_health and connection_id in self.connection_health[device_id]:
-                        del self.connection_health[device_id][connection_id]
-                    # Clean up empty device entries
-                    if not self.device_connections[device_id]:
-                        del self.device_connections[device_id]
-                        # Update last activity time when device has no connections
-                        self.device_last_activity[device_id] = asyncio.get_event_loop().time()
-                    if device_id in self.connection_health and not self.connection_health[device_id]:
-                        del self.connection_health[device_id]
-        
-        logger.info(f"WebSocket disconnected for device {device_id}, connection {connection_id}")
-    
+                if device_id in self.connection_health and connection_id in self.connection_health[device_id]:
+                    del self.connection_health[device_id][connection_id]
+                if not self.device_connections.get(device_id):
+                    self.device_connections.pop(device_id, None)
+                if device_id in self.connection_health and not self.connection_health[device_id]:
+                    del self.connection_health[device_id]
+
     async def disconnect_device(self, device_id: str):
         """Disconnect all WebSocket connections for a specific device"""
+        to_close: List[WebSocket] = []
         async with self.connection_lock:
             if device_id in self.device_connections:
-                connections = list(self.device_connections[device_id].keys())
-                for connection_id in connections:
-                    try:
-                        websocket = self.device_connections[device_id][connection_id]
-                        await websocket.close()
-                    except Exception as e:
-                        logger.error(f"Error closing WebSocket for device {device_id}, connection {connection_id}: {str(e)}")
+                for connection_id, websocket in list(self.device_connections[device_id].items()):
+                    self.handling_connections.pop((device_id, connection_id), None)
+                    to_close.append(websocket)
                 del self.device_connections[device_id]
-        
-        logger.info(f"All WebSocket connections disconnected for device {device_id}")
-    
+            self.connection_health.pop(device_id, None)
+
+        for websocket in to_close:
+            try:
+                await websocket.close(code=1001)
+            except Exception as e:
+                logger.error(
+                    f"Error closing WebSocket for device {device_id}: {str(e)}",
+                    exc_info=e,
+                )
+
+    # ── messaging ─────────────────────────────────────────────────────
+
+    async def _send_one(
+        self, device_id: str, connection_id: str, websocket: WebSocket, payload: str
+    ) -> None:
+        try:
+            await websocket.send_text(payload)
+        except Exception as e:
+            logger.error(
+                f"Error sending data to device {device_id}, connection {connection_id}: {str(e)}",
+                exc_info=e,
+            )
+            await self.disconnect(device_id, connection_id)
+
+    async def _fan_out(self, targets: List[Tuple[str, str, WebSocket]], data: Dict[str, Any]) -> None:
+        """Send to every target concurrently.
+
+        Sending in a loop meant one slow consumer — a client whose socket buffer
+        is full — blocked delivery to everyone behind it in the list. With
+        overlay frames on this path that showed up as the whole session stalling
+        because a single tab was busy. Serialize the payload once while we are
+        at it; it was identical for every recipient.
+        """
+        if not targets:
+            return
+        payload = json.dumps(data)
+        await asyncio.gather(
+            *(
+                self._send_one(device_id, connection_id, websocket, payload)
+                for device_id, connection_id, websocket in targets
+            ),
+            return_exceptions=True,
+        )
+
     async def send_to_device(self, device_id: str, data: Dict[str, Any]):
         """Send data to all WebSocket connections for a specific device"""
         async with self.connection_lock:
             if device_id not in self.device_connections:
                 logger.warning(f"No connections found for device {device_id}")
                 return
-            
-            connections = list(self.device_connections[device_id].items())
-        
-        # Send to all connections for this device
-        for connection_id, websocket in connections:
-            try:
-                await websocket.send_text(json.dumps(data))
-                logger.info(f"Sent data to device {device_id}, connection {connection_id}")
-            except Exception as e:
-                logger.error(f"Error sending data to device {device_id}, connection {connection_id}: {str(e)}")
-                # Remove broken connection
-                await self.disconnect(device_id, connection_id)
-    
+
+            targets = [
+                (device_id, connection_id, websocket)
+                for connection_id, websocket in self.device_connections[device_id].items()
+            ]
+
+        await self._fan_out(targets, data)
+
     async def send_to_all_devices(self, data: Dict[str, Any]):
         """Send data to all WebSocket connections across all devices"""
         async with self.connection_lock:
-            all_connections = []
-            for device_id, connections in self.device_connections.items():
-                for connection_id, websocket in connections.items():
-                    all_connections.append((device_id, connection_id, websocket))
-        
-        # Send to all connections
-        for device_id, connection_id, websocket in all_connections:
-            try:
-                await websocket.send_text(json.dumps(data))
-                logger.info(f"Sent data to device {device_id}, connection {connection_id}")
-            except Exception as e:
-                logger.error(f"Error sending data to device {device_id}, connection {connection_id}: {str(e)}")
-                # Remove broken connection
-                await self.disconnect(device_id, connection_id)
-    
+            targets = [
+                (device_id, connection_id, websocket)
+                for device_id, connections in self.device_connections.items()
+                for connection_id, websocket in connections.items()
+            ]
+
+        await self._fan_out(targets, data)
+
+    # ── queries ───────────────────────────────────────────────────────
+
     def get_device_connection_count(self, device_id: str) -> int:
-        """Get the number of active connections for a specific device"""
         if device_id in self.device_connections:
             return len(self.device_connections[device_id])
         return 0
-    
+
     def get_all_devices(self) -> Set[str]:
-        """Get all device IDs with active connections"""
         return set(self.device_connections.keys())
-    
+
     def get_total_connection_count(self) -> int:
-        """Get total number of active connections across all devices"""
         total = 0
         for connections in self.device_connections.values():
             total += len(connections)
         return total
-    
+
+    # ── health / long-request protection ──────────────────────────────
+
+    @contextmanager
+    def handling(self, device_id: str, connection_id: str) -> Iterator[None]:
+        """Skip stale-sweep while this connection is in a long request. Reentrant."""
+        key = (device_id, connection_id)
+        self.handling_connections[key] = self.handling_connections.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            remaining = self.handling_connections.get(key, 1) - 1
+            if remaining > 0:
+                self.handling_connections[key] = remaining
+            else:
+                self.handling_connections.pop(key, None)
+
     async def update_connection_health(self, device_id: str, connection_id: str):
         """Update the last ping time for a connection"""
         current_time = asyncio.get_event_loop().time()
         async with self.connection_lock:
-            if device_id in self.connection_health:
-                self.connection_health[device_id][connection_id] = current_time
-                # Update device last activity time
-                self.device_last_activity[device_id] = current_time
-    
+            if device_id not in self.connection_health:
+                self.connection_health[device_id] = {}
+            self.connection_health[device_id][connection_id] = current_time
+
     async def cleanup_stale_connections(self):
-        """Remove connections that haven't been pinged recently and are actually closed"""
+        """Close and remove connections that missed the ping/pong window."""
         current_time = asyncio.get_event_loop().time()
-        stale_connections = []
-        
+        stale: List[Tuple[str, str, WebSocket]] = []
+
         async with self.connection_lock:
-            for device_id, health_data in self.connection_health.items():
-                for connection_id, last_ping in health_data.items():
-                    # Check if connection is stale (no ping for timeout period)
-                    if current_time - last_ping > self.connection_timeout:
-                        # Check if the connection actually exists and is closed
-                        if (device_id in self.device_connections and 
-                            connection_id in self.device_connections[device_id]):
-                            websocket = self.device_connections[device_id][connection_id]
-                            # Only clean up if the WebSocket is actually closed
-                            try:
-                                if websocket.client_state.name == 'DISCONNECTED':
-                                    stale_connections.append((device_id, connection_id))
-                                    logger.warning(f"Found stale closed connection {connection_id} for device {device_id}")
-                                else:
-                                    # Connection is still open but no ping - this shouldn't happen with proper ping
-                                    logger.warning(f"Connection {connection_id} for device {device_id} is open but hasn't pinged for {current_time - last_ping:.1f}s")
-                                    # Don't clean up open connections, just log the warning
-                            except Exception as e:
-                                # If we can't check the state, assume it's stale
-                                logger.warning(f"Could not check state of connection {connection_id} for device {device_id}: {e}")
-                                stale_connections.append((device_id, connection_id))
-        
-        # Clean up stale connections
-        for device_id, connection_id in stale_connections:
-            logger.warning(f"Cleaning up stale connection {connection_id} for device {device_id}")
+            for device_id, health_data in list(self.connection_health.items()):
+                for connection_id, last_ping in list(health_data.items()):
+                    if current_time - last_ping <= self.connection_timeout:
+                        continue
+                    if (device_id, connection_id) in self.handling_connections:
+                        # Actively handling a long request (e.g. forceReload) —
+                        # don't treat unread pings as a dead socket.
+                        continue
+                    websocket = None
+                    if (
+                        device_id in self.device_connections
+                        and connection_id in self.device_connections[device_id]
+                    ):
+                        websocket = self.device_connections[device_id][connection_id]
+                    age = current_time - last_ping
+                    if websocket is None:
+                        health_data.pop(connection_id, None)
+                        logger.warning(
+                            f"Removing orphan health entry {connection_id} for device {device_id}"
+                        )
+                        continue
+                    logger.warning(
+                        f"Connection {connection_id} for device {device_id} "
+                        f"stale for {age:.1f}s — closing"
+                    )
+                    stale.append((device_id, connection_id, websocket))
+
+            for device_id in [
+                d for d, h in self.connection_health.items() if not h
+            ]:
+                self.connection_health.pop(device_id, None)
+
+        for device_id, connection_id, websocket in stale:
+            await self._close_quietly(websocket)
             await self.disconnect(device_id, connection_id)
-    
-    async def cleanup_inactive_handlers(self):
-        """Clean up handlers for devices that have been disconnected for more than 5 minutes"""
-        current_time = asyncio.get_event_loop().time()
-        devices_to_cleanup = []
-        
-        async with self.connection_lock:
-            for device_id, last_activity in self.device_last_activity.items():
-                # Check if device has no active connections and has been disconnected for more than 5 minutes
-                has_active_connections = device_id in self.device_connections and len(self.device_connections[device_id]) > 0
-                if not has_active_connections and current_time - last_activity > self.handler_cleanup_timeout:
-                    devices_to_cleanup.append(device_id)
-        
-        # Clean up handlers for disconnected devices
-        for device_id in devices_to_cleanup:
-            logger.info(f"Cleaning up handlers for disconnected device {device_id} (disconnected for {current_time - self.device_last_activity[device_id]:.1f}s)")
-            await self._cleanup_device_handlers(device_id)
-            # Remove from activity tracking
-            if device_id in self.device_last_activity:
-                del self.device_last_activity[device_id]
-    
-    async def _try_restore_handlers(self, device_id: str):
-        """Try to restore handlers for a reconnected device"""
-        try:
-            # Import here to avoid circular imports
-            from app.websocket.segmentation_consumer import (
-                device_annotation_handlers, 
-                device_type_manage_handlers,
-                TypeManageHandler
-            )
-            
-            # Check if handlers exist for this device
-            has_annotation_handler = device_id in device_annotation_handlers
-            has_type_handler = device_id in device_type_manage_handlers
-            
-            if not has_annotation_handler or not has_type_handler:
-                logger.info(f"Restoring handlers for reconnected device {device_id}")
-                
-                # Initialize type manage handler if missing
-                if not has_type_handler:
-                    device_type_manage_handlers[device_id] = TypeManageHandler()
-                    logger.info(f"Restored type manage handler for device {device_id}")
-                
-                # Note: Annotation handler will be restored when path is set
-                # We can't restore it here without knowing the file path
-                logger.info(f"Device {device_id} handlers initialized, annotation handler will be restored when path is set")
-                
-        except Exception as e:
-            logger.error(f"Error restoring handlers for device {device_id}: {e}")
-    
-    async def _cleanup_device_handlers(self, device_id: str):
-        """Clean up segmentation handlers for a specific device"""
-        try:
-            # Import here to avoid circular imports
-            from app.websocket.segmentation_consumer import cleanup_device_resources
-            cleanup_device_resources(device_id)
-            logger.info(f"Successfully cleaned up handlers for device {device_id}")
-        except Exception as e:
-            logger.error(f"Error cleaning up handlers for device {device_id}: {e}")
-    
+
     async def start_health_checker(self):
-        """Start background task to clean up stale connections and inactive handlers"""
+        """Start background task to clean up stale WebSocket connections"""
         while True:
             try:
                 await asyncio.sleep(self.health_check_interval)
-                # Clean up stale connections
                 await self.cleanup_stale_connections()
-                # Clean up handlers for disconnected devices (5 minutes after disconnection)
-                await self.cleanup_inactive_handlers()
+                # Both sweeps below run in a worker thread, never inline.
+                #
+                # This coroutine is on the service's only event loop, and the
+                # sweeps are emphatically not cheap: they take locks the request
+                # path also takes, drop handlers holding centroids/contours/KDTree,
+                # close WSI handles, and finish with a full gc.collect(). With a
+                # heap full of decoder state and large arrays that collection
+                # alone runs for seconds — and every HTTP request and WebSocket
+                # message on the service is frozen for exactly that long. Tidying
+                # up must never be visible to someone opening a slide.
+                try:
+                    from app.services.seg_registry import sweep_idle_handlers
+
+                    swept = await asyncio.to_thread(sweep_idle_handlers)
+                    if swept:
+                        logger.info(f"Swept {swept} idle segmentation handler(s)")
+                except Exception as sweep_err:
+                    logger.warning(f"Idle handler sweep failed: {sweep_err}")
+                # ...and the open WSI handles behind abandoned viewer sessions.
+                # Only DELETE /v1/delete_instance used to free these, so any tab
+                # that closed without a clean unmount leaked a file descriptor.
+                try:
+                    from app.services.load import release_idle_slides
+
+                    released = await asyncio.to_thread(release_idle_slides)
+                    if released:
+                        logger.info(f"Released {released} idle slide handle(s)")
+                except Exception as release_err:
+                    logger.warning(f"Idle slide release failed: {release_err}")
             except Exception as e:
-                logger.error(f"Error in health checker: {e}")
-                await asyncio.sleep(5)  # Wait before retrying
+                logger.error(f"Error in health checker: {e}", exc_info=e)
+                await asyncio.sleep(5)
 
 
 # Global connection manager instance
 device_connection_manager = DeviceConnectionManager()
-
-
-async def handle_device_websocket(websocket: WebSocket, user: Optional[AuthUser] = None):
-    """
-    Handle WebSocket connection with device isolation
-    """
-    # Extract device ID from WebSocket
-    device_id = get_device_id_from_websocket(websocket)
-    if not device_id:
-        logger.warning("WebSocket: No device ID provided, closing connection")
-        await websocket.close(code=1008, reason="Device ID required")
-        return
-    
-    connection_id = None
-    try:
-        # Connect to device-specific connection manager
-        connection_id = await device_connection_manager.connect(websocket, device_id)
-        
-        # Log connection info
-        if user:
-            logger.info(f"WebSocket connected for user: {user.uid} ({user.email}) on device: {device_id}")
-        else:
-            logger.info(f"WebSocket connected (no auth) on device: {device_id}")
-        
-        # Keep connection alive and handle incoming messages
-        while True:
-            try:
-                # Wait for any message from client
-                data = await websocket.receive_text()
-                if data == "ping":
-                    await websocket.send_text("pong")
-                    # Update connection health on ping
-                    await device_connection_manager.update_connection_health(device_id, connection_id)
-                elif data == "get_status":
-                    # Send connection status
-                    status = {
-                        "type": "status",
-                        "device_id": device_id,
-                        "connection_id": connection_id,
-                        "total_connections_for_device": device_connection_manager.get_device_connection_count(device_id),
-                        "total_devices": len(device_connection_manager.get_all_devices()),
-                        "total_connections": device_connection_manager.get_total_connection_count()
-                    }
-                    await websocket.send_text(json.dumps(status))
-                    # Update connection health on status request
-                    await device_connection_manager.update_connection_health(device_id, connection_id)
-                else:
-                    # Forward all other messages to segmentation consumer
-                    try:
-                        parsed_data = json.loads(data)
-                        # Forward to segmentation handler
-                        from app.websocket.segmentation_consumer import handle_segmentation_message
-                        await handle_segmentation_message(websocket, device_id, parsed_data, user=user)
-                    except json.JSONDecodeError:
-                        # If not JSON, treat as ping
-                        await websocket.send_text("pong")
-                    
-                    # Update health for any other message
-                    await device_connection_manager.update_connection_health(device_id, connection_id)
-            except WebSocketDisconnect:
-                break
-            except Exception as e:
-                logger.error(f"WebSocket error for device {device_id}: {str(e)}")
-                break
-                
-    except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected for device {device_id}")
-    except Exception as e:
-        logger.error(f"Error in WebSocket for device {device_id}: {str(e)}")
-    finally:
-        if connection_id:
-            await device_connection_manager.disconnect(device_id, connection_id)
 
 
 async def send_to_device(device_id: str, data: Dict[str, Any]):
@@ -352,7 +328,13 @@ async def disconnect_device(device_id: str):
 
 
 async def start_websocket_health_checker():
-    """Start the WebSocket health checker background task"""
-    asyncio.create_task(device_connection_manager.start_health_checker())
-    logger.info("WebSocket health checker started")
+    """Start the WebSocket health checker background task.
 
+    Tracked, not detached: this loop is the only thing that closes dead sockets
+    and reclaims idle segmentation handlers and slide handles, and asyncio keeps
+    only weak references to tasks.
+    """
+    track_background_task(
+        asyncio.create_task(device_connection_manager.start_health_checker()),
+        "websocket health checker",
+    )

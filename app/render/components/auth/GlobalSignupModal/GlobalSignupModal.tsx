@@ -7,7 +7,7 @@ import { toast } from 'sonner';
 import * as z from 'zod';
 import { getApiResponseErrorMessage, getErrorMessage } from '@/utils/common/apiResponse';
 import { initUserAssetsEndpoint, sendCodeEndpoint, verifyCodeEndpoint } from '../../../config/endpoints';
-import useGlobalSignup from '../../../hooks/useGlobalSignup';
+import useGlobalSignup from '../../../hooks/auth/useGlobalSignup';
 import { useSignupModal } from '../../../store/zustand/store';
 import ImageComparisonSlider from '../../assets/ImageComparisonSlider';
 import {
@@ -75,11 +75,13 @@ const GlobalSignupModal = ({
   const signupModalContext = useSignupModal((s) => s.signupModalContext);
   const {
     loginViaGoogle,
+    loginViaUPenn,
   } = useGlobalSignup({
     setModalVisible: setSignupModalOpen,
     signupSuccess: signupModalContext?.signupSuccess,
   });
   const [isGooglePending, setIsGooglePending] = useState(false);
+  const [isUPennPending, setIsUPennPending] = useState(false);
   const [isEmailPending, setIsEmailPending] = useState(false);
   const [emailStep, setEmailStep] = useState<'email' | 'verify'>('email');
   const [email, setEmail] = useState('');
@@ -113,12 +115,25 @@ const GlobalSignupModal = ({
     }
   };
 
+  const handleUPennClick = async () => {
+    if (isUPennPending) return;
+    try {
+      setIsUPennPending(true);
+      await loginViaUPenn();
+      // loginViaUPenn handles modal closing and the signupSuccess callback.
+    } catch (error: any) {
+      console.log('UPenn login error:', error?.code || error);
+    } finally {
+      setIsUPennPending(false);
+    }
+  };
+
   const handleSendCode = async () => {
     if (isEmailPending) return;
     try {
       setIsEmailPending(true);
       
-      const response = await fetch(sendCodeEndpoint, {
+      const response = await fetch(sendCodeEndpoint(), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -151,7 +166,7 @@ const GlobalSignupModal = ({
     try {
       setIsEmailPending(true);
       
-      const response = await fetch(verifyCodeEndpoint, {
+      const response = await fetch(verifyCodeEndpoint(), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -168,7 +183,7 @@ const GlobalSignupModal = ({
       if (result.success && result.user?.custom_token) {
         // Use Firebase custom token to sign in
         const { getAuth, signInWithCustomToken } = await import('firebase/auth');
-        const { app } = await import('../../../config/firebaseConfig');
+        const { app } = await import('../../../config/firebase.config');
         
         const auth = getAuth(app);
         const userCredential = await signInWithCustomToken(auth, result.user.custom_token);
@@ -177,7 +192,7 @@ const GlobalSignupModal = ({
         const idToken = await userCredential.user.getIdToken();
         
         // Call /v1/me to create user data
-        const meResponse = await fetch(initUserAssetsEndpoint, {
+        const meResponse = await fetch(initUserAssetsEndpoint(), {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -188,6 +203,8 @@ const GlobalSignupModal = ({
         if (meResponse.ok) {
           toast.success('Email verification successful');
           setSignupModalOpen(false);
+          // Same hook Google / SAML use — e.g. claim a pending share link.
+          signupModalContext?.signupSuccess?.();
         } else {
           console.error('Failed to create user data');
           toast.error('Login successful but failed to initialize user data');
@@ -208,7 +225,7 @@ const GlobalSignupModal = ({
     try {
       setIsEmailPending(true);
       
-      const response = await fetch(sendCodeEndpoint, {
+      const response = await fetch(sendCodeEndpoint(), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -238,6 +255,7 @@ const GlobalSignupModal = ({
   useEffect(() => {
     if (!isSignupModalOpen) {
       setIsGooglePending(false);
+      setIsUPennPending(false);
       setIsEmailPending(false);
       setEmailStep('email');
       setEmail('');
@@ -274,8 +292,10 @@ const GlobalSignupModal = ({
                 email={email}
                 setEmail={setEmail}
                 isGooglePending={isGooglePending}
+                isUPennPending={isUPennPending}
                 isEmailPending={isEmailPending}
                 onGoogleClick={handleGoogleClick}
+                onUPennClick={handleUPennClick}
                 onSendCode={handleSendCode}
                 signupModalContext={signupModalContext}
                 errorTip={errorTip}

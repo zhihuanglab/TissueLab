@@ -3,15 +3,19 @@ import { useDispatch } from 'react-redux';
 import { LineGeometry } from '@annotorious/annotorious';
 import { ImageAnnotation, ShapeType } from '@annotorious/react';
 import { AppDispatch } from '@/store';
+import { useUserInfo } from '@/contexts/UserInfoProvider';
+import { resolveAnnotatorLabel } from '@/utils/viewer/annotator';
 import { AnnotationClass } from '@/store/slices/viewer/annotationSlice';
-import { CentroidsArray } from '@/components/imageViewer/CentroidsArray';
+import { CentroidsArray } from '@/types/centroidsArray';
 import { annotationTypeStore } from '@/store/zustand/slice/annotationTypesStore';
-import { getDefaultOutputPath } from '@/utils/workflowUtils';
+import { toLocalWorkflowZarrPath } from '@/utils/agent/workflow/pathNorm';
+import { scheduleCoalescedClassificationAfterAnnotation } from '@/utils/agent/workflow/workflow.utils';
 import { convertToAppropriateUnit } from '@/utils/viewer/viewerHelpers';
-import { isPublicReadOnlyPath } from '@/utils/sampleDirectoryUtils';
-import { AI_SERVICE_API_ENDPOINT } from '@/constants/config';
-import { apiFetch } from '@/utils/common/apiFetch';
-import EventBus from '@/utils/EventBus';
+import { getPointerPosition } from '@/utils/viewer/pointerPositionStore';
+import { denyWriteToast } from '@/hooks/usePathWriteAccess';
+import { AI_SERVICE_API_ENDPOINT } from '@/config/api.config';
+import { segFetch } from '@/utils/common/segFetch';
+import eventBus from '@/utils/common/eventBus';
 
 const DOUBLE_CLICK_THRESHOLD_MS = 500; // Milliseconds
 const CLICK_RADIUS_SQUARED = 350 * 350; // Using 350px radius
@@ -22,14 +26,13 @@ interface UseAnnotationHandlersParams {
   annotatorInstance: any;
   centroids: CentroidsArray;
   activeManualClassificationClassRef: React.MutableRefObject<any>;
-  currentSvsPath: string | null;
   currentPath: string | null;
   currentInstanceId?: string | null;
   nucleiClasses: AnnotationClass[];
   currentOrgan: string | null;
   slideInfo: { mpp?: number };
-  mousePos: { x: number; y: number };
   handleToolbarClick: (tool: string) => void;
+  isWebMode: boolean;
   selectedFolder: string | null;
   selectedModelForCurrentPath: string | null;
   updateClassifier: boolean;
@@ -55,20 +58,27 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
     onSaveAnnotationSuccess,
     centroids,
     activeManualClassificationClassRef,
-    currentSvsPath,
     currentPath,
     currentInstanceId,
     nucleiClasses,
     currentOrgan,
     slideInfo,
-    mousePos,
     handleToolbarClick,
+    isWebMode,
     selectedFolder,
     selectedModelForCurrentPath,
     updateClassifier,
     updateAfterEveryAnnotation,
     setRulerTooltip,
   } = params;
+
+  // Annotation author: stored as the user id (always traceable). Kept in a
+  // ref so the save callbacks don't need it in their dependency arrays.
+  const { userInfo } = useUserInfo();
+  const annotatorLabelRef = useRef('Unknown');
+  useEffect(() => {
+    annotatorLabelRef.current = resolveAnnotatorLabel({ userId: userInfo?.user_id });
+  }, [userInfo?.user_id]);
 
   // Refs for click detection
   const lastClickTimestampRef = useRef<number>(0);
@@ -93,35 +103,41 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
       classification: newClassName,
       color: newClassColor,
       method,
-      annotator: 'Unknown',
+      annotator: annotatorLabelRef.current,
       ui_nuclei_classes: nucleiClasses.map(cls => cls.name),
       ui_nuclei_colors: nucleiClasses.map(cls => cls.color),
       ui_organ: currentOrgan,
     };
 
-    const headers: any = {};
-    if (currentInstanceId) {
-      headers['X-Instance-ID'] = currentInstanceId;
+    if (!currentInstanceId) {
+      console.warn('[Annotation Handler] Missing currentInstanceId; aborting save_annotation.');
+      return;
     }
 
     try {
-      await apiFetch(`${AI_SERVICE_API_ENDPOINT}/tasks/v1/save_annotation`, {
+      await segFetch(currentInstanceId, `${AI_SERVICE_API_ENDPOINT}/tasks/v1/save_annotation`, {
         method: 'POST',
         body: JSON.stringify(payload),
-        headers,
         returnAxiosFormat: true,
       });
       console.log(`[Annotation Handler] Annotation saved successfully via API.`);
 
       // Immediately refresh counts: global totals and per-class list via WS
-      EventBus.emit('refresh-annotations');
-      EventBus.emit('refresh-websocket-path', { path: zarrPath, forceReload: true });
+      eventBus.emit('refresh-annotations');
+      eventBus.emit('refresh-websocket-path', { path: zarrPath, skipViewportRefresh: true });
       onSaveAnnotationSuccess?.();
 
-      if (updateAfterEveryAnnotation && currentSvsPath && nucleiClasses.length > 0) {
+      if (updateAfterEveryAnnotation && currentPath && nucleiClasses.length > 0) {
         // Route auto-update through the panel's manual update handler so payload semantics
         // (including class_operations and classifier paths) stay identical.
-        EventBus.emit('trigger-nuclei-update', { zarrPath, source: 'auto-annotation' });
+        // Go through the coalescer, not a bare emit: WorkflowGraph drops
+        // `trigger-nuclei-update` outright while a run is in flight, and with
+        // auto-update on there almost always is one (the previous annotation
+        // started it). Every annotation made during that run was silently lost.
+        scheduleCoalescedClassificationAfterAnnotation(() => ({
+          zarrPath,
+          source: 'auto-annotation',
+        }));
       }
 
       setTimeout(() => handleToolbarClick('move'), 50);
@@ -133,7 +149,7 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
     currentOrgan,
     currentInstanceId,
     updateAfterEveryAnnotation,
-    currentSvsPath,
+    currentPath,
     dispatch,
     handleToolbarClick,
     onSaveAnnotationSuccess,
@@ -141,14 +157,7 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
 
   // Handle canvas double-click for classification
   const handleCanvasDoubleClick = useCallback(async (event: OpenSeadragon.CanvasDoubleClickEvent) => {
-    // Check if in samples directory
-    if (isPublicReadOnlyPath(currentSvsPath)) {
-      console.log('[handleCanvasDoubleClick] Cannot annotate in samples directory');
-      return;
-    }
-
     if (!viewerInstance || !activeManualClassificationClassRef.current) {
-      console.log('[handleCanvasDoubleClick] Viewer or active class not available.');
       return;
     }
 
@@ -183,6 +192,9 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
     });
 
     if (closestCentroidTuple && minDistanceSquared <= CLICK_RADIUS_SQUARED) {
+      if (denyWriteToast('annotate', currentPath)) {
+        return;
+      }
       const centroidId = closestCentroidTuple[0];
       const originalX = closestCentroidTuple[1]; // This is level0_x
       const originalY = closestCentroidTuple[2]; // This is level0_y
@@ -206,7 +218,7 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
         }
       }
 
-      const zarrPath = getDefaultOutputPath(currentSvsPath);
+      const zarrPath = toLocalWorkflowZarrPath(currentPath);
       if (!zarrPath) {
         console.error('[handleCanvasDoubleClick] Could not get Zarr path for saving annotation.');
         return;
@@ -225,10 +237,10 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
       console.log('[handleCanvasDoubleClick] No close centroid found, or double-click intended for Annotorious.');
     }
   }, [
-    currentSvsPath,
     viewerInstance,
     activeManualClassificationClassRef,
     centroids,
+    currentPath,
     saveAnnotationAndTriggerWorkflow,
   ]);
 
@@ -295,7 +307,7 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
         }
       }
 
-      const zarrPath = getDefaultOutputPath(currentSvsPath);
+      const zarrPath = toLocalWorkflowZarrPath(currentPath);
       if (!zarrPath) {
         console.error('[handleClickAnnotationForClassification] Double-click: Could not get Zarr path.');
         lastClickTimestampRef.current = 0;
@@ -393,7 +405,6 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
   }, [
     activeManualClassificationClassRef,
     annotatorInstance,
-    currentSvsPath,
     nucleiClasses,
     updateAfterEveryAnnotation,
     currentOrgan,
@@ -402,6 +413,7 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
     currentPath,
     centroids,
     viewerInstance,
+    isWebMode,
     selectedFolder,
     selectedModelForCurrentPath,
     updateClassifier,
@@ -419,8 +431,20 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
         Math.pow(end[1] - start[1], 2)
       ); // unit: pixel
 
-      // Multiply by MPP to get accurate measurement in microns
-      const mpp = slideInfo.mpp || 1; // Default to 1 if MPP is not available
+      // Multiply by MPP to get accurate measurement in microns.
+      // Never default mpp to 1 — that silently invents physical lengths.
+      const rawMpp = slideInfo?.mpp;
+      const mpp =
+        rawMpp != null && Number(rawMpp) > 0 ? Number(rawMpp) : null;
+      if (!mpp) {
+        setRulerTooltip({
+          visible: true,
+          text: `${Math.round(lineLength)} px | N/A (MPP required)`,
+          position: { ...getPointerPosition() },
+        });
+        tooltipVisibleRef.current = true;
+        return;
+      }
       const lineLengthInMicrons = lineLength * mpp; // unit: micron (µm)
 
       // Convert to appropriate unit
@@ -430,11 +454,14 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
       setRulerTooltip({
         visible: true,
         text: `${Math.round(lineLength)} px | ${adjustedValue.toFixed(2)} ${unit}`,
-        position: { x: mousePos.x, y: mousePos.y },
+        position: { ...getPointerPosition() },
       });
       tooltipVisibleRef.current = true;
     }
-  }, [slideInfo, mousePos, setRulerTooltip]);
+    // getPointerPosition is read at call time, so the pointer is NOT a
+    // dependency — otherwise this callback (and every effect keyed on it) would
+    // be rebuilt on every mouse move.
+  }, [slideInfo, setRulerTooltip]);
 
   const rulerLeaveHandler = useCallback(() => {
     setRulerTooltip(prev => ({ ...prev, visible: false }));
