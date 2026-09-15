@@ -39,7 +39,7 @@ tifffile==2026.3.3
 tiffslide==3.0.1
 imagecodecs==2026.3.6
 fastslide==0.8.0
-pyvips[binary]==3.1.1
+pyvips==3.2.0
 
 # Radiology / extra slide formats — imported by tissuelab_sdk.wrapper
 nibabel==5.4.2
