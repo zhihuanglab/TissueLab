@@ -175,7 +175,9 @@ export const apiFetch = async (url: string, options: FetchRequestInit) => {
   if (ownsAuthHeader) {
     // Open edition: without a Firebase session getAuthToken() hands out the
     // local placeholder. The local service ignores bearer tokens, so local
-    // requests keep working; hosted (community) requests keep asking to sign in.
+    // requests keep working. Hosted (community) calls need a real session:
+    // open the sign-in modal and stop, instead of failing the page with a
+    // runtime error. Anonymous Firebase sessions can still browse.
     const isLocalEndpoint =
       url.startsWith(CTRL_SERVICE_API_ENDPOINT) || url.startsWith(AI_SERVICE_API_ENDPOINT);
     const isCommunityEndpoint = url.startsWith(COMMUNITY_API_ENDPOINT);
@@ -189,7 +191,10 @@ export const apiFetch = async (url: string, options: FetchRequestInit) => {
 
       if (!isLocalEndpoint && (isHttps || isCommunityEndpoint)) {
         notifyMissingAuth();
-        throw new Error(AUTH_MISSING_ERROR);
+        // String, not Error. The pages dev overlay treats
+        // console.error(label, error) as a runtime error when the second
+        // value is an Error, which covered the sign-in modal.
+        throw AUTH_MISSING_ERROR;
       }
     }
   }
