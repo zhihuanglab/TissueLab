@@ -996,6 +996,19 @@ def _find_patch_group(zf) -> Optional[str]:
     return None
 
 
+def _find_patch_coordinates(zf, classification_group: str) -> Optional[np.ndarray]:
+    """Load patch bounding boxes from the classification or segmentation group."""
+    candidates = [classification_group, "Patch-Segmentation"]
+    for name in candidates:
+        try:
+            group = zf[name]
+            if "coordinates" in group:
+                return np.asarray(group["coordinates"][:])
+        except Exception:
+            continue
+    return None
+
+
 def _build_patch_candidates(params: Dict) -> Dict:
     """Patch-classification mirror of _build_candidates.
 
@@ -1047,10 +1060,14 @@ def _build_patch_candidates(params: Dict) -> Dict:
                 if patch_group is None:
                     return {"success": False, "error": "No patch classification found - please run patch classification first", "code": 409}
                 pg = zf[patch_group]
-                if 'class_indices' not in pg or 'coordinates' not in pg:
+                if 'class_indices' not in pg:
                     return {"success": False, "error": "Patch classification data incomplete"}
                 classifications = np.asarray(pg['class_indices'][:]).astype(int)
-                coordinates = np.asarray(pg['coordinates'][:])  # (n_patches, 4): [x1,y1,x2,y2]
+                coordinates = _find_patch_coordinates(zf, patch_group)
+                if coordinates is None or coordinates.ndim != 2 or coordinates.shape[1] < 4:
+                    return {"success": False, "error": "Patch classification data incomplete: patch coordinates are missing or invalid"}
+                if len(coordinates) != len(classifications):
+                    return {"success": False, "error": "Patch classification data incomplete: patch data lengths do not match"}
                 class_names = None
                 if 'classes/name' in pg:
                     class_names = [n.decode('utf-8') if isinstance(n, bytes) else str(n)
@@ -1059,6 +1076,8 @@ def _build_patch_candidates(params: Dict) -> Dict:
 
             if probabilities is None:
                 return {"success": False, "error": "No patch probabilities found - re-run patch classification (zero-shot has none)"}
+            if probabilities.ndim != 2 or len(probabilities) != len(classifications):
+                return {"success": False, "error": "Patch classification data incomplete: probabilities do not match patches"}
             if not class_names or class_name not in class_names:
                 return {"success": False, "error": f"Class '{class_name}' not found in patch classification"}
             target_idx = class_names.index(class_name)
