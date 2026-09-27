@@ -480,9 +480,10 @@ export default function SelectionContent({
           }
         })
         .catch((err) => {
-          if (isSegmentationHandlerNotReadyError(err)) return;
-          console.warn('POST /save_annotation error or workflow trigger error:', err);
           rollback();
+          if (!isSegmentationHandlerNotReadyError(err)) {
+            console.warn('POST /save_annotation error or workflow trigger error:', err);
+          }
           
           // Check if error is related to samples directory restriction
           if (!toastIfDenied(err, 'annotate nuclei', 'Failed to save nuclei annotations. Reverted to previous state.')) {
@@ -613,9 +614,10 @@ export default function SelectionContent({
           }
         })
         .catch((err) => {
-          if (isSegmentationHandlerNotReadyError(err)) return;
-          console.warn('POST save_annotation (exclude) error:', err);
           rollback();
+          if (!isSegmentationHandlerNotReadyError(err)) {
+            console.warn('POST save_annotation (exclude) error:', err);
+          }
           if (!toastIfDenied(err, 'annotate nuclei', 'Failed to save nuclei exclusion. Reverted to previous state.')) {
             toast.error(getErrorMessage(err, 'Failed to save nuclei exclusion. Reverted to previous state.'));
           }
@@ -818,9 +820,10 @@ export default function SelectionContent({
         }
       })
       .catch((err) => {
-        if (isSegmentationHandlerNotReadyError(err)) return;
-        console.warn('POST /save_patch error:', err);
         revertOptimisticUpdates();
+        if (!isSegmentationHandlerNotReadyError(err)) {
+          console.warn('POST /save_patch error:', err);
+        }
         
         // Check for specific error types and provide user-friendly messages
         const errorMessage = getErrorMessage(err, '');
@@ -958,9 +961,10 @@ export default function SelectionContent({
         refreshGtHighlightIndices(currentPath);
       })
       .catch((err) => {
-        if (isSegmentationHandlerNotReadyError(err)) return;
-        console.warn('POST /save_patch (exclude) error:', err);
         revertOptimisticUpdates();
+        if (!isSegmentationHandlerNotReadyError(err)) {
+          console.warn('POST /save_patch (exclude) error:', err);
+        }
         if (!toastIfDenied(err, 'annotate tissue', 'Failed to save tissue exclusion.')) {
           toast.error(getErrorMessage(err, 'Failed to save tissue exclusion.'));
         }
