@@ -143,17 +143,64 @@ export const uploadFolderPath = async (relativeFolderPath: string) => {
   return (responseJson as any).data || responseJson;
 };
 
-export const uploadFilePath = async (relativePath: string) => {
-  const formData = new FormData();
-  formData.append('relative_path', relativePath);
+export const uploadFilePath = async (
+  relativePath: string,
+  options?: { signal?: AbortSignal },
+) => {
+  const maxRetries = 1;
 
-  const responseJson = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/load/v1/upload_path`, {
-    method: 'POST',
-    body: formData,
-  });
-  console.log('[uploadFilePath]: responseJson (unwrapped):', responseJson);
+  for (let attempt = 0; ; attempt += 1) {
+    if (options?.signal?.aborted) {
+      throw new DOMException('The request was aborted', 'AbortError');
+    }
 
-  return responseJson as UploadPathResult;
+    const formData = new FormData();
+    formData.append('relative_path', relativePath);
+
+    try {
+      const responseJson = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/load/v1/upload_path`, {
+        method: 'POST',
+        body: formData,
+        signal: options?.signal,
+      });
+      console.log('[uploadFilePath]: responseJson (unwrapped):', responseJson);
+      return responseJson as UploadPathResult;
+    } catch (error: any) {
+      // Do not retry an intentional cancellation (navigation, a newer slide,
+      // or the user stopping the load).
+      if (options?.signal?.aborted || error?.name === 'AbortError') {
+        throw error;
+      }
+
+      const status = Number(error?.status ?? error?.response?.status ?? 0);
+      const networkFailure = error instanceof TypeError && status === 0;
+      const retryable = status === 499 || networkFailure;
+      if (!retryable || attempt >= maxRetries) {
+        throw error;
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        const signal = options?.signal;
+        let settled = false;
+        const cleanup = () => signal?.removeEventListener('abort', onAbort);
+        const onAbort = () => {
+          if (settled) return;
+          settled = true;
+          globalThis.clearTimeout(timer);
+          cleanup();
+          reject(new DOMException('The request was aborted', 'AbortError'));
+        };
+        const timer = globalThis.setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve();
+        }, 500);
+        signal?.addEventListener('abort', onAbort, { once: true });
+        if (signal?.aborted) onAbort();
+      });
+    }
+  }
 };
 
 export const loadFileData = async (filename: string) => {
