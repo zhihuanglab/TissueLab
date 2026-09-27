@@ -14,7 +14,7 @@ import { convertToAppropriateUnit } from '@/utils/viewer/viewerHelpers';
 import { getPointerPosition } from '@/utils/viewer/pointerPositionStore';
 import { denyWriteToast } from '@/hooks/usePathWriteAccess';
 import { AI_SERVICE_API_ENDPOINT } from '@/config/api.config';
-import { segFetch } from '@/utils/common/segFetch';
+import { isSegmentationHandlerNotReadyError, segFetch } from '@/utils/common/segFetch';
 import eventBus from '@/utils/common/eventBus';
 
 const DOUBLE_CLICK_THRESHOLD_MS = 500; // Milliseconds
@@ -142,7 +142,9 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
 
       setTimeout(() => handleToolbarClick('move'), 50);
     } catch (error) {
-      console.error(`[Annotation Handler] Error saving annotation or triggering workflow via API:`, error);
+      if (!isSegmentationHandlerNotReadyError(error)) {
+        console.warn(`[Annotation Handler] Error saving annotation or triggering workflow via API:`, error);
+      }
     }
   }, [
     nucleiClasses,

@@ -34,7 +34,7 @@ import {
 } from "@/store/slices/viewer/annotationSlice";
 import { useRefreshGtHighlightIndices } from "@/hooks/viewer/useRefreshGtHighlightIndices";
 import { apiFetch, payloadFromAxiosAppResponse } from '@/utils/common/apiFetch'
-import { segFetch } from '@/utils/common/segFetch'
+import { isSegmentationHandlerNotReadyError, segFetch } from '@/utils/common/segFetch'
 import { getErrorMessage } from "@/utils/common/apiResponse";
 import { toast } from "sonner";
 import { deleteNucleiAnnotation } from '@/services/data.service'
@@ -219,6 +219,7 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
   //   • "Yes" confirmations + "No" reclassifications → one save_annotation/batch call
   //   • Saved-view removals → delete each from user_annotation
   const submitPendingReclassifications = useCallback(async (): Promise<ReviewSaveResult | null> => {
+    if (!activeInstanceId || !currentPath) return null;
     if (!reviewState.slideId) return null;
     if (!assertWritable("submit review changes")) {
       return null;
@@ -369,7 +370,8 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
       refreshGtHighlightIndices(currentPath ?? reviewState.slideId);
       return { marked: markedCount, removed: removedCount };
     } catch (error) {
-      console.error('[AL] Error submitting review actions:', error);
+      if (isSegmentationHandlerNotReadyError(error)) return null;
+      console.warn('[AL] Error submitting review actions:', error);
       toast.error(getErrorMessage(error, "Failed to submit review changes."));
       return null;
     }

@@ -7,7 +7,7 @@ import { ImageAnnotation } from "@annotorious/react"
 import { useDispatch, useSelector } from "react-redux"
 import { useActiveSlidePath, useInstanceSlidePath } from "@/utils/viewer/slidePath";
 import { AppDispatch, RootState } from "@/store"
-import { segFetch } from '@/utils/common/segFetch'
+import { isSegmentationHandlerNotReadyError, segFetch } from '@/utils/common/segFetch'
 import { getErrorMessage } from "@/utils/common/apiResponse"
 import { toast } from "sonner"
 import {
@@ -334,7 +334,8 @@ export default function SelectionContent({
 
       dispatch(setPatchClassificationData(mergedData));
     } catch (error) {
-      console.error('Failed to refresh patch classification data:', error);
+      if (isSegmentationHandlerNotReadyError(error)) return;
+      console.warn('Failed to refresh patch classification data:', error);
     }
   }, [dispatch, reduxPatchClassificationData, instanceIdProp]);
 
@@ -479,7 +480,8 @@ export default function SelectionContent({
           }
         })
         .catch((err) => {
-          console.error('POST /save_annotation error or workflow trigger error:', err);
+          if (isSegmentationHandlerNotReadyError(err)) return;
+          console.warn('POST /save_annotation error or workflow trigger error:', err);
           rollback();
           
           // Check if error is related to samples directory restriction
@@ -611,7 +613,8 @@ export default function SelectionContent({
           }
         })
         .catch((err) => {
-          console.error('POST save_annotation (exclude) error:', err);
+          if (isSegmentationHandlerNotReadyError(err)) return;
+          console.warn('POST save_annotation (exclude) error:', err);
           rollback();
           if (!toastIfDenied(err, 'annotate nuclei', 'Failed to save nuclei exclusion. Reverted to previous state.')) {
             toast.error(getErrorMessage(err, 'Failed to save nuclei exclusion. Reverted to previous state.'));
@@ -805,13 +808,18 @@ export default function SelectionContent({
           }
 
           // Refresh counts asynchronously - don't block
-          refreshPatchCountsFromServer().catch(err => console.error('[SelectionContent] Refresh counts error:', err));
+          refreshPatchCountsFromServer().catch(err => {
+            if (!isSegmentationHandlerNotReadyError(err)) {
+              console.warn('[SelectionContent] Refresh counts error:', err);
+            }
+          });
         } catch (err) {
           console.error('[MarkTissue] Error processing response:', err);
         }
       })
       .catch((err) => {
-        console.error('POST /save_patch error:', err);
+        if (isSegmentationHandlerNotReadyError(err)) return;
+        console.warn('POST /save_patch error:', err);
         revertOptimisticUpdates();
         
         // Check for specific error types and provide user-friendly messages
@@ -950,7 +958,8 @@ export default function SelectionContent({
         refreshGtHighlightIndices(currentPath);
       })
       .catch((err) => {
-        console.error('POST /save_patch (exclude) error:', err);
+        if (isSegmentationHandlerNotReadyError(err)) return;
+        console.warn('POST /save_patch (exclude) error:', err);
         revertOptimisticUpdates();
         if (!toastIfDenied(err, 'annotate tissue', 'Failed to save tissue exclusion.')) {
           toast.error(getErrorMessage(err, 'Failed to save tissue exclusion.'));

@@ -27,7 +27,7 @@ import {
 
 import { AI_SERVICE_API_ENDPOINT } from '@/config/api.config';
 import { RootState } from '@/store';
-import { segFetch } from '@/utils/common/segFetch';
+import { isSegmentationHandlerNotReadyError, segFetch } from '@/utils/common/segFetch';
 import { getErrorMessage } from '@/utils/common/apiResponse';
 import eventBus from '@/utils/common/eventBus';
 
@@ -80,11 +80,15 @@ const ZarrCard: React.FC<ZarrCardProps> = ({ currentPath }) => {
   const [error, setError] = useState<string | null>(null);
   const [actualDataFilePath, setActualDataFilePath] = useState<string | null>(null);
   const lastLoadedSlide = useRef<string | null>(null);
+  const loadSequence = useRef(0);
 
   const loadZarrFileDirectly = useCallback(async (opts?: { skipSegReload?: boolean }) => {
     if (!currentPath) return;
-    if (lastLoadedSlide.current === currentPath) return;
-    lastLoadedSlide.current = currentPath;
+    const loadKey = `${activeInstanceId ?? ''}::${currentPath}`;
+    if (lastLoadedSlide.current === loadKey) return;
+    const sequence = ++loadSequence.current;
+    const isCurrentLoad = () => loadSequence.current === sequence;
+    lastLoadedSlide.current = loadKey;
     
     const fileName = currentPath.split(/[\\/]/).pop();
     if (!fileName) return;
@@ -103,9 +107,12 @@ const ZarrCard: React.FC<ZarrCardProps> = ({ currentPath }) => {
       if (!opts?.skipSegReload) {
         try {
           await reloadSegHandler(currentPath, activeInstanceId);
+          if (!isCurrentLoad()) return;
           console.log('Successfully set file path on backend:', currentPath);
         } catch (pathError) {
-          console.error('Failed to set file path on backend:', pathError);
+          if (isSegmentationHandlerNotReadyError(pathError)) return;
+          console.warn('Failed to set file path on backend:', pathError);
+          if (!isCurrentLoad()) return;
           setZarrFileExists(false);
           setError(getErrorMessage(pathError, 'Failed to set file path on backend'));
           return;
@@ -140,6 +147,8 @@ const ZarrCard: React.FC<ZarrCardProps> = ({ currentPath }) => {
         })
       ]);
 
+      if (!isCurrentLoad()) return;
+
       console.log('Zarr file info:', fileInfo);
       console.log('Zarr structure:', structure);
 
@@ -155,11 +164,12 @@ const ZarrCard: React.FC<ZarrCardProps> = ({ currentPath }) => {
       }
 
     } catch (error) {
+      if (!isCurrentLoad()) return;
       setError(getErrorMessage(error, 'Unknown error occurred'));
-      console.error('Failed to load Zarr data:', error);
+      console.warn('Failed to load Zarr data:', error);
       setZarrFileExists(false);
     } finally {
-      setZarrLoading(false);
+      if (isCurrentLoad()) setZarrLoading(false);
     }
   }, [currentPath, activeInstanceId]);
 
@@ -167,6 +177,7 @@ const ZarrCard: React.FC<ZarrCardProps> = ({ currentPath }) => {
     if (!currentPath) {
       // Reset lastLoadedSlide when currentPath is cleared
       lastLoadedSlide.current = null;
+      loadSequence.current += 1;
       return;
     }
       // reset states

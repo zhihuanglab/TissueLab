@@ -227,7 +227,7 @@ export const loadFileData = async (filename: string) => {
   return data;
 };
 
-import { segFetch } from '@/utils/common/segFetch';
+import { isSegmentationHandlerNotReadyError, segFetch } from '@/utils/common/segFetch';
 
 // New function to reset segmentation data for a viewer instance
 export const resetSegmentationData = async (instanceId?: string | null) => {
@@ -246,7 +246,8 @@ export const resetSegmentationData = async (instanceId?: string | null) => {
     console.log('Reset segmentation data response:', responseJson);
     return responseJson;
   } catch (error) {
-    console.error('Error resetting segmentation data:', error);
+    if (isSegmentationHandlerNotReadyError(error)) return null;
+    console.warn('Error resetting segmentation data:', error);
     throw error;
   }
 };
