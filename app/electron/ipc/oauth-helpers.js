@@ -158,19 +158,20 @@ async function performGoogleOAuth({ clientId, openExternal }) {
   } catch (error) {
     console.error('[OAuth] Error during Google OAuth:', error);
     
-    // Clean up server if it exists
-    if (callbackServer && callbackServer.server) {
-      try {
-        callbackServer.server.close();
-      } catch (e) {
-        // Ignore cleanup errors
-      }
-    }
-    
     return {
       success: false,
       error: error.message || 'Failed to authenticate with Google'
     };
+  } finally {
+    // Close the callback server after the code exchange completes, rather
+    // than from the HTTP callback itself.
+    if (callbackServer && callbackServer.server) {
+      try {
+        callbackServer.server.close();
+      } catch (e) {
+        // Ignore cleanup errors from an already-closed server.
+      }
+    }
   }
 }
 

@@ -5,13 +5,20 @@ const fssync = require('fs');
 const os = require('os');
 const http = require('http');
 const net = require('net');
-const { setupProtocolHandlers } = require('./ipc/protocol-helpers');
+const { setupProtocolHandlers, registerProtocolClient } = require('./ipc/protocol-helpers');
 const { performGoogleOAuth, refreshGoogleToken } = require('./ipc/oauth-helpers');
 // const ProjectBehaviorRecording = require('./services/recording/projectBehaviorRecording');
 
 let mainWindow;
 
 let currentTitleBarTheme = 'dark';
+
+// Keep the Electron identity stable across `npm run start`, dev mode, and
+// packaged launches. requestSingleInstanceLock is scoped by userData.
+app.setName('TissueLab');
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.zhihuanglab.tissuelab');
+}
 
 let activeDownloads = new Map();
 
@@ -102,8 +109,9 @@ function checkNextjsServerReady(url, callback, maxAttempts = 120, retryIntervalM
   }
 }
 
-// Register custom deep link protocol handlers
-setupProtocolHandlers(app, () => mainWindow);
+// Register custom deep link protocol handlers. A second dev process must not
+// continue into app.whenReady() and create its own window after app.quit().
+const protocolSetup = setupProtocolHandlers(app, () => mainWindow);
 
 // Configure GPU features for best compatibility and performance:
 // - Enable WebGL (required for image viewer)
@@ -679,10 +687,13 @@ ipcMain.handle('get-backend-port', () => {
 
 // Launch Django service
 app.whenReady().then(() => {
+  if (!protocolSetup.acquiredSingleInstanceLock) {
+    return;
+  }
 
   // Register as default protocol handler (tissuelab://)
   try {
-    const registered = app.setAsDefaultProtocolClient('tissuelab');
+    const registered = registerProtocolClient(app, __filename);
     console.log('[Protocol] setAsDefaultProtocolClient(tissuelab):', registered);
   } catch (e) {
     console.warn('[Protocol] Failed to register protocol handler:', e.message);
@@ -711,6 +722,10 @@ app.on('window-all-closed', () => {
 
 // Handle macOS dock icon click - reopen window when clicked
 app.on('activate', () => {
+  if (!protocolSetup.acquiredSingleInstanceLock) {
+    return;
+  }
+
   if (mainWindow === null) {
     checkNextjsServerReady(NEXTJS_URL, (isReady) => {
       if (isReady) {

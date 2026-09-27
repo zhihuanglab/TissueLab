@@ -8,7 +8,7 @@ const http = require('http');
 const net = require('net');
 const { downloadFile, extractAndPersist } = require('./ipc/tasknode-helpers');
 const { getServiceRoot } = require('./ipc/service-root');
-const { setupProtocolHandlers } = require('./ipc/protocol-helpers');
+const { setupProtocolHandlers, registerProtocolClient } = require('./ipc/protocol-helpers');
 const { performGoogleOAuth, refreshGoogleToken } = require('./ipc/oauth-helpers');
 
 let mainWindow;
@@ -17,6 +17,13 @@ let nextjsStandaloneProcess;
 let backendServiceProcess;
 let backendCheckInterval;
 let backendMonitorInterval;
+
+// Keep the Electron identity stable across `npm run start`, dev mode, and
+// packaged launches. requestSingleInstanceLock is scoped by userData.
+app.setName('TissueLab');
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.zhihuanglab.tissuelab');
+}
 
 // Track current theme for title bar overlay
 let currentTitleBarTheme = 'dark'; // Default theme
@@ -94,7 +101,8 @@ function checkBackendHealth(port) {
 }
 
 // Register custom deep link protocol handlers
-setupProtocolHandlers(app, () => mainWindow);
+// Keep the start and dev entry points on the same single-instance path.
+const protocolSetup = setupProtocolHandlers(app, () => mainWindow || splashWindow);
 
 // Buffer management functions
 function addToBuffer(buffer, data, maxSize = MAX_BUFFER_SIZE) {
@@ -1321,44 +1329,12 @@ async function spawnBackendService() {
   }
 }
 
-// Ensure only one instance of the application is running
-const gotTheLock = app.requestSingleInstanceLock();
-
-if (!gotTheLock) {
-  console.log('[ELECTRON] Another instance is already running, exiting...');
-  app.quit();
-} else {
-  // Handle second instance - focus the main window (like Discord)
-  app.on('second-instance', (event, commandLine, workingDirectory) => {
-    console.log('[ELECTRON] Second instance detected, focusing main window...');
-    // Someone tried to run a second instance, focus our window instead
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) {
-        mainWindow.restore();
-      }
-      if (!mainWindow.isVisible()) {
-        mainWindow.show();
-      }
-      mainWindow.focus();
-    } else if (splashWindow) {
-      // If main window doesn't exist yet, focus splash window
-      if (splashWindow.isMinimized()) {
-        splashWindow.restore();
-      }
-      if (!splashWindow.isVisible()) {
-        splashWindow.show();
-      }
-      splashWindow.focus();
-    }
-  });
-}
-
 // Launch Django service
 let appReadyInitialized = false; // Prevent multiple initializations
 
 app.whenReady().then(() => {
   // Skip initialization if another instance is running
-  if (!gotTheLock) {
+  if (!protocolSetup.acquiredSingleInstanceLock) {
     return;
   }
   
@@ -1376,7 +1352,7 @@ app.whenReady().then(() => {
   
   // Register as default protocol handler (tissuelab://)
   try {
-    const registered = app.setAsDefaultProtocolClient('tissuelab');
+    const registered = registerProtocolClient(app, __filename);
     console.log('[Protocol] setAsDefaultProtocolClient(tissuelab):', registered);
   } catch (e) {
     console.warn('[Protocol] Failed to register protocol handler:', e.message);
@@ -1406,7 +1382,6 @@ app.whenReady().then(() => {
         console.log('[ELECTRON] Next.js standalone server is ready');
         // Ensure app name and process title are correct when server is ready (Next.js may have changed them)
         process.title = 'TissueLab';
-        app.setName('TissueLab');
         startBackendServiceAndWindow();
       } else {
         console.error('[ELECTRON] Next.js standalone server failed to start');
@@ -1480,6 +1455,13 @@ app.whenReady().then(() => {
 
 // Handle macOS dock icon click - reopen window when clicked
 app.on('activate', () => {
+  // A second process can receive lifecycle events while it is shutting down
+  // after failing to acquire the single-instance lock. Never create a window
+  // in that process.
+  if (!protocolSetup.acquiredSingleInstanceLock) {
+    return;
+  }
+
   if (mainWindow === null) {
     createSplashWindow();
     createWindow();
