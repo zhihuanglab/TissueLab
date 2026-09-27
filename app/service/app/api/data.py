@@ -41,6 +41,7 @@ from app.services.data import (
     zarr_staging_base,
     find_zarr_root,
     cleanup_zarr_staging,
+    is_valid_staging_id,
     write_staged_zarr_upload,
     resolve_staged_zarr_root,
     enhanced_file_analysis_service,
@@ -668,7 +669,7 @@ async def stage_zarr_candidate_endpoint(
         # (not a CORS-less generic 500).
         base = zarr_staging_base()
         if sid:
-            if os.sep in sid or sid in (".", ".."):
+            if not is_valid_staging_id(sid):
                 raise HTTPException(status_code=400, detail="Invalid staging_id")
             staging_dir = os.path.join(base, sid)
             if not os.path.isdir(staging_dir):
@@ -718,13 +719,22 @@ async def stage_zarr_candidate_endpoint(
 async def cleanup_zarr_staging_endpoint(request: Request):
     """Delete a staging dir created by stage_candidate. Body: {staging_id}."""
     try:
-        body = await request.json()
-        staging_id = (body.get("staging_id") or "").strip()
+        try:
+            body = await request.json()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Request body must be JSON: {staging_id}")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Request body must be JSON: {staging_id}")
+        staging_id = str(body.get("staging_id") or "").strip()
         if staging_id:
+            if not is_valid_staging_id(staging_id):
+                raise HTTPException(status_code=400, detail="Invalid staging_id")
             # Off the loop: rmtree of a staging dir holding an uploaded zarr,
             # which is one file per chunk.
             await asyncio.to_thread(cleanup_zarr_staging, staging_id)
         return success_response({"ok": True})
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error cleaning staging: {str(e)}")

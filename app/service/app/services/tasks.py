@@ -513,6 +513,11 @@ def stop_service(service_name: str) -> dict:
         except Exception as e:
             return {"error": f"Failed to stop {service_name}: {str(e)}"}
 
+    # The service was marked running, but no process is tracked in this worker.
+    # Normalize the state so callers always receive a result and can recover.
+    details["running"] = False
+    return {"message": f"{service_name} had no tracked process; marked as stopped."}
+
 def start_all_services() -> dict:
     """Start all services"""
     results = {}

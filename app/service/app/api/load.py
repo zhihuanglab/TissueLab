@@ -44,10 +44,13 @@ load_router = APIRouter()
 
 
 async def _parse_json_body(request: Request) -> Dict[str, Any]:
-    """Read and parse a JSON request body."""
+    """Read and parse a JSON object request body."""
     body = await request.body()
     body_text = body.decode('utf-8', errors='replace')
-    return json.loads(body_text)
+    data = json.loads(body_text)
+    if not isinstance(data, dict):
+        raise ValueError("JSON body must be an object")
+    return data
 
 
 async def _parse_loose_request_data(request: Request) -> Dict[str, Any]:
@@ -182,8 +185,8 @@ async def create_instance(request: Request):
         try:
             data = await _parse_json_body(request)
             file_path = data.get('file_path', '') or data.get('relative_path', '')
-        except json.JSONDecodeError:
-            return error_response("Invalid JSON format")
+        except ValueError:
+            return error_response("Invalid JSON format", code=400)
 
         authorized_path, denied = await authorize_read_or_response_async(
             request, file_path, operation="create viewer instance"
@@ -216,8 +219,8 @@ async def delete_instance(request: Request):
         try:
             data = await _parse_json_body(request)
             instance_id = data.get('instance_id', '')
-        except json.JSONDecodeError:
-            return error_response("Invalid JSON format")
+        except ValueError:
+            return error_response("Invalid JSON format", code=400)
 
         denied = _guard_session(
             request, instance_id, "delete viewer instance", teardown=True
@@ -678,8 +681,8 @@ async def set_z_layer_api(request: Request):
     try:
         try:
             data = await _parse_json_body(request)
-        except json.JSONDecodeError:
-            return error_response("Invalid JSON format")
+        except ValueError:
+            return error_response("Invalid JSON format", code=400)
 
         session_id = data.get('session_id', 'default')
         if session_id == "default":
@@ -689,9 +692,13 @@ async def set_z_layer_api(request: Request):
             return denied
         z_layer = data.get('z_layer')
         if z_layer is None:
-            return error_response("z_layer is required")
+            return error_response("z_layer is required", code=400)
+        try:
+            z_layer = int(z_layer)
+        except (TypeError, ValueError):
+            return error_response("z_layer must be an integer", code=400)
 
-        result = set_z_layer_for_api(session_id, int(z_layer))
+        result = set_z_layer_for_api(session_id, z_layer)
         if result["status"] == "error":
             return error_response(result["message"])
         return success_response(result["data"])

@@ -452,10 +452,11 @@ def stop_service(service_name: str):
         result = service_stop_service(service_name)
         
         # Handle result
+        if not isinstance(result, dict):
+            return error_response(f"Failed to stop service {service_name}")
         if "error" in result:
             return error_response(result["error"])
-        else:
-            return success_response({"message": result.get("message", f"Service {service_name} stopped successfully")})
+        return success_response({"message": result.get("message", f"Service {service_name} stopped successfully")})
     except Exception as e:
         return error_response(f"API Error: {str(e)}")
 
