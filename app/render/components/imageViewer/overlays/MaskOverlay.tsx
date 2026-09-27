@@ -101,7 +101,8 @@ const MaskOverlay: React.FC<MaskOverlayProps> = ({
       const requestedOffsetY = originalY1;
 
       // Get canvas/viewer size for downsampling
-      const viewerElement = viewer.element;
+      const viewerElement = viewer?.element;
+      if (!viewerElement) return;
       const viewerRect = viewerElement.getBoundingClientRect();
       const canvasWidth = Math.round(viewerRect.width);
       const canvasHeight = Math.round(viewerRect.height);

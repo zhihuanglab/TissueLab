@@ -66,7 +66,9 @@ export const useOpenSeadragonGestures = ({
           const macSpeedBoost = isMac ? 1.5 : 1.0; // Additional 1.5x boost for Mac
           const effectiveZoomSpeed = zoomSpeed * macSpeedBoost;
           const zoomFactor = event.deltaY > 0 ? 1 / (1 + event.deltaY * baseMultiplier * effectiveZoomSpeed) : 1 + Math.abs(event.deltaY) * baseMultiplier * effectiveZoomSpeed;
-          const rect = viewer.container.getBoundingClientRect();
+          const container = viewer.container;
+          if (!container) return;
+          const rect = container.getBoundingClientRect();
           const relativeX = event.clientX - rect.left;
           const relativeY = event.clientY - rect.top;
           const mousePoint = new OpenSeadragon.Point(relativeX, relativeY);

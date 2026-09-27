@@ -4158,8 +4158,9 @@ export const WorkflowGraph: React.FC = () => {
 
   const handleCanvasMouseMove = useCallback(
     (e: React.MouseEvent) => {
-      if (!canvasRef.current) return
-      const rect = canvasRef.current.getBoundingClientRect()
+      const canvas = canvasRef.current
+      if (!canvas) return
+      const rect = canvas.getBoundingClientRect()
       const panSession = panSessionRef.current
       if (panSession && !dragging && !connectingRef.current) {
         const next = {
@@ -4233,8 +4234,9 @@ export const WorkflowGraph: React.FC = () => {
     (e: React.MouseEvent, nodeId: string, port: PortSide) => {
       e.stopPropagation()
       e.preventDefault()
-      if (!canvasRef.current) return
-      const rect = canvasRef.current.getBoundingClientRect()
+      const canvas = canvasRef.current
+      if (!canvas) return
+      const rect = canvas.getBoundingClientRect()
       const pan = panOffsetRef.current
       // Connecting preview uses visual coords for SVG drawing.
       setConnecting({

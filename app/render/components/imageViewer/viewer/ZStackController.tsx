@@ -102,13 +102,14 @@ const ZStackController: React.FC<ZStackControllerProps> = ({
     }
     lastUpdateTimeRef.current = now;
     
-    if (controllerRef.current && isPositioned) {
-      const parentElement = controllerRef.current.parentElement;
+    const controller = controllerRef.current;
+    if (controller && isPositioned) {
+      const parentElement = controller.parentElement;
       if (!parentElement) return;
       
       const parentWidth = parentElement.offsetWidth;
       const parentHeight = parentElement.offsetHeight;
-      const rect = controllerRef.current.getBoundingClientRect();
+      const rect = controller.getBoundingClientRect();
       
       if (!rect || rect.width === 0) return;
       
@@ -206,7 +207,9 @@ const ZStackController: React.FC<ZStackControllerProps> = ({
           return false;
         }
         
-        const rect = controllerRef.current.getBoundingClientRect();
+        const controller = controllerRef.current;
+        if (!controller) return false;
+        const rect = controller.getBoundingClientRect();
         
         let newX, newY;
         

@@ -183,8 +183,19 @@ export const captureSnapshot = async (
       };
     }
 
+    // The viewer can be torn down between the toolbar click and this async
+    // capture (for example while switching panes/slides). Treat that as a
+    // normal unavailable-snapshot state instead of throwing from window.onerror.
+    const container = viewerInstance?.container as HTMLElement | null | undefined;
+    if (!container) {
+      return {
+        success: false,
+        error: 'Viewer container is no longer available'
+      };
+    }
+
     // get container size
-    const containerRect = viewerInstance.container.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
     
     // use html2canvas result, avoid edge seam caused by scale/interpolation
     let exportCanvas: HTMLCanvasElement | null = null;
@@ -196,7 +207,7 @@ export const captureSnapshot = async (
     }
     
     // find OpenSeadragon canvas
-    const openseadragonCanvas = viewerInstance.container.querySelector('.openseadragon-canvas') as HTMLCanvasElement;
+    const openseadragonCanvas = container.querySelector('.openseadragon-canvas') as HTMLCanvasElement;
     
     if (!openseadragonCanvas) {
       return {
