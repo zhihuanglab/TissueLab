@@ -61,12 +61,6 @@ function setupProtocolHandlers(app, getMainWindow) {
     return { acquiredSingleInstanceLock: false, handleDeepLink };
   }
 
-  console.log('[Protocol] Single-instance lock acquired', {
-    executable: process.execPath,
-    userData: app.getPath('userData'),
-    argv: process.argv,
-  });
-
   // Windows passes the URL in argv when a second instance is launched.
   app.on('second-instance', (event, argv) => {
     handleDeepLink(findDeepLink(argv));
