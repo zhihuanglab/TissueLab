@@ -163,7 +163,7 @@ def _ensure_handler_bound(
         )
     target = bound or file_path
     if not target:
-        return
+        raise FileNotFoundError("No Zarr file is bound to this handler")
     try:
         handler.ensure_file(
             target,
@@ -322,6 +322,8 @@ def tissues(request: Request):
         if denied is not None:
             return denied
         file_path = handler.get_current_file_path()
+        if not file_path:
+            return error_response("No file path available", code=404)
         # Only load if handler doesn't have data
         if handler.centroids is None:
             handler.load_file(file_path, force_reload=False, reload_segmentation_data=False)
@@ -520,6 +522,8 @@ def total_counts(request: Request):
         handler, denied = _get_owned_handler(request)
         if denied is not None:
             return denied
+        if not file_path and not getattr(handler, "zarr_file", None):
+            return error_response("No classification data in zarr", code=404)
         try:
             _ensure_handler_bound(handler, file_path)
         except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
@@ -758,6 +762,8 @@ def annotations(
             return denied
         # Read ACL only (Viewer/Samples hydrate/sidebar). Export routes use guard_write_path.
         path = handler.get_current_file_path() or ""
+        if not path:
+            return error_response("No file path available", code=404)
         _, denied = authorize_read_or_response(request, path, operation="list annotations")
         if denied is not None:
             return denied
@@ -999,6 +1005,8 @@ def list_user_annotations(request: Request):
         if denied is not None:
             return denied
         path = handler.get_current_file_path() or ""
+        if not path:
+            return error_response("No file path available", code=404)
         _, denied = authorize_read_or_response(request, path, operation="list annotations")
         if denied is not None:
             return denied
@@ -1030,6 +1038,11 @@ def classification_metadata(request: Request):
             return denied
         file_path = handler.get_current_file_path()
         result = {"cell": None, "patch": None}
+        # A handler can briefly exist before its slide path is bound (for
+        # example while a viewer session is being restored). Metadata is
+        # optional, so avoid passing None into the Zarr opener.
+        if not file_path:
+            return success_response(result)
         try:
             from app.config.zarr_compat import open_zarr
             zf = open_zarr(file_path, mode='r')
@@ -1171,7 +1184,10 @@ def export_classifications(
         handler, denied = _get_owned_handler(request)
         if denied is not None:
             return denied
-        _, denied = guard_write_path(request, handler.get_current_file_path() or "", "export classifications")
+        file_path = handler.get_current_file_path()
+        if not file_path:
+            return error_response("No file path available", code=404)
+        _, denied = guard_write_path(request, file_path, "export classifications")
         if denied is not None:
             return denied
 

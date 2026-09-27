@@ -1234,7 +1234,9 @@ async def reset_classification_data_endpoint(request: Request):
     )
 
     if result["status"] == "error":
-        return error_response(result["message"])
+        message = result["message"]
+        code = 404 if message.startswith("Zarr file not found") else 500
+        return error_response(message, code=code)
         
     return success_response(result)
 
@@ -1253,7 +1255,9 @@ async def reset_patch_classification_endpoint(request: Request):
         reset_patch_classification_data, resolve_path(zarr_path)
     )
     if result.get("status") != "success":
-        return error_response(result.get("message", "Failed to reset patch classification"))
+        message = result.get("message", "Failed to reset patch classification")
+        code = 404 if message.startswith("Zarr file not found") else 500
+        return error_response(message, code=code)
     return success_response(result)
 
 @tasks_router.post("/v1/reset_tissue_segmentation", summary="Remove VISTA's Tissue-Segmentation group (downstream of patch classification)")
@@ -1271,7 +1275,9 @@ async def reset_tissue_segmentation_endpoint(request: Request):
         reset_tissue_segmentation_data, resolve_path(zarr_path)
     )
     if result.get("status") == "error":
-        return error_response(result.get("message", "Failed to reset tissue segmentation"))
+        message = result.get("message", "Failed to reset tissue segmentation")
+        code = 404 if message.startswith("Zarr file not found") else 500
+        return error_response(message, code=code)
     return success_response(result)
 
 @tasks_router.post("/v1/clear_workflow")
