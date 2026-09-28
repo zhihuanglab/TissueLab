@@ -62,6 +62,23 @@ def _is_stop_owned(execution: Optional["WorkflowExecution"], task: Optional["Tas
     return is_cancel_owned_status(execution.status)
 
 
+async def _derive_patch_masks(zarr_path: Optional[str]) -> None:
+    """Best-effort, off the loop; a no-op unless Patch-Classification changed."""
+    if not zarr_path:
+        return
+    try:
+        from app.utils import resolve_path
+        from app.services.patch_masks import ensure_patch_masks
+        resolved = as_zarr_path(resolve_path(zarr_path))
+        if not resolved or not os.path.exists(resolved):
+            return
+        result = await asyncio.to_thread(ensure_patch_masks, resolved)
+        if result.get("status") == "written":
+            logger.info(f"[patch_masks] after task: {result}")
+    except Exception as exc:
+        logger.warning(f"[patch_masks] derivation after task skipped: {exc}")
+
+
 class TaskScheduler:
     """
     Central scheduler that dispatches tasks to available models.
@@ -571,6 +588,12 @@ class TaskScheduler:
 
                 # Update workflow tracking
                 execution.completed_tasks.add(task.node_name)
+
+                # Fold this run's patch classification into Tissue-Segmentation
+                # masks now, while Patch-Classification still holds it: the
+                # next classification node overwrites that group, and the
+                # masks are how results of several classifiers coexist.
+                await _derive_patch_masks(task.zarr_path)
 
             except asyncio.CancelledError:
                 # force-finalize cancels orphan runners; CancelledError is BaseException.

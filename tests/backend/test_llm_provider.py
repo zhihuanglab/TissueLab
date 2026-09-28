@@ -154,10 +154,10 @@ async def test_workflow_agent_end_to_end_on_chat_only_server(mock_server, monkey
     sel = await agent.select_impl_from_candidates("count", steps["steps"][0], [{"impl": "StarDist"}, {"impl": "InstanSegNode"}])
     assert sel["selected_impl"] == "StarDist"
 
-    code = await agent.get_script("count tumor cells", zarr_structure="{}", original_question="count", use_scripts_library=False)
+    code = await agent.get_script("count tumor cells", zarr_structure="{}", original_question="count")
     assert code.startswith("def analyze_medical_image")
 
-    system_prompt, user_prompt, _ = await agent.prepare_script_prompts(script_task="count", zarr_structure="{}", original_question="count")
+    system_prompt, user_prompt = await agent.prepare_script_prompts(script_task="count", zarr_structure="{}", original_question="count")
     streamed = "".join(agent.iter_script_chat_stream(system_prompt, user_prompt))
     assert "analyze_medical_image" in streamed
 

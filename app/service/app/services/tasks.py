@@ -211,6 +211,20 @@ async def _stream_script_generation(system_prompt: str, user_prompt: str, uid: s
     return {"generated_script": _extract_code_from_markdown(text)}
 
 
+async def _ensure_patch_masks_for_analysis(resolved_zarr_path: str) -> None:
+    """Derive Tissue-Segmentation masks from Patch-Classification before analysis.
+
+    Runs off the event loop (a zarr read + a few array writes). A failure is
+    logged and swallowed: the analysis should still run on the patch data.
+    """
+    try:
+        from app.services.patch_masks import ensure_patch_masks
+        result = await asyncio.to_thread(ensure_patch_masks, resolved_zarr_path)
+        logger.info(f"[CodingAgent] patch masks: {result}")
+    except Exception as exc:
+        logger.warning(f"[CodingAgent] patch mask derivation skipped: {exc}")
+
+
 async def _generate_script_output(
     script_prompt: str,
     zarr_path: str,
@@ -229,6 +243,10 @@ async def _generate_script_output(
         error_msg = f"Zarr file not found at {zarr_path} (resolved to {resolved_zarr_path})"
         logger.error(f"[CodingAgent] {error_msg}")
         return {"error": error_msg}
+
+    # Patch classification -> per-class masks, BEFORE the structure walk below,
+    # so the agent sees Tissue-Segmentation/masks when it writes the script.
+    await _ensure_patch_masks_for_analysis(resolved_zarr_path)
 
     prompt_text = script_prompt if isinstance(script_prompt, str) else str(script_prompt)
     if prompt_text.strip() == "":
@@ -267,12 +285,11 @@ async def _generate_script_output(
 
     if uid and agent.code_provider_name == "openai":
         try:
-            system_prompt, user_prompt, _ = await agent.prepare_script_prompts(
+            system_prompt, user_prompt = await agent.prepare_script_prompts(
                 script_task=combined_prompt,
                 zarr_structure=structure_json,
                 original_question=combined_prompt,
                 web_search_enabled=False,
-                use_scripts_library=True,
             )
             stream_result = await _stream_script_generation(system_prompt, user_prompt, uid)
             if isinstance(stream_result, dict) and "generated_script" in stream_result:
@@ -292,7 +309,6 @@ async def _generate_script_output(
             zarr_structure=structure_json,
             original_question=combined_prompt,
             web_search_enabled=False,
-            use_scripts_library=True,
         )
         return {"generated_script": script or ""}
     except asyncio.CancelledError:
@@ -3226,6 +3242,13 @@ def reset_patch_classification_data(zarr_path: str) -> dict:
             if 'Patch-Classification' in zf:
                 del zf['Patch-Classification']
                 removed.append('Patch-Classification')
+            # ...and the Tissue-Segmentation masks derived from it (VISTA's
+            # own masks, if any, stay).
+            try:
+                from app.services.patch_masks import clear_patch_masks
+                removed.extend(clear_patch_masks(zf))
+            except Exception as exc:
+                logger.warning(f"[reset_patch_classification_data] derived masks not cleared: {exc}")
 
         # After deleting from Zarr, reload all handlers that use this file
         try:
@@ -4826,7 +4849,7 @@ def process_node(name, obj):
     :return: A dictionary representing the structure of the current group or dataset.
     """
     if isinstance(obj, zarr.Group):
-        return {
+        group_info = {
             "type": "Group",
             "name": name,
             # members(), not items(): a zarr v3 Group has no items(), so this
@@ -4838,6 +4861,16 @@ def process_node(name, obj):
                 for key, item in obj.members()
             }
         }
+        # Group attrs carry the calibration the analysis code needs — mpp and
+        # patch_size on Patch-Segmentation/metadata, scale/origin on
+        # Tissue-Segmentation/masks/<tissue> — and were invisible here, so
+        # generated scripts guessed (mpp=0.25) instead of reading them.
+        if hasattr(obj, 'attrs') and obj.attrs:
+            try:
+                group_info["attributes"] = json.loads(json.dumps(dict(obj.attrs), default=str))
+            except Exception:
+                pass
+        return group_info
     elif isinstance(obj, zarr.Array):
         # Convert shape tuple to list for JSON serialization
         shape_list = list(obj.shape) if obj.shape else []

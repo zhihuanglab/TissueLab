@@ -458,7 +458,6 @@ async def process_script(
             zarr_structure=_structure_text(request),
             original_question=request.prompt,
             web_search_enabled=_web_search_enabled(request),
-            use_scripts_library=True,
         )
         return success_response(script)
     except Exception as e:
@@ -479,12 +478,11 @@ async def process_script_stream(
         raise AppErrors.NOT_IMPLEMENTED("Script streaming requires CODE_PROVIDER=openai")
 
     try:
-        system_prompt, user_prompt, _ = await workflow_agent.prepare_script_prompts(
+        system_prompt, user_prompt = await workflow_agent.prepare_script_prompts(
             script_task=request.prompt,
             zarr_structure=_structure_text(request),
             original_question=request.prompt,
             web_search_enabled=_web_search_enabled(request),
-            use_scripts_library=True,
         )
     except Exception as e:
         return error_response(str(e))

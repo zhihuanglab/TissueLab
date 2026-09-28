@@ -36,7 +36,7 @@ class FakeAgent:
         return {"selected_impl": names[-1], "reason": "last wins", "ranking": list(reversed(names))}
 
     async def prepare_script_prompts(self, **kwargs):
-        return "SYS", "USER", []
+        return "SYS", "USER"
 
     def iter_script_chat_stream(self, system_prompt, user_prompt):
         yield "```python\n"

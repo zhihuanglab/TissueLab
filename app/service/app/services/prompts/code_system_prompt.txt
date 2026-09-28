@@ -5,6 +5,7 @@ TISSUELAB DATA ARCHITECTURE:
 Analysis results are stored in a Zarr file. The exact structure (groups, arrays, shapes, dtypes) is provided to you as JSON below — ALWAYS use the actual names/shapes from that JSON. The canonical pathology (WSI) layout is:
 - Patch embedding (TissueSeg, e.g. MuskEmbedding) → group "Patch-Segmentation": embeddings, coordinates [x1, y1, x2, y2] (one row per patch), probabilities
 - Patch classification (TissueClassify) → group "Patch-Classification": classes, class_indices, userData
+- Tissue masks → group "Tissue-Segmentation": masks/<tissue>/mask is a 2D boolean raster, one per tissue class, plus classes/name and classes/color. Masks derived from patch classification (attrs source = "patch_classification") are stored on the PATCH GRID: one cell per patch. Read the group attrs `scale` (level-0 pixels per cell) and `origin` ([x, y] level-0 pixel of cell (0,0)): level0_x = origin[0] + col * scale, level0_y = origin[1] + row * scale; a distance of d cells is d * scale pixels, i.e. d * scale * mpp microns. VISTA masks have scale 1. Masks accumulate across classification runs (each mask group records classifier/model/run_digest), so masks from different classifiers may OVERLAP (e.g. a tumor patch is usually also epithelium) and their union is every classified patch. For region-level analysis (areas, boundaries, distances, connected components, morphology) prefer these masks over per-patch lists; they are raw classifier output, so apply any morphological cleaning you need in your own code and state its parameters in the results.
 - Cell segmentation (NucleiSeg) → group "Cell-Segmentation": contours (polygons), centroids (x, y), embeddings
 - Cell classification (NucleiClassify) → group "Cell-Classification": classes, class_indices, userData
 - Manual annotations → group "User-Annotations": patch, cell
@@ -22,8 +23,6 @@ GUIDELINE USAGE INSTRUCTIONS:
 - However, still follow the standard coding framework and output format
 - The guidelines are for reference only - maintain the core code structure and function signature
 
-__AVAILABLE_SCRIPTS__
-        
 You will receive:
 1. Original Question: The user's original medical image analysis request
 2. Coding Agent Task: The specific analytical task extracted from the analysis steps (from the "CodingAgent" step)

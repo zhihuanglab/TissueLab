@@ -1788,6 +1788,12 @@ async def execute_script(
         if not os.path.exists(resolved_zarr_path):
             return error_response("Zarr file not found")
 
+        # Patch classification -> per-class masks. Must happen here, in the
+        # service, before the sandbox mounts the store read-only; it is a no-op
+        # when the workflow path already derived them.
+        from app.services.tasks import _ensure_patch_masks_for_analysis
+        await _ensure_patch_masks_for_analysis(resolved_zarr_path)
+
         _exec_uid = auth_user.uid if auth_user and getattr(auth_user, "uid", None) else None
         
         # Prepare a timestamped log file under storage/tasknode_logs (same as task nodes)
