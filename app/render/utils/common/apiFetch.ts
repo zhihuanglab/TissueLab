@@ -1,5 +1,5 @@
 import { getOrCreateDeviceId } from './device.utils';
-import { AUTH_MISSING_ERROR, forceRefreshAuthToken, getAuthToken, LOCAL_DEFAULT_TOKEN, notifyMissingAuth } from './authToken';
+import { AUTH_MISSING_ERROR, forceRefreshAuthToken, getAuthToken, LOCAL_DEFAULT_TOKEN, notifyMissingAuth, waitForAuthReady } from './authToken';
 import { notifyRateLimitExceeded } from './errorNotifications';
 import { AI_SERVICE_API_ENDPOINT, COMMUNITY_API_ENDPOINT, CTRL_SERVICE_API_ENDPOINT } from '@/config/api.config';
 import { ApiError, isApiResponse, normalizeApiResponse, readApiErrorDetails } from './apiResponse';
@@ -181,21 +181,25 @@ export const apiFetch = async (url: string, options: FetchRequestInit) => {
     const isLocalEndpoint =
       url.startsWith(CTRL_SERVICE_API_ENDPOINT) || url.startsWith(AI_SERVICE_API_ENDPOINT);
     const isCommunityEndpoint = url.startsWith(COMMUNITY_API_ENDPOINT);
-    const rawToken = await getAuthToken();
-    const token = rawToken === LOCAL_DEFAULT_TOKEN && !isLocalEndpoint ? null : rawToken;
+    const requiresAuth = !isLocalEndpoint &&
+      (url.startsWith('https://') || isCommunityEndpoint);
+    let authRetried = false;
 
-    if (token) {
-      headers.set('Authorization', `Bearer ${token}`);
-    } else {
-      const isHttps = url.startsWith('https://');
+    while (true) {
+      const rawToken = await getAuthToken();
+      const token = rawToken === LOCAL_DEFAULT_TOKEN && !isLocalEndpoint ? null : rawToken;
 
-      if (!isLocalEndpoint && (isHttps || isCommunityEndpoint)) {
-        notifyMissingAuth();
-        // String, not Error. The pages dev overlay treats
-        // console.error(label, error) as a runtime error when the second
-        // value is an Error, which covered the sign-in modal.
-        throw AUTH_MISSING_ERROR;
+      if (token) {
+        headers.set('Authorization', `Bearer ${token}`);
+        break;
       }
+
+      if (!requiresAuth) break;
+      if (authRetried) throw AUTH_MISSING_ERROR;
+
+      notifyMissingAuth();
+      await waitForAuthReady();
+      authRetried = true;
     }
   }
 
