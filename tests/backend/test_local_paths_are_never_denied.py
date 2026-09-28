@@ -280,7 +280,6 @@ NOT_SWEPT = {
     "POST /v1/convert": "long h5→zarr conversion",
     "POST /convert-to-pyramidal-tiff": "long libvips conversion",
     "POST /v1/zarr/replace": "destructive: swaps a zarr store in place",
-    "POST /v1/zarr/stage_candidate": "multipart upload staging",
     "POST /v1/s{session_id}/upload_path": "same guard as create_instance, session-scoped",
     "POST /v1/start_batch": "runs a real multi-slide queue; its per-item guard "
                             "(_patch_batch_items) is covered in test_acl_nonexistent_paths",

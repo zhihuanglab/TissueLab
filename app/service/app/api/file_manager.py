@@ -35,7 +35,7 @@ from app.services.file_manager.common import (
     validate_user_access_to_path,
 )
 from app.config.path_config import is_public_read_only_path
-from app.services import zarr_replace
+from app.services import sidecar
 from app.utils import resolve_path
 
 file_manager_router = APIRouter()
@@ -307,11 +307,11 @@ async def zarr_validate_replacement(
     slide_wh = _slide_wh_from_payload(payload)
 
     def _run():
-        zarr_replace.recover_interrupted_swap(staging_abs, target_zarr, dispose=False)
-        zroot = zarr_replace.prepare_candidate(staging_abs)
+        sidecar.recover_interrupted_swap(staging_abs, target_zarr, dispose=False)
+        zroot = sidecar.prepare_candidate(staging_abs)
         if not zroot:
             raise ValueError("No Zarr store (zarr.json/.zgroup) found in the upload.")
-        return zarr_replace.validate_replacement(zroot, slide_wh)
+        return sidecar.validate_replacement(zroot, slide_wh)
 
     try:
         return await asyncio.to_thread(_run)
@@ -345,11 +345,11 @@ async def zarr_replace_endpoint(
     slide_wh = _slide_wh_from_payload(payload)
 
     def _run():
-        zarr_replace.recover_interrupted_swap(staging_abs, target_zarr)
-        zroot = zarr_replace.prepare_candidate(staging_abs)
+        sidecar.recover_interrupted_swap(staging_abs, target_zarr)
+        zroot = sidecar.prepare_candidate(staging_abs)
         if not zroot:
             raise ValueError("No Zarr store (zarr.json/.zgroup) found in the upload.")
-        return zarr_replace.apply_replacement(zroot, target_zarr, slide_wh)
+        return sidecar.apply_replacement(zroot, target_zarr, slide_wh)
 
     try:
         result = await asyncio.to_thread(_run)

@@ -1,12 +1,12 @@
-"""Whole-.zarr replacement (user-supplied preprocessing, incl. nuclei segmentation).
+"""Sidecar (.zarr) replacement: validate a user-supplied store and swap it in crash-safely.
 
-Ctrl-Service owns user storage, so both the compatibility check and the crash-safe
-swap live here. The candidate is uploaded via the normal file-manager upload into a
-staging folder under the user's own directory; these helpers then validate it against
-the slide (dimensions passed from the frontend — no slide reader needed here) and,
-on confirmation, atomically swap it into place. Staging is already an uploaded copy
-and is deleted after a successful swap, so the incoming tree is renamed (same
-filesystem) rather than copytree'd.
+The single implementation behind both entry points:
+  * api/file_manager.py  ``/fm/v1/zarr/*``   — candidate uploaded into a staging folder under
+    the user's directory (zip or tree); slide dimensions come from the frontend; staging is
+    a copy already, so the incoming tree is renamed into place (``move_candidate=True``).
+  * api/data.py          ``/data/v1/zarr/*`` — candidate is a store the user already owns on
+    the server; dimensions are read from the slide (``slide_dimensions``); the user's store is
+    copied, never moved (``move_candidate=False``).
 """
 import json
 import os
@@ -199,11 +199,14 @@ def apply_replacement(
     candidate_zarr_abs: str,
     target_zarr_abs: str,
     slide_wh: Optional[Tuple[int, int]] = None,
+    *,
+    move_candidate: bool = True,
 ) -> Dict[str, Any]:
     """Crash-safe whole-.zarr swap. Re-validates first and refuses on any error, so
-    the target is never touched unless the candidate is valid. Staging is already an
-    uploaded copy, so the incoming tree is renamed into place on the same filesystem;
-    copytree is only used across devices.
+    the target is never touched unless the candidate is valid. With ``move_candidate``
+    (a disposable staging copy) the incoming tree is renamed into place on the same
+    filesystem and copytree is only used across devices; with ``move_candidate=False``
+    (the user's own store) it is always copied.
 
     On failure the candidate is renamed back to its staging path (not deleted), so
     the user can retry without re-uploading.
@@ -231,7 +234,7 @@ def apply_replacement(
     # Staging is already an uploaded copy (deleted after swap), so prefer a
     # same-filesystem rename over copytree — a full copy of a large .zarr can
     # take minutes and trip reverse-proxy idle timeouts ("network error").
-    moved = _stage_incoming(cand, incoming)
+    moved = _stage_incoming(cand, incoming, allow_move=move_candidate)
 
     had_old = os.path.isdir(tgt)
     try:
@@ -253,6 +256,21 @@ def apply_replacement(
     return {"ok": True, "target_zarr": tgt, "nuclei_count": v["summary"].get("nuclei_count"), "warnings": v["warnings"]}
 
 
+def slide_dimensions(slide_path: Optional[str]) -> Optional[Tuple[int, int]]:
+    """(width, height) in level-0 pixels for a slide on disk, or None if unreadable."""
+    if not slide_path or not os.path.exists(slide_path):
+        return None
+    try:
+        import tiffslide
+        return tuple(int(x) for x in tiffslide.TiffSlide(slide_path).dimensions)
+    except Exception:
+        try:
+            from tissuelab_sdk.wrapper import TiffSlideWrapper
+            return tuple(int(x) for x in TiffSlideWrapper(slide_path).dimensions)
+        except Exception:
+            return None
+
+
 def _same_device(src: str, dst_parent: str) -> bool:
     try:
         return os.stat(src).st_dev == os.stat(dst_parent).st_dev
@@ -260,7 +278,7 @@ def _same_device(src: str, dst_parent: str) -> bool:
         return False
 
 
-def _stage_incoming(cand: str, incoming: str) -> bool:
+def _stage_incoming(cand: str, incoming: str, allow_move: bool = True) -> bool:
     """Place the candidate at ``incoming``. Returns True if cand was moved
     (same-device rename), False if it was copied."""
     if os.path.abspath(cand) == os.path.abspath(incoming):
@@ -271,13 +289,14 @@ def _stage_incoming(cand: str, incoming: str) -> bool:
         _dispose_dir(incoming)
     parent = os.path.dirname(incoming)
     os.makedirs(parent, exist_ok=True)
-    if _same_device(cand, parent):
+    if allow_move and _same_device(cand, parent):
         try:
             os.rename(cand, incoming)
             return True
         except OSError:
             pass
     shutil.copytree(cand, incoming)
+    _strip_ds_store_in_groups(incoming)
     return False
 
 
