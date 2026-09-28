@@ -84,5 +84,5 @@ exclude, reason, raw = judge_region(llm, "<case>/lymphnode/3/image.png", 3, prom
 ## Configuration
 
 `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `CODE_MODEL` / `LLM_MODEL` from the environment or
-`app/service/.env.local`. Default model `gpt-5.2`. Any interpreter with `openai`, `numpy` and `Pillow`
+`app/service/.env.local`. Default model `gpt-5.4`. Any interpreter with `openai`, `numpy` and `Pillow`
 works; the service environment has them.

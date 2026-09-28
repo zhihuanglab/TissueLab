@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 SERVICE_DIR = os.path.abspath(os.path.join(PACKAGE_DIR, "..", "..", "..", ".."))  # app/service
-DEFAULT_MODEL = "gpt-5.2"
+DEFAULT_MODEL = "gpt-5.4"
 MAX_IMAGE_SIDE = 1600
 
 
