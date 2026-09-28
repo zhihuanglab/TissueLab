@@ -136,13 +136,11 @@ datas.extend([
     # Agent / coding-agent system prompts
     ("app/services/prompts/*.txt", "app/services/prompts/"),
 
-    # Discovery loop prompts, and the helper library each run copies into the
-    # worker sandbox's /shared/lib as source (so it must exist as .py files)
+    # Discovery system prompts, and the loader library each run copies into the
+    # sandbox's /shared/lib as source (so it must exist as .py files)
     ("app/services/agent/discovery/prompts/*.md", "app/services/agent/discovery/prompts/"),
     ("app/services/agent/discovery/shared_lib_source/shared_analysis/*.py",
      "app/services/agent/discovery/shared_lib_source/shared_analysis/"),
-    ("app/services/agent/discovery/shared_lib_source/templates/*.py",
-     "app/services/agent/discovery/shared_lib_source/templates/"),
 
     # Model registry. Ship only the registries — storage/ also holds logs/,
     # tasknode_logs/ and uploads/, which are dev artifacts (~4 MB) and must
@@ -259,7 +257,7 @@ hiddenimports.extend([
 INFERENCE_STACK_EXCLUDES = [
     "torch", "torchvision", "torchaudio", "transformers", "tokenizers", "safetensors",
     "huggingface_hub", "accelerate", "timm", "open_clip", "clip", "clip_interrogator",
-    "tensorflow", "keras", "jax", "jaxlib", "sklearn", "scikit_learn", "numba",
+    "tensorflow", "keras", "jax", "jaxlib", "numba",
     "llvmlite", "dask", "xarray", "csbdeep", "instanseg", "datasets", "einops", "fairscale",
     "shapely", "rasterio", "slideio", "s3fs", "IPython", "jupyter", "notebook", "pytest",
     # hosted-platform cloud stack — see tests/smoke/smoke_test.py, which fails the bundle on these.
