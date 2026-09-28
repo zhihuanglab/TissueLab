@@ -164,6 +164,12 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
 
   test('a problem that does not match the data is rejected with the reason', async ({ page, guards }) => {
     await openResearchPanel(page);
+    // "New research task" starts from the workspace's problem.md again, not an empty box.
+    await expect(problemBox(page)).toHaveValue(PROBLEM);
+    await problemBox(page).fill('');
+    await page.getByRole('button', { name: 'New research task', exact: true }).click();
+    await expect(problemBox(page)).toHaveValue(PROBLEM);
+
     const before = fs.readdirSync(runsDir()).length;
     const started = await startRun(page, PROBLEM.replace('outcome: score', 'outcome: survival'), 1);
     expect((await started.json()).code).toBe(400);

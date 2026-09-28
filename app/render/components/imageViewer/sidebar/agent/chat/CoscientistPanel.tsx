@@ -72,6 +72,17 @@ type ResumeInfo = {
 
 // ─── Lightweight markdown renderer ───────────────────────────────────────────
 
+// problem.md's header, as the service's EXAMPLE_HEADER (discovery/problem.py);
+// used when the service cannot be asked (no workspace yet).
+const PROBLEM_TEMPLATE = `---
+outcome: <cohort column to predict>
+covariates: [<cohort column>, ...]
+cohort_file: training_cohort.csv
+id_column: donor_id
+slide_column: slide_name
+---
+`
+
 function renderMarkdown(text: string): React.ReactNode[] {
   const elements: React.ReactNode[] = []
   const lines = text.split("\n")
@@ -266,20 +277,27 @@ export const CoscientistPanel: React.FC = () => {
 
   useEffect(() => { fetchWorkspaceRuns() }, [fetchWorkspaceRuns])
 
-  // Pre-fill problem.md from the workspace, or its header template
-  useEffect(() => {
-    if (!workspaceDir || program) return
-    authedFetch(
-      `${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/problem?data_dir=${encodeURIComponent(workspaceDir)}`,
-      { method: "GET" }
-    ).then(({ data }) => {
-      if (data?.data?.found && data.data.content) {
-        setProgram(data.data.content)
-      } else if (data?.data?.template) {
-        setProgram(`${data.data.template}\n`)
-      }
-    }).catch(() => {})
-  }, [workspaceDir]) // eslint-disable-line react-hooks/exhaustive-deps
+  // Fill the box with the workspace's problem.md, else the header template (the
+  // service's, or the local copy when there is no workspace / no answer). Text
+  // the user wrote is never replaced; a previous fill is, e.g. once a slide opens.
+  const prefilledRef = useRef("")
+  const prefillProblem = useCallback(async () => {
+    let text = PROBLEM_TEMPLATE
+    if (workspaceDir) {
+      try {
+        const { data } = await authedFetch(
+          `${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/problem?data_dir=${encodeURIComponent(workspaceDir)}`,
+          { method: "GET" }
+        )
+        if (data?.data?.found && data.data.content) text = data.data.content
+        else if (data?.data?.template) text = `${data.data.template}\n`
+      } catch { /* keep the local template */ }
+    }
+    setProgram(prev => (!prev || prev === prefilledRef.current ? text : prev))
+    prefilledRef.current = text
+  }, [authedFetch, workspaceDir])
+
+  useEffect(() => { prefillProblem() }, [prefillProblem])
 
   // ─── Start research ──────────────────────────────────────────────────────
 
@@ -652,7 +670,7 @@ export const CoscientistPanel: React.FC = () => {
             <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="Run history" onClick={() => { if (!showHistory) void fetchWorkspaceRuns(); setShowHistory(!showHistory) }}>
               <History className="h-4 w-4" />
             </Button>
-            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="New research task" onClick={() => { setPhase("input"); setProgram(""); setCurrentRound(null); setJournal([]); setError(null); setResumeInfo(null); setActiveRunId(null); setMeasureStatus("idle"); setFinalSummary(null); }}>
+            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="New research task" onClick={() => { setPhase("input"); setProgram(""); prefillProblem(); setCurrentRound(null); setJournal([]); setError(null); setResumeInfo(null); setActiveRunId(null); setMeasureStatus("idle"); setFinalSummary(null); }}>
               <Plus className="h-4 w-4" />
             </Button>
           </div>
@@ -732,7 +750,7 @@ export const CoscientistPanel: React.FC = () => {
               <Textarea
                 value={program}
                 onChange={e => setProgram(e.target.value)}
-                placeholder={"---\noutcome: <cohort column to predict>\ncovariates: [<cohort column>, ...]\ncohort_file: training_cohort.csv\n---\nDescribe the research question..."}
+                placeholder={`${PROBLEM_TEMPLATE}Describe the research question...`}
                 className="min-h-[180px] font-mono text-[13px] leading-relaxed resize-none border-border/60 focus:border-primary/50 focus:ring-primary/20 bg-background"
               />
               <div className="text-[10px] text-muted-foreground mt-1">
