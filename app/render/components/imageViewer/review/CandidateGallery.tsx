@@ -437,8 +437,9 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
 
   // Calculate dropdown position
   const updateDropdownPosition = () => {
-    if (buttonRef.current) {
-      const rect = buttonRef.current.getBoundingClientRect();
+    const button = buttonRef.current;
+    if (button) {
+      const rect = button.getBoundingClientRect();
       setDropdownPosition({
         top: rect.top - 8, // 8px above the button
         left: rect.left,

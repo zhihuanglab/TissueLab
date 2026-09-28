@@ -159,7 +159,9 @@ export function NucleiSegRegionAndMppPanel({
       return
     }
 
-    const containerRect = viewer.container.getBoundingClientRect()
+    const container = viewer?.container
+    if (!container) return
+    const containerRect = container.getBoundingClientRect()
     const dpr = window.devicePixelRatio || 1
 
     let imgX1 = liveRectangleCoords.x1

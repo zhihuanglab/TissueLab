@@ -33,6 +33,7 @@ import {
 } from '@/utils/common/auth.utils';
 import {
   forceRefreshAuthToken,
+  notifyAuthReady,
   registerAuthTokenCacheInvalidator,
   resolveSessionToken,
 } from '@/utils/common/authToken';
@@ -953,6 +954,7 @@ export function UserInfoProvider({ children }: { children: React.ReactNode }) {
         }
         await updateUserInfo();
       }
+      if (!user.isAnonymous) notifyAuthReady();
     });
 
     // Cleanup

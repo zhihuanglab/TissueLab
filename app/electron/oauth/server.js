@@ -5,7 +5,7 @@
  */
 
 const http = require('http');
-const url = require('url');
+const { URL } = require('url');
 
 /**
  * Create a local HTTP server to handle OAuth callback
@@ -21,12 +21,12 @@ function createCallbackServer(port = 42813, callbackPath = '/') {
     let state = null;
     
     const server = http.createServer((req, res) => {
-      const parsedUrl = url.parse(req.url, true);
+      const parsedUrl = new URL(req.url || '/', 'http://127.0.0.1');
       const pathname = parsedUrl.pathname;
       
       // Handle callback path (root path for Desktop apps)
       if (pathname === callbackPath || pathname === '/') {
-        const query = parsedUrl.query;
+        const query = Object.fromEntries(parsedUrl.searchParams.entries());
         
         // Check for error
         if (query.error) {
@@ -39,7 +39,6 @@ function createCallbackServer(port = 42813, callbackPath = '/') {
           res.setHeader('Location', 'https://tissuelab.org/auth?status=error');
           res.end();
           
-          server.close();
           return;
         }
         
@@ -53,21 +52,15 @@ function createCallbackServer(port = 42813, callbackPath = '/') {
           res.setHeader('Location', 'https://tissuelab.org/auth');
           res.end();
           
-          // Close server after short delay to ensure response is sent
-          setTimeout(() => {
-            server.close();
-          }, 50);
+          // Keep the callback server alive until the OAuth helper finishes
+          // exchanging the code for tokens. Closing here can race with the
+          // browser redirect or a second callback request.
         } else {
-          error = {
-            error: 'missing_code',
-            error_description: 'No authorization code received'
-          };
-          
-          res.statusCode = 302;
-          res.setHeader('Location', 'https://tissuelab.org/auth?status=missing_code');
-          res.end();
-          
-          server.close();
+          // Browsers may request the bare loopback URL before Google sends
+          // the OAuth callback. Do not turn that harmless request into a
+          // terminal OAuth error; keep waiting for the request containing code.
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end('<!doctype html><title>Waiting for Google sign-in</title><p>Waiting for the TissueLab app to finish sign-in&hellip;</p>');
         }
       } else {
         // 404 for other paths

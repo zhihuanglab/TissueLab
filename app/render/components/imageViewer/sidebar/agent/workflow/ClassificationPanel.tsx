@@ -50,7 +50,7 @@ import { DrawingTool, setTool } from "@/store/slices/viewer/toolSlice";
 import { generateRandomColor, validateAndFixColor } from "@/utils/common/color.utils";
 import { useRefreshGtHighlightIndices } from '@/hooks/viewer/useRefreshGtHighlightIndices';
 import { apiFetch } from '@/utils/common/apiFetch'
-import { segFetch } from '@/utils/common/segFetch';
+import { isSegmentationHandlerNotReadyError, segFetch } from '@/utils/common/segFetch';
 import eventBus from "@/utils/common/eventBus";
 import { formatPath } from "@/utils/common/path.utils";
 import {
@@ -305,7 +305,9 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
 
       dispatch(setNucleiClasses(finalClasses));
     } catch (e) {
-      console.warn('[ClassificationPanel] Classifier mode: failed to sync classes from classifications', e);
+      if (!isSegmentationHandlerNotReadyError(e)) {
+        console.warn('[ClassificationPanel] Classifier mode: failed to sync classes from classifications', e);
+      }
     }
   }, [formattedPath, activeInstanceId, hasClassifierApplied, dispatch]);
   
@@ -853,7 +855,7 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
   // Fetch global totals (model + manual overrides) from backend
   const fetchGlobalTotals = useCallback(async () => {
     try {
-      if (!formattedPath) return;
+      if (!formattedPath || !activeInstanceId) return;
 
       // Get TOTAL counts (model + manual) for display
       const totalResp = await segFetch(activeInstanceId, `${AI_SERVICE_API_ENDPOINT}/seg/v1/total_counts?file_path=${encodeURIComponent(formattedPath)}`, {
@@ -953,9 +955,11 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
       }
 
     } catch (e) {
-      console.error('Error fetching counts:', e);
+      if (!isSegmentationHandlerNotReadyError(e)) {
+        console.warn('Error fetching counts:', e);
+      }
     }
-  }, [formattedPath, dispatch]); // Don't include nucleiClasses to avoid infinite loop
+  }, [formattedPath, activeInstanceId, dispatch]); // Don't include nucleiClasses to avoid infinite loop
 
   const getContrastTextColor = (hexColor: string): string => {
     try {

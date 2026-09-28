@@ -1739,6 +1739,16 @@ def _encode_tile_vips(img: pyvips.Image, quality: int = 85) -> bytes:
     return img.jpegsave_buffer(Q=quality, keep="none")
 
 
+def _slide_gone_during_read(session_id: str, session_data: Dict, slide, epoch: int) -> bool:
+    """Return whether a tile read started on a closed or replaced slide."""
+    with session_lock:
+        return (
+            sessions.get(session_id) is not session_data
+            or session_data.get('slide') is not slide
+            or session_data.get('tile_epoch', 0) != epoch
+        )
+
+
 def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
              color_mode: str = None, channels: List[int] = None,
              colors: List[List[int]] = None, session_id: str = "default",
@@ -1766,6 +1776,7 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
         ensure_session_slide(session_id)
 
     session_slide = session_data['slide']
+    read_epoch = session_data.get('tile_epoch', 0)
     session_slide_levels = session_data['slide_levels']
     session_current_file_format = session_data['current_file_format']
     session_tiff_slide_wrapper = session_data['tiff_slide_wrapper']
@@ -2017,6 +2028,17 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
             "height": out_h
         }
     except Exception as e:
+        if session_slide is not None and _slide_gone_during_read(
+            session_id, session_data, session_slide, read_epoch
+        ):
+            logger.info(
+                f"Tile ({level},{col},{row}) dropped: slide for session "
+                f"{session_id} closed during the read"
+            )
+            return {
+                "status": "stale",
+                "message": f"Slide for session {session_id} was closed during the read",
+            }
         traceback.print_exc()
         # Swallowed here (we return a debug tile), so report explicitly — fingerprint
         # dedups the flood when one slide fails every tile.

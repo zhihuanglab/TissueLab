@@ -10,6 +10,10 @@ let lastAuthModalAt = 0;
 
 export const AUTH_MISSING_ERROR = 'Authentication required';
 
+let authReadyWaiter: Promise<void> | null = null;
+let resolveAuthReady: (() => void) | null = null;
+let authReadyTimeout: ReturnType<typeof setTimeout> | null = null;
+
 export const notifyMissingAuth = () => {
   const now = Date.now();
   if (now - lastAuthModalAt < AUTH_MODAL_COOLDOWN_MS) return;
@@ -19,6 +23,38 @@ export const notifyMissingAuth = () => {
   signupModalStore.getState().setSignupModalOpen(true, {
     description: 'Please sign in to use this feature'
   });
+};
+
+/**
+ * Wait for the login modal to finish a real Firebase sign-in. Requests that
+ * opened the modal can then retry themselves instead of leaving the page in a
+ * stale, unauthenticated state.
+ */
+export const waitForAuthReady = (timeoutMs = 120_000): Promise<void> => {
+  if (authReadyWaiter) return authReadyWaiter;
+
+  authReadyWaiter = new Promise<void>((resolve, reject) => {
+    resolveAuthReady = resolve;
+    authReadyTimeout = setTimeout(() => {
+      toast.error('Sign-in timed out. Please try again.');
+      reject(new Error(AUTH_MISSING_ERROR));
+      authReadyWaiter = null;
+      resolveAuthReady = null;
+      authReadyTimeout = null;
+    }, timeoutMs);
+  });
+
+  return authReadyWaiter;
+};
+
+/** Resolve all requests waiting for the login that opened the modal. */
+export const notifyAuthReady = () => {
+  if (!resolveAuthReady) return;
+  if (authReadyTimeout) clearTimeout(authReadyTimeout);
+  resolveAuthReady();
+  authReadyWaiter = null;
+  resolveAuthReady = null;
+  authReadyTimeout = null;
 };
 
 export const AUTH_COOKIE_NAME = 'tissuelab_token';

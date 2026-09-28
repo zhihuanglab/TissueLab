@@ -2506,11 +2506,19 @@ def resolve_staged_zarr_root(search_root: str) -> Optional[str]:
 
 def cleanup_zarr_staging(staging_id: str) -> None:
     """Remove one staging directory (best-effort). staging_id is a bare uuid."""
-    if not staging_id or os.sep in staging_id or staging_id in (".", ".."):
+    if not is_valid_staging_id(staging_id):
         return
     path = os.path.join(zarr_staging_base(), staging_id)
     if os.path.isdir(path):
         shutil.rmtree(path, ignore_errors=True)
+
+
+_STAGING_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def is_valid_staging_id(staging_id: Optional[str]) -> bool:
+    """Return whether a staging id is a uuid4().hex directory name."""
+    return bool(staging_id) and _STAGING_ID_RE.fullmatch(staging_id) is not None
 
 
 # ── Whole-.zarr replacement (user-supplied preprocessing, incl. nuclei seg) ──

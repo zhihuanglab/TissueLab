@@ -5,7 +5,7 @@
  * ensuring sequential processing to avoid conflicts and improve performance.
  */
 
-import { segFetch } from '@/utils/common/segFetch';
+import { isSegmentationHandlerNotReadyError, segFetch } from '@/utils/common/segFetch';
 import { AI_SERVICE_API_ENDPOINT } from "@/config/api.config";
 import { AppDispatch, store } from "@/store";
 import {
@@ -211,7 +211,9 @@ class AnnotationQueue {
     // Process all tasks in parallel
     const promises = tasks.map(task => 
       this.processTask(task).catch(error => {
-        console.error('[AnnotationQueue] Error processing batch task:', error);
+        if (!isSegmentationHandlerNotReadyError(error)) {
+          console.warn('[AnnotationQueue] Error processing batch task:', error);
+        }
         if (task.onError) {
           task.onError(error);
         }
@@ -299,7 +301,9 @@ class AnnotationQueue {
       try {
         await this.processTask(task);
       } catch (error) {
-        console.error('[AnnotationQueue] Error processing task:', error);
+        if (!isSegmentationHandlerNotReadyError(error)) {
+          console.warn('[AnnotationQueue] Error processing task:', error);
+        }
         if (task.onError) {
           task.onError(error);
         }

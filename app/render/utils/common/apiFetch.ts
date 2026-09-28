@@ -1,5 +1,5 @@
 import { getOrCreateDeviceId } from './device.utils';
-import { AUTH_MISSING_ERROR, forceRefreshAuthToken, getAuthToken, LOCAL_DEFAULT_TOKEN, notifyMissingAuth } from './authToken';
+import { AUTH_MISSING_ERROR, forceRefreshAuthToken, getAuthToken, LOCAL_DEFAULT_TOKEN, notifyMissingAuth, waitForAuthReady } from './authToken';
 import { notifyRateLimitExceeded } from './errorNotifications';
 import { AI_SERVICE_API_ENDPOINT, COMMUNITY_API_ENDPOINT, CTRL_SERVICE_API_ENDPOINT } from '@/config/api.config';
 import { ApiError, isApiResponse, normalizeApiResponse, readApiErrorDetails } from './apiResponse';
@@ -175,22 +175,31 @@ export const apiFetch = async (url: string, options: FetchRequestInit) => {
   if (ownsAuthHeader) {
     // Open edition: without a Firebase session getAuthToken() hands out the
     // local placeholder. The local service ignores bearer tokens, so local
-    // requests keep working; hosted (community) requests keep asking to sign in.
+    // requests keep working. Hosted (community) calls need a real session:
+    // open the sign-in modal and stop, instead of failing the page with a
+    // runtime error. Anonymous Firebase sessions can still browse.
     const isLocalEndpoint =
       url.startsWith(CTRL_SERVICE_API_ENDPOINT) || url.startsWith(AI_SERVICE_API_ENDPOINT);
     const isCommunityEndpoint = url.startsWith(COMMUNITY_API_ENDPOINT);
-    const rawToken = await getAuthToken();
-    const token = rawToken === LOCAL_DEFAULT_TOKEN && !isLocalEndpoint ? null : rawToken;
+    const requiresAuth = !isLocalEndpoint &&
+      (url.startsWith('https://') || isCommunityEndpoint);
+    let authRetried = false;
 
-    if (token) {
-      headers.set('Authorization', `Bearer ${token}`);
-    } else {
-      const isHttps = url.startsWith('https://');
+    while (true) {
+      const rawToken = await getAuthToken();
+      const token = rawToken === LOCAL_DEFAULT_TOKEN && !isLocalEndpoint ? null : rawToken;
 
-      if (!isLocalEndpoint && (isHttps || isCommunityEndpoint)) {
-        notifyMissingAuth();
-        throw new Error(AUTH_MISSING_ERROR);
+      if (token) {
+        headers.set('Authorization', `Bearer ${token}`);
+        break;
       }
+
+      if (!requiresAuth) break;
+      if (authRetried) throw AUTH_MISSING_ERROR;
+
+      notifyMissingAuth();
+      await waitForAuthReady();
+      authRetried = true;
     }
   }
 

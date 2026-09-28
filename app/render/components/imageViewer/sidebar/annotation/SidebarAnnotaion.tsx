@@ -32,7 +32,7 @@ import { useAnnotatorInstance } from "@/contexts/AnnotatorContext";
 import { RootState } from "@/store";
 import { selectPatchClassificationData, setEditAnnotations } from "@/store/slices/viewer/annotationSlice";
 import { useAnnotationTypes } from "@/store/zustand/slice/annotationTypesStore";
-import { segFetch } from '@/utils/common/segFetch';
+import { isSegmentationHandlerNotReadyError, segFetch } from '@/utils/common/segFetch';
 import { getClassColor } from "@/utils/agent/patchClassification.utils";
 import { apiListManualAnnotations } from "@/utils/viewer/manualAnnotation.api";
 import { verticesBounds, MANUAL_SOURCE, toManualZarrPath } from "@/utils/viewer/annotation.utils";
@@ -569,6 +569,7 @@ const SidebarAnnotation: React.FC = () => {
   };
 
   const fetchAiAnnotations = async (offset: number, limit: number) => {
+    if (!currentImagePath || !activeInstanceId) return;
     try {
       setLoading(true);
       const response = await segFetch(activeInstanceId, `${AI_SERVICE_API_ENDPOINT}/seg/v1/annotations/?offset=${offset}&limit=${limit}`, {
@@ -589,13 +590,19 @@ const SidebarAnnotation: React.FC = () => {
         setTotalAiAnnotations(newTotal);
       }
     } catch (error) {
-      console.error("Error fetching AI annotations:", error);
+      if (isSegmentationHandlerNotReadyError(error)) {
+        // A slide switch tears down the old handler before the new one is
+        // ready. This is an expected transient state, not a dev-runtime error.
+        return;
+      }
+      console.warn("Error fetching AI annotations:", error);
     } finally {
       setLoading(false);
     }
   };
 
   const fetchSavedUserAnnotations = async () => {
+    if (!currentImagePath || !activeInstanceId) return;
     const seq = ++savedUserFetchSeqRef.current;
     const pathAtStart = currentImagePath;
     const instanceAtStart = activeInstanceId;
@@ -646,8 +653,8 @@ const SidebarAnnotation: React.FC = () => {
       }
     } catch (error) {
       if (seq !== savedUserFetchSeqRef.current) return;
-      console.error("Error fetching saved user annotations:", error);
-      setSavedUserAnnotations([]);
+      if (isSegmentationHandlerNotReadyError(error)) return;
+      console.warn("Error fetching saved user annotations:", error);
     }
   };
 
@@ -697,6 +704,7 @@ const SidebarAnnotation: React.FC = () => {
   };
 
   const fetchClassificationMeta = async () => {
+    if (!currentImagePath || !activeInstanceId) return;
     try {
       const response = await segFetch(activeInstanceId, `${AI_SERVICE_API_ENDPOINT}/seg/v1/classification/metadata`, { method: 'GET',  returnAxiosFormat: true });
       const payload = response?.data?.data ?? response?.data;
@@ -705,12 +713,13 @@ const SidebarAnnotation: React.FC = () => {
         patch: payload?.patch ?? null,
       });
     } catch (error) {
-      console.error("Error fetching classification metadata:", error);
-      setClassificationMeta({});
+      if (isSegmentationHandlerNotReadyError(error)) return;
+      console.warn("Error fetching classification metadata:", error);
     }
   };
 
   const fetchAiAnnotationsPatch = async (offset: number, limit: number) => {
+    if (!currentImagePath || !activeInstanceId) return;
     try {
       setLoading(true);
       const response = await segFetch(activeInstanceId, `${AI_SERVICE_API_ENDPOINT}/seg/v1/patches/?offset=${offset}&limit=${limit}`, {
@@ -731,7 +740,10 @@ const SidebarAnnotation: React.FC = () => {
         setTotalAiAnnotationsPatch(newTotal);
       }
     } catch (error) {
-      console.error("Error fetching AI annotations patch:", error);
+      if (isSegmentationHandlerNotReadyError(error)) {
+        return;
+      }
+      console.warn("Error fetching AI annotations patch:", error);
     } finally {
       setLoading(false);
     }
@@ -751,7 +763,7 @@ const SidebarAnnotation: React.FC = () => {
     fetchSavedUserAnnotations();
     fetchClassificationMeta();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentImagePath, userAnnotations.length]);
+  }, [currentImagePath, activeInstanceId, userAnnotations.length]);
 
   useEffect(() => {
     const onManualChanged = () => {
@@ -765,11 +777,11 @@ const SidebarAnnotation: React.FC = () => {
 
   useEffect(() => {
     fetchAiAnnotations(aiPagination.offset, aiPagination.limit);
-  }, [aiPagination.offset, aiPagination.limit, currentImagePath]);
+  }, [aiPagination.offset, aiPagination.limit, currentImagePath, activeInstanceId]);
 
   useEffect(() => {
     fetchAiAnnotationsPatch(aiPaginationPatch.offset, aiPaginationPatch.limit);
-  }, [aiPaginationPatch.offset, aiPaginationPatch.limit, currentImagePath]);
+  }, [aiPaginationPatch.offset, aiPaginationPatch.limit, currentImagePath, activeInstanceId]);
 
   const uniquePatchIds = useMemo(
     () =>

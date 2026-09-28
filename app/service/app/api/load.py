@@ -1,4 +1,5 @@
 from fastapi import APIRouter, File, UploadFile, Query, Response, Request, Depends
+from starlette.requests import ClientDisconnect
 from typing import Optional, Dict, Any
 import asyncio
 import traceback
@@ -44,10 +45,13 @@ load_router = APIRouter()
 
 
 async def _parse_json_body(request: Request) -> Dict[str, Any]:
-    """Read and parse a JSON request body."""
+    """Read and parse a JSON object request body."""
     body = await request.body()
     body_text = body.decode('utf-8', errors='replace')
-    return json.loads(body_text)
+    data = json.loads(body_text)
+    if not isinstance(data, dict):
+        raise ValueError("JSON body must be an object")
+    return data
 
 
 async def _parse_loose_request_data(request: Request) -> Dict[str, Any]:
@@ -55,43 +59,45 @@ async def _parse_loose_request_data(request: Request) -> Dict[str, Any]:
     data: Dict[str, Any] = {}
     headers = dict(request.headers)
     content_type = headers.get("content-type", "")
-    body = await request.body()
-    body_text = body.decode("utf-8", errors="replace")
 
-    if "application/json" in content_type:
-        try:
-            parsed = json.loads(body_text)
-            if isinstance(parsed, dict):
-                data.update(parsed)
-        except json.JSONDecodeError:
-            pass
-    elif "application/x-www-form-urlencoded" in content_type:
-        for part in body_text.split("&"):
-            if "=" in part:
-                key, value = part.split("=", 1)
-                data[key] = urllib.parse.unquote_plus(value)
-    elif "multipart/form-data" in content_type:
-        try:
-            form = await request.form()
-            data.update(dict(form))
-        except Exception:
-            pass
+    # Let Starlette parse multipart requests directly. Reading the entire raw
+    # body first is unnecessary for FormData and makes client disconnects more
+    # likely to surface while this helper is still buffering the request.
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        data.update(dict(form))
     else:
-        try:
-            parsed = json.loads(body_text)
-            if isinstance(parsed, dict):
-                data.update(parsed)
-        except Exception:
+        body = await request.body()
+        body_text = body.decode("utf-8", errors="replace")
+
+        if "application/json" in content_type:
+            try:
+                parsed = json.loads(body_text)
+                if isinstance(parsed, dict):
+                    data.update(parsed)
+            except json.JSONDecodeError:
+                pass
+        elif "application/x-www-form-urlencoded" in content_type:
             for part in body_text.split("&"):
                 if "=" in part:
                     key, value = part.split("=", 1)
                     data[key] = urllib.parse.unquote_plus(value)
-            if not data:
-                try:
-                    form = await request.form()
-                    data.update(dict(form))
-                except Exception:
-                    pass
+        else:
+            try:
+                parsed = json.loads(body_text)
+                if isinstance(parsed, dict):
+                    data.update(parsed)
+            except Exception:
+                for part in body_text.split("&"):
+                    if "=" in part:
+                        key, value = part.split("=", 1)
+                        data[key] = urllib.parse.unquote_plus(value)
+                if not data:
+                    try:
+                        form = await request.form()
+                        data.update(dict(form))
+                    except Exception:
+                        pass
 
     for key, value in dict(request.query_params).items():
         data.setdefault(key, value)
@@ -182,8 +188,8 @@ async def create_instance(request: Request):
         try:
             data = await _parse_json_body(request)
             file_path = data.get('file_path', '') or data.get('relative_path', '')
-        except json.JSONDecodeError:
-            return error_response("Invalid JSON format")
+        except ValueError:
+            return error_response("Invalid JSON format", code=400)
 
         authorized_path, denied = await authorize_read_or_response_async(
             request, file_path, operation="create viewer instance"
@@ -216,8 +222,8 @@ async def delete_instance(request: Request):
         try:
             data = await _parse_json_body(request)
             instance_id = data.get('instance_id', '')
-        except json.JSONDecodeError:
-            return error_response("Invalid JSON format")
+        except ValueError:
+            return error_response("Invalid JSON format", code=400)
 
         denied = _guard_session(
             request, instance_id, "delete viewer instance", teardown=True
@@ -299,6 +305,11 @@ async def upload_file_path_api_with_session(request: Request, session_id: str = 
             return error_response(result["message"])
         return success_response(result)
 
+    except ClientDisconnect:
+        # The client cancelled the request or disconnected while the body was
+        # being read. This is not a server error and should not be reported as
+        # a 500/uncaught backend exception.
+        return Response(status_code=499)
     except Exception as e:
         traceback.print_exc()
         return error_response(f"Error loading file from path: {str(e)}")
@@ -321,6 +332,8 @@ async def upload_folder(request: Request, auth_user: AuthUser = Depends(get_auth
             return error_response(result["message"])
         return success_response(result)
 
+    except ClientDisconnect:
+        return Response(status_code=499)
     except Exception as e:
         traceback.print_exc()
         return error_response(f"Error uploading folder: {str(e)}")
@@ -678,8 +691,8 @@ async def set_z_layer_api(request: Request):
     try:
         try:
             data = await _parse_json_body(request)
-        except json.JSONDecodeError:
-            return error_response("Invalid JSON format")
+        except ValueError:
+            return error_response("Invalid JSON format", code=400)
 
         session_id = data.get('session_id', 'default')
         if session_id == "default":
@@ -689,9 +702,13 @@ async def set_z_layer_api(request: Request):
             return denied
         z_layer = data.get('z_layer')
         if z_layer is None:
-            return error_response("z_layer is required")
+            return error_response("z_layer is required", code=400)
+        try:
+            z_layer = int(z_layer)
+        except (TypeError, ValueError):
+            return error_response("z_layer must be an integer", code=400)
 
-        result = set_z_layer_for_api(session_id, int(z_layer))
+        result = set_z_layer_for_api(session_id, z_layer)
         if result["status"] == "error":
             return error_response(result["message"])
         return success_response(result["data"])

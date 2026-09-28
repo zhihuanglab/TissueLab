@@ -3686,7 +3686,10 @@ class SegmentationHandler:
         """
         # Only load if handler doesn't have data
         if self.centroids is None or self.zarr_file is None:
-            self.load_file(self.get_current_file_path(), force_reload=False, reload_segmentation_data=False)
+            current_file = self.get_current_file_path()
+            if not current_file:
+                return None
+            self.load_file(current_file, force_reload=False, reload_segmentation_data=False)
 
         # If there are no base classifications from the Zarr file, there's nothing to return.
         if self.class_id is None or self.class_name is None or self.class_hex_color is None:
@@ -6751,9 +6754,9 @@ class SegmentationHandler:
         """
         # Use caching for performance - total_counts is called frequently
         # Check cache first to avoid expensive recalculations
+        current_file = self.get_current_file_path()
         if hasattr(self, '_global_label_counts_cache') and self._global_label_counts_cache is not None:
             # Check if cache is still valid (file hasn't changed)
-            current_file = self.get_current_file_path()
             cached_file, cached_result = self._global_label_counts_cache
             if cached_file == current_file:
                 return cached_result
@@ -6761,12 +6764,19 @@ class SegmentationHandler:
         # Only load if handler doesn't have zarr_file set
         # Note: centroids check is done later only if needed for total_cells calculation
         if self.zarr_file is None:
-            self.load_file(self.get_current_file_path(), force_reload=False, reload_segmentation_data=False)
+            if not current_file:
+                return {
+                    'total_cells': 0,
+                    'class_counts_by_id': {},
+                    'dynamic_class_names': [],
+                    'class_hex_colors': [],
+                }
+            self.load_file(current_file, force_reload=False, reload_segmentation_data=False)
         
         # Load centroids only if needed for total_cells (lazy loading)
         if self.centroids is None and self.zarr_file is not None:
             # Only reload segmentation data if we need centroids for total_cells
-            self.load_file(self.get_current_file_path(), force_reload=False, reload_segmentation_data=True)
+            self.load_file(current_file, force_reload=False, reload_segmentation_data=True)
 
         # IMPORTANT: Ensure manual annotations are applied before calculating counts
         # This is critical because save_annotation may have updated the Zarr file,

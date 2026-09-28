@@ -8,6 +8,7 @@
 import { annotationTypeStore } from '@/store/zustand/slice/annotationTypesStore';
 import { applyIncomingNucleiClasses } from '@/utils/annotations/nucleiClassList';
 import type { AnnotationClass } from '@/store/slices/viewer/annotationSlice';
+import { isSegmentationHandlerNotReadyError } from '@/utils/common/segFetch';
 
 export type ClassificationLoadOutcome =
   /** Backend not ready / transient failure — keep whatever the overlay has. */
@@ -19,14 +20,7 @@ export type ClassificationLoadOutcome =
 
 /** Messages that mean "handler not bound yet", not "no data". */
 export function isNonFatalHandlerNotReadyMessage(value: unknown): boolean {
-  if (typeof value !== 'string') return false;
-  const normalized = value.trim().toLowerCase();
-  return (
-    normalized.includes('no handler found for instance') ||
-    normalized.includes('no segmentation handler for') ||
-    normalized.includes('x-instance-id header is required') ||
-    normalized.includes('open a slide first')
-  );
+  return isSegmentationHandlerNotReadyError(value);
 }
 
 /**

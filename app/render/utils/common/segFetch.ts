@@ -15,6 +15,27 @@ export class MissingInstanceIdError extends Error {
   }
 }
 
+/**
+ * A slide switch briefly removes the old handler before the websocket's
+ * set_path bind creates the new one. Requests issued in that window receive a
+ * normal backend business error; callers should keep their current UI state
+ * and wait for the next refresh instead of surfacing a runtime error.
+ */
+export function isSegmentationHandlerNotReadyError(error: unknown): boolean {
+  const message =
+    error && typeof error === 'object' && 'message' in error
+      ? (error as { message?: unknown }).message
+      : error;
+  if (typeof message !== 'string') return false;
+  const normalized = message.trim().toLowerCase();
+  return (
+    normalized.includes('no handler found for instance') ||
+    normalized.includes('no segmentation handler for') ||
+    normalized.includes('x-instance-id header is required') ||
+    normalized.includes('open a slide first')
+  );
+}
+
 export function requireInstanceId(
   instanceId: string | null | undefined,
   context?: string

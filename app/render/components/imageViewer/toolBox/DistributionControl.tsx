@@ -6,7 +6,7 @@ import { useDispatch } from "react-redux"
 import { useInstanceSlidePath } from "@/utils/viewer/slidePath";
 import { setFilterHighlightIndices } from "@/store/slices/viewer/shapeSlice"
 import { Button } from "@/components/ui/button"
-import { segFetch } from "@/utils/common/segFetch"
+import { isSegmentationHandlerNotReadyError, segFetch } from "@/utils/common/segFetch"
 import { getErrorMessage } from "@/utils/common/apiResponse"
 import { AI_SERVICE_API_ENDPOINT } from "@/config/api.config"
 import { formatPath } from "@/utils/common/path.utils"
@@ -262,7 +262,7 @@ export default function DistributionControl({
   }, [isDragging, updateThresholdFromClientX])
 
   const fetchRegionProbabilityHistogram = useCallback(async () => {
-    if (selectedClass.source !== "nuclei" || !shapeCoords || !currentPath) {
+    if (selectedClass.source !== "nuclei" || !shapeCoords || !currentPath || !instanceId) {
       setProbHist([])
       return
     }
@@ -293,6 +293,7 @@ export default function DistributionControl({
         setProbHist([])
       }
     } catch (e) {
+      if (isSegmentationHandlerNotReadyError(e)) return
       setError(getErrorMessage(e, "Failed to load probability distribution"))
       setRegionProbs([])
       setRegionIndices([])

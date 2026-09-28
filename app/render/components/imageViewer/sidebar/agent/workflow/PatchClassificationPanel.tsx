@@ -31,7 +31,7 @@ import {
 import { useRefreshGtHighlightIndices } from '@/hooks/viewer/useRefreshGtHighlightIndices';
 import eventBus from '@/utils/common/eventBus';
 import { apiFetch } from '@/utils/common/apiFetch'
-import { segFetch } from '@/utils/common/segFetch';
+import { isSegmentationHandlerNotReadyError, segFetch } from '@/utils/common/segFetch';
 import { getErrorMessage } from '@/utils/common/apiResponse';
 import { isNegativeControl, mergePatchClassificationData, NEGATIVE_CONTROL_CLASS_NAME, NEGATIVE_CONTROL_COLOR, normalizePatchClassificationData } from "@/utils/agent/patchClassification.utils";
 import { formatPath } from "@/utils/common/path.utils";
@@ -218,7 +218,7 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
   // When a classifier is applied, force panel classes/colors/counts to follow backend
   // so all classes inside classifier are always visible in panel.
   const syncPatchClassesFromBackendIfClassifier = useCallback(async () => {
-    if (!formattedPath || !hasClassifierApplied) return;
+    if (!formattedPath || !activeInstanceId || !hasClassifierApplied) return;
     try {
       const resp = await segFetch(activeInstanceId, `${AI_SERVICE_API_ENDPOINT}/seg/v1/patch_classification`, {
         method: 'GET',
@@ -259,7 +259,9 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
         class_counts: counts,
       } as any));
     } catch (e) {
-      console.warn('[PatchClassificationPanel] Failed to sync patch classes from backend in classifier mode', e);
+      if (!isSegmentationHandlerNotReadyError(e)) {
+        console.warn('[PatchClassificationPanel] Failed to sync patch classes from backend in classifier mode', e);
+      }
     }
   }, [formattedPath, hasClassifierApplied, dispatch, activeInstanceId]);
 
