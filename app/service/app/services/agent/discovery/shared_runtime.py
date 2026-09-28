@@ -26,10 +26,10 @@ LIB_SOURCE_ROOT = SOURCE_ROOT / "shared_analysis"
 TEMPLATE_SOURCE_ROOT = SOURCE_ROOT / "templates"
 
 
-def _copy_tree(source: Path, destination: Path) -> None:
+def copy_tree(source: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     for path in source.rglob("*"):
-        if path.is_dir() or path.name == "__pycache__":
+        if path.is_dir() or "__pycache__" in path.parts:
             continue
         relative = path.relative_to(source)
         target = destination / relative
@@ -109,8 +109,8 @@ def ensure_shared_runtime(
     cache_dir.mkdir(parents=True, exist_ok=True)
     region_dir.mkdir(parents=True, exist_ok=True)
 
-    _copy_tree(LIB_SOURCE_ROOT, lib_dir / "shared_analysis")
-    _copy_tree(TEMPLATE_SOURCE_ROOT, templates_dir)
+    copy_tree(LIB_SOURCE_ROOT, lib_dir / "shared_analysis")
+    copy_tree(TEMPLATE_SOURCE_ROOT, templates_dir)
 
     slide_manifest = build_slide_manifest(data_dir)
     cohort_summary = {

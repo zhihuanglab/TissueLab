@@ -1,17 +1,13 @@
 """Discovery (autoresearch) routes and the Open-specific parts of the loop.
 
 The loop itself is stubbed: these tests cover sessions, the on-disk run
-listing, the run/stream lifecycle, and that model-written code never runs in
-the service process.
+listing, the run/stream/cancel lifecycle, and the preconditions checked
+before a run starts. test_discovery_runtime.py covers the loop's internals.
 """
 import json
-import subprocess
-import sys
 import time
 
 import pytest
-
-from conftest import SERVICE_DIR
 
 
 @pytest.fixture
@@ -26,6 +22,7 @@ def llm_ready(monkeypatch):
     import app.api.discovery as discovery_api
 
     monkeypatch.setattr(discovery_api, "unavailable_reason", lambda: None)
+    monkeypatch.setattr(discovery_api, "docker_unavailable_reason", lambda: None)
 
 
 def _create_session(client, workspace):
@@ -36,27 +33,6 @@ def _create_session(client, workspace):
     body = r.json()
     assert body["code"] == 0, body
     return body["data"]["session_id"]
-
-
-def test_service_process_does_not_load_sandbox_only_packages():
-    # scikit-learn lives only in the worker image; importing the loop and the
-    # routes must not pull it into the service.
-    code = (
-        "import sys, app.api.discovery, app.services.agent.discovery.deterministic_evaluator; "
-        "print('sklearn' in sys.modules)"
-    )
-    out = subprocess.run([sys.executable, "-c", code], cwd=SERVICE_DIR, capture_output=True, text=True)
-    assert out.returncode == 0, out.stderr
-    assert out.stdout.strip().splitlines()[-1] == "False"
-
-
-def test_shared_analysis_exports_resolve_lazily():
-    from app.services.agent.discovery.shared_lib_source import shared_analysis
-
-    assert "partial_correlation" in shared_analysis.__all__
-    assert callable(shared_analysis.partial_correlation)
-    with pytest.raises(AttributeError):
-        shared_analysis.not_an_export  # noqa: B018
 
 
 def test_session_create_list_get(client, workspace, local_uid):
@@ -113,18 +89,6 @@ def test_start_run_without_key_is_501(client, workspace):
     assert "OPENAI_API_KEY" in body["message"]
 
 
-def test_responses_api_is_required(monkeypatch):
-    from app.services.agent.discovery import client as discovery_client
-
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
-    monkeypatch.delenv("LLM_API", raising=False)
-    assert "Responses API" in discovery_client.unavailable_reason()
-
-    monkeypatch.delenv("OPENAI_BASE_URL")
-    assert discovery_client.unavailable_reason() is None
-
-
 def test_run_streams_loop_events_and_completes(client, workspace, llm_ready, monkeypatch):
     import app.services.agent.discovery.run_manager as run_manager_mod
 
@@ -157,49 +121,76 @@ def test_run_streams_loop_events_and_completes(client, workspace, llm_ready, mon
     assert session["runs"][-1]["status"] == "completed"
 
 
-def test_result_script_replay_runs_in_the_sandbox(tmp_path, monkeypatch):
-    import app.services.agent.discovery.deterministic_evaluator as evaluator
+def test_start_run_without_docker_is_501(client, workspace, monkeypatch):
+    import app.api.discovery as discovery_api
 
-    calls = []
+    monkeypatch.setattr(discovery_api, "unavailable_reason", lambda: None)
+    monkeypatch.setattr(discovery_api, "docker_unavailable_reason", lambda: "Docker is not running.")
+    session_id = _create_session(client, workspace)
+    body = client.post(f"/api/agent/v1/coscientist/sessions/{session_id}/run", json={"task": "t"}).json()
+    assert body["code"] == 501
+    assert body["message"] == "Docker is not running."
 
-    class FakeSandbox:
-        def __init__(self, scratch_dir, *, data_dir, shared_dir, command_timeout_sec):
-            calls.append({"scratch": scratch_dir, "data": data_dir, "shared": shared_dir})
 
-        def start(self):
-            calls[-1]["started"] = True
+def test_submitted_program_replaces_existing_program_md(client, workspace, llm_ready, monkeypatch):
+    import app.services.agent.discovery.run_manager as run_manager_mod
 
-        def exec(self, command, timeout_sec=None):
-            calls[-1]["command"] = command
-            scratch = calls[-1]["scratch"]
-            (scratch / "donor_feature_table.csv").write_text("donor_id,f\nd1,1.0\n")
-            (scratch / "__materialized_interface_metadata.json").write_text("{}")
-            return {"exit_code": 0, "stdout": "", "stderr": ""}
+    seen = {}
 
-        def stop(self):
-            calls[-1]["stopped"] = True
+    async def fake_loop(**kwargs):
+        seen["program"] = kwargs["program_text"]
+        return {"answer": "", "status": "completed", "iterations": 0}
 
-    monkeypatch.setattr(evaluator, "SandboxSession", FakeSandbox)
+    monkeypatch.setattr(run_manager_mod, "run_autoresearch", fake_loop)
+    (workspace / "program.md").write_text("old objective")
 
-    worker_dir = tmp_path / "worker"
-    worker_dir.mkdir()
-    (worker_dir / "result.py").write_text("def compute_donor_score(*a, **k):\n    return {}\n")
-    scratch, shared = tmp_path / "scratch", tmp_path / "shared"
-    scratch.mkdir()
-    shared.mkdir()
+    session_id = _create_session(client, workspace)
+    run_id = client.post(
+        f"/api/agent/v1/coscientist/sessions/{session_id}/run",
+        json={"task": "edited objective", "context": {"workspace_path": str(workspace)}},
+    ).json()["data"]["run_id"]
+    with client.stream("GET", f"/api/agent/v1/coscientist/sessions/{session_id}/runs/{run_id}/stream") as r:
+        list(r.iter_lines())
 
-    table, _, issues = evaluator.materialize_donor_table_via_script_interface(
-        script_path=worker_dir / "result.py",
-        data_dir=tmp_path,
-        shared_dir=shared,
-        scratch_dir=scratch,
-        timeout_sec=30,
-    )
+    assert seen["program"] == "edited objective"
+    assert (workspace / "program.md").read_text() == "edited objective"
 
-    assert issues == []
-    assert table == scratch / "donor_feature_table.csv"
-    call = calls[0]
-    assert call["started"] and call["stopped"]
-    assert call["command"].startswith("/usr/local/bin/python3 /scratch/__materialize_donor_table.py /scratch/result.py /data /shared /scratch")
-    assert sys.executable not in call["command"]
-    assert (scratch / "result.py").exists()
+
+def test_cancel_stops_the_worker_thread_and_reports_once(client, workspace, llm_ready, monkeypatch):
+    import asyncio
+    import threading
+
+    import app.services.agent.discovery.run_manager as run_manager_mod
+
+    thread_saw_cancel = threading.Event()
+    worker_entered = threading.Event()
+
+    def blocking_worker(cancel_event):
+        worker_entered.set()
+        if cancel_event.wait(10):
+            thread_saw_cancel.set()
+
+    async def fake_loop(**kwargs):
+        await kwargs["emit"]({"type": "round_started", "round_id": 1, "total_rounds": 1})
+        await asyncio.to_thread(blocking_worker, kwargs["cancel_event"])
+        return {"answer": "", "status": "completed", "iterations": 1}
+
+    monkeypatch.setattr(run_manager_mod, "run_autoresearch", fake_loop)
+
+    session_id = _create_session(client, workspace)
+    run_id = client.post(
+        f"/api/agent/v1/coscientist/sessions/{session_id}/run",
+        json={"task": "t", "context": {"workspace_path": str(workspace)}},
+    ).json()["data"]["run_id"]
+    assert worker_entered.wait(5)
+
+    body = client.post(f"/api/agent/v1/coscientist/sessions/{session_id}/runs/{run_id}/cancel").json()
+    assert body["data"] == {"cancelled": True}
+    assert thread_saw_cancel.wait(5)
+
+    with client.stream("GET", f"/api/agent/v1/coscientist/sessions/{session_id}/runs/{run_id}/stream") as r:
+        events = [json.loads(line[len("data: "):]) for line in r.iter_lines() if line.startswith("data: ")]
+    assert [e for e in events if e["type"] == "error"] == [{"type": "error", "message": "Run cancelled"}]
+
+    session = client.get(f"/api/agent/v1/coscientist/sessions/{session_id}").json()["data"]
+    assert session["runs"][-1]["status"] == "cancelled"

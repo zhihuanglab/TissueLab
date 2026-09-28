@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -30,7 +31,13 @@ class DiscoveryRunManager:
         self.store = store
         self._tasks: Dict[str, asyncio.Task] = {}
         self._queues: Dict[str, asyncio.Queue] = {}
+        # Set on cancel/shutdown. task.cancel() only stops the awaiting
+        # coroutine; the scout/worker threads and their containers watch this.
+        self._cancel_events: Dict[str, threading.Event] = {}
         self._lock = asyncio.Lock()
+
+    def _cancel_event(self, run_id: str) -> threading.Event:
+        return self._cancel_events.setdefault(run_id, threading.Event())
 
     async def start_run(
         self,
@@ -172,6 +179,7 @@ class DiscoveryRunManager:
                 data_dir=str(data_dir),
                 run_root=str(resume_run_root),
                 emit=lambda event: self._emit(session_id, run.run_id, event),
+                cancel_event=self._cancel_event(run.run_id),
                 rounds=max(1, rounds_to_run),
                 model=saved_config.get("model"),
                 reasoning_effort=str(saved_config.get("reasoning_effort", "high")),
@@ -273,18 +281,20 @@ class DiscoveryRunManager:
     async def cancel_run(self, session_id: str, run_id: str) -> bool:
         task = self._tasks.get(run_id)
         if task and not task.done():
+            self._cancel_event(run_id).set()
+            # The task's CancelledError handler records the status, emits
+            # "Run cancelled" and closes the stream — once.
             task.cancel()
-            await asyncio.to_thread(
-                self.store.update_run_status,
-                session_id,
-                run_id,
-                status="cancelled",
-                ended_at=datetime.now(timezone.utc).isoformat(),
-            )
-            await self._emit(session_id, run_id, {"type": "error", "message": "Run cancelled"})
-            await self._close_queue(run_id)
             return True
         return False
+
+    def request_shutdown(self) -> list[asyncio.Task]:
+        """Signal every active run's threads and cancel its task; returns the tasks."""
+        active = [(run_id, task) for run_id, task in self._tasks.items() if not task.done()]
+        for run_id, task in active:
+            self._cancel_event(run_id).set()
+            task.cancel()
+        return [task for _, task in active]
 
     async def _emit(self, session_id: str, run_id: str, event: Dict[str, Any]) -> None:
         queue = self._queues.get(run_id)
@@ -407,11 +417,16 @@ class DiscoveryRunManager:
 
         data_dir = workspace_data_dir(workspace_path)
 
-        # Save the user's task as program.md if one doesn't exist yet
+        # The submitted text is the program: the panel pre-fills it from an
+        # existing program.md and promises to save edits back there.
         program_path = data_dir / "program.md"
-        if not program_path.exists() and run.task:
-            await asyncio.to_thread(program_path.write_text, run.task)
-        program_text = await asyncio.to_thread(program_path.read_text) if program_path.exists() else run.task
+        if run.task:
+            await asyncio.to_thread(program_path.write_text, run.task, encoding="utf-8")
+            program_text = run.task
+        elif program_path.exists():
+            program_text = await asyncio.to_thread(program_path.read_text, encoding="utf-8")
+        else:
+            program_text = ""
 
         # Create a run directory inside the workspace
         run_root = data_dir / "autoresearch_runs" / run.run_id
@@ -438,6 +453,7 @@ class DiscoveryRunManager:
             data_dir=str(data_dir),
             run_root=str(run_root),
             emit=lambda event: self._emit(session.session_id, run.run_id, event),
+            cancel_event=self._cancel_event(run.run_id),
             rounds=max(1, rounds),
             reasoning_effort=reasoning_effort,
             worker_wall_clock_sec=max(60, worker_wall_clock_sec),

@@ -196,6 +196,8 @@ export const CoscientistPanel: React.FC = () => {
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
+  // Set by Stop: the aborted stream then rejects, and that is not an error.
+  const stoppingRef = useRef(false)
   const roundSummaryRef = useRef<string>("")
 
   const workspacePath = formatPath(currentPath ?? "")
@@ -300,6 +302,7 @@ export const CoscientistPanel: React.FC = () => {
       return
     }
     setError(null)
+    stoppingRef.current = false
     setPhase("running")
     setJournal([])
     setCurrentRound(null)
@@ -330,6 +333,7 @@ export const CoscientistPanel: React.FC = () => {
       setActiveRunId(runId)
       await consumeStream(sessionId, runId)
     } catch (err: any) {
+      if (stoppingRef.current) return
       setError(err.message)
       setPhase("complete")
     }
@@ -359,6 +363,7 @@ export const CoscientistPanel: React.FC = () => {
       return
     }
     setError(null)
+    stoppingRef.current = false
     setPhase("running")
     setJournal([])
     setCurrentRound(null)
@@ -399,6 +404,7 @@ export const CoscientistPanel: React.FC = () => {
 
       await consumeStream(sessionId, runId)
     } catch (err: any) {
+      if (stoppingRef.current) return
       setError(err.message)
       setPhase("complete")
     }
@@ -484,6 +490,11 @@ export const CoscientistPanel: React.FC = () => {
         })
         break
 
+      case "candidate_proposed":
+        setRoundPhase("workers")
+        setCurrentRound(prev => prev ? { ...prev, focus: event.scientific_question || event.candidate_id || "" } : prev)
+        break
+
       case "coordinator_done":
         setRoundPhase("workers")
         setCurrentRound(prev => prev ? { ...prev, focus: event.round_focus || "" } : prev)
@@ -514,6 +525,7 @@ export const CoscientistPanel: React.FC = () => {
             ),
           }
         })
+        setRoundPhase("evaluating")
         break
 
       case "worker_failed":
@@ -526,6 +538,7 @@ export const CoscientistPanel: React.FC = () => {
             ),
           }
         })
+        setRoundPhase("evaluating")
         break
 
       case "worker_tool_call":
@@ -617,6 +630,8 @@ export const CoscientistPanel: React.FC = () => {
 
       case "complete":
         setActiveRunId(null)
+        setFinalizingResearch(false)
+        if (event.result?.answer) setFinalSummary(event.result.answer)
         break
 
       case "error":
@@ -635,6 +650,7 @@ export const CoscientistPanel: React.FC = () => {
     const sessionId = activeSessionId
     const runId = activeRunId
     setPhase(transitionResearchPhase(phase, "STOP"))
+    stoppingRef.current = true
     abortRef.current?.abort()
     if (sessionId && runId) {
       void authedFetch(
@@ -1072,7 +1088,7 @@ export const CoscientistPanel: React.FC = () => {
               <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-muted/30 border border-border/40">
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-primary shrink-0" />
                 <span className="text-xs text-muted-foreground">
-                  {roundPhase === "coordinator" && "Coordinator is planning worker assignments..."}
+                  {roundPhase === "coordinator" && "Proposing the next candidate..."}
                   {roundPhase === "workers" && (() => {
                     const total = currentRound?.workers.length || 0;
                     const done = currentRound?.workers.filter(w => w.status === "completed" || w.status === "failed").length || 0;

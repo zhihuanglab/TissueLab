@@ -8,19 +8,21 @@ flags used by synthesis, journaling, and later held-out evaluation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
 import shlex
 import shutil
-import tempfile
 import textwrap
+import threading
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from .sandbox import SandboxSession
+from .shared_runtime import copy_tree
 from .shared_lib_source.shared_analysis.artifacts import (
     coerce_results_payload,
     resolve_covariate_names,
@@ -41,6 +43,12 @@ SHARED_LIB_SOURCE = Path(__file__).resolve().parent / "shared_lib_source"
 # The image's own interpreter, not the sandbox's warm-runtime python3 wrapper:
 # the replay helper needs real argv and exit codes.
 SANDBOX_PYTHON = "/usr/local/bin/python3"
+# Replays persist under the worker's own folder so the donor table they build
+# outlives the evaluation that reads it, and a later re-evaluation of the same
+# result.py (panel review, panel-member frames) reuses it instead of starting
+# another container.
+REPLAY_DIRNAME = "replay"
+REPLAY_RECORD_NAME = "replay.json"
 REPLAY_TIMEOUT_SEC = 300
 DEFAULT_EVAL_COVARIATES = [*DEFAULT_CONFOUNDS, "sex"]
 CANONICAL_SCORE_FUNCTION = "compute_donor_score"
@@ -90,13 +98,15 @@ def materialize_donor_table_via_script_interface(
     shared_dir: Path,
     scratch_dir: Path,
     timeout_sec: int,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[Path | None, dict[str, Any], list[str]]:
     """Replay a worker's result.py to rebuild its donor table.
 
     result.py is model-written code, so it runs in the same Docker sandbox as
     the worker did (/data read-only, no network) — never in the service
     process's interpreter. scratch_dir and shared_dir are mounted at /scratch
-    and /shared; every output lands in scratch_dir.
+    and /shared; every output lands in scratch_dir. Setting cancel_event
+    removes the container, ending the replay early.
     """
     if not script_path.exists():
         return None, {}, [f"missing result script for evaluator materialization: {script_path}"]
@@ -298,6 +308,9 @@ def materialize_donor_table_via_script_interface(
         shlex.quote(arg)
         for arg in (
             SANDBOX_PYTHON,
+            # no .pyc: with rootful Docker they'd be root-owned files in a
+            # host folder the service later deletes
+            "-B",
             _in_sandbox(helper_path),
             _in_sandbox(staged_script),
             "/data",
@@ -313,12 +326,14 @@ def materialize_donor_table_via_script_interface(
         shared_dir=shared_dir,
         command_timeout_sec=timeout_sec,
     )
+    stop_cancel_watch = sandbox.watch_cancel(cancel_event)
     try:
         sandbox.start()
         proc = sandbox.exec(command, timeout_sec=timeout_sec)
     except Exception as exc:
         return None, {}, [f"could not start the sandbox to materialize the donor table: {exc}"]
     finally:
+        stop_cancel_watch()
         sandbox.stop()
 
     if proc["exit_code"] == -1 and "timed out" in (proc.get("stderr") or ""):
@@ -504,16 +519,6 @@ def _bootstrap_stability_gate_passed(sign_consistency: Any, valid_samples: Any) 
     return sign >= MIN_BOOTSTRAP_SIGN_CONSISTENCY and valid >= MIN_BOOTSTRAP_VALID_SAMPLES
 
 
-def _copy_tree(source: Path, destination: Path) -> None:
-    destination.mkdir(parents=True, exist_ok=True)
-    for path in source.rglob("*"):
-        if path.is_dir() or path.name == "__pycache__":
-            continue
-        relative = path.relative_to(source)
-        target = destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, target)
-
 
 def _safe_write_text(path: Path, text: str) -> None:
     try:
@@ -606,7 +611,7 @@ def _copy_shared_runtime(source_shared_dir: Path, destination_shared_dir: Path) 
     for name in ("cache", "lib", "templates"):
         source = source_shared_dir / name
         if source.exists():
-            _copy_tree(source, destination_shared_dir / name)
+            copy_tree(source, destination_shared_dir / name)
     for path in source_shared_dir.iterdir():
         if path.is_file():
             shutil.copy2(path, destination_shared_dir / path.name)
@@ -823,11 +828,76 @@ def _objective_metrics_from_table_path(
     return metrics, []
 
 
+def _replay_donor_table(
+    *,
+    worker_dir: Path,
+    script_path: Path,
+    data_dir: Path,
+    cancel_event: threading.Event | None,
+) -> tuple[Path | None, dict[str, Any], list[str]]:
+    """Materialize result.py's donor table under worker_dir/replay, once per script version.
+
+    The outcome (table or failure) is recorded against the script's hash, so
+    re-evaluating the same candidate never replays it again.
+    """
+    replay_root = worker_dir / REPLAY_DIRNAME
+    scratch_dir = replay_root / "scratch"
+    shared_dir = replay_root / "shared"
+    record_path = replay_root / REPLAY_RECORD_NAME
+    source_sha = hashlib.sha256(script_path.read_bytes()).hexdigest()
+
+    record = _load_optional_json(record_path) or {}
+    if record.get("source_sha256") == source_sha:
+        table_path = scratch_dir / "donor_feature_table.csv"
+        if record.get("ok") and table_path.exists():
+            return table_path, dict(record.get("metadata") or {}), []
+        if not record.get("ok"):
+            return None, {}, list(record.get("issues") or ["replay failed"])
+
+    shutil.rmtree(replay_root, ignore_errors=True)
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    _seed_replay_context(worker_dir, scratch_dir)
+    try:
+        _copy_shared_runtime(worker_dir.parent.parent / "shared", shared_dir)
+    except Exception:
+        pass
+    # /shared/lib is on the sandbox PYTHONPATH; seed it from source when the
+    # run's shared runtime was never materialized.
+    if not (shared_dir / "lib" / "shared_analysis").exists():
+        copy_tree(SHARED_LIB_SOURCE / "shared_analysis", shared_dir / "lib" / "shared_analysis")
+
+    table_path, metadata, issues = materialize_donor_table_via_script_interface(
+        script_path=script_path,
+        data_dir=data_dir,
+        shared_dir=shared_dir,
+        scratch_dir=scratch_dir,
+        timeout_sec=REPLAY_TIMEOUT_SEC,
+        cancel_event=cancel_event,
+    )
+    if cancel_event is None or not cancel_event.is_set():
+        # A cancelled replay is not a verdict on the script; leave it unrecorded.
+        _safe_write_text(
+            record_path,
+            json.dumps(
+                {
+                    "source_sha256": source_sha,
+                    "ok": table_path is not None,
+                    "metadata": metadata,
+                    "issues": issues,
+                },
+                indent=2,
+            ),
+        )
+    return table_path, metadata, issues
+
+
 def _objective_metrics_from_feature_table(
     *,
     worker_dir: Path,
     data_dir: str | Path | None,
     results: dict[str, Any],
+    cancel_event: threading.Event | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     artifacts = results.get("artifacts") or {}
     donor_feature_table_path = _resolve_worker_artifact_path(
@@ -840,46 +910,22 @@ def _objective_metrics_from_feature_table(
     if donor_feature_table_path is None and data_dir is not None:
         result_script_path = worker_dir / "result.py"
         if result_script_path.exists():
-            with tempfile.TemporaryDirectory(prefix="autoresearch_materialize_") as tmpdir:
-                tmp_root = Path(tmpdir)
-                tmp_shared = tmp_root / "shared"
-                tmp_scratch = tmp_root / "scratch"
-                tmp_shared.mkdir(parents=True, exist_ok=True)
-                tmp_scratch.mkdir(parents=True, exist_ok=True)
-                _seed_replay_context(worker_dir, tmp_scratch)
-                try:
-                    _copy_shared_runtime(worker_dir.parent.parent / "shared", tmp_shared)
-                except Exception:
-                    pass
-                # /shared/lib is on the sandbox PYTHONPATH; seed it from source
-                # when the run's shared runtime was never materialized.
-                if not (tmp_shared / "lib" / "shared_analysis").exists():
-                    _copy_tree(
-                        SHARED_LIB_SOURCE / "shared_analysis",
-                        tmp_shared / "lib" / "shared_analysis",
-                    )
-                donor_feature_table_path, interface_metadata, materialize_issues = materialize_donor_table_via_script_interface(
-                    script_path=result_script_path,
-                    data_dir=Path(data_dir),
-                    shared_dir=tmp_shared,
-                    scratch_dir=tmp_scratch,
-                    timeout_sec=REPLAY_TIMEOUT_SEC,
-                )
-                if donor_feature_table_path is None:
-                    return None, materialize_issues or ["missing donor_feature_table artifact"]
-                results = {
-                    **results,
-                    **{k: v for k, v in interface_metadata.items() if v},
-                    "artifacts": {
-                        **artifacts,
-                        "donor_feature_table": str(donor_feature_table_path),
-                    },
-                }
-                return _objective_metrics_from_table_path(
-                    donor_feature_table_path=donor_feature_table_path,
-                    data_dir=data_dir,
-                    results=results,
-                )
+            donor_feature_table_path, interface_metadata, materialize_issues = _replay_donor_table(
+                worker_dir=worker_dir,
+                script_path=result_script_path,
+                data_dir=Path(data_dir),
+                cancel_event=cancel_event,
+            )
+            if donor_feature_table_path is None:
+                return None, materialize_issues or ["missing donor_feature_table artifact"]
+            results = {
+                **results,
+                **{k: v for k, v in interface_metadata.items() if v},
+                "artifacts": {
+                    **artifacts,
+                    "donor_feature_table": str(donor_feature_table_path),
+                },
+            }
     if donor_feature_table_path is None:
         return None, ["missing donor_feature_table artifact"]
     return _objective_metrics_from_table_path(
@@ -905,6 +951,7 @@ def _panel_member_feature_frame(
     member: dict[str, Any],
     data_dir: str | Path,
     primary_outcome: str | None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[pd.DataFrame | None, str | None]:
     worker_dir_value = member.get("worker_dir")
     if not worker_dir_value:
@@ -920,6 +967,7 @@ def _panel_member_feature_frame(
         results_path=results_path,
         primary_outcome=primary_outcome,
         panel_state={},
+        cancel_event=cancel_event,
     )
     results = evaluation.get("results", {}) or {}
     table_path_value = ((results.get("artifacts") or {}).get("donor_feature_table"))
@@ -951,6 +999,7 @@ def _panel_score_from_feature_table(
     data_dir: str | Path,
     results: dict[str, Any],
     panel_state: dict[str, Any] | None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any] | None:
     if panel_state is None:
         return None
@@ -1010,6 +1059,7 @@ def _panel_score_from_feature_table(
             member=member,
             data_dir=data_dir,
             primary_outcome=outcome_col or None,
+            cancel_event=cancel_event,
         )
         if frame is None or not panel_col:
             continue
@@ -1102,7 +1152,12 @@ def evaluate_worker_artifacts(
     results_path: str | Path | None,
     primary_outcome: str | None = None,
     panel_state: dict[str, Any] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
+    """Score one worker's artifacts against the panel.
+
+    cancel_event ends a Docker replay of result.py early (run cancelled).
+    """
     worker_dir = Path(worker_dir)
     worker_brief = _load_worker_brief(worker_dir)
     if panel_state is None:
@@ -1138,6 +1193,7 @@ def evaluate_worker_artifacts(
         worker_dir=worker_dir,
         data_dir=data_dir,
         results=results,
+        cancel_event=cancel_event,
     )
     if objective_issues:
         warnings.extend(objective_issues)
@@ -1153,6 +1209,7 @@ def evaluate_worker_artifacts(
             data_dir=data_dir,
             results=canonical_results,
             panel_state=panel_state,
+            cancel_event=cancel_event,
         )
         if panel_metrics:
             canonical_results.update(panel_metrics)

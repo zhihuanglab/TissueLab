@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -269,6 +270,7 @@ def run_worker(
     sandbox_auto_build: bool = True,
     command_timeout_sec: int = 300,
     on_event: Optional[Callable] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> dict:
     """
     Run a single worker agent to completion.
@@ -318,10 +320,13 @@ def run_worker(
     previous_response: Optional[str] = None
 
     session.start()
+    stop_cancel_watch = session.watch_cancel(cancel_event)
     try:
         turn_id = 1
         sent_wrapup = False
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError(f"{worker_name} cancelled")
             remaining = max(1, int(deadline - time.monotonic()))
 
             # Hard wrap-up: override pending_input with a forceful instruction and
@@ -534,4 +539,5 @@ def run_worker(
                 f"{worker_name} response on turn {turn_id} was neither a tool call nor DONE"
             )
     finally:
+        stop_cancel_watch()
         session.stop()

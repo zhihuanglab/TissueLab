@@ -8,6 +8,7 @@ and write a dataset_guide.md that future workers can reference.
 from __future__ import annotations
 
 import json
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -102,6 +103,7 @@ def run_scout(
     on_event: Optional[Callable] = None,
     exploration_request: str = "",
     max_turns: int = 0,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
     """
     Run the dataset scout to explore /data and write a guide.
@@ -161,8 +163,11 @@ def run_scout(
     sent_wrapup = False
 
     session.start()
+    stop_cancel_watch = session.watch_cancel(cancel_event)
     try:
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return {"status": "cancelled", "turns": turn_id}
             turn_id += 1
             remaining = max(1, int(deadline - time.monotonic()))
 
@@ -287,6 +292,7 @@ def run_scout(
             "guide_excerpt": "",
         }
     finally:
+        stop_cancel_watch()
         if log_file:
             log_file.close()
         session.stop()

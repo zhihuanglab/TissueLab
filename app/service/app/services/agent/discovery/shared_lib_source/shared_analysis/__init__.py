@@ -69,7 +69,14 @@ _EXPORTS = {
 __all__ = sorted(_EXPORTS)
 
 
+# The eager version bound these as a side effect of importing them, so
+# ``import shared_analysis as sa; sa.stats`` worked; keep that.
+_SUBMODULES = frozenset(_EXPORTS.values())
+
+
 def __getattr__(name: str):
+    if name in _SUBMODULES:
+        return importlib.import_module(f".{name}", __name__)
     module = _EXPORTS.get(name)
     if module is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -79,4 +86,4 @@ def __getattr__(name: str):
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(_EXPORTS))
+    return sorted(set(globals()) | set(_EXPORTS) | _SUBMODULES)

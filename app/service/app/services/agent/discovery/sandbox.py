@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+
+import psutil
 
 
 _DOCKER_IMAGE_LOCK = threading.Lock()
@@ -33,7 +36,11 @@ _DOCKER_IMAGE_LOCK = threading.Lock()
 DOCKER_INSPECT_TIMEOUT = 30
 DOCKER_BUILD_TIMEOUT = 1800
 
+DOCKER_RUN_TIMEOUT = 120
+DOCKER_CLI_TIMEOUT = 15
+
 DEFAULT_IMAGE = "tissuelab-autoresearch-worker"
+OWNER_LABEL = "tissuelab.discovery.pid"
 
 # Resource caps for the worker container. The code inside is model-generated and
 # unreviewed, so an unbounded container could take the host down with it: an
@@ -385,6 +392,34 @@ class SandboxSession:
         self.started = False
         self.persistent_python_ready = False
 
+    def watch_cancel(self, cancel_event: Optional[threading.Event]) -> Callable[[], None]:
+        """Kill the container once cancel_event is set; returns a function that ends the watch."""
+        if cancel_event is None:
+            return lambda: None
+        done = threading.Event()
+
+        def _watch() -> None:
+            while not done.is_set():
+                if cancel_event.wait(0.5):
+                    if not done.is_set():
+                        self.kill()
+                    return
+
+        threading.Thread(target=_watch, name="discovery-cancel-watch", daemon=True).start()
+        return done.set
+
+    def kill(self) -> None:
+        """Remove the container now, from any thread.
+
+        Used on cancel: a command running inside the container returns as
+        soon as the container is gone, so the worker thread stops waiting on
+        it. stop() still runs afterwards from the owning thread.
+        """
+        name = self.container_name
+        if self.backend != "docker" or not name:
+            return
+        _remove_containers([name])
+
     def exec(self, command: str, timeout_sec: Optional[int] = None) -> dict:
         if not self.started:
             raise RuntimeError("Sandbox session has not been started")
@@ -542,6 +577,9 @@ class SandboxSession:
         cmd = [
             "docker", "run", "-d", "--rm",
             "--name", self.container_name,
+            # Owner pid: lets service shutdown and the next startup find
+            # containers this process left behind (see remove_owned_containers).
+            "--label", f"{OWNER_LABEL}={os.getpid()}",
             "--network", "none",
             "--read-only",
             "--memory", SANDBOX_MEMORY,
@@ -560,7 +598,12 @@ class SandboxSession:
         cmd.extend([
             self.image, "sleep", "infinity",
         ])
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, check=False, timeout=DOCKER_RUN_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"Docker did not start the sandbox within {DOCKER_RUN_TIMEOUT}s") from e
         if proc.returncode != 0:
             raise RuntimeError(
                 f"Failed to start Docker sandbox: {proc.stderr.strip() or proc.stdout.strip()}"
@@ -687,3 +730,70 @@ class SandboxSession:
         if not prelude:
             return command
         return f"{prelude}\n{command}"
+
+
+def _remove_containers(names: list[str]) -> None:
+    if not names:
+        return
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", *names],
+            capture_output=True, text=True, check=False, timeout=DOCKER_CLI_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def docker_unavailable_reason() -> Optional[str]:
+    """Why discovery sandboxes cannot run right now, or None when Docker is usable."""
+    if not shutil.which("docker"):
+        return "Discovery needs Docker to sandbox model-written code, but the docker CLI was not found."
+    try:
+        proc = subprocess.run(
+            ["docker", "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True, text=True, check=False, timeout=DOCKER_CLI_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return f"Docker did not answer within {DOCKER_CLI_TIMEOUT}s; is the Docker daemon running?"
+    except OSError as e:
+        return f"Could not run docker: {e}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        return "Docker is not running" + (f": {detail[-1]}" if detail else ".")
+    return None
+
+
+def remove_owned_containers(*, current_process: bool) -> int:
+    """Remove discovery sandboxes by owner.
+
+    current_process=True removes this process's containers (service shutdown);
+    False removes those whose owning process is gone (startup sweep after a
+    crash or a force-kill). Containers of another live service are left alone.
+    """
+    if not shutil.which("docker"):
+        return 0
+    try:
+        proc = subprocess.run(
+            ["docker", "ps", "-a", "--filter", f"label={OWNER_LABEL}",
+             "--format", f'{{{{.Names}}}}\t{{{{.Label "{OWNER_LABEL}"}}}}'],
+            capture_output=True, text=True, check=False, timeout=DOCKER_CLI_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    if proc.returncode != 0:
+        return 0
+    own_pid = os.getpid()
+    doomed: list[str] = []
+    for line in proc.stdout.splitlines():
+        name, _, pid_text = line.partition("\t")
+        try:
+            pid = int(pid_text.strip())
+        except ValueError:
+            continue
+        if current_process:
+            if pid == own_pid:
+                doomed.append(name.strip())
+        elif pid != own_pid and not psutil.pid_exists(pid):
+            doomed.append(name.strip())
+    _remove_containers(doomed)
+    return len(doomed)

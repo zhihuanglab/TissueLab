@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import threading
 import traceback
 import asyncio
 from tempfile import NamedTemporaryFile
@@ -418,6 +419,7 @@ def _review_candidate_against_panel(
     worker_roundup: dict[str, Any],
     data_dir: Path,
     primary_outcome: str,
+    cancel_event: Optional[threading.Event] = None,
 ) -> dict[str, Any]:
     if worker_roundup.get("status") != "completed":
         return {
@@ -447,6 +449,7 @@ def _review_candidate_against_panel(
             results_path=worker_roundup.get("results_path") or "",
             primary_outcome=primary_outcome,
             panel_state={"members": reduced_members},
+            cancel_event=cancel_event,
         )
         action_reviews.append(
             {
@@ -557,6 +560,24 @@ def _round_summary(
     )
 
 
+def _findings_markdown(accepted_panel: dict[str, Any]) -> str:
+    members = [m for m in (accepted_panel.get("members") or []) if isinstance(m, dict)]
+    score = _safe_float(accepted_panel.get("best_panel_score"))
+    lines = [
+        f"Accepted panel members: {len(members)}",
+        f"Best panel score: {score if score is not None else 'NA'}",
+    ]
+    if members:
+        lines.append("")
+        for member in members:
+            delta = _safe_float(member.get("delta_panel_score"))
+            lines.append(
+                f"- {member.get('feature_name', '')} (round {member.get('round_id', '?')}, "
+                f"gain {delta if delta is not None else 'NA'})"
+            )
+    return "\n".join(lines) + "\n"
+
+
 def _write_round_summary(round_dir: Path, summary: dict[str, Any]) -> None:
     _write_json(round_dir / "round_summary.json", summary)
 
@@ -600,8 +621,15 @@ async def run_autoresearch(
     dataset_scout_enabled: bool = True,
     primary_outcome: str = "slope_zmem0",
     worker_reasoning_effort: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> dict[str, Any]:
+    """Run `rounds` rounds of the loop in run_root.
+
+    cancel_event stops the scout / worker threads and their sandboxes: the
+    awaiting coroutine can be cancelled, but the threads it waits on cannot.
+    """
     model = model or discovery_model()
+
     data_dir = Path(data_dir)
     run_root = Path(run_root)
     run_root.mkdir(parents=True, exist_ok=True)
@@ -635,13 +663,15 @@ async def run_autoresearch(
                 model=model,
                 reasoning_effort="medium",
                 on_event=_on_scout,
+                cancel_event=cancel_event,
             )
             await emit({"type": "scout_done", "status": scout_result.get("status", ""), "turns": scout_result.get("turns", 0)})
         except Exception as exc:
             await emit({"type": "scout_done", "status": "error", "error": str(exc)})
 
     data_summary = guide_path.read_text(encoding="utf-8") if guide_path.exists() else ""
-    shared_runtime = ensure_shared_runtime(
+    shared_runtime = await asyncio.to_thread(
+        ensure_shared_runtime,
         shared_dir=shared_dir,
         data_dir=data_dir,
         dataset_guide_text=data_summary,
@@ -722,6 +752,7 @@ async def run_autoresearch(
                 sandbox_auto_build=sandbox_auto_build,
                 command_timeout_sec=command_timeout_sec,
                 on_event=_on_worker,
+                cancel_event=cancel_event,
             )
             worker_status = "completed"
         except Exception as exc:
@@ -757,14 +788,18 @@ async def run_autoresearch(
 
         evaluation: dict[str, Any] = {}
         if worker_status == "completed":
+            # Evaluation reads tables, bootstraps and may replay result.py in
+            # Docker: keep it off the event loop that serves the whole app.
             try:
-                evaluation = evaluate_worker_artifacts(
+                evaluation = await asyncio.to_thread(
+                    evaluate_worker_artifacts,
                     worker_name=worker_brief["worker_name"],
                     worker_dir=worker_result["worker_dir"],
                     data_dir=data_dir,
                     results_path=worker_result.get("results_path") or "",
                     primary_outcome=primary_outcome,
                     panel_state={"members": accepted_panel.get("members", [])},
+                    cancel_event=cancel_event,
                 )
             except Exception as exc:
                 evaluation = {"results": {}, "summary": f"Evaluator error: {exc}"}
@@ -780,12 +815,14 @@ async def run_autoresearch(
             "summary": evaluation.get("summary") or worker_result.get("summary", ""),
         }
 
-        review = _review_candidate_against_panel(
+        review = await asyncio.to_thread(
+            _review_candidate_against_panel,
             accepted_panel=accepted_panel,
             worker_brief=worker_brief,
             worker_roundup=worker_roundup,
             data_dir=data_dir,
             primary_outcome=primary_outcome,
+            cancel_event=cancel_event,
         )
         chosen_review = review.get("chosen_review") or {}
         chosen_evaluation = chosen_review.get("evaluation") or {}
@@ -858,10 +895,10 @@ async def run_autoresearch(
         rounds_done += 1
 
     best_panel_score = accepted_panel.get("best_panel_score")
-    answer = (
-        f"Accepted panel members: {len(accepted_panel.get('members', []))}\n"
-        f"Best panel score: {best_panel_score}"
-    )
+    answer = _findings_markdown(accepted_panel)
+    # The Research panel shows this live (complete event) and when the run is
+    # reopened from history (research_findings.md).
+    _write_text_atomic(run_root / "research_findings.md", answer)
     return {
         "answer": answer,
         "status": "completed",

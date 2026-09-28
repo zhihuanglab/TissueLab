@@ -51,8 +51,12 @@ def get_client() -> OpenAI:
 
 
 def responses_create(payload: dict, timeout: int = 180) -> dict:
-    """Call the OpenAI Responses API and return the raw response dict."""
-    client = get_client()
+    """Call the OpenAI Responses API and return the raw response dict.
+
+    timeout bounds each attempt, and one retry keeps a worker's wall clock
+    meaningful: the SDK default (600s, two retries) could hold a call ~30 min.
+    """
+    client = get_client().with_options(timeout=timeout, max_retries=1)
     response = client.responses.create(**payload)
     if hasattr(response, "model_dump"):
         return response.model_dump(mode="json", warnings="none")

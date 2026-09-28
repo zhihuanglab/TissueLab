@@ -5,6 +5,7 @@ Ported from the TissueLab control plane, which served them under
 to either backend unchanged. The loop itself lives in
 :mod:`app.services.agent.discovery`.
 """
+import asyncio
 import csv
 import json
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ from app.services.agent.discovery import (
     workspace_data_dir,
 )
 from app.services.agent.discovery.client import unavailable_reason
+from app.services.agent.discovery.sandbox import docker_unavailable_reason
 from app.services.file_manager.common import (
     assert_can_access_path_async,
     assert_can_write_path_async,
@@ -57,8 +59,9 @@ class ResumeFromPathRequest(BaseModel):
     additional_rounds: Optional[int] = None
 
 
-def _assert_llm_ready() -> None:
-    reason = unavailable_reason()
+async def _assert_run_prerequisites() -> None:
+    """A run needs the Responses API and a working Docker; fail before spending on either."""
+    reason = unavailable_reason() or await asyncio.to_thread(docker_unavailable_reason)
     if reason:
         raise AppErrors.NOT_IMPLEMENTED(reason)
 
@@ -298,7 +301,7 @@ async def start_discovery_run(
             ctx.get("workspace_path") or "",
             "start research",
         )
-        _assert_llm_ready()
+        await _assert_run_prerequisites()
 
         template_type = request.template_type or (session.context or {}).get("template_type")
         run_manager = get_discovery_run_manager()
@@ -412,7 +415,7 @@ async def resume_autoresearch_run(
             (session.context or {}).get("workspace_path") or "",
             "resume research",
         )
-        _assert_llm_ready()
+        await _assert_run_prerequisites()
         run_manager = get_discovery_run_manager()
         new_run = await run_manager.resume_run(
             session_id=session_id,
@@ -448,7 +451,7 @@ async def resume_autoresearch_from_path(
             request.run_root_path,
             "resume research",
         )
-        _assert_llm_ready()
+        await _assert_run_prerequisites()
         run_manager = get_discovery_run_manager()
         new_run = await run_manager.resume_run_from_path(
             session_id=session_id,

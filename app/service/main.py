@@ -156,6 +156,19 @@ async def lifespan(app: FastAPI):
         except Exception as fm_err:
             print(f"[WARN] File manager task reconciliation failed: {fm_err}")
 
+        # Discovery sandboxes left running by a crashed or force-killed service
+        # (their owning pid is gone). Background: docker may be slow or absent.
+        async def _sweep_discovery_containers() -> None:
+            try:
+                from app.services.agent.discovery.sandbox import remove_owned_containers
+                removed = await asyncio.to_thread(remove_owned_containers, current_process=False)
+                if removed:
+                    print(f"[INFO] Removed {removed} orphaned discovery sandbox container(s)")
+            except Exception as sweep_err:
+                print(f"[WARN] Discovery container sweep failed: {sweep_err}")
+
+        asyncio.get_running_loop().create_task(_sweep_discovery_containers())
+
         # Non-blocking auto-activation on startup if enabled
         from app.services.activation import is_auto_activation_enabled, auto_activate_all_tasknodes
         if is_auto_activation_enabled():
@@ -171,6 +184,21 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     try:
+        # First: the desktop shell force-kills the service ~2.5s after asking it
+        # to stop, and a killed service would leave its discovery containers
+        # running (they `sleep infinity`). Stop the runs, then remove them.
+        try:
+            from app.services.agent.discovery import run_manager as discovery_runs
+            from app.services.agent.discovery.sandbox import remove_owned_containers
+            manager = discovery_runs._run_manager_instance
+            stopping = manager.request_shutdown() if manager is not None else []
+            await asyncio.to_thread(remove_owned_containers, current_process=True)
+            if stopping:
+                # let the cancelled tasks record "cancelled" on their sessions
+                await asyncio.wait(stopping, timeout=2)
+        except Exception as de:
+            print(f"[WARN] Error stopping discovery runs: {de}")
+
         # Drop all in-memory segmentation handlers before pool shutdown.
         try:
             from app.services.seg_registry import clear_all_instance_handlers
