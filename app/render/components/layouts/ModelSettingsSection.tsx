@@ -1,6 +1,7 @@
 'use client'
 
 import React, { useCallback, useEffect, useState } from 'react'
+import { Eye, EyeOff } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
@@ -42,6 +43,9 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
   // A typed key replaces the saved one; untouched keys stay as they are.
   const [keys, setKeys] = useState<Record<SecretName, string>>({ OPENAI_API_KEY: '', DISCOVERY_API_KEY: '' })
   const [clearKeys, setClearKeys] = useState<Record<SecretName, boolean>>({ OPENAI_API_KEY: false, DISCOVERY_API_KEY: false })
+  // The eye shows what is typed; a saved key never comes back from the service
+  // (its CORS is open, so any page could read it), only its last characters.
+  const [showKeys, setShowKeys] = useState<Record<SecretName, boolean>>({ OPENAI_API_KEY: false, DISCOVERY_API_KEY: false })
   // Like "billing address same as shipping": research on the Agent's endpoint and key.
   const [usesAgent, setUsesAgent] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -53,6 +57,7 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
     setPlain(Object.fromEntries(PLAIN.map((name) => [name, next.fields[name].value])) as Record<PlainName, string>)
     setKeys({ OPENAI_API_KEY: '', DISCOVERY_API_KEY: '' })
     setClearKeys({ OPENAI_API_KEY: false, DISCOVERY_API_KEY: false })
+    setShowKeys({ OPENAI_API_KEY: false, DISCOVERY_API_KEY: false })
     setUsesAgent(next.fields.RESEARCH_USES_AGENT.value)
   }, [])
 
@@ -104,19 +109,33 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
       : field?.env_set
         ? `${field.env_hint} (from .env.local)`
         : fallback
+    const shown = showKeys[name]
     return (
       <div className="flex gap-2">
-        <Input
-          type="password"
-          autoComplete="off"
-          aria-label={name === 'OPENAI_API_KEY' ? 'Agent API key' : 'Research API key'}
-          placeholder={placeholder}
-          value={keys[name]}
-          onChange={(e) => {
-            setSaved(false)
-            setKeys((prev) => ({ ...prev, [name]: e.target.value }))
-          }}
-        />
+        <div className="relative flex-1">
+          <Input
+            type={shown ? 'text' : 'password'}
+            autoComplete="off"
+            spellCheck={false}
+            aria-label={name === 'OPENAI_API_KEY' ? 'Agent API key' : 'Research API key'}
+            placeholder={placeholder}
+            value={keys[name]}
+            className="pr-9"
+            onChange={(e) => {
+              setSaved(false)
+              setKeys((prev) => ({ ...prev, [name]: e.target.value }))
+            }}
+          />
+          <button
+            type="button"
+            aria-label={shown ? 'Hide API key' : 'Show API key'}
+            title={shown ? 'Hide' : 'Show'}
+            className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted-foreground hover:text-foreground"
+            onClick={() => setShowKeys((prev) => ({ ...prev, [name]: !prev[name] }))}
+          >
+            {shown ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+          </button>
+        </div>
         {field?.set && !cleared && (
           <Button
             type="button"

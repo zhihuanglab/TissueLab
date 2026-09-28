@@ -46,6 +46,13 @@ test.describe('Preferences: AI models', () => {
 
     await dialog.getByLabel('Agent model').fill('e2e-model');
     await dialog.getByLabel('Agent API key').fill(KEY);
+    // The eye reveals what was typed, and hides it again.
+    const keyBox = dialog.getByLabel('Agent API key');
+    await expect(keyBox).toHaveAttribute('type', 'password');
+    await dialog.getByRole('button', { name: 'Show API key' }).first().click();
+    await expect(keyBox).toHaveAttribute('type', 'text');
+    await dialog.getByRole('button', { name: 'Hide API key' }).first().click();
+    await expect(keyBox).toHaveAttribute('type', 'password');
     await dialog.getByLabel('Research model').fill('gpt-5.4-mini');
     const saved = page.waitForResponse((r) => r.url().endsWith('/agent/v1/model_settings') && r.request().method() === 'PUT');
     await dialog.getByRole('button', { name: 'Save AI Models' }).click();
