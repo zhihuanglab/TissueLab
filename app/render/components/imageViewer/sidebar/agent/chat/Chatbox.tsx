@@ -214,6 +214,19 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
     { text: "Help me to calculate the ratio of tumor vs. lymphocytes in this breast cancer tissue.", enableWebSearch: false },
     { text: "Please calculate the number of kidney glomerulus in this tissue using ST clustering?", enableWebSearch: false },
     { text: "What is the diagnosis of this lymph node? Is it macrometastasis, micrometastasis, or isolated tumor cells?", enableWebSearch: true },
+    {
+      text: [
+        "Measure the depth of invasion of the tumor on this slide, in mm.",
+        "Definitions to use (all on the patch grid):",
+        "- Tissue = every classified patch (any class, including Negative control). Clean the tissue mask, the tumor mask and the merged mask (below) with a morphological closing followed by an opening, both with a 3x3-patch square structuring element.",
+        "- Outer tissue boundary = the EXTERNAL contour of the cleaned tissue mask only. Internal holes inside the tissue (lumens, tears, gaps between patches) are NOT tissue boundary and must be ignored.",
+        "- Merged region = Tumor OR Epithelium, cleaned as above. Use only the OUTER rings of the merged region (ignore hole boundaries inside it).",
+        "- Tissue SURFACE = the points of the merged region's outer rings that lie within 3 patches of the outer tissue boundary (the mucosal surface).",
+        "- Depth of invasion = max over all cleaned tumor patches of (distance to the nearest surface point). Convert to mm with the mask scale and the slide mpp.",
+        "Return depth_mm, the deepest tumor point and its nearest surface point as level-0 pixel coordinates (x, y), the number of surface segments, and the parameters you used.",
+      ].join("\n"),
+      enableWebSearch: false,
+    },
     { text: "Does this CT scan suggest fatty liver?", enableWebSearch: true },
     { text: "Does this X-ray suggest any Nodule?", enableWebSearch: false },
     { text: "Does this time-series 3D cardiac scan indicate myocardial hypertrophy?", enableWebSearch: true }
