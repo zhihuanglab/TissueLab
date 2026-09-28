@@ -143,6 +143,13 @@ async def lifespan(app: FastAPI):
         anyio.to_thread.current_default_thread_limiter().total_tokens = SYNC_ROUTE_THREADS
         print(f"[INFO] Sync route threads: {SYNC_ROUTE_THREADS}")
 
+        # LLM endpoints / keys saved in Preferences override .env.local.
+        try:
+            from app.services.llm_settings import apply_saved_settings
+            apply_saved_settings()
+        except Exception as llm_err:
+            print(f"[WARN] Could not apply saved model settings: {llm_err}")
+
         # Start WebSocket health checker
         await start_websocket_health_checker()
         print("[INFO] WebSocket health checker started")
@@ -325,7 +332,9 @@ if __name__ == "__main__":
     print(f" service root: {_settings.TL_SERVICE_ROOT}")
     print(f" storage root: {STORAGE_ROOT}")
     print(f" local user: {_settings.LOCAL_USER_ID}")
-    print(f" LLM agent: {'configured' if os.getenv('OPENAI_API_KEY') else 'not configured (set OPENAI_API_KEY)'}")
+    from app.services.llm_settings import apply_saved_settings
+    apply_saved_settings()
+    print(f" LLM agent: {'configured' if os.getenv('OPENAI_API_KEY') else 'not configured (Preferences > AI Models, or OPENAI_API_KEY)'}")
     print(f" {libvips_summary()}")
     print("=======================================================")
     print(get_activation_status_message())

@@ -41,14 +41,15 @@ def unavailable_reason() -> Optional[str]:
     """Why a discovery run cannot start with the current LLM settings, or None."""
     if not (_discovery_env("API_KEY") or os.getenv("OPENAI_API_KEY")):
         return (
-            "Discovery is not configured: set OPENAI_API_KEY in app/service/.env.local."
+            "Research is not configured: add an API key in Preferences > AI Models "
+            "(or set OPENAI_API_KEY in .env.local)."
         )
     # A dedicated DISCOVERY_BASE_URL is declared to speak the Responses API.
     if not _discovery_env("BASE_URL") and llm_config.api_mode() != "responses":
         return (
             "Discovery needs OpenAI's Responses API; the configured endpoint speaks "
-            "Chat Completions only. Set DISCOVERY_BASE_URL / DISCOVERY_API_KEY to an "
-            "endpoint that does (e.g. OpenAI) to keep the agent on its current model."
+            "Chat Completions only. Give Research its own endpoint in Preferences > AI Models "
+            "(or DISCOVERY_BASE_URL / DISCOVERY_API_KEY) to keep the agent on its current model."
         )
     return None
 

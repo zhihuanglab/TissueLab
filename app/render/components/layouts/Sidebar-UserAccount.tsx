@@ -7,7 +7,7 @@ import { useAuthorProfile } from "@/hooks/community/useAuthorProfile";
 import { RootState } from "@/store";
 import { useSignupModal } from "@/store/zustand/store";
 import { cn } from "@/utils/common/twMerge";
-import { EllipsisVertical, User } from "lucide-react";
+import { EllipsisVertical, Settings, User } from "lucide-react";
 import React, { useEffect, useRef, useState } from "react";
 import { useSelector } from "react-redux";
 import AccountSettingsModal from "./AccountSettingsModal";
@@ -212,13 +212,25 @@ const UserAccountSection: React.FC<UserAccountSectionProps> = ({
                         className={cn(
                             "flex items-center gap-2",
                             isSidebar && !isCollapsed
-                                ? "w-full justify-start text-muted-foreground hover:bg-muted hover:text-foreground"
+                                ? "min-w-0 flex-1 justify-start text-muted-foreground hover:bg-muted hover:text-foreground"
                                 : "rounded-full text-muted-foreground hover:text-foreground"
                         )}
                         onClick={() => setSignupModalOpen(true)}
                     >
                         <User className="h-5 w-5 text-muted-foreground" />
                         {!isCollapsed && <span className="text-sm text-muted-foreground">Login</span>}
+                    </Button>
+                    {/* Preferences (AI models, theme, ...) without signing in:
+                        the local edition runs on an anonymous session. */}
+                    <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label="Preferences"
+                        title="Preferences"
+                        className="shrink-0 text-muted-foreground hover:text-foreground"
+                        onClick={() => setIsPreferencesOpen(true)}
+                    >
+                        <Settings className="h-4 w-4" />
                     </Button>
                 </div>
             )}

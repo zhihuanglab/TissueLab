@@ -26,6 +26,7 @@ from app.services.agent.workflow_agent import (
     get_workflow_agent,
 )
 from app.services.agent.verification_agent import get_verification_agent
+from app.services import llm_settings
 from app.services.feedback import get_feedback_service
 from app.utils.workflow.model_store import model_store
 
@@ -551,3 +552,24 @@ async def verify_result(
         return success_response(result)
     except ValueError as e:
         return error_response(str(e))
+
+
+class ModelSettingsRequest(BaseModel):
+    """Per field: omitted / null keeps the saved value, "" clears it, text sets it."""
+    fields: Dict[str, Optional[str]]
+
+
+@agent_router.get("/v1/model_settings")
+def get_model_settings(auth_user: AuthUser = Depends(get_auth_user)):
+    """The LLM endpoints / keys / models set in Preferences (keys only as a hint)."""
+    return success_response(llm_settings.public_settings())
+
+
+@agent_router.put("/v1/model_settings")
+def put_model_settings(request: ModelSettingsRequest, auth_user: AuthUser = Depends(get_auth_user)):
+    """Save and apply at once: the next agent / research request uses them."""
+    try:
+        llm_settings.update_settings(request.fields)
+    except llm_settings.SettingsError as e:
+        raise AppErrors.PARAMS_ERROR(str(e))
+    return success_response(llm_settings.public_settings())

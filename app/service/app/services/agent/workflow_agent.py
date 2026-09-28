@@ -1336,8 +1336,8 @@ def get_workflow_agent() -> WorkflowAgent:
     if _workflow_agent is None:
         if not agent_configured():
             raise AgentNotConfigured(
-                "The LLM agent is not configured: set OPENAI_API_KEY in app/service/.env.local "
-                "(an OpenAI-compatible endpoint can be set with OPENAI_BASE_URL)."
+                "The LLM agent is not configured: add an API key in Preferences > AI Models "
+                "(or set OPENAI_API_KEY in .env.local)."
             )
         _workflow_agent = WorkflowAgent()
     return _workflow_agent

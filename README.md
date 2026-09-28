@@ -117,7 +117,7 @@ trust (see [docs/local-mode.md](docs/local-mode.md)).
 **By default**, TissueLab ships with a working configuration — no additional setup is needed to
 run. Both sides read one `.env` file each; anything can be overridden in `.env.local`.
 
-**Backend** — `app/service/.env.local` (copy of `.env.example`, gitignored):
+**Backend** — `app/service/.env.local` (copy of `.env.example`, gitignored). The LLM connection (endpoint, API key, model, protocol, and a separate one for the Research panel) can also be set in the app under **Preferences → AI Models** (the gear next to Login): saved to `<service root>/storage/llm_settings.json`, applied immediately, and taking precedence over `.env.local`; a cleared field falls back to it.
 
 | Variable | Purpose |
 |----------|---------|
@@ -367,7 +367,7 @@ npm run dist:win       # dist/TissueLab-Setup-<version>.exe + dist/win-unpacked/
 npm run dist:mac       # DMG
 ```
 
-An installed app reads `OPENAI_API_KEY` and the other settings from `<service root>/.env.local`
+An installed app takes the LLM settings from **Preferences → AI Models**, or reads `OPENAI_API_KEY` and the other settings from `<service root>/.env.local`
 (`%APPDATA%\TissueLab\.env.local` on Windows,
 `~/Library/Application Support/TissueLab/.env.local` on macOS); see `app/service/.env.example`.
 

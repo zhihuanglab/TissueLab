@@ -11,7 +11,6 @@ import json
 import os
 from typing import Tuple
 
-from app.core import settings
 from app.core.logger import logger
 
 _REVIEW_MODEL = os.getenv("CODEEXEC_REVIEW_MODEL", "gpt-4o-mini")
@@ -44,7 +43,8 @@ def review_code(code: str) -> Tuple[bool, str]:
     """Return (allowed, reason). Fails open when the LLM is unavailable."""
     if not _REVIEW_ENABLED:
         return True, "LLM review disabled (CODEEXEC_REVIEW != 1)"
-    api_key = getattr(settings, "OPENAI_API_KEY", None)
+    # os.environ, not settings: Preferences may set the key after startup.
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return True, "LLM review skipped (no OPENAI_API_KEY)"
     try:
