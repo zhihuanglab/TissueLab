@@ -16,6 +16,7 @@ import { RootState, AppDispatch } from "@/store"
 import { setSelectedAgent, type AgentName } from "@/store/slices/chat/agentSlice"
 import { formatPath } from "@/utils/common/path.utils"
 import { CTRL_SERVICE_API_ENDPOINT } from "@/config/api.config"
+import { ResearchProblemForm } from "./ResearchProblemForm"
 import { getAuthToken } from "@/utils/common/authToken"
 import {
   isResearchCancelling,
@@ -71,17 +72,6 @@ type ResumeInfo = {
 }
 
 // ─── Lightweight markdown renderer ───────────────────────────────────────────
-
-// problem.md's header, as the service's EXAMPLE_HEADER (discovery/problem.py);
-// used when the service cannot be asked (no workspace yet).
-const PROBLEM_TEMPLATE = `---
-outcome: <cohort column to predict>
-covariates: [<cohort column>, ...]
-cohort_file: training_cohort.csv
-id_column: donor_id
-slide_column: slide_name
----
-`
 
 function renderMarkdown(text: string): React.ReactNode[] {
   const elements: React.ReactNode[] = []
@@ -152,7 +142,10 @@ export const CoscientistPanel: React.FC = () => {
   const [phase, setPhase] = useState<ResearchPhase>("input")
 
   // Input state
+  // problem.md as the form composes it; ready = outcome and question are set
   const [program, setProgram] = useState("")
+  const [programReady, setProgramReady] = useState(false)
+  const [formResetKey, setFormResetKey] = useState(0)
   const [rounds, setRounds] = useState(3)
   const [reasoningEffort, setReasoningEffort] = useState<"low" | "medium" | "high">("high")
   const [workerTimeLimitMin, setWorkerTimeLimitMin] = useState(30)
@@ -227,7 +220,6 @@ export const CoscientistPanel: React.FC = () => {
       )
       if (!res.ok || res.data?.code !== 0) return
       const payload = res.data.data || {}
-      if (payload.problem_text) setProgram(payload.problem_text)
       setJournal((payload.journal || []) as JournalEntry[])
       setFinalSummary(payload.final_summary || null)
       setCurrentRound(null)
@@ -277,32 +269,10 @@ export const CoscientistPanel: React.FC = () => {
 
   useEffect(() => { fetchWorkspaceRuns() }, [fetchWorkspaceRuns])
 
-  // Fill the box with the workspace's problem.md, else the header template (the
-  // service's, or the local copy when there is no workspace / no answer). Text
-  // the user wrote is never replaced; a previous fill is, e.g. once a slide opens.
-  const prefilledRef = useRef("")
-  const prefillProblem = useCallback(async () => {
-    let text = PROBLEM_TEMPLATE
-    if (workspaceDir) {
-      try {
-        const { data } = await authedFetch(
-          `${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/problem?data_dir=${encodeURIComponent(workspaceDir)}`,
-          { method: "GET" }
-        )
-        if (data?.data?.found && data.data.content) text = data.data.content
-        else if (data?.data?.template) text = `${data.data.template}\n`
-      } catch { /* keep the local template */ }
-    }
-    setProgram(prev => (!prev || prev === prefilledRef.current ? text : prev))
-    prefilledRef.current = text
-  }, [authedFetch, workspaceDir])
-
-  useEffect(() => { prefillProblem() }, [prefillProblem])
-
   // ─── Start research ──────────────────────────────────────────────────────
 
   const startResearch = async () => {
-    if (!program.trim()) return
+    if (!programReady) return
     if (!pathWritable) {
       setError(writeBlockTitle || 'Not allowed here.')
       return
@@ -670,7 +640,7 @@ export const CoscientistPanel: React.FC = () => {
             <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="Run history" onClick={() => { if (!showHistory) void fetchWorkspaceRuns(); setShowHistory(!showHistory) }}>
               <History className="h-4 w-4" />
             </Button>
-            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="New research task" onClick={() => { setPhase("input"); setProgram(""); prefillProblem(); setCurrentRound(null); setJournal([]); setError(null); setResumeInfo(null); setActiveRunId(null); setMeasureStatus("idle"); setFinalSummary(null); }}>
+            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="New research task" onClick={() => { setPhase("input"); setFormResetKey(k => k + 1); setCurrentRound(null); setJournal([]); setError(null); setResumeInfo(null); setActiveRunId(null); setMeasureStatus("idle"); setFinalSummary(null); }}>
               <Plus className="h-4 w-4" />
             </Button>
           </div>
@@ -744,20 +714,13 @@ export const CoscientistPanel: React.FC = () => {
               </div>
             )}
 
-            {/* Program input */}
-            <div>
-              <label className="text-xs font-semibold text-foreground mb-1.5 block">Research Problem</label>
-              <Textarea
-                value={program}
-                onChange={e => setProgram(e.target.value)}
-                placeholder={`${PROBLEM_TEMPLATE}Describe the research question...`}
-                className="min-h-[180px] font-mono text-[13px] leading-relaxed resize-none border-border/60 focus:border-primary/50 focus:ring-primary/20 bg-background"
-              />
-              <div className="text-[10px] text-muted-foreground mt-1">
-                Saved as <span className="font-mono">problem.md</span> in your workspace. The header names the outcome, covariates and
-                cohort file; the text below it is the research question. Nothing else about the data is told to the agents.
-              </div>
-            </div>
+            {/* Research problem: picked from the workspace's cohort table */}
+            <ResearchProblemForm
+              workspaceDir={workspaceDir}
+              authedFetch={authedFetch}
+              resetKey={formResetKey}
+              onChange={(text, ready) => { setProgram(text); setProgramReady(ready) }}
+            />
 
             {/* Config */}
             <div className="flex gap-3">
@@ -829,7 +792,7 @@ export const CoscientistPanel: React.FC = () => {
             {/* Start button */}
             <Button
               onClick={startResearch}
-              disabled={!program.trim() || !pathWritable}
+              disabled={!programReady || !pathWritable}
               title={writeBlockTitle}
               className="w-full h-10 bg-primary hover:bg-primary/90 text-primary-foreground font-medium shadow-sm"
             >

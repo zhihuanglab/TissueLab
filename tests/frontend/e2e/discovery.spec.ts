@@ -16,6 +16,7 @@ import type { Page, Response } from '@playwright/test';
 import { e2eEnv, expect, test } from './fixtures';
 import { openAgentChat, openSlide } from './helpers';
 
+// What the form writes for the choices the first test makes.
 const PROBLEM = `---
 outcome: score
 covariates: [age, sex]
@@ -44,13 +45,13 @@ async function openResearchPanel(page: Page): Promise<void> {
   await openAgentChat(page);
   await page.getByRole('combobox').filter({ hasText: /^Agent$/ }).click();
   await page.getByRole('option', { name: 'Research' }).click();
-  await expect(page.getByText('Research Problem')).toBeVisible();
+  await expect(page.getByLabel('Research question')).toBeVisible();
 }
 
-const problemBox = (page: Page) => page.getByPlaceholder(/Describe the research question/);
+const questionBox = (page: Page) => page.getByLabel('Research question');
+const QUESTION_TEXT = 'Which cell-composition measurements predict the score?';
 
-async function startRun(page: Page, problem: string, rounds: number): Promise<Response> {
-  await problemBox(page).fill(problem);
+async function startRun(page: Page, rounds: number): Promise<Response> {
   await page.locator('input[type="number"]').first().fill(String(rounds));
   const started = page.waitForResponse((r) => r.url().endsWith('/agent/v1/discovery/runs') && r.request().method() === 'POST');
   await page.getByRole('button', { name: 'Start Research' }).click();
@@ -80,14 +81,25 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     }
   });
 
-  test('a two-round run: template, live progress, findings, and its folder', async ({ page, guards }) => {
+  test('a two-round run: the form, live progress, findings, and its folder', async ({ page, guards }) => {
     test.setTimeout(420_000);
     await openResearchPanel(page);
 
-    // No problem.md yet: the box is seeded with the header template.
-    await expect(problemBox(page)).toHaveValue(/^---\noutcome: <cohort column to predict>/);
+    // No problem.md yet: the form found the cohort table and its id / slide columns.
+    await expect(page.getByLabel('Cohort table')).toHaveText('cases.csv');
+    await expect(page.getByText('14 rows · 14/14 slides found in this folder')).toBeVisible();
+    await expect(page.getByLabel('Patient ID column')).toHaveText('case');
+    await expect(page.getByLabel('Slide column')).toHaveText('slide');
+    await expect(page.getByRole('button', { name: 'Start Research' })).toBeDisabled();
 
-    const started = await startRun(page, PROBLEM, 2);
+    // Pick the outcome and covariates, write the question: that is problem.md.
+    await page.getByLabel('Outcome').click();
+    await page.getByRole('option', { name: /^score/ }).click();
+    await page.getByRole('button', { name: 'age', exact: true }).click();
+    await page.getByRole('button', { name: 'sex', exact: true }).click();
+    await questionBox(page).fill(QUESTION_TEXT);
+
+    const started = await startRun(page, 2);
     const body = await started.json();
     expect(body.code, JSON.stringify(body)).toBe(0);
     const runId: string = body.data.run_id;
@@ -120,10 +132,12 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     test.setTimeout(420_000);
     await openResearchPanel(page);
 
-    // The previous run saved problem.md: the panel pre-fills it.
-    await expect(problemBox(page)).toHaveValue(PROBLEM);
+    // The previous run saved problem.md: the form is filled from it.
+    await expect(page.getByLabel('Outcome')).toContainText('score');
+    await expect(page.getByRole('button', { name: 'age', exact: true })).toHaveAttribute('aria-pressed', 'true');
+    await expect(questionBox(page)).toHaveValue(QUESTION_TEXT);
 
-    const started = await startRun(page, PROBLEM, 2);
+    const started = await startRun(page, 2);
     const runId: string = (await started.json()).data.run_id;
     await expect(page.getByText(QUESTION).first()).toBeVisible({ timeout: 120_000 });
 
@@ -164,14 +178,17 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
 
   test('a problem that does not match the data is rejected with the reason', async ({ page, guards }) => {
     await openResearchPanel(page);
-    // "New research task" starts from the workspace's problem.md again, not an empty box.
-    await expect(problemBox(page)).toHaveValue(PROBLEM);
-    await problemBox(page).fill('');
+    // "New research task" starts over from the workspace's problem.md.
+    await questionBox(page).fill('');
     await page.getByRole('button', { name: 'New research task', exact: true }).click();
-    await expect(problemBox(page)).toHaveValue(PROBLEM);
+    await expect(questionBox(page)).toHaveValue(QUESTION_TEXT);
 
+    // "Edit as text" shows problem.md itself; a column the cohort lacks is refused.
+    await page.getByRole('button', { name: 'Edit as text' }).click();
+    await expect(page.getByLabel('problem.md')).toHaveValue(PROBLEM);
+    await page.getByLabel('problem.md').fill(PROBLEM.replace('outcome: score', 'outcome: survival'));
     const before = fs.readdirSync(runsDir()).length;
-    const started = await startRun(page, PROBLEM.replace('outcome: score', 'outcome: survival'), 1);
+    const started = await startRun(page, 1);
     expect((await started.json()).code).toBe(400);
     await expect(page.getByText(/cases\.csv lacks column\(s\) \['survival'\]/)).toBeVisible();
     expect(fs.readdirSync(runsDir()).length).toBe(before);

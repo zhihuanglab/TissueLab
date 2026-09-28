@@ -29,7 +29,12 @@ from app.services.agent.discovery.loop import (
     load_results_rows,
     read_run_state,
 )
-from app.services.agent.discovery.problem import EXAMPLE_HEADER
+from app.services.agent.discovery.problem import parse_problem
+from app.services.agent.discovery.workspace_scan import (
+    problem_fields,
+    scan_workspace,
+    write_cohort_template,
+)
 from app.services.agent.discovery.run_manager import PROBLEM_FILENAME
 from app.services.agent.discovery.sandbox import RUNS_DIRNAME, docker_unavailable_reason
 from app.services.file_manager.common import (
@@ -107,18 +112,54 @@ def _load_run(run_root: Path) -> Dict[str, Any]:
     }
 
 
-@discovery_router.get("/v1/discovery/problem")
-async def get_problem(data_dir: str, auth_user: AuthUser = Depends(get_auth_user)):
-    """problem.md of a data folder (or of a slide's folder); `template` seeds a new one."""
+class ParseProblemRequest(BaseModel):
+    text: str
+
+
+class CohortTemplateRequest(BaseModel):
+    data_dir: str
+
+
+def _parsed(text: str) -> Dict[str, Any]:
+    """problem.md text as the form's fields, or why it does not parse."""
     try:
-        await assert_can_access_path_async(auth_user, data_dir, "read research problem")
-        problem_path = workspace_data_dir(data_dir) / PROBLEM_FILENAME
+        return {"fields": problem_fields(parse_problem(text)), "error": None}
+    except ProblemError as exc:
+        return {"fields": None, "error": str(exc)}
+
+
+@discovery_router.get("/v1/discovery/setup")
+def get_setup(data_dir: str, auth_user: AuthUser = Depends(get_auth_user)):
+    """What the panel needs to set up a run in a data folder (or a slide's folder):
+    its problem.md, and the cohort files with their columns sorted into the likely
+    id / slide / outcome / covariate roles."""
+    try:
+        assert_can_access_path(auth_user, data_dir, "read research setup")
+        folder = workspace_data_dir(data_dir)
+        problem_path = folder / PROBLEM_FILENAME
         content = problem_path.read_text(encoding="utf-8") if problem_path.exists() else ""
-        return success_response({"found": problem_path.exists(), "content": content, "template": EXAMPLE_HEADER})
+        problem = {"found": problem_path.exists(), "content": content, **_parsed(content)}
+        return success_response({"data_dir": str(folder), "problem": problem, **scan_workspace(folder)})
     except AppError:
         raise
     except Exception as exc:
         return error_response(str(exc))
+
+
+@discovery_router.post("/v1/discovery/problem/parse")
+def parse_problem_text(request: ParseProblemRequest, auth_user: AuthUser = Depends(get_auth_user)):
+    return success_response(_parsed(request.text))
+
+
+@discovery_router.post("/v1/discovery/cohort/template")
+async def create_cohort_template(request: CohortTemplateRequest, auth_user: AuthUser = Depends(get_auth_user)):
+    """Start training_cohort.csv from the slides in the folder; the user fills in the outcome."""
+    await assert_can_write_path_async(auth_user, request.data_dir, "create cohort file")
+    try:
+        name = await asyncio.to_thread(write_cohort_template, workspace_data_dir(request.data_dir))
+    except ProblemError as exc:
+        raise AppErrors.PARAMS_ERROR(str(exc))
+    return success_response({"file": name})
 
 
 # Sync handlers (FastAPI runs them in its threadpool): they read run folders from disk.

@@ -33,11 +33,8 @@ import pandas as pd
 import yaml
 
 EXAMPLE_HEADER = """---
-outcome: <cohort column to predict>
-covariates: [<cohort column>, ...]
-cohort_file: training_cohort.csv
-id_column: donor_id
-slide_column: slide_name
+outcome: survival_months
+covariates: [age, sex]
 ---
 """
 

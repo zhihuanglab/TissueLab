@@ -74,25 +74,66 @@ def test_session_routes_are_gone(client):
     assert r.status_code in (404, 405) or r.json().get("code") in (404, 405)
 
 
-def test_problem_endpoint_reads_problem_md_and_offers_template(client, workspace, storage_root):
+def test_setup_sorts_the_cohort_columns_into_roles(client, workspace, storage_root):
+    (workspace / "notes.csv").write_text("a\n1\n", encoding="utf-8")  # one column: not a cohort
+    (workspace / "labs.csv").write_text("case,value\nx,1\ny,2\n", encoding="utf-8")
     rel = workspace.relative_to(storage_root).as_posix()
-    r = client.get(f"{API}/problem", params={"data_dir": rel}).json()["data"]
-    assert r["found"] is False and r["content"] == ""
-    assert r["template"].startswith("---\noutcome:")
+    r = client.get(f"{API}/setup", params={"data_dir": rel}).json()["data"]
+    assert r["problem"] == {"found": False, "content": "", "fields": None, "error": r["problem"]["error"]}
+    assert r["slides"] == ["d1.zarr", "d2.zarr"]
 
+    # the file whose rows name the slides here comes first
+    assert [c["file"] for c in r["cohorts"]] == ["training_cohort.csv", "labs.csv"]
+    cohort = r["cohorts"][0]
+    assert cohort["rows"] == 2 and cohort["slides_found"] == 2
+    assert (cohort["id_column"], cohort["slide_column"], cohort["mpp_column"]) == ("donor_id", "slide_name", None)
+    assert cohort["outcome_candidates"] == ["slope", "age"]
+    assert cohort["covariate_candidates"] == ["slope", "age"]
+    slope = next(c for c in cohort["columns"] if c["name"] == "slope")
+    assert slope["numeric"] and (slope["min"], slope["max"]) == (-0.1, 0.2)
+    assert r["cohorts"][1]["slide_column"] is None and r["cohorts"][1]["id_column"] == "case"
+
+
+def test_setup_returns_problem_md_parsed_for_the_form(client, workspace, storage_root):
     (workspace / "problem.md").write_text(PROBLEM, encoding="utf-8")
-    r = client.get(f"{API}/problem", params={"data_dir": rel}).json()["data"]
-    assert r["found"] is True and r["content"] == PROBLEM
+    rel = workspace.relative_to(storage_root).as_posix()
+    problem = client.get(f"{API}/setup", params={"data_dir": rel}).json()["data"]["problem"]
+    assert problem["found"] is True and problem["content"] == PROBLEM and problem["error"] is None
+    assert problem["fields"]["outcome"] == "slope"
+    assert problem["fields"]["covariates"] == ["age"]
+    assert problem["fields"]["cohort_file"] == "training_cohort.csv"
+    assert problem["fields"]["question"] == "Which tissue measurements track the slope?"
 
 
-def test_problem_endpoint_accepts_the_open_slides_path_with_either_separator(client, workspace, storage_root):
+def test_setup_accepts_the_open_slides_path_with_either_separator(client, workspace, storage_root):
     # the panel sends the open slide's path; on Windows formatPath uses "\\"
     (workspace / "problem.md").write_text(PROBLEM, encoding="utf-8")
     (workspace / "slide.svs").write_bytes(b"x")
     rel = (workspace / "slide.svs").relative_to(storage_root).as_posix()
     for data_dir in (rel, rel.replace("/", "\\")):
-        r = client.get(f"{API}/problem", params={"data_dir": data_dir}).json()["data"]
-        assert r["found"] is True and r["content"] == PROBLEM, data_dir
+        r = client.get(f"{API}/setup", params={"data_dir": data_dir}).json()["data"]
+        assert r["problem"]["content"] == PROBLEM, data_dir
+        assert r["data_dir"] == str(workspace)
+
+
+def test_parse_problem_text(client):
+    ok = client.post(f"{API}/problem/parse", json={"text": PROBLEM}).json()["data"]
+    assert ok["error"] is None and ok["fields"]["outcome"] == "slope"
+    bad = client.post(f"{API}/problem/parse", json={"text": "---\ncovariates: [age]\n---\nq\n"}).json()["data"]
+    assert bad["fields"] is None and "outcome" in bad["error"]
+
+
+def test_cohort_template_lists_the_slides(client, workspace):
+    (workspace / "training_cohort.csv").unlink()
+    (workspace / "scans").mkdir()
+    (workspace / "scans" / "P7.svs.zarr").mkdir()
+    r = client.post(f"{API}/cohort/template", json={"data_dir": str(workspace)}).json()
+    assert r["code"] == 0 and r["data"]["file"] == "training_cohort.csv"
+    assert (workspace / "training_cohort.csv").read_text().splitlines() == [
+        "donor_id,slide_name,outcome", "d1,d1.zarr,", "d2,d2.zarr,", "P7,scans/P7.svs.zarr,",
+    ]
+    again = client.post(f"{API}/cohort/template", json={"data_dir": str(workspace)}).json()
+    assert again["code"] == 400 and "already exists" in again["message"]
 
 
 def test_workspace_runs_list_and_load(client, workspace):
