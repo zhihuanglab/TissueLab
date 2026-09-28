@@ -29,6 +29,7 @@ test.describe('Preferences: AI models', () => {
       ['OPENAI_BASE_URL', 'OPENAI_API_KEY', 'LLM_MODEL', 'LLM_API', 'DISCOVERY_BASE_URL', 'DISCOVERY_API_KEY', 'DISCOVERY_MODEL']
         .map((name) => [name, '']),
     );
+    fields.RESEARCH_USES_AGENT = 'false';
     await request.put(`${e2eEnv().backendOrigin}/api/agent/v1/model_settings`, { data: { fields } });
   });
 
@@ -67,6 +68,34 @@ test.describe('Preferences: AI models', () => {
     await expect(dialog.getByLabel('Agent API key')).toHaveAttribute('placeholder', /\(from \.env\.local\)$/);
     expect(JSON.parse(fs.readFileSync(settingsFile(), 'utf8')).OPENAI_API_KEY).toBeUndefined();
 
+    expect(guards.pageErrors).toEqual([]);
+  });
+
+  test('research "same as Agent" switch hides its connection and follows the Agent', async ({ page, guards }) => {
+    const dialog = await openPreferences(page, guards.firebase.idToken);
+    const status = dialog.getByTestId('model-settings-status');
+    const sameAsAgent = dialog.getByRole('checkbox', { name: "Use the Agent's endpoint and API key" });
+
+    // .env.local gives research its own endpoint here: the switch starts off.
+    await expect(sameAsAgent).not.toBeChecked();
+    await expect(dialog.getByLabel('Research endpoint')).toHaveAttribute('placeholder', /\(from \.env\.local\)$/);
+    await expect(status).toContainText('Research: ready');
+
+    // On: the fields go away, and research follows the Agent (a Chat Completions mock).
+    await sameAsAgent.click();
+    await expect(dialog.getByLabel('Research endpoint')).toHaveCount(0);
+    await expect(dialog.getByLabel('Research API key')).toHaveCount(0);
+    await expect(dialog.getByLabel('Research model')).toBeVisible();
+    await dialog.getByRole('button', { name: 'Save AI Models' }).click();
+    await expect(dialog.getByText('Saved — in effect now.')).toBeVisible();
+    await expect(status).toContainText(/Research: .*Responses API/);
+    expect(JSON.parse(fs.readFileSync(settingsFile(), 'utf8'))).toMatchObject({ RESEARCH_USES_AGENT: 'true' });
+
+    // Off again: its own endpoint from .env.local is back.
+    await sameAsAgent.click();
+    await expect(dialog.getByLabel('Research endpoint')).toBeVisible();
+    await dialog.getByRole('button', { name: 'Save AI Models' }).click();
+    await expect(status).toContainText('Research: ready (gpt-5.4)');
     expect(guards.pageErrors).toEqual([]);
   });
 

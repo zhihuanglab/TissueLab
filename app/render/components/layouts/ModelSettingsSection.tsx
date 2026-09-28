@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -18,7 +19,7 @@ type SecretName = 'OPENAI_API_KEY' | 'DISCOVERY_API_KEY'
 interface PlainField { value: string; env_value: string }
 interface SecretField { set: boolean; hint: string | null; env_set: boolean; env_hint: string | null }
 interface ModelSettings {
-  fields: Record<PlainName, PlainField> & Record<SecretName, SecretField>
+  fields: Record<PlainName, PlainField> & Record<SecretName, SecretField> & { RESEARCH_USES_AGENT: { value: boolean } }
   status: {
     agent_configured: boolean
     agent_protocol: string
@@ -41,6 +42,8 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
   // A typed key replaces the saved one; untouched keys stay as they are.
   const [keys, setKeys] = useState<Record<SecretName, string>>({ OPENAI_API_KEY: '', DISCOVERY_API_KEY: '' })
   const [clearKeys, setClearKeys] = useState<Record<SecretName, boolean>>({ OPENAI_API_KEY: false, DISCOVERY_API_KEY: false })
+  // Like "billing address same as shipping": research on the Agent's endpoint and key.
+  const [usesAgent, setUsesAgent] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
@@ -50,6 +53,7 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
     setPlain(Object.fromEntries(PLAIN.map((name) => [name, next.fields[name].value])) as Record<PlainName, string>)
     setKeys({ OPENAI_API_KEY: '', DISCOVERY_API_KEY: '' })
     setClearKeys({ OPENAI_API_KEY: false, DISCOVERY_API_KEY: false })
+    setUsesAgent(next.fields.RESEARCH_USES_AGENT.value)
   }, [])
 
   useEffect(() => {
@@ -69,6 +73,9 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
     setSaved(false)
     const fields: Record<string, string | null> = { ...plain }
     for (const name of SECRETS) fields[name] = keys[name].trim() ? keys[name].trim() : clearKeys[name] ? '' : null
+    fields.RESEARCH_USES_AGENT = usesAgent ? 'true' : 'false'
+    // The service drops research's own endpoint / key while the switch is on.
+    if (usesAgent) fields.DISCOVERY_BASE_URL = fields.DISCOVERY_API_KEY = null
     try {
       show((await apiFetch(API(), { method: 'PUT', body: JSON.stringify({ fields }) })) as ModelSettings)
       setSaved(true)
@@ -181,17 +188,33 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
       <div className="space-y-3">
         <h4 className="text-sm font-semibold text-foreground">Research (discovery)</h4>
         <p className="text-xs text-muted-foreground">
-          Needs the OpenAI Responses API. Leave empty to use the Agent&apos;s endpoint and key; set them when the
-          Agent runs on a self-hosted model.
+          Needs the OpenAI Responses API. Give it its own endpoint when the Agent runs on a self-hosted model.
         </p>
-        {row('Endpoint', 'Responses API base URL',
-          <Input
-            aria-label="Research endpoint"
-            placeholder={envHint('DISCOVERY_BASE_URL', 'Same as Agent')}
-            value={plain.DISCOVERY_BASE_URL}
-            onChange={(e) => setField('DISCOVERY_BASE_URL', e.target.value)}
-          />)}
-        {row('API key', 'Stored locally, never shown again', keyInput('DISCOVERY_API_KEY', 'Same as Agent'))}
+        <div className="flex items-center gap-2">
+          <Checkbox
+            id="research-uses-agent"
+            checked={usesAgent}
+            onCheckedChange={(checked) => {
+              setSaved(false)
+              setUsesAgent(checked === true)
+            }}
+          />
+          <Label htmlFor="research-uses-agent" className="text-sm text-foreground cursor-pointer">
+            Use the Agent&apos;s endpoint and API key
+          </Label>
+        </div>
+        {!usesAgent && (
+          <>
+            {row('Endpoint', 'Responses API base URL',
+              <Input
+                aria-label="Research endpoint"
+                placeholder={envHint('DISCOVERY_BASE_URL', 'e.g. https://api.openai.com/v1 (empty: Agent endpoint)')}
+                value={plain.DISCOVERY_BASE_URL}
+                onChange={(e) => setField('DISCOVERY_BASE_URL', e.target.value)}
+              />)}
+            {row('API key', 'Stored locally, never shown again', keyInput('DISCOVERY_API_KEY', 'sk-... (empty: Agent key)'))}
+          </>
+        )}
         {row('Model', 'Model the research loop runs on',
           <Input
             aria-label="Research model"

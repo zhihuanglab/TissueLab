@@ -30,7 +30,8 @@ def test_nothing_saved(client, settings_module):
     body = client.get(API).json()
     assert body["code"] == 0
     fields = body["data"]["fields"]
-    assert set(fields) == set(settings_module.FIELDS)
+    assert set(fields) == {*settings_module.FIELDS, "RESEARCH_USES_AGENT"}
+    assert fields["RESEARCH_USES_AGENT"] == {"value": True}
     assert fields["OPENAI_API_KEY"] == {"set": False, "hint": None, "env_set": False, "env_hint": None}
     assert fields["LLM_MODEL"] == {"value": "", "env_value": ""}
     assert body["data"]["status"]["agent_configured"] is False
@@ -85,6 +86,31 @@ def test_research_endpoint_of_its_own(client, settings_module):
     assert os.environ["DISCOVERY_API_KEY"] == "sk-research-000000005678"
 
 
+def test_research_same_as_agent_switch(client, settings_module, monkeypatch):
+    # .env.local gives research its own endpoint: the switch starts off.
+    monkeypatch.setitem(settings_module._baseline, "DISCOVERY_BASE_URL", "https://env.example/v1")
+    monkeypatch.setitem(settings_module._baseline, "DISCOVERY_API_KEY", "sk-env-research-0000")
+    settings_module.apply_saved_settings()
+    assert client.get(API).json()["data"]["fields"]["RESEARCH_USES_AGENT"] == {"value": False}
+
+    # On: research follows the agent, the .env.local pair and any saved one notwithstanding.
+    _put(client, DISCOVERY_BASE_URL="https://saved.example/v1", DISCOVERY_API_KEY="sk-saved-research-1111")
+    data = _put(client, RESEARCH_USES_AGENT="true", OPENAI_API_KEY=KEY)["data"]
+    assert data["fields"]["RESEARCH_USES_AGENT"] == {"value": True}
+    assert data["fields"]["DISCOVERY_BASE_URL"]["value"] == ""
+    assert data["fields"]["DISCOVERY_API_KEY"]["set"] is False
+    assert "DISCOVERY_BASE_URL" not in os.environ and "DISCOVERY_API_KEY" not in os.environ
+    assert data["status"]["research_unavailable_reason"] is None  # the agent is on OpenAI here
+    settings_module.apply_saved_settings()
+    assert "DISCOVERY_BASE_URL" not in os.environ
+
+    # Off again: back to .env.local's pair.
+    data = _put(client, RESEARCH_USES_AGENT="false")["data"]
+    assert data["fields"]["RESEARCH_USES_AGENT"] == {"value": False}
+    assert os.environ["DISCOVERY_BASE_URL"] == "https://env.example/v1"
+    assert "RESEARCH_USES_AGENT" not in settings_module.load_saved()
+
+
 def test_null_keeps_empty_clears(client, settings_module):
     _put(client, OPENAI_API_KEY=KEY, LLM_MODEL="m1")
     data = _put(client, OPENAI_API_KEY=None, LLM_MODEL="m2")["data"]
@@ -115,6 +141,7 @@ def test_cleared_field_falls_back_to_env_file(client, settings_module, monkeypat
     ({"OPENAI_BASE_URL": "localhost:11434"}, "http(s) URL"),
     ({"LLM_API": "grpc"}, "LLM_API must be one of"),
     ({"PATH": "/tmp"}, "Unknown setting"),
+    ({"RESEARCH_USES_AGENT": "yes"}, "must be true or false"),
 ])
 def test_rejects_bad_values_and_saves_nothing(client, settings_module, fields, message):
     body = _put(client, **fields)

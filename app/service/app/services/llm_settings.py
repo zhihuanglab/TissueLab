@@ -8,6 +8,10 @@ variables (see :mod:`app.services.llm_config` and
 wins over ``.env.local`` / the shell, a cleared one falls back to it. Applying
 drops the cached LLM clients so the next request uses the new connection; a
 request already in flight finishes on the old one.
+
+``RESEARCH_USES_AGENT`` is the one setting that is not an environment variable:
+while it is on, discovery runs on the agent's endpoint and key, whatever
+DISCOVERY_BASE_URL / DISCOVERY_API_KEY say (in Preferences or .env.local).
 """
 from __future__ import annotations
 
@@ -30,6 +34,9 @@ FIELDS = (
     "DISCOVERY_API_KEY",
     "DISCOVERY_MODEL",
 )
+# Research follows the agent's connection ("same as the agent" in Preferences).
+USES_AGENT = "RESEARCH_USES_AGENT"
+RESEARCH_CONNECTION = ("DISCOVERY_BASE_URL", "DISCOVERY_API_KEY")
 SECRETS = frozenset({"OPENAI_API_KEY", "DISCOVERY_API_KEY"})
 URL_FIELDS = frozenset({"OPENAI_BASE_URL", "DISCOVERY_BASE_URL"})
 LLM_API_VALUES = ("chat", "responses")
@@ -56,7 +63,10 @@ def load_saved() -> Dict[str, str]:
         return {}
     if not isinstance(raw, dict):
         return {}
-    return {k: v.strip() for k, v in raw.items() if k in FIELDS and isinstance(v, str) and v.strip()}
+    return {
+        k: v.strip() for k, v in raw.items()
+        if (k in FIELDS or k == USES_AGENT) and isinstance(v, str) and v.strip()
+    }
 
 
 def _write(saved: Mapping[str, str]) -> None:
@@ -82,7 +92,10 @@ def _reset_clients() -> None:
 
 def _apply(saved: Mapping[str, str]) -> None:
     for name in FIELDS:
-        value = saved.get(name) or _baseline.get(name)
+        if name in RESEARCH_CONNECTION and saved.get(USES_AGENT):
+            value = None
+        else:
+            value = saved.get(name) or _baseline.get(name)
         if value:
             os.environ[name] = value
         else:
@@ -103,6 +116,10 @@ def _validate(name: str, value: str) -> str:
         value = value.lower()
         if value not in LLM_API_VALUES:
             raise SettingsError(f"LLM_API must be one of {', '.join(LLM_API_VALUES)} (or empty for auto).")
+    if name == USES_AGENT:
+        value = value.lower()
+        if value not in ("true", "false"):
+            raise SettingsError(f"{USES_AGENT} must be true or false.")
     return value
 
 
@@ -110,9 +127,10 @@ def update_settings(changes: Mapping[str, Optional[str]]) -> Dict[str, str]:
     """Merge ``changes`` into the saved overrides, persist, and apply them.
 
     Per field: ``None`` (or absent) keeps the saved value, ``""`` clears it (back
-    to ``.env.local``), any other string replaces it.
+    to ``.env.local``), any other string replaces it. ``RESEARCH_USES_AGENT``
+    takes "true" / "false"; turning it on drops research's own endpoint / key.
     """
-    unknown = sorted(set(changes) - set(FIELDS))
+    unknown = sorted(set(changes) - set(FIELDS) - {USES_AGENT})
     if unknown:
         raise SettingsError(f"Unknown setting(s): {', '.join(unknown)}.")
     with _lock:
@@ -120,10 +138,14 @@ def update_settings(changes: Mapping[str, Optional[str]]) -> Dict[str, str]:
         for name, value in changes.items():
             if value is None:
                 continue
-            value = value.strip()
-            if value:
-                saved[name] = _validate(name, value)
+            value = _validate(name, value.strip()) if value.strip() else ""
+            if value and not (name == USES_AGENT and value == "false"):
+                saved[name] = value
             else:
+                saved.pop(name, None)
+        if saved.get(USES_AGENT):
+            # Its own endpoint / key would only sit there unused.
+            for name in RESEARCH_CONNECTION:
                 saved.pop(name, None)
         _write(saved)
         _apply(saved)
@@ -152,6 +174,10 @@ def public_settings() -> dict:
             }
         else:
             fields[name] = {"value": saved.get(name, ""), "env_value": env_value}
+    # On when asked for, or when nothing gives research a connection of its own.
+    fields[USES_AGENT] = {
+        "value": bool(saved.get(USES_AGENT)) or not any(os.environ.get(n) for n in RESEARCH_CONNECTION),
+    }
     return {"fields": fields, "status": status()}
 
 
@@ -173,6 +199,7 @@ def status() -> dict:
 __all__ = [
     "FIELDS",
     "SettingsError",
+    "USES_AGENT",
     "apply_saved_settings",
     "load_saved",
     "public_settings",
