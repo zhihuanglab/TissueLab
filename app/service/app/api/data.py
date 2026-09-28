@@ -18,6 +18,7 @@ from app.utils import resolve_path
 from app.config.zarr_compat import as_zarr_path
 from app.services.seg_registry import iter_annotation_handlers
 from app.core.executors import zarr_structure_executor
+from app.services import sidecar
 from app.services.data import (
     get_file_structure,
     get_group_info,
@@ -36,14 +37,6 @@ from app.services.data import (
     search_zarr_objects,
     analyze_zarr_file_service,
     validate_zarr_file_service,
-    validate_zarr_replacement_service,
-    apply_zarr_replacement_service,
-    zarr_staging_base,
-    find_zarr_root,
-    cleanup_zarr_staging,
-    is_valid_staging_id,
-    write_staged_zarr_upload,
-    resolve_staged_zarr_root,
     enhanced_file_analysis_service,
     search_segmentation_arrays_service,
     get_batch_array_info_service,
@@ -555,8 +548,10 @@ async def validate_zarr_replacement_endpoint(request: Request):
         # the zarr-only file check on it; we just resolve it to read its dimensions.
         slide = resolve_path(target_slide) if target_slide else None
 
-        # Opens the candidate store — filesystem work, off the loop.
-        result = await asyncio.to_thread(validate_zarr_replacement_service, cand, slide)
+        # Opens the candidate store and the slide — filesystem work, off the loop.
+        result = await asyncio.to_thread(
+            lambda: sidecar.validate_replacement(cand, sidecar.slide_dimensions(slide) if slide else None)
+        )
         return success_response(result)
 
     except HTTPException:
@@ -598,9 +593,11 @@ async def replace_zarr_endpoint(request: Request):
         # Sidecar convention: "<slide>.zarr" (unless the path already ends in .zarr).
         target_zarr = as_zarr_path(slide)
 
-        # Off the loop: this walks and rewrites the whole store on disk.
+        # Off the loop: copies the whole store on disk. The user's own store is
+        # copied, never moved.
         result = await asyncio.to_thread(
-            apply_zarr_replacement_service, cand, target_zarr, slide
+            lambda: sidecar.apply_replacement(cand, target_zarr, sidecar.slide_dimensions(slide),
+                                              move_candidate=False)
         )
         return success_response(result)
 
@@ -611,133 +608,6 @@ async def replace_zarr_endpoint(request: Request):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error replacing Zarr: {str(e)}")
-
-
-@data_router.post("/v1/zarr/stage_candidate")
-async def stage_zarr_candidate_endpoint(
-    request: Request,
-    files: List[UploadFile] = File(...),
-    relative_paths: Optional[str] = Form(None),
-    staging_id: Optional[str] = Form(None),
-    finalize: Optional[str] = Form(None),
-    target_path: Optional[str] = Form(None),
-):
-    """Receive an uploaded replacement candidate into a server staging dir. A .zip
-    goes in one call. A dragged/selected folder is uploaded in BATCHES (a zarr has
-    thousands of chunk files, over the per-request multipart limit): the first call
-    omits staging_id and gets one back; later calls pass it to append; the last call
-    passes finalize=true. Only the finalizing call resolves + returns staging_path.
-    Caller must call cleanup_staging when done."""
-    import uuid as _uuid
-    import json as _json
-
-    effective_target = target_path
-    if not effective_target:
-        try:
-            from app.services.load import sessions, session_lock
-            from app.utils.common.request import get_instance_id
-
-            instance_id = get_instance_id(request)
-            with session_lock:
-                effective_target = (
-                    sessions.get(instance_id, {}).get("current_file_path")
-                    if instance_id else None
-                )
-        except Exception:
-            effective_target = None
-    if not effective_target:
-        return permission_denied_response(
-            access_mode="forbidden",
-            operation="stage Zarr replacement",
-            request_id=request.headers.get("X-Request-ID"),
-            error_code="TARGET_CONTEXT_REQUIRED",
-        )
-    _, denied = await guard_write_path_async(request, effective_target, "stage Zarr replacement")
-    if denied is not None:
-        return denied
-    if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded")
-
-    is_zip = len(files) == 1 and (files[0].filename or "").lower().endswith(".zip")
-    do_finalize = is_zip or (str(finalize or "").lower() in ("1", "true", "yes"))
-
-    sid = (staging_id or "").strip()
-    created = False
-    try:
-        # Resolve staging dir: reuse across batches, or create a fresh one. Kept
-        # inside the try so a non-writable storage root surfaces a real error
-        # (not a CORS-less generic 500).
-        base = zarr_staging_base()
-        if sid:
-            if not is_valid_staging_id(sid):
-                raise HTTPException(status_code=400, detail="Invalid staging_id")
-            staging_dir = os.path.join(base, sid)
-            if not os.path.isdir(staging_dir):
-                raise HTTPException(status_code=400, detail="Unknown staging_id (expired?)")
-        else:
-            sid = _uuid.uuid4().hex
-            staging_dir = os.path.join(base, sid)
-            os.makedirs(staging_dir, exist_ok=True)
-            created = True
-
-        rels: List[str] = []
-        if not is_zip:
-            rels = _json.loads(relative_paths) if relative_paths else []
-            if len(rels) != len(files):
-                rels = [f.filename or f"file_{i}" for i, f in enumerate(files)]
-
-        # Writing the batch out (a zip expanded, or thousands of chunk files)
-        # and the .DS_Store walk are both long blocking IO — a multi-GB candidate
-        # would otherwise hold the event loop for the whole upload.
-        search_root = await asyncio.to_thread(
-            write_staged_zarr_upload, staging_dir, files, rels, is_zip=is_zip
-        )
-
-        # More batches coming — just acknowledge, don't resolve yet.
-        if not do_finalize:
-            return success_response({"staging_id": sid})
-
-        zroot = await asyncio.to_thread(resolve_staged_zarr_root, search_root)
-        if not zroot:
-            await asyncio.to_thread(cleanup_zarr_staging, sid)
-            raise HTTPException(status_code=400, detail="No Zarr store (zarr.json/.zgroup) found in the upload.")
-
-        return success_response({"staging_id": sid, "staging_path": zroot})
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Only tear down staging on the finalize call or if we created it now;
-        # a mid-batch failure shouldn't discard earlier batches silently.
-        if do_finalize or created:
-            await asyncio.to_thread(cleanup_zarr_staging, sid)
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error staging candidate: {str(e)}")
-
-
-@data_router.post("/v1/zarr/cleanup_staging")
-async def cleanup_zarr_staging_endpoint(request: Request):
-    """Delete a staging dir created by stage_candidate. Body: {staging_id}."""
-    try:
-        try:
-            body = await request.json()
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Request body must be JSON: {staging_id}")
-        if not isinstance(body, dict):
-            raise HTTPException(status_code=400, detail="Request body must be JSON: {staging_id}")
-        staging_id = str(body.get("staging_id") or "").strip()
-        if staging_id:
-            if not is_valid_staging_id(staging_id):
-                raise HTTPException(status_code=400, detail="Invalid staging_id")
-            # Off the loop: rmtree of a staging dir holding an uploaded zarr,
-            # which is one file per chunk.
-            await asyncio.to_thread(cleanup_zarr_staging, staging_id)
-        return success_response({"ok": True})
-    except HTTPException:
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error cleaning staging: {str(e)}")
 
 
 @data_router.get("/v1/version")

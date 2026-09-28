@@ -1,6 +1,7 @@
 import cv2
 
 from app.utils.geometry import patch_group_outline
+from app.services.patch_masks import mask_grid_transform
 import math
 import json
 import orjson
@@ -596,6 +597,18 @@ def get_segmentation_mask(handler: Optional["SegmentationHandler"],
                 tissue_class = "" if sub == "default" else sub
             if mask_dataset is None:
                 return {"success": False, "error": "Mask dataset not found in Tissue-Segmentation/masks"}
+            # Masks derived from patch classification (services/patch_masks.py)
+            # are stored on the patch grid: one cell per `scale` level-0 pixels,
+            # offset by `origin`. Everything below works in the mask's own
+            # units, so bring the viewport into grid space here and scale the
+            # sizes back on the way out. VISTA masks have scale 1, origin 0.
+            raw_x1, raw_y1 = x1, y1
+            grid_scale, (grid_ox, grid_oy) = mask_grid_transform(masks_group[sub])
+            if grid_scale != 1 or grid_ox or grid_oy:
+                x1 = (x1 - grid_ox) / grid_scale
+                y1 = (y1 - grid_oy) / grid_scale
+                x2 = (x2 - grid_ox) / grid_scale
+                y2 = (y2 - grid_oy) / grid_scale
             # Note: overlay color is resolved on the frontend from the shared patch
             # classification color map (by tissue_class), so no color is returned here.
             
@@ -834,9 +847,10 @@ def get_segmentation_mask(handler: Optional["SegmentationHandler"],
                 "data": mask_subset.tobytes(),
                 "shape": [final_height, final_width],
                 "dtype": "uint8",
-                "offset": [int(x1), int(y1)],  # Original requested offset in RAW coordinates (may be negative)
-                "full_shape": [mask_height, mask_width],
-                "region_size": [actual_mask_width, actual_mask_height]  # Actual mask data size in RAW coordinates (before padding, before downsampling)
+                "offset": [int(raw_x1), int(raw_y1)],  # Original requested offset in RAW coordinates (may be negative)
+                "full_shape": [mask_height * grid_scale + grid_oy, mask_width * grid_scale + grid_ox],
+                # Actual mask data size in RAW coordinates (before padding, before downsampling)
+                "region_size": [actual_mask_width * grid_scale, actual_mask_height * grid_scale]
             }
             
             if tissue_class and tissue_class != 'default':

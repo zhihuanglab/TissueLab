@@ -19,15 +19,9 @@ from app.services.providers import LLMProvider, OpenAIProvider
 from app.services import llm_config
 from app.services.agent.knowledge_store import get_knowledge_store
 from app.repos.schema.knowledge import KnowledgeItem
-import aiohttp
 
 # PROMPTS_DIR is in parent directory (app/services/prompts)
 PROMPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts")
-# Public script library (pre-written, tested analysis scripts the coding agent may reuse).
-SCRIPTS_GCS_BASE_URL = os.getenv(
-    "TL_SCRIPTS_BASE_URL",
-    "https://storage.googleapis.com/tissuelab-2025.firebasestorage.app/scripts",
-)
 
 
 class AgentNotConfigured(RuntimeError):
@@ -102,10 +96,6 @@ class WorkflowAgent:
         router_path = os.path.join(PROMPTS_DIR, "router_system_prompt.txt")
         self.prompt_router = _read_text(router_path) if os.path.exists(router_path) else None
 
-        # Cache for scripts metadata (refreshed periodically)
-        self._scripts_metadata_cache = None
-        self._scripts_cache_timestamp = 0
-
         # Knowledge base cache
         self._knowledge_cache: Dict[str, List[KnowledgeItem]] = {}
         self._knowledge_lock = threading.Lock()
@@ -125,94 +115,6 @@ class WorkflowAgent:
     def _get_provider(self, provider_name: str) -> LLMProvider:
         """Get provider by name (only the OpenAI-compatible provider ships)."""
         return self.openai_provider
-
-    async def _fetch_scripts_metadata(self) -> List[Dict[str, Any]]:
-        """
-        Fetch scripts metadata from GCS.
-        Returns list of script metadata dicts.
-        Caches result for 1 hour to avoid excessive fetches.
-        """
-        import time
-
-        # Check cache (1 hour TTL)
-        current_time = time.time()
-        if self._scripts_metadata_cache and (current_time - self._scripts_cache_timestamp) < 3600:
-            return self._scripts_metadata_cache
-
-        try:
-            metadata_url = f"{SCRIPTS_GCS_BASE_URL}/metadata.json"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(metadata_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        scripts = data.get("scripts", [])
-                        # Update cache
-                        self._scripts_metadata_cache = scripts
-                        self._scripts_cache_timestamp = current_time
-                        return scripts
-                    else:
-                        print(f"[agent_service] Failed to fetch scripts metadata: HTTP {resp.status}")
-                        return []
-        except Exception as e:
-            print(f"[agent_service] Error fetching scripts metadata: {e}")
-            return []
-
-    async def _fetch_script_from_gcs(self, script_id: str) -> Optional[str]:
-        """
-        Fetch a script's Python code from GCS.
-
-        Args:
-            script_id: The script ID (e.g., "depth_of_invasion")
-
-        Returns:
-            Python code as string, or None if fetch failed
-        """
-        try:
-            script_url = f"{SCRIPTS_GCS_BASE_URL}/{script_id}.py"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(script_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        code = await resp.text()
-                        return code
-                    else:
-                        print(f"[agent_service] Failed to fetch script {script_id}: HTTP {resp.status}")
-                        return None
-        except Exception as e:
-            print(f"[agent_service] Error fetching script {script_id}: {e}")
-            return None
-
-    def _format_scripts_for_prompt(self, scripts: List[Dict[str, Any]]) -> str:
-        """
-        Format scripts metadata for inclusion in system prompt.
-
-        Args:
-            scripts: List of script metadata dicts
-
-        Returns:
-            Formatted string for prompt
-        """
-        if not scripts:
-            return "No pre-written scripts available."
-
-        lines = ["AVAILABLE PRE-WRITTEN SCRIPTS:", ""]
-        for script in scripts:
-            lines.append(f"ID: {script.get('id')}")
-            lines.append(f"Name: {script.get('name')}")
-            lines.append(f"Description: {script.get('description')}")
-            keywords = script.get('keywords', [])
-            if keywords:
-                lines.append(f"Keywords: {', '.join(keywords)}")
-            required = script.get('required_datasets', [])
-            if required:
-                lines.append(f"Required datasets: {', '.join(required)}")
-            lines.append("")
-
-        lines.append("You can use fetch_script(script_id) to retrieve a pre-written script when it matches the user's request.")
-        lines.append("Only use fetch_script if the script clearly matches the task and required datasets are available.")
-        lines.append("Otherwise, generate new code as usual.")
-        lines.append("")
-
-        return "\n".join(lines)
 
     def _fetch_guidelines(self, query_text: str, always_search: bool = False) -> str:
         """
@@ -1157,15 +1059,14 @@ Return only JSON, no other text. If is_correction is false, other fields can be 
         zarr_structure: str = None,
         original_question: str = None,
         web_search_enabled: bool = False,
-        use_scripts_library: bool = False,
-    ) -> Tuple[str, str, List[Dict[str, Any]]]:
-        """Build system/user prompts and optional fetch_script tools (same inputs as get_script)."""
-        if use_scripts_library:
-            scripts_metadata = await self._fetch_scripts_metadata()
-            scripts_text = self._format_scripts_for_prompt(scripts_metadata)
-        else:
-            scripts_text = "(No script library for this run. Generate code from scratch.)"
+    ) -> Tuple[str, str]:
+        """Build the system/user prompts for code generation (same inputs as get_script).
 
+        The coding agent always writes the analysis from the question and the
+        store's structure; there is no library of pre-written scripts. What a
+        measurement means (which classes, which boundary, which units) comes
+        from the user's question, not from a script chosen for them.
+        """
         combined_for_search = f"Original Question: {original_question or script_task or ''}\n\nScript Task: {script_task or ''}"
         search_enabled = web_search_enabled or (os.getenv("ENABLE_GUIDELINE_SEARCH", "0") == "1")
         if search_enabled:
@@ -1188,11 +1089,7 @@ Return only JSON, no other text. If is_correction is false, other fields can be 
         else:
             guideline_block = ""
 
-        system_prompt = (
-            self.prompt_code
-            .replace("__GUIDELINE_INFO__", guideline_block)
-            .replace("__AVAILABLE_SCRIPTS__", scripts_text)
-        )
+        system_prompt = self.prompt_code.replace("__GUIDELINE_INFO__", guideline_block)
 
         user_prompt = (
             f"Original Question: {original_question or script_task or ''}\n\n"
@@ -1200,35 +1097,11 @@ Return only JSON, no other text. If is_correction is false, other fields can be 
             f"Input JSON structure (data at json_path): {zarr_structure or ''}"
         )
 
-        tools: List[Dict[str, Any]] = []
-        if use_scripts_library:
-            tools = [{
-                "type": "function",
-                "name": "fetch_script",
-                "description": "Fetch a pre-written, tested script from the library. Use this when an existing script matches the user's request instead of generating new code.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "script_id": {
-                            "type": "string",
-                            "description": "The ID of the script to fetch (e.g., 'depth_of_invasion')"
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Brief explanation of why this script matches the user's request"
-                        }
-                    },
-                    "required": ["script_id"],
-                    "additionalProperties": False
-                }
-            }]
-
-        return system_prompt, user_prompt, tools
+        return system_prompt, user_prompt
 
     def iter_script_chat_stream(self, system_prompt: str, user_prompt: str) -> Iterator[str]:
         """
         Stream assistant text deltas via Chat Completions (OpenAI client).
-        SSE path does not execute fetch_script tools; prompt still lists library scripts.
         """
         kwargs: Dict[str, Any] = {
             "model": self.model_code,
@@ -1255,65 +1128,39 @@ Return only JSON, no other text. If is_correction is false, other fields can be 
             except Exception:
                 continue
 
-    async def get_script(self, script_task: str, zarr_structure: str = None, original_question: str = None, web_search_enabled: bool = False, use_scripts_library: bool = False) -> str:
+    async def get_script(self, script_task: str, zarr_structure: str = None, original_question: str = None, web_search_enabled: bool = False) -> str:
         """
-        Generate or fetch Python code that defines analyze_medical_image(path) (using provider abstraction).
-
-        The LLM can either:
-        1. Call fetch_script(script_id) tool to retrieve a pre-written script from GCS (when use_scripts_library=True)
-        2. Generate new code directly (wrapped in markdown code blocks)
+        Generate Python code that defines analyze_medical_image(path) (using provider abstraction).
 
         Args:
             script_task: The task description for code generation
             zarr_structure: Input file structure (JSON string; e.g. for analyze_medical_image the input is a path to a JSON file)
             original_question: Original user question
             web_search_enabled: Whether to enable web search for guidelines
-            use_scripts_library: If True, load GCS scripts metadata and expose fetch_script; default False（默认不读 knowledge/scripts）
 
         Returns:
             Python code as a string (extracted from markdown code blocks if present).
         """
-        system_prompt, user_prompt, tools = await self.prepare_script_prompts(
+        system_prompt, user_prompt = await self.prepare_script_prompts(
             script_task=script_task,
             zarr_structure=zarr_structure,
             original_question=original_question,
             web_search_enabled=web_search_enabled,
-            use_scripts_library=use_scripts_library,
         )
 
         try:
             # Use provider abstraction
             provider = self._get_provider(self.code_provider_name)
-            response = await asyncio.to_thread(provider.infer, 
+            response = await asyncio.to_thread(provider.infer,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 model=self.model_code,
-                tools=tools if tools else None,
             )
-
-            # Check if LLM decided to use a tool
-            generated_code = None
-            if response.tool_calls:
-                for tc in response.tool_calls:
-                    if tc.name == "fetch_script":
-                        script_id = tc.arguments.get("script_id")
-                        # Fetch the script from GCS
-                        fetched_code = await self._fetch_script_from_gcs(script_id)
-                        if fetched_code:
-                            generated_code = fetched_code
-                            break
-                        else:
-                            print(f"[get_script] Failed to fetch '{script_id}', generating instead")
-
-            # No tool call or fetch failed - extract generated code
-            if not generated_code:
-                raw_response = response.text or ""
-                # Extract code from markdown code blocks
-                generated_code = _extract_code_from_markdown(raw_response)
-
-            return generated_code
+            raw_response = response.text or ""
+            # Extract code from markdown code blocks
+            return _extract_code_from_markdown(raw_response)
 
         except Exception as e:
             print("Error in get_script():", e)

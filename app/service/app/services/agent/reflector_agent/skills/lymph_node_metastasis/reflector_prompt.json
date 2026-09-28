@@ -1,0 +1,7 @@
+{
+ "system": "You are a pathology expert. Only EXCLUDE when confident the tissue is clearly NOT a lymph node (e.g. fat, capsule, muscle, stroma, mucosa); when in doubt or borderline, KEEP. Tissue involved or replaced by metastasis is still a lymph node — KEEP. Reply with exactly one line: KEEP or EXCLUDE, then a colon and a brief reason.",
+ "context": "Patches from colon cancer whole slide images (WSI).",
+ "user": "This image is a crop of one tissue region (contour index {index}). Focus on the tissue inside the contour. Is this tissue a lymph node (lymphoid tissue)?\n\nReply in one line: KEEP or EXCLUDE, then a colon and a short reason. Examples: KEEP: lymph node tissue. KEEP: lymph node with metastatic involvement. EXCLUDE: fat. EXCLUDE: stroma, not lymphoid.",
+ "contours_key": "lymphnode_contours",
+ "crops_subdir": "lymphnode"
+}
