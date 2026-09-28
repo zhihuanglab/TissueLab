@@ -37,7 +37,6 @@ from app.services.file_manager.common import (
     assert_can_access_path_async,
     assert_can_write_path_async,
 )
-from app.utils import resolve_path
 
 discovery_router = APIRouter()
 
@@ -78,6 +77,7 @@ def _run_summary(run_root: Path) -> Dict[str, Any]:
         "run_root_path": str(run_root),
         "updated_at": datetime.fromtimestamp(run_root.stat().st_mtime, tz=timezone.utc).isoformat(),
         "status": status,
+        "rounds": rounds,
         "next_round_id": next_round_id,
     }
 
@@ -109,10 +109,10 @@ def _load_run(run_root: Path) -> Dict[str, Any]:
 
 @discovery_router.get("/v1/discovery/problem")
 async def get_problem(data_dir: str, auth_user: AuthUser = Depends(get_auth_user)):
-    """problem.md of a data folder; `template` seeds a new one."""
+    """problem.md of a data folder (or of a slide's folder); `template` seeds a new one."""
     try:
         await assert_can_access_path_async(auth_user, data_dir, "read research problem")
-        problem_path = Path(resolve_path(data_dir)) / PROBLEM_FILENAME
+        problem_path = workspace_data_dir(data_dir) / PROBLEM_FILENAME
         content = problem_path.read_text(encoding="utf-8") if problem_path.exists() else ""
         return success_response({"found": problem_path.exists(), "content": content, "template": EXAMPLE_HEADER})
     except AppError:

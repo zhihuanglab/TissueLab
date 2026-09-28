@@ -1,7 +1,9 @@
 /**
  * Playwright global setup: boots the whole local stack once per run.
  *
- *   1. the mock OpenAI-compatible LLM  (tests/smoke/mock_llm_server.py)
+ *   1. the mock OpenAI-compatible LLM  (tests/smoke/mock_llm_server.py) and the
+ *      scripted Responses server the discovery loop talks to
+ *      (tests/smoke/mock_discovery_llm.py, via DISCOVERY_BASE_URL)
  *   2. the Python service              (app/service/main.py) on a free port,
  *      against a temporary service root with the test slide copied in
  *   3. a mock of the hosted TissueLab community (`mock-community-server.ts`,
@@ -25,6 +27,9 @@ const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
 const RENDER_ROOT = path.join(REPO_ROOT, 'app', 'render');
 const SERVICE_DIR = path.join(REPO_ROOT, 'app', 'service');
 const MOCK_LLM_SCRIPT = path.join(REPO_ROOT, 'tests', 'smoke', 'mock_llm_server.py');
+const MOCK_DISCOVERY_LLM_SCRIPT = path.join(REPO_ROOT, 'tests', 'smoke', 'mock_discovery_llm.py');
+// Seconds the discovery mock waits before each reply, so a test can stop a run midway.
+const DISCOVERY_LLM_DELAY_SEC = '1';
 const NEXT_BIN = path.join(RENDER_ROOT, 'node_modules', 'next', 'dist', 'bin', 'next');
 // `next dev` writes .next/dev/types/validator.ts, which redeclares the same global
 // types as .next/types/validator.ts from `next build`; with both present
@@ -192,6 +197,17 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     const llmBase = `http://127.0.0.1:${llmPort}/v1`;
     await waitForHttp(`${llmBase}/models`, { label: 'mock LLM', timeoutMs: 60_000, child: llm });
 
+    const discoveryPort = await freePort();
+    const discoveryLlm = spawnLogged(
+      'mock-discovery-llm',
+      python,
+      [MOCK_DISCOVERY_LLM_SCRIPT, '--port', String(discoveryPort), '--delay', DISCOVERY_LLM_DELAY_SEC],
+      { cwd: REPO_ROOT, env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' }, log: path.join(serviceRoot, 'mock-discovery-llm.log') },
+    );
+    children.push(discoveryLlm);
+    const discoveryBase = `http://127.0.0.1:${discoveryPort}/v1`;
+    await waitForHttp(`${discoveryBase}/models`, { label: 'mock discovery LLM', timeoutMs: 60_000, child: discoveryLlm });
+
     // ---- 2. Python service -------------------------------------------------
     const slideName = copySlide(serviceRoot);
     const backendPort = await freePort();
@@ -209,6 +225,8 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
       OPENAI_API_KEY: 'dummy',
       OPENAI_BASE_URL: llmBase,
       LLM_MODEL: 'mock-llm',
+      DISCOVERY_BASE_URL: discoveryBase,
+      DISCOVERY_API_KEY: 'dummy',
     };
     delete backendEnv.LLM_API;
     const backend = spawnLogged('backend', python, ['main.py', '--port', String(backendPort), '--service-root', serviceRoot], {
@@ -260,6 +278,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.TL_E2E_API_URL = apiUrl;
     process.env.TL_E2E_SERVICE_ROOT = serviceRoot;
     process.env.TL_E2E_MOCK_LLM_URL = llmBase;
+    process.env.TL_E2E_DISCOVERY_LLM_URL = discoveryBase;
     process.env.TL_E2E_COMMUNITY_URL = community.url;
     if (slideName) process.env.TL_E2E_SLIDE_NAME = slideName;
     else delete process.env.TL_E2E_SLIDE_NAME;

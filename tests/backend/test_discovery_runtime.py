@@ -347,6 +347,24 @@ def test_responses_api_is_required(monkeypatch):
     assert discovery_client.unavailable_reason() is None
 
 
+def test_a_dedicated_discovery_endpoint_frees_the_agent_model(monkeypatch):
+    # The chat agent on a self-hosted Chat Completions server, discovery on its own Responses endpoint.
+    from app.services.agent.discovery import client as discovery_client
+
+    monkeypatch.setenv("OPENAI_API_KEY", "local-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.delenv("LLM_API", raising=False)
+    assert "DISCOVERY_BASE_URL" in discovery_client.unavailable_reason()
+
+    monkeypatch.setenv("DISCOVERY_BASE_URL", "https://api.openai.com/v1")
+    monkeypatch.setenv("DISCOVERY_API_KEY", "sk-discovery")
+    monkeypatch.setattr(discovery_client, "_client", None)
+    assert discovery_client.unavailable_reason() is None
+    client = discovery_client.get_client()
+    assert str(client.base_url).rstrip("/") == "https://api.openai.com/v1" and client.api_key == "sk-discovery"
+    monkeypatch.setattr(discovery_client, "_client", None)
+
+
 def test_responses_calls_carry_the_callers_timeout(monkeypatch):
     from app.services.agent.discovery import client as discovery_client
 

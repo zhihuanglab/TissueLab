@@ -4,6 +4,10 @@ OpenAI Responses API client for the discovery loop.
 The proposer and worker drive custom tool calls chained by previous_response_id,
 which only OpenAI's Responses API provides — a Chat Completions endpoint
 (OPENAI_BASE_URL pointing at vLLM, Ollama, …) cannot run this loop.
+
+DISCOVERY_BASE_URL / DISCOVERY_API_KEY give discovery its own Responses
+endpoint, so the chat agent can stay on a self-hosted model; unset, discovery
+uses OPENAI_BASE_URL / OPENAI_API_KEY like the agent.
 """
 
 from __future__ import annotations
@@ -29,16 +33,22 @@ def discovery_model() -> str:
     return (os.getenv("DISCOVERY_MODEL") or "").strip() or DEFAULT_DISCOVERY_MODEL
 
 
+def _discovery_env(name: str) -> str:
+    return (os.getenv(f"DISCOVERY_{name}") or "").strip()
+
+
 def unavailable_reason() -> Optional[str]:
     """Why a discovery run cannot start with the current LLM settings, or None."""
-    if not os.getenv("OPENAI_API_KEY"):
+    if not (_discovery_env("API_KEY") or os.getenv("OPENAI_API_KEY")):
         return (
             "Discovery is not configured: set OPENAI_API_KEY in app/service/.env.local."
         )
-    if llm_config.api_mode() != "responses":
+    # A dedicated DISCOVERY_BASE_URL is declared to speak the Responses API.
+    if not _discovery_env("BASE_URL") and llm_config.api_mode() != "responses":
         return (
             "Discovery needs OpenAI's Responses API; the configured endpoint speaks "
-            "Chat Completions only (OPENAI_BASE_URL / LLM_API)."
+            "Chat Completions only. Set DISCOVERY_BASE_URL / DISCOVERY_API_KEY to an "
+            "endpoint that does (e.g. OpenAI) to keep the agent on its current model."
         )
     return None
 
@@ -46,7 +56,11 @@ def unavailable_reason() -> Optional[str]:
 def get_client() -> OpenAI:
     global _client
     if _client is None:
-        _client = OpenAI()
+        # None falls back to OPENAI_BASE_URL / OPENAI_API_KEY.
+        _client = OpenAI(
+            base_url=_discovery_env("BASE_URL") or None,
+            api_key=_discovery_env("API_KEY") or None,
+        )
     return _client
 
 

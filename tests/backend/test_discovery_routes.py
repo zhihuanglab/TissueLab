@@ -85,6 +85,16 @@ def test_problem_endpoint_reads_problem_md_and_offers_template(client, workspace
     assert r["found"] is True and r["content"] == PROBLEM
 
 
+def test_problem_endpoint_accepts_the_open_slides_path_with_either_separator(client, workspace, storage_root):
+    # the panel sends the open slide's path; on Windows formatPath uses "\\"
+    (workspace / "problem.md").write_text(PROBLEM, encoding="utf-8")
+    (workspace / "slide.svs").write_bytes(b"x")
+    rel = (workspace / "slide.svs").relative_to(storage_root).as_posix()
+    for data_dir in (rel, rel.replace("/", "\\")):
+        r = client.get(f"{API}/problem", params={"data_dir": data_dir}).json()["data"]
+        assert r["found"] is True and r["content"] == PROBLEM, data_dir
+
+
 def test_workspace_runs_list_and_load(client, workspace):
     run_root = workspace / "autoresearch_runs" / "run_abc"
     (run_root / "round_0001").mkdir(parents=True)
@@ -94,7 +104,7 @@ def test_workspace_runs_list_and_load(client, workspace):
     (run_root / "round_0001" / "round_feedback.json").write_text(json.dumps({"summary": "kept cand_1"}))
 
     runs = client.get(f"{API}/runs", params={"workspace_path": str(workspace)}).json()["data"]["runs"]
-    assert [(r["run_id"], r["status"], r["next_round_id"]) for r in runs] == [("run_abc", "incomplete", 2)]
+    assert [(r["run_id"], r["status"], r["rounds"], r["next_round_id"]) for r in runs] == [("run_abc", "incomplete", 3, 2)]
 
     loaded = client.get(f"{API}/runs/load", params={"run_root_path": str(run_root)}).json()["data"]
     assert loaded["problem_text"] == PROBLEM

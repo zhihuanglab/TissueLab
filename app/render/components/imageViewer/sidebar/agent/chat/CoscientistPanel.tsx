@@ -60,6 +60,7 @@ type WorkspaceRun = {
   run_root_path: string
   status: "running" | "completed" | "incomplete"
   updated_at?: string
+  rounds: number
   next_round_id: number
 }
 
@@ -171,7 +172,8 @@ export const CoscientistPanel: React.FC = () => {
   const roundSummaryRef = useRef<string>("")
 
   const workspacePath = formatPath(currentPath ?? "")
-  const workspaceDir = workspacePath ? workspacePath.replace(/\/[^/]+$/, "") || workspacePath : ""
+  // The open slide's folder; formatPath yields "\\" separators on Windows.
+  const workspaceDir = workspacePath ? workspacePath.replace(/[\\/][^\\/]+$/, "") || workspacePath : ""
 
   // ─── API helpers ─────────────────────────────────────────────────────────
 
@@ -223,6 +225,8 @@ export const CoscientistPanel: React.FC = () => {
       setResumeInfo(payload.status === "incomplete"
         ? { runId: payload.run_id, runRootPath: payload.run_root_path, nextRoundId: payload.next_round_id }
         : null)
+      // offer the rounds the run still had planned
+      setResumeRounds(Math.max(1, (payload.rounds || 1) - (payload.next_round_id || 1) + 1))
       setPhase("complete")
     } catch {}
   }, [authedFetch])
@@ -543,6 +547,7 @@ export const CoscientistPanel: React.FC = () => {
         .finally(() => {
           setActiveRunId(null)
           setPhase(transitionResearchPhase("cancelling", "CANCEL_ACK"))
+          void fetchWorkspaceRuns()   // the stopped run is now resumable from the history
         })
       return
     }
@@ -644,10 +649,10 @@ export const CoscientistPanel: React.FC = () => {
                 <span className="text-xs">{isCancelling ? "Stopping..." : "Stop"}</span>
               </Button>
             )}
-            <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setShowHistory(!showHistory)}>
+            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="Run history" onClick={() => { if (!showHistory) void fetchWorkspaceRuns(); setShowHistory(!showHistory) }}>
               <History className="h-4 w-4" />
             </Button>
-            <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => { setPhase("input"); setProgram(""); setCurrentRound(null); setJournal([]); setError(null); setResumeInfo(null); setActiveRunId(null); setMeasureStatus("idle"); setFinalSummary(null); }}>
+            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="New research task" onClick={() => { setPhase("input"); setProgram(""); setCurrentRound(null); setJournal([]); setError(null); setResumeInfo(null); setActiveRunId(null); setMeasureStatus("idle"); setFinalSummary(null); }}>
               <Plus className="h-4 w-4" />
             </Button>
           </div>
