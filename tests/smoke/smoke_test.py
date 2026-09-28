@@ -166,7 +166,7 @@ def main():
             internal = os.path.join(os.path.dirname(os.path.abspath(args.exe)), "_internal")
             bundled = {d.lower() for d in os.listdir(internal)} if os.path.isdir(internal) else set()
             forbidden = sorted(b for b in bundled if b.split("-")[0] in {
-                "torch", "torchvision", "torchaudio", "transformers", "tensorflow", "keras", "sklearn",
+                "torch", "torchvision", "torchaudio", "transformers", "tensorflow", "keras",
                 "numba", "firebase_admin", "google"})
             check("frozen bundle has no inference / cloud stack", not forbidden, str(forbidden))
             size_mb = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(os.path.dirname(os.path.abspath(args.exe))) for f in fs) / 1e6

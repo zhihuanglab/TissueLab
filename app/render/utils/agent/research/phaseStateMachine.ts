@@ -1,5 +1,6 @@
 /**
- * Research (Coscientist) panel phase state machine.
+ * Research panel phases. The panel sets input / running / complete directly;
+ * stopping goes through a cancelling phase until the backend acknowledges.
  */
 
 export const ResearchPhaseStatus = {
@@ -11,15 +12,11 @@ export const ResearchPhaseStatus = {
 
 export type ResearchPhase = (typeof ResearchPhaseStatus)[keyof typeof ResearchPhaseStatus]
 
-export type ResearchPhaseEvent = "START" | "STOP" | "CANCEL_ACK" | "COMPLETE" | "ERROR" | "RESET"
+export type ResearchPhaseEvent = "STOP" | "CANCEL_ACK"
 
 const RESEARCH_TRANSITIONS: Partial<Record<`${ResearchPhase}:${ResearchPhaseEvent}`, ResearchPhase>> = {
-  [`${ResearchPhaseStatus.Input}:START`]: ResearchPhaseStatus.Running,
   [`${ResearchPhaseStatus.Running}:STOP`]: ResearchPhaseStatus.Cancelling,
   [`${ResearchPhaseStatus.Cancelling}:CANCEL_ACK`]: ResearchPhaseStatus.Complete,
-  [`${ResearchPhaseStatus.Running}:COMPLETE`]: ResearchPhaseStatus.Complete,
-  [`${ResearchPhaseStatus.Running}:ERROR`]: ResearchPhaseStatus.Complete,
-  [`${ResearchPhaseStatus.Complete}:RESET`]: ResearchPhaseStatus.Input,
 }
 
 export function transitionResearchPhase(phase: ResearchPhase, event: ResearchPhaseEvent): ResearchPhase {

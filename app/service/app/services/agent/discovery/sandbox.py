@@ -1,17 +1,21 @@
 """
-Sandboxed execution environment for autoresearch workers.
+Docker sandbox for model-written code (proposer exploration, worker scripts,
+the controller's donor-table materialization).
 
-Each worker runs inside a Docker container with:
-- The user's data folder mounted read-only at /data
-- A writable /scratch directory for output
-- No network access
-- Resource limits: memory, CPU, pid count and tmpfs size (see SANDBOX_* above,
-  overridable through TL_SANDBOX_* environment variables)
+Each session is one container with:
+- the data folder read-only at /data, with the run-output folder masked so a
+  run never sees earlier runs' results, plus optional read-only single-file
+  overlays (the outcome-free cohort file)
+- a writable /scratch (the session's own folder) and a shared /shared
+- no network, a read-only root filesystem, and memory / CPU / pid / tmpfs caps
+  (TL_SANDBOX_* environment variables)
+- a warm Python runtime: `python` inside the container forwards to a server
+  that forks one child per request, so a stuck request can be killed without
+  losing the warm imports
 
-Not sandboxed: the container still runs as root internally. /scratch is a host
-bind mount owned by the service user, so dropping to a non-root uid would have
-to match it per deployment; the read-only rootfs and dropped network are what
-contain the process today.
+The container still runs as root internally; /scratch is a host bind mount
+owned by the service user, and the read-only rootfs plus the dropped network
+are what contain the process.
 """
 
 from __future__ import annotations
@@ -20,7 +24,6 @@ import hashlib
 import os
 import shutil
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -35,28 +38,29 @@ _DOCKER_IMAGE_LOCK = threading.Lock()
 # is instant when the daemon is healthy; a first build pulls a base image.
 DOCKER_INSPECT_TIMEOUT = 30
 DOCKER_BUILD_TIMEOUT = 1800
-
 DOCKER_RUN_TIMEOUT = 120
 DOCKER_CLI_TIMEOUT = 15
 
-DEFAULT_IMAGE = "tissuelab-autoresearch-worker"
-OWNER_LABEL = "tissuelab.discovery.pid"
-
-# Resource caps for the worker container. The code inside is model-generated and
-# unreviewed, so an unbounded container could take the host down with it: an
-# accidental full-slide allocation exhausts RAM for every other service, and a
-# runaway loop or fork bomb takes the CPUs. Generous by default — a real
-# analysis loads whole arrays — and overridable per deployment.
+# Resource caps for the container. The code inside is model-generated and
+# unreviewed, so an unbounded container could take the host down with it.
 SANDBOX_MEMORY = os.environ.get("TL_SANDBOX_MEMORY", "8g")
 SANDBOX_CPUS = os.environ.get("TL_SANDBOX_CPUS", "4")
 SANDBOX_PIDS_LIMIT = os.environ.get("TL_SANDBOX_PIDS_LIMIT", "512")
-# Writable tmpfs at /tmp: capped too, it is host RAM.
 SANDBOX_TMPFS_SIZE = os.environ.get("TL_SANDBOX_TMPFS_SIZE", "512m")
+
+OWNER_LABEL = "tissuelab.discovery.pid"
+SHARED_READ_ONLY = ("lib", "dataset.json", "data_intuition.md")
+# Runs live under <data folder>/autoresearch_runs; the sandbox masks it.
+RUNS_DIRNAME = "autoresearch_runs"
+SANDBOX_PYTHON = "/usr/local/bin/python3"
+
 RUNTIME_DIRNAME = ".tl_runtime"
 RUNTIME_SOCKET_NAME = "runtime.sock"
 DOCKER_RUNTIME_SOCKET_PATH = "/tmp/tl_runtime.sock"
 RUNTIME_SERVER_SCRIPT = "runtime_server.py"
 RUNTIME_CLIENT_SCRIPT = "runtime_client.py"
+# zarr 3 reads the stores TissueLab writes; the rest is the analysis stack
+# worker scripts reach for.
 DOCKERFILE_TEMPLATE = """\
 FROM python:3.11-slim
 
@@ -66,18 +70,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
 
 RUN pip install --no-cache-dir \\
     numpy pandas scipy scikit-learn matplotlib seaborn \\
-    "zarr==3.1.5" pillow openslide-python tifffile h5py openpyxl \\
-    rich statsmodels shapely scikit-image networkx
+    "zarr>=3,<4" pillow openslide-python tifffile h5py openpyxl \\
+    rich statsmodels shapely scikit-image networkx \\
+    numba pyarrow tqdm
 
 WORKDIR /scratch
 """
+# The tag follows the Dockerfile, so changing it builds a fresh image instead
+# of silently reusing a stale one.
+DEFAULT_IMAGE = (
+    "tissuelab-discovery-worker:"
+    + hashlib.sha256(DOCKERFILE_TEMPLATE.encode("utf-8")).hexdigest()[:12]
+)
 
 RUNTIME_SERVER_CODE = r"""#!/usr/bin/env python3
 import contextlib
+import importlib
 import io
 import json
 import os
 import runpy
+import signal
 import socket
 import sys
 import traceback
@@ -95,6 +108,16 @@ def _execute(req):
     exit_code = 0
     old_cwd = os.getcwd()
     old_argv = list(sys.argv)
+    old_path = list(sys.path)
+    # Honor the caller's PYTHONPATH (forwarded by the client) and always expose the shared
+    # helper library, so `PYTHONPATH=/shared/lib python x.py` behaves like a plain interpreter.
+    extra_paths = [p for p in str(req.get("pythonpath") or "").split(":") if p]
+    shared_lib = os.path.join(os.environ.get("TL_SHARED_ROOT", "/shared"), "lib")
+    if os.path.isdir(shared_lib) and shared_lib not in extra_paths:
+        extra_paths.append(shared_lib)
+    for p in reversed(extra_paths):
+        if p not in sys.path:
+            sys.path.insert(0, p)
     try:
         os.chdir(cwd)
         with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
@@ -136,6 +159,7 @@ def _execute(req):
         stderr_buf.write(traceback.format_exc())
     finally:
         sys.argv = old_argv
+        sys.path[:] = old_path
         os.chdir(old_cwd)
     return {
         "exit_code": int(exit_code),
@@ -144,32 +168,63 @@ def _execute(req):
     }
 
 
+def _preload():
+    # Warm the import cache in the parent so forked request children start fast.
+    shared_lib = os.path.join(os.environ.get("TL_SHARED_ROOT", "/shared"), "lib")
+    if os.path.isdir(shared_lib) and shared_lib not in sys.path:
+        sys.path.insert(0, shared_lib)
+    for name in ("numpy", "pandas", "scipy.spatial", "zarr", "shared_analysis.slides"):
+        try:
+            importlib.import_module(name)
+        except Exception:
+            pass
+
+
+def _handle(conn):
+    with conn:
+        reader = conn.makefile("r", encoding="utf-8")
+        writer = conn.makefile("w", encoding="utf-8")
+        line = reader.readline()
+        if not line:
+            return
+        try:
+            req = json.loads(line)
+        except Exception:
+            writer.write(json.dumps({"exit_code": 2, "stdout": "", "stderr": "Invalid runtime request"}) + "\n")
+            writer.flush()
+            return
+        resp = _execute(req)
+        writer.write(json.dumps(resp) + "\n")
+        writer.flush()
+
+
 def main():
     sock_path = Path(SOCKET_PATH)
     sock_path.parent.mkdir(parents=True, exist_ok=True)
     if sock_path.exists():
         sock_path.unlink()
+    (sock_path.parent / "server.pid").write_text(str(os.getpid()), encoding="utf-8")
+    _preload()
+    # Each request runs in a forked child: a stuck or killed request cannot wedge the
+    # server, and the host can kill request children on timeout (see _kill_inflight_docker).
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(sock_path))
     server.listen(8)
     try:
         while True:
             conn, _ = server.accept()
-            with conn:
-                reader = conn.makefile("r", encoding="utf-8")
-                writer = conn.makefile("w", encoding="utf-8")
-                line = reader.readline()
-                if not line:
-                    continue
+            pid = os.fork()
+            if pid == 0:
+                code = 0
                 try:
-                    req = json.loads(line)
+                    server.close()
+                    _handle(conn)
                 except Exception:
-                    writer.write(json.dumps({"exit_code": 2, "stdout": "", "stderr": "Invalid runtime request"}) + "\n")
-                    writer.flush()
-                    continue
-                resp = _execute(req)
-                writer.write(json.dumps(resp) + "\n")
-                writer.flush()
+                    code = 1
+                finally:
+                    os._exit(code)
+            conn.close()
     finally:
         server.close()
         try:
@@ -246,14 +301,15 @@ def main():
     head = args[0]
     req = None
 
+    pythonpath = os.environ.get("PYTHONPATH", "")
     if head == "-c" and len(args) >= 2:
-        req = {"mode": "exec", "code": args[1], "args": args[2:], "cwd": cwd}
+        req = {"mode": "exec", "code": args[1], "args": args[2:], "cwd": cwd, "pythonpath": pythonpath}
     elif head == "-":
-        req = {"mode": "exec", "code": sys.stdin.read(), "args": args[1:], "cwd": cwd}
+        req = {"mode": "exec", "code": sys.stdin.read(), "args": args[1:], "cwd": cwd, "pythonpath": pythonpath}
     elif not head.startswith("-"):
         script_path = Path(head)
         if script_path.exists():
-            req = {"mode": "run_path", "path": str(script_path.resolve()), "args": args[1:], "cwd": cwd}
+            req = {"mode": "run_path", "path": str(script_path.resolve()), "args": args[1:], "cwd": cwd, "pythonpath": pythonpath}
 
     if req is None:
         _fallback(sys.argv[1:])
@@ -271,8 +327,22 @@ exec "{real_python}" "{client_path}" "$@"
 """
 
 
+def _symlinks_under(data_dir: Path) -> list[Path]:
+    """Every symlink below data_dir, skipping the (masked) run-output folder."""
+    found: list[Path] = []
+    for root, dirs, files in os.walk(data_dir):
+        root_path = Path(root)
+        if root_path == data_dir and RUNS_DIRNAME in dirs:
+            dirs.remove(RUNS_DIRNAME)
+        for name in [*dirs, *files]:
+            entry = root_path / name
+            if entry.is_symlink():
+                found.append(entry)
+    return sorted(found, key=lambda p: p.relative_to(data_dir).as_posix())
+
+
 class SandboxSession:
-    """Manages a Docker container for a single worker's sandboxed execution."""
+    """One Docker container for one proposer, worker or controller step."""
 
     def __init__(
         self,
@@ -280,10 +350,8 @@ class SandboxSession:
         *,
         data_dir: str | Path,
         shared_dir: Optional[str | Path] = None,
-        backend: str = "docker",
-        image: str = DEFAULT_IMAGE,
-        auto_build: bool = True,
         command_timeout_sec: int = 300,
+        file_overlays: Optional[dict[str, str | Path]] = None,
     ) -> None:
         self.scratch_dir = Path(scratch_dir).resolve()
         self.scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -291,106 +359,32 @@ class SandboxSession:
         self.shared_dir = Path(shared_dir).resolve() if shared_dir else None
         if self.shared_dir:
             self.shared_dir.mkdir(parents=True, exist_ok=True)
-        self.backend = backend
-        self.image = image
-        self.auto_build = bool(auto_build)
+        # container path -> host file, bind-mounted read-only over /data (the
+        # outcome-free cohort file shadowing the real one).
+        self.file_overlays = {str(k): str(Path(v).resolve()) for k, v in (file_overlays or {}).items()}
+        self.image = DEFAULT_IMAGE
         self.command_timeout_sec = int(command_timeout_sec)
         self.container_name: Optional[str] = None
-        self.runtime_process: Optional[subprocess.Popen] = None
         self.started = False
-        self.persistent_python_ready = False
-        self.real_python_path = sys.executable
-
-    def _docker_data_mounts(self) -> list[str]:
-        mounts = ["-v", f"{self.data_dir}:/data:ro"]
-        # If /data contains symlinks to files or directories outside the mounted
-        # root, those targets are invisible inside the container. Overlay the
-        # resolved targets onto the same /data/<name> paths so worker shell
-        # exploration sees the real slide contents.
-        try:
-            children = sorted(self.data_dir.iterdir(), key=lambda p: p.name)
-        except OSError:
-            return mounts
-
-        for child in children:
-            if not child.is_symlink():
-                continue
-            try:
-                target = child.resolve(strict=True)
-            except OSError:
-                continue
-            mounts.extend(["-v", f"{target}:/data/{child.name}:ro"])
-        return mounts
-
-    def describe(self) -> dict:
-        if self.backend == "docker":
-            return {
-                "backend": "docker",
-                "data_root": "/data",
-                "scratch_root": "/scratch",
-                "shared_root": "/shared" if self.shared_dir else None,
-                "python_import_root": "/shared/lib" if self.shared_dir else None,
-                "persistent_python_ready": self.persistent_python_ready,
-                "notes": [
-                    "Data folder is mounted read-only at /data.",
-                    "Write ephemeral output into /scratch.",
-                    "Persistent shared storage is at /shared (read-write, persists across rounds).",
-                    "If /shared/lib exists it is already on PYTHONPATH inside shell_exec commands.",
-                    "python/python3 are wrapped to reuse a warm per-worker runtime for scripts, -c, and stdin code when available.",
-                    "No network access available.",
-                ],
-            }
-        return {
-            "backend": "host",
-            "data_root": str(self.data_dir),
-            "scratch_root": str(self.scratch_dir),
-            "shared_root": str(self.shared_dir) if self.shared_dir else None,
-            "persistent_python_ready": self.persistent_python_ready,
-            "notes": [
-                "Running on host (no Docker isolation).",
-                "python/python3 are wrapped to reuse a warm per-worker runtime for scripts, -c, and stdin code when available.",
-            ],
-        }
 
     def start(self) -> None:
         if self.started:
             return
-        if self.backend == "docker":
-            self.real_python_path = "/usr/local/bin/python3"
-        else:
-            self.real_python_path = sys.executable
         self._install_runtime_files()
-        if self.backend == "docker":
-            self._start_docker()
-        elif self.backend == "host":
-            self._start_host_runtime()
-            self.started = True
-        else:
-            raise ValueError(f"Unsupported sandbox backend: {self.backend}")
-        if self.backend == "docker":
+        self._start_docker()
+        try:
             self._start_docker_runtime()
+        except Exception:
+            self.stop()   # never leave a half-started `sleep infinity` container behind
+            raise
 
     def stop(self) -> None:
         if not self.started:
             return
-        if self.runtime_process is not None:
-            self.runtime_process.terminate()
-            try:
-                self.runtime_process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.runtime_process.kill()
-            self.runtime_process = None
-        socket_path = self._runtime_socket_path()
-        if socket_path.exists():
-            socket_path.unlink()
-        if self.backend == "docker" and self.container_name:
-            subprocess.run(
-                ["docker", "rm", "-f", self.container_name],
-                capture_output=True, text=True, check=False,
-            )
+        if self.container_name:
+            _remove_containers([self.container_name])
             self.container_name = None
         self.started = False
-        self.persistent_python_ready = False
 
     def watch_cancel(self, cancel_event: Optional[threading.Event]) -> Callable[[], None]:
         """Kill the container once cancel_event is set; returns a function that ends the watch."""
@@ -412,168 +406,186 @@ class SandboxSession:
         """Remove the container now, from any thread.
 
         Used on cancel: a command running inside the container returns as
-        soon as the container is gone, so the worker thread stops waiting on
+        soon as the container is gone, so the calling thread stops waiting on
         it. stop() still runs afterwards from the owning thread.
         """
-        name = self.container_name
-        if self.backend != "docker" or not name:
-            return
-        _remove_containers([name])
+        if self.container_name:
+            _remove_containers([self.container_name])
 
     def exec(self, command: str, timeout_sec: Optional[int] = None) -> dict:
         if not self.started:
             raise RuntimeError("Sandbox session has not been started")
         timeout = int(timeout_sec or self.command_timeout_sec)
-        if self.backend == "docker":
-            return self._docker_exec(command, timeout)
-        return self._host_exec(command, timeout)
+        assert self.container_name is not None
+        try:
+            proc = subprocess.run(
+                ["docker", "exec", "-i", "-w", "/",
+                 self.container_name, "/bin/sh", "-lc", self._wrap_command(command)],
+                capture_output=True, text=True,
+                timeout=timeout, check=False,
+            )
+            return {
+                "exit_code": proc.returncode,
+                "stdout": proc.stdout[-20_000:],
+                "stderr": proc.stderr[-20_000:],
+            }
+        except subprocess.TimeoutExpired:
+            self._kill_inflight()
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Command timed out after {timeout}s (process killed)",
+            }
 
-    # -- Persistent runtime helpers -----------------------------------------
+    # -- warm Python runtime ----------------------------------------------------
 
     def _runtime_root(self) -> Path:
         return self.scratch_dir / RUNTIME_DIRNAME
 
-    def _runtime_socket_path(self) -> Path:
-        if self.backend == "docker":
-            return self._runtime_root() / RUNTIME_SOCKET_NAME
-        digest = hashlib.sha1(str(self.scratch_dir).encode()).hexdigest()[:12]
-        return Path("/tmp") / f"tlrt_{digest}.sock"
-
-    def _runtime_server_path(self) -> Path:
-        return self._runtime_root() / RUNTIME_SERVER_SCRIPT
-
-    def _runtime_client_path(self) -> Path:
-        return self._runtime_root() / RUNTIME_CLIENT_SCRIPT
-
-    def _runtime_bin_dir(self) -> Path:
-        return self._runtime_root() / "bin"
-
     def _runtime_exec_root(self) -> str:
-        return f"/scratch/{RUNTIME_DIRNAME}" if self.backend == "docker" else str(self._runtime_root())
-
-    def _runtime_exec_socket(self) -> str:
-        if self.backend == "docker":
-            return DOCKER_RUNTIME_SOCKET_PATH
-        return str(self._runtime_socket_path())
-
-    def _runtime_exec_server(self) -> str:
-        return f"{self._runtime_exec_root()}/{RUNTIME_SERVER_SCRIPT}"
-
-    def _runtime_exec_client(self) -> str:
-        return f"{self._runtime_exec_root()}/{RUNTIME_CLIENT_SCRIPT}"
-
-    def _runtime_exec_bin_dir(self) -> str:
-        return f"{self._runtime_exec_root()}/bin"
+        return f"/scratch/{RUNTIME_DIRNAME}"
 
     def _install_runtime_files(self) -> None:
         runtime_root = self._runtime_root()
-        runtime_root.mkdir(parents=True, exist_ok=True)
-        self._runtime_bin_dir().mkdir(parents=True, exist_ok=True)
-
-        server_path = self._runtime_server_path()
-        client_path = self._runtime_client_path()
+        bin_dir = runtime_root / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        server_path = runtime_root / RUNTIME_SERVER_SCRIPT
+        client_path = runtime_root / RUNTIME_CLIENT_SCRIPT
         server_path.write_text(RUNTIME_SERVER_CODE, encoding="utf-8")
         client_path.write_text(RUNTIME_CLIENT_CODE, encoding="utf-8")
         os.chmod(server_path, 0o755)
         os.chmod(client_path, 0o755)
-
         for name in ("python", "python3", "tlpy"):
-            wrapper_path = self._runtime_bin_dir() / name
+            wrapper_path = bin_dir / name
             wrapper_path.write_text(
                 RUNTIME_WRAPPER_TEMPLATE.format(
-                    real_python=self.real_python_path,
-                    client_path=self._runtime_exec_client(),
+                    real_python=SANDBOX_PYTHON,
+                    client_path=f"{self._runtime_exec_root()}/{RUNTIME_CLIENT_SCRIPT}",
                 ),
                 encoding="utf-8",
             )
             os.chmod(wrapper_path, 0o755)
 
-        socket_path = self._runtime_socket_path()
-        if socket_path.exists():
-            socket_path.unlink()
-
     def _runtime_env(self) -> dict[str, str]:
         return {
             "TL_RUNTIME_ROOT": self._runtime_exec_root(),
-            "TL_RUNTIME_SOCKET": self._runtime_exec_socket(),
-            "TL_REAL_PYTHON": self.real_python_path,
+            "TL_RUNTIME_SOCKET": DOCKER_RUNTIME_SOCKET_PATH,
+            "TL_REAL_PYTHON": SANDBOX_PYTHON,
+            **({"TL_SHARED_ROOT": "/shared"} if self.shared_dir else {}),
         }
-
-    def _wait_for_runtime_socket(self, timeout_sec: float = 5.0) -> bool:
-        deadline = time.monotonic() + timeout_sec
-        while time.monotonic() < deadline:
-            if self.backend == "docker":
-                if self.container_name:
-                    probe = subprocess.run(
-                        [
-                            "docker", "exec",
-                            self.container_name,
-                            "/bin/sh", "-lc",
-                            f'[ -S "{self._runtime_exec_socket()}" ]',
-                        ],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
-                    if probe.returncode == 0:
-                        self.persistent_python_ready = True
-                        return True
-                time.sleep(0.1)
-                continue
-
-            socket_path = self._runtime_socket_path()
-            if socket_path.exists():
-                self.persistent_python_ready = True
-                return True
-            time.sleep(0.05)
-        self.persistent_python_ready = False
-        return False
-
-    def _start_host_runtime(self) -> None:
-        env = os.environ.copy()
-        env.update(self._runtime_env())
-        env["HOME"] = str(self.scratch_dir)
-        env["MPLCONFIGDIR"] = str(self.scratch_dir / ".matplotlib")
-        server_log = self._runtime_root() / "server.log"
-        with server_log.open("w", encoding="utf-8") as log_file:
-            self.runtime_process = subprocess.Popen(
-                [self.real_python_path, str(self._runtime_server_path())],
-                cwd=str(self.scratch_dir),
-                env=env,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-            )
-        self._wait_for_runtime_socket()
 
     def _start_docker_runtime(self) -> None:
         assert self.container_name is not None
-        env = self._runtime_env()
-        cmd = [
-            "docker", "exec", "-d",
-            "-w", "/",
-        ]
-        for key, value in env.items():
+        cmd = ["docker", "exec", "-d", "-w", "/"]
+        for key, value in self._runtime_env().items():
             cmd.extend(["-e", f"{key}={value}"])
-        cmd.extend(
-            [
-                self.container_name,
-                "/bin/sh",
-                "-lc",
-                (
-                    f'cd /scratch && exec {self.real_python_path} {self._runtime_exec_server()} '
-                    f'>{self._runtime_exec_root()}/server.log 2>&1'
-                ),
-            ]
-        )
-        subprocess.run(cmd, capture_output=True, text=True, check=False)
+        cmd.extend([
+            self.container_name, "/bin/sh", "-lc",
+            (
+                f"cd /scratch && exec {SANDBOX_PYTHON} {self._runtime_exec_root()}/{RUNTIME_SERVER_SCRIPT} "
+                f">{self._runtime_exec_root()}/server.log 2>&1"
+            ),
+        ])
+        subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=DOCKER_CLI_TIMEOUT)
         self._wait_for_runtime_socket()
 
-    # -- Docker helpers -------------------------------------------------------
+    def _wait_for_runtime_socket(self, timeout_sec: float = 5.0) -> bool:
+        """True once the warm runtime listens; without it `python` falls back to a cold interpreter."""
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            probe = subprocess.run(
+                ["docker", "exec", self.container_name, "/bin/sh", "-lc",
+                 f'[ -S "{DOCKER_RUNTIME_SOCKET_PATH}" ]'],
+                capture_output=True, text=True, check=False, timeout=DOCKER_CLI_TIMEOUT,
+            )
+            if probe.returncode == 0:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _kill_inflight(self) -> None:
+        """After a timeout, kill the timed-out command's process tree and any runtime
+        request child still running, so later commands (and the controller's
+        materialization) do not queue behind a zombie computation."""
+        code = (
+            "import os,signal\n"
+            f"root={self._runtime_exec_root()!r}\n"
+            "def kids(pp):\n"
+            "    out=[]\n"
+            "    for d in os.listdir('/proc'):\n"
+            "        if not d.isdigit(): continue\n"
+            "        try: st=open(f'/proc/{d}/stat').read()\n"
+            "        except OSError: continue\n"
+            "        if int(st.rsplit(')',1)[1].split()[1])==pp: out.append(int(d))\n"
+            "    return out\n"
+            "def killtree(p, include_self):\n"
+            "    for c in kids(p): killtree(c, True)\n"
+            "    if include_self:\n"
+            "        try: os.kill(p, signal.SIGKILL)\n"
+            "        except OSError: pass\n"
+            "def readpid(name):\n"
+            "    try: return int(open(os.path.join(root,name)).read().strip())\n"
+            "    except Exception: return None\n"
+            "p=readpid('current_cmd.pid')\n"
+            "if p and p!=os.getpid(): killtree(p, True)\n"
+            "s=readpid('server.pid')\n"
+            "if s: killtree(s, False)\n"
+        )
+        try:
+            subprocess.run(
+                ["docker", "exec", self.container_name, SANDBOX_PYTHON, "-c", code],
+                capture_output=True, text=True, check=False, timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _wrap_command(self, command: str) -> str:
+        prelude_lines = [
+            "cd /scratch || exit 97",
+            'export TL_DATA_ROOT="/data"',
+            f'export TL_RUNTIME_ROOT="{self._runtime_exec_root()}"',
+            f'export TL_RUNTIME_SOCKET="{DOCKER_RUNTIME_SOCKET_PATH}"',
+            f'export TL_REAL_PYTHON="{SANDBOX_PYTHON}"',
+            f'export PATH="{self._runtime_exec_root()}/bin:$PATH"',
+            f'echo $$ > "{self._runtime_exec_root()}/current_cmd.pid" 2>/dev/null || true',
+        ]
+        if self.shared_dir:
+            prelude_lines.extend([
+                'export PYTHONPATH="/shared/lib${PYTHONPATH:+:$PYTHONPATH}"',
+                'export TL_SHARED_ROOT="/shared"',
+            ])
+        return "\n".join(prelude_lines) + "\n" + command
+
+    # -- container ---------------------------------------------------------------
+
+    def _data_mounts(self) -> list[str]:
+        mounts = ["-v", f"{self.data_dir}:/data:ro"]
+        # Symlink targets outside the mounted folder are otherwise invisible:
+        # overlay each resolved link at its original relative path.
+        try:
+            entries = _symlinks_under(self.data_dir)
+        except OSError:
+            entries = []
+        for entry in entries:
+            try:
+                target = entry.resolve(strict=True)
+                relative = entry.relative_to(self.data_dir)
+            except (OSError, ValueError):
+                continue
+            container_path = (Path("/data") / relative).as_posix()
+            if container_path in self.file_overlays:
+                continue   # shadowed by an overlay (e.g. a symlinked cohort file)
+            mounts.extend(["-v", f"{target}:{container_path}:ro"])
+        # Earlier runs' outputs (results, panels, reports) sit inside the data
+        # folder; an empty tmpfs over it keeps them out of this run's view.
+        if (self.data_dir / RUNS_DIRNAME).is_dir():
+            mounts.extend(["--tmpfs", f"/data/{RUNS_DIRNAME}:ro,size=64k"])
+        return mounts
 
     def _start_docker(self) -> None:
         self._ensure_docker_image()
         digest = hashlib.sha1(str(self.scratch_dir).encode()).hexdigest()[:12]
-        self.container_name = f"tl-autoresearch-{digest}-{int(time.time())}"
+        self.container_name = f"tl-discovery-{digest}-{int(time.time())}"
         cmd = [
             "docker", "run", "-d", "--rm",
             "--name", self.container_name,
@@ -592,12 +604,17 @@ class SandboxSession:
             "-e", "MPLCONFIGDIR=/scratch/.matplotlib",
             "-v", f"{self.scratch_dir}:/scratch:rw",
         ]
-        cmd.extend(self._docker_data_mounts())
+        cmd.extend(self._data_mounts())
+        for container_path, host_path in sorted(self.file_overlays.items()):
+            cmd.extend(["-v", f"{host_path}:{container_path}:ro"])
         if self.shared_dir:
             cmd.extend(["-v", f"{self.shared_dir}:/shared:rw"])
-        cmd.extend([
-            self.image, "sleep", "infinity",
-        ])
+            # What the controller trusts stays read-only: the loaders, the cohort
+            # layout and the brief. The rest of /shared (e.g. proposer_cache) is writable.
+            for name in SHARED_READ_ONLY:
+                if (self.shared_dir / name).exists():
+                    cmd.extend(["-v", f"{self.shared_dir / name}:/shared/{name}:ro"])
+        cmd.extend([self.image, "sleep", "infinity"])
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, check=False, timeout=DOCKER_RUN_TIMEOUT,
@@ -609,30 +626,6 @@ class SandboxSession:
                 f"Failed to start Docker sandbox: {proc.stderr.strip() or proc.stdout.strip()}"
             )
         self.started = True
-
-    def _docker_exec(self, command: str, timeout: int) -> dict:
-        assert self.container_name is not None
-        wrapped = self._wrap_command(command)
-        try:
-            proc = subprocess.run(
-                ["docker", "exec", "-i", "-w", "/",
-                 self.container_name, "/bin/sh", "-lc", wrapped],
-                capture_output=True, text=True,
-                timeout=timeout, check=False,
-            )
-            return {
-                "backend": "docker",
-                "exit_code": proc.returncode,
-                "stdout": proc.stdout[-20_000:],
-                "stderr": proc.stderr[-20_000:],
-            }
-        except subprocess.TimeoutExpired:
-            return {
-                "backend": "docker",
-                "exit_code": -1,
-                "stdout": "",
-                "stderr": f"Command timed out after {timeout}s",
-            }
 
     def _ensure_docker_image(self) -> None:
         # Both calls below carry a timeout because this lock is module-wide: a
@@ -646,90 +639,23 @@ class SandboxSession:
                     timeout=DOCKER_INSPECT_TIMEOUT,
                 )
             except subprocess.TimeoutExpired as e:
-                raise RuntimeError(
-                    f"Docker did not answer within {DOCKER_INSPECT_TIMEOUT}s"
-                ) from e
+                raise RuntimeError(f"Docker did not answer within {DOCKER_INSPECT_TIMEOUT}s") from e
             if check.returncode == 0:
                 return
-            if not self.auto_build:
-                raise RuntimeError(
-                    f"Docker image '{self.image}' not found and auto_build is disabled"
-                )
-            print(f"[autoresearch] Building Docker image '{self.image}'...")
+            print(f"[discovery] Building Docker image '{self.image}'...")
             try:
                 proc = subprocess.run(
                     ["docker", "build", "-t", self.image, "-f", "-", "."],
                     input=DOCKERFILE_TEMPLATE,
                     capture_output=True, text=True, check=False,
-                    cwd=str(Path(__file__).parent),
+                    cwd=str(self.scratch_dir),   # the Dockerfile copies nothing: keep the context tiny
                     timeout=DOCKER_BUILD_TIMEOUT,
                 )
             except subprocess.TimeoutExpired as e:
-                raise RuntimeError(
-                    f"Docker build exceeded {DOCKER_BUILD_TIMEOUT}s"
-                ) from e
+                raise RuntimeError(f"Docker build exceeded {DOCKER_BUILD_TIMEOUT}s") from e
             if proc.returncode != 0:
-                raise RuntimeError(
-                    f"Docker build failed: {proc.stderr.strip() or proc.stdout.strip()}"
-                )
-            print(f"[autoresearch] Docker image '{self.image}' built successfully")
-
-    # -- Host fallback --------------------------------------------------------
-
-    def _host_exec(self, command: str, timeout: int) -> dict:
-        env = os.environ.copy()
-        env["HOME"] = str(self.scratch_dir)
-        env["MPLCONFIGDIR"] = str(self.scratch_dir / ".matplotlib")
-        env.update(self._runtime_env())
-        runtime_bin = self._runtime_exec_bin_dir()
-        env["PATH"] = f"{runtime_bin}:{env.get('PATH', '')}" if env.get("PATH") else runtime_bin
-        if self.shared_dir:
-            shared_lib = str(Path("/shared") / "lib") if self.backend == "docker" else str(self.shared_dir / "lib")
-            existing = env.get("PYTHONPATH", "")
-            env["PYTHONPATH"] = f"{shared_lib}:{existing}" if existing else shared_lib
-        try:
-            proc = subprocess.run(
-                ["/bin/sh", "-lc", self._wrap_command(command)],
-                cwd=str(self.scratch_dir),
-                env=env,
-                capture_output=True, text=True,
-                timeout=timeout, check=False,
-            )
-            return {
-                "backend": "host",
-                "exit_code": proc.returncode,
-                "stdout": proc.stdout[-20_000:],
-                "stderr": proc.stderr[-20_000:],
-            }
-        except subprocess.TimeoutExpired:
-            return {
-                "backend": "host",
-                "exit_code": -1,
-                "stdout": "",
-                "stderr": f"Command timed out after {timeout}s",
-            }
-
-    def _wrap_command(self, command: str) -> str:
-        prelude_lines = [
-            'cd /scratch || exit 97',
-            f'export TL_RUNTIME_ROOT="{self._runtime_exec_root()}"',
-            f'export TL_RUNTIME_SOCKET="{self._runtime_exec_socket()}"',
-            f'export TL_REAL_PYTHON="{self.real_python_path}"',
-            f'export PATH="{self._runtime_exec_bin_dir()}:$PATH"',
-        ]
-        if self.shared_dir:
-            prelude_lines.extend(
-                [
-                    'export PYTHONPATH="/shared/lib${PYTHONPATH:+:$PYTHONPATH}"',
-                    'export TL_SHARED_ROOT="/shared"',
-                    'export TL_SHARED_CACHE="/shared/cache"',
-                    'export TL_SHARED_TEMPLATE="/shared/templates/worker_analysis_template.py"',
-                ]
-            )
-        prelude = "\n".join(prelude_lines)
-        if not prelude:
-            return command
-        return f"{prelude}\n{command}"
+                raise RuntimeError(f"Docker build failed: {proc.stderr.strip() or proc.stdout.strip()}")
+            print(f"[discovery] Docker image '{self.image}' built successfully")
 
 
 def _remove_containers(names: list[str]) -> None:

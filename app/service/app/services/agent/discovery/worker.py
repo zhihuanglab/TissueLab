@@ -1,9 +1,20 @@
-"""
-Worker agent for autoresearch.
+"""The worker: one candidate, one deliverable (result.py), then the controller's checks.
 
-Each worker receives one candidate biomarker brief and runs in a sandboxed
-environment with shell access to the user's data. It explores, analyzes,
-and produces a runnable biomarker script, with any extra artifacts optional.
+Contract (prompts/worker.md):
+  * The worker's only job is to write /scratch/result.py defining
+        compute_donor_features(donor_id, data_root) -> {variation_name: float | nan}
+    run it once on all donors, and reply DONE.
+  * The controller (this module) then, inside the same sandbox, imports result.py
+    and calls it for every cohort donor -> /scratch/donor_feature_table.csv, and
+    checks: import works, planned columns present, no duplicate donors, primary
+    coverage >= 80%, no mention of the outcome or covariates in the code or the
+    shell commands, and the problem's class rules. results.json is written from
+    the plan.
+
+Guards: per-command timeout floor, a rewrite cap with a nudge, a hard turn cap,
+and materialization even when the conversation died (a usable result.py still
+yields a round). Outcomes never enter the sandbox: the cohort file is shadowed
+by an identifier-only copy.
 """
 
 from __future__ import annotations
@@ -15,529 +26,372 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Optional
 
-from .client import (
-    custom_tool_call_output,
-    custom_tool_calls,
-    output_text,
-    response_id,
-    responses_create,
-)
-from .shared_lib_source.shared_analysis.artifacts import (
-    coerce_results_payload,
-    write_results_payload,
-)
+import pandas as pd
+
+from .client import custom_tool_call_output, custom_tool_calls, output_text, response_id, responses_create
+from .panel_cv import PredictivePanelConfig
+from .problem import ProblemSpec, write_public_cohort
 from .sandbox import SandboxSession
+from .tools import SHELL_TOOL_NAME, SHELL_TOOL_SPEC, bounded_tool_text, is_done, load_prompt
 
-
-REPORT_NAME = "report.md"
 RESULT_NAME = "result.py"
+TABLE_NAME = "donor_feature_table.csv"
 RESULTS_NAME = "results.json"
-SHELL_TOOL_NAME = "shell_exec"
-SHELL_TOOL_SPEC = {
-    "type": "custom",
-    "name": SHELL_TOOL_NAME,
-    "description": (
-        "Run one shell command batch inside the worker sandbox. "
-        "Use it to inspect the data folder, run analysis scripts, and write files into /scratch. "
-        "Input must be raw shell text, not JSON."
-    ),
-    "format": {"type": "text"},
-}
-TOOL_SPECS = [SHELL_TOOL_SPEC]
+MATERIALIZE_SCRIPT = ".tl_materialize.py"
+MATERIALIZE_REPORT = "materialize_report.json"
 
-PROMPTS_DIR = Path(__file__).parent / "prompts"
-TEMPLATES_DIR = Path(__file__).parent / "shared_lib_source" / "templates"
+MIN_COVERAGE = PredictivePanelConfig.min_candidate_coverage   # the judge gates on it too
+MAX_REWRITES = 4
+MAX_TURNS = 40
+MIN_COMMAND_TIMEOUT = 120
+MATERIALIZE_TIMEOUT = 1800
 
 
-def _load_prompt(name: str) -> str:
-    return (PROMPTS_DIR / name).read_text(encoding="utf-8")
+class ControllerChecksFailed(RuntimeError):
+    """The worker's result.py ran but failed the controller's checks — a verdict, not a crash."""
 
 
-def _is_done(text: str) -> bool:
-    stripped = text.strip()
-    if not stripped:
-        return False
-    if stripped == "DONE" or stripped.startswith("DONE\n"):
-        return True
-    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-    return bool(lines) and lines[-1] == "DONE"
-
-
-def _parse_report(report_path: Path) -> dict:
-    text = report_path.read_text() if report_path.exists() else ""
-    sections: dict[str, list[str]] = {}
-    current = "body"
-    sections[current] = []
-    for line in text.splitlines():
-        match = re.match(r"^#+\s*(.+?)\s*$", line.strip())
-        if match:
-            current = match.group(1).strip().lower()
-            sections.setdefault(current, [])
-            continue
-        sections.setdefault(current, []).append(line.rstrip())
-    parsed = {k: "\n".join(v).strip() for k, v in sections.items()}
-    summary = parsed.get("summary", "").splitlines()[0].strip() if parsed.get("summary") else ""
-    return {
-        "report_text": text,
-        "summary": summary,
-        "rationale": parsed.get("rationale", ""),
-    }
-
-
-def _fallback_worker_summary(worker_brief: dict) -> dict[str, str]:
-    summary = str(
-        worker_brief.get("candidate_id")
-        or worker_brief.get("scientific_question")
-        or worker_brief.get("worker_name")
-        or ""
-    ).strip()
-    rationale = str(worker_brief.get("approach") or worker_brief.get("notes") or "").strip()
-    return {"report_text": "", "summary": summary, "rationale": rationale}
-
-
-def _persist_scratch_artifacts(
-    *,
-    worker_dir: Path,
-    scratch_dir: Path,
-    results: dict[str, Any],
-) -> dict[str, Any]:
-    persisted = dict(results or {})
-    artifacts = dict(persisted.get("artifacts") or {})
-    if not artifacts:
-        return persisted
-
-    sandbox_dir = worker_dir / "sandbox"
-    sandbox_dir.mkdir(parents=True, exist_ok=True)
-
-    for artifact_name, artifact_ref in list(artifacts.items()):
-        if artifact_ref is None:
-            continue
-        ref_text = str(artifact_ref).strip()
-        if not ref_text:
-            continue
-        ref_path = Path(ref_text)
-        source: Path | None = None
-        target: Path | None = None
-
-        if ref_path.is_absolute():
-            if str(ref_path).startswith("/scratch/"):
-                relative = ref_path.relative_to("/scratch")
-                source = scratch_dir / relative
-                target = sandbox_dir / relative
-            else:
-                continue
-        else:
-            source = scratch_dir / ref_path
-            target = sandbox_dir / ref_path
-
-        if source is None or target is None or not source.exists() or not source.is_file():
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            same_file = source.resolve() == target.resolve()
-        except FileNotFoundError:
-            same_file = False
-        if not same_file:
-            shutil.copy2(source, target)
-        if not ref_path.is_absolute():
-            artifacts[artifact_name] = f"/scratch/{ref_path.as_posix()}"
-
-    persisted["artifacts"] = artifacts
-    return persisted
-
-
-def _extract_thought(response: dict) -> str:
-    """Extract a chain-of-thought summary from the model's reasoning or text output."""
-    # Try reasoning summary first (most informative)
-    for item in response.get("output", []):
-        if item.get("type") != "reasoning":
-            continue
-        for summary_item in item.get("summary") or []:
-            text = summary_item.get("text", "").strip()
-            if not text:
-                continue
-            lines = [l.strip() for l in text.splitlines() if l.strip()]
-            if not lines:
-                continue
-            thought = lines[0].replace("**", "")
-            if len(thought) > 120:
-                thought = thought[:117] + "..."
-            return thought
-
-    # Fallback: try message text output
-    for item in response.get("output", []):
-        if item.get("type") != "message":
-            continue
-        for content in item.get("content") or []:
-            text = (content.get("text") or "").strip()
-            if text:
-                first_line = text.splitlines()[0].strip()
-                if len(first_line) > 120:
-                    first_line = first_line[:117] + "..."
-                return first_line
-
-    return ""
-
-
-def _write_worker_context(
-    scratch_dir: Path,
-    *,
-    worker_brief: dict,
-    program_text: str,
-    shared_dir: Path | None = None,
-    shared_runtime_manifest: dict[str, Any] | None = None,
-    preserve_existing_result: bool = False,
-) -> None:
-    """Write context files into the worker's scratch directory."""
-    scratch_dir.mkdir(parents=True, exist_ok=True)
-    (scratch_dir / "worker_brief.json").write_text(json.dumps(worker_brief, indent=2))
-    (scratch_dir / "program.md").write_text(program_text)
-    context_bundle: dict[str, Any] = {
-        "worker_brief": worker_brief,
-    }
-    if shared_dir is not None:
-        runtime_manifest_path = shared_dir / "cache" / "runtime_manifest.json"
-        slide_manifest_path = shared_dir / "cache" / "slide_manifest.json"
-        cohort_summary_path = shared_dir / "cache" / "cohort_summary.json"
-        quickstart_path = shared_dir / "cache" / "runtime_quickstart.md"
-        guide_path = shared_dir / "dataset_guide.md"
-        slide_manifest = _load_json_file(slide_manifest_path) if slide_manifest_path.exists() else {}
-        context_bundle.update(
-            {
-                "runtime_manifest": shared_runtime_manifest or (
-                    _load_json_file(runtime_manifest_path) if runtime_manifest_path.exists() else {}
-                ),
-                "cohort_summary": _load_json_file(cohort_summary_path) if cohort_summary_path.exists() else {},
-                "slide_manifest_head": {
-                    "data_root": slide_manifest.get("data_root"),
-                    "cohort_rows": slide_manifest.get("cohort_rows"),
-                    "slide_count": slide_manifest.get("slide_count"),
-                    "slides": slide_manifest.get("slides", [])[:5],
-                },
-                "runtime_quickstart_excerpt": _read_text_excerpt(quickstart_path, max_chars=2000),
-                "dataset_guide_excerpt": _read_text_excerpt(guide_path, max_chars=4000),
-            }
-        )
-    (scratch_dir / "context_bundle.json").write_text(json.dumps(context_bundle, indent=2))
-    template_path = (
-        (shared_dir / "templates" / "worker_analysis_template.py")
-        if shared_dir is not None
-        else TEMPLATES_DIR / "worker_analysis_template.py"
+def _kickoff_message(plan: dict[str, Any]) -> str:
+    names = [v.get("name", "") for v in plan.get("variations", [])]
+    return (
+        "Your task: implement the plan in /scratch/plan.json.\n"
+        "Write /scratch/result.py that defines\n"
+        "    compute_donor_features(donor_id, data_root) -> dict\n"
+        f"returning exactly these keys: {names} (float, or float('nan') when not analyzable).\n"
+        "Use the shared loaders in shared_analysis.slides (see /shared/data_intuition.md for "
+        "the classes, regions and spacings in these slides).\n"
+        "Run it once on every donor (cd /scratch && python result.py) to confirm it works "
+        "and prints per-donor values. Then reply with the single word DONE.\n"
+        "Do not write any other deliverable; the controller builds the donor table and "
+        "all metadata from your script."
     )
-    if not template_path.exists():
-        template_path = TEMPLATES_DIR / "worker_analysis_template.py"
-    if template_path.exists() and not (preserve_existing_result and (scratch_dir / RESULT_NAME).exists()):
-        shutil.copy2(template_path, scratch_dir / RESULT_NAME)
 
 
-def _load_shared_runtime_manifest(shared_dir: Optional[str | Path]) -> dict:
-    if not shared_dir:
-        return {}
-    manifest_path = Path(shared_dir) / "cache" / "runtime_manifest.json"
-    if not manifest_path.exists():
-        return {}
+def _materialize_script(plan: dict[str, Any]) -> str:
+    names = [v.get("name", "") for v in plan.get("variations", [])]
+    return f'''
+import json, math, os, sys, traceback
+_shared = os.environ.get("TL_SHARED_ROOT") or "/shared"
+for _p in (os.path.join(_shared, "lib"), "/scratch"):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+import pandas as pd
+from shared_analysis.slides import donor_ids
+names = {json.dumps(names)}
+report = {{"status": "ok", "errors": {{}}, "rows": 0, "coverage": {{}}, "import_error": None}}
+try:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("result", "/scratch/result.py")
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    fn = getattr(mod, "compute_donor_features", None)
+    if fn is None:
+        raise AttributeError("result.py does not define compute_donor_features")
+except Exception as exc:
+    report["status"] = "import_failed"; report["import_error"] = "".join(traceback.format_exception(exc))[-3000:]
+    json.dump(report, open("/scratch/{MATERIALIZE_REPORT}", "w"), indent=1); sys.exit(0)
+rows = []
+for donor_id in donor_ids("/data"):
+    rec = {{"donor_id": donor_id}}
     try:
-        return json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+        out = fn(donor_id, "/data")
+        if out is None: out = {{}}
+        if not isinstance(out, dict):
+            raise TypeError(f"compute_donor_features returned {{type(out).__name__}}, expected dict")
+        for k in names:
+            v = out.get(k, float("nan"))
+            try:
+                v = float(v)
+            except Exception:
+                v = float("nan")
+            rec[k] = v if math.isfinite(v) else float("nan")
+        extra = sorted(set(out) - set(names))
+        if extra: report.setdefault("extra_keys", sorted(set(report.get("extra_keys", [])) | set(extra)))
+    except Exception as exc:
+        report["errors"][donor_id] = "".join(traceback.format_exception(exc))[-1500:]
+        for k in names: rec[k] = float("nan")
+    rows.append(rec)
+    print(donor_id, {{k: rec[k] for k in names}}, flush=True)
+table = pd.DataFrame(rows, columns=["donor_id"] + names)
+table.to_csv("/scratch/{TABLE_NAME}", index=False)
+report["rows"] = int(len(table))
+for k in names:
+    report["coverage"][k] = float(table[k].notna().mean()) if len(table) else 0.0
+report["n_errors"] = len(report["errors"])
+json.dump(report, open("/scratch/{MATERIALIZE_REPORT}", "w"), indent=1)
+print("MATERIALIZED", report["rows"], report["coverage"])
+'''
 
 
-def _load_json_file(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _worker_scripts(scratch_dir: Path) -> list[Path]:
+    """Python files the worker wrote in /scratch (result.py and any helper it imports)."""
+    return sorted(p for p in scratch_dir.glob("*.py") if not p.name.startswith("."))
 
 
-def _read_text_excerpt(path: Path, *, max_chars: int) -> str:
-    if not path.exists() or max_chars <= 0:
-        return ""
-    return path.read_text(encoding="utf-8")[:max_chars]
+def class_rule_violations(scripts: list[Path], spec: ProblemSpec) -> list[str]:
+    """Lines that break the problem's class rules.
+
+    * an excluded class may not appear as a string literal at all (outside comments);
+    * an exclude-only class may not be selected: `== 'X'`, `.eq('X')`, `isin([... 'X' ...])`;
+    * when any rule is set, numeric class_id selection is rejected: classes are selected
+      by cell_type name, since ids differ per classifier.
+    """
+    if not (spec.excluded_classes or spec.exclude_only_classes):
+        return []
+
+    def literal(name: str) -> str:
+        return r"""['"]""" + re.escape(name) + r"""['"]"""
+
+    excluded = [re.compile(literal(n)) for n in spec.excluded_classes]
+    selected = [
+        re.compile(r"""(==\s*|\.eq\(\s*|\.isin\([^)]*)""" + literal(n)) for n in spec.exclude_only_classes
+    ] + [re.compile(literal(n) + r"""\s*==""") for n in spec.exclude_only_classes]
+    cid_select = re.compile(r"""class_id['"\]]*\s*(==|\.eq\(|\.isin\()""")
+    hits: list[str] = []
+    for path in scripts:
+        for lineno, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            code = line.split("#", 1)[0]
+            stripped = code.strip()
+            if not stripped:
+                continue
+            if any(p.search(code) for p in excluded) or any(p.search(code) for p in selected):
+                hits.append(f"{path.name}:{lineno}: {stripped[:160]}")
+            elif cid_select.search(code):
+                hits.append(f"{path.name}:{lineno}: {stripped[:160]} (numeric class_id selection)")
+    return hits
+
+
+def outcome_references(worker_dir: Path, scripts: list[Path], names: list[str]) -> list[str]:
+    """Lines in the worker's scripts or shell commands naming the outcome or a covariate."""
+    names = [n for n in names if n]
+    if not names:
+        return []
+    pattern = re.compile(r"\b(" + "|".join(re.escape(n) for n in names) + r")\b")
+    hits: list[str] = []
+    for path in [*scripts, *sorted(worker_dir.glob("turn_*.command.sh"))]:
+        for lineno, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            if pattern.search(line):
+                hits.append(f"{path.name}:{lineno}: {line.strip()[:160]}")
+    return hits
 
 
 def run_worker(
     *,
-    worker_brief: dict,
+    worker_brief: dict[str, Any],
     round_dir: str | Path,
-    program_text: str,
+    spec: ProblemSpec,
     data_dir: str | Path,
-    shared_dir: Optional[str | Path] = None,
-    model: str = "gpt-5.4",
-    reasoning_effort: str = "medium",
-    worker_wall_clock_sec: int = 600,
-    final_synthesis_buffer_sec: int = 120,
-    sandbox_backend: str = "docker",
-    sandbox_image: str = "tissuelab-autoresearch-worker",
-    sandbox_auto_build: bool = True,
-    command_timeout_sec: int = 300,
-    on_event: Optional[Callable] = None,
+    shared_dir: str | Path,
+    model: str,
+    reasoning_effort: str = "high",
+    worker_wall_clock_sec: int = 1800,
+    command_timeout_sec: int = 900,
+    on_event: Optional[Callable[[dict[str, Any]], None]] = None,
     cancel_event: Optional[threading.Event] = None,
-) -> dict:
-    """
-    Run a single worker agent to completion.
-
-    Returns a dict with worker_name, candidate/report paths, summary, etc.
-    """
+) -> dict[str, Any]:
+    """Run one worker. Raises if no usable result.py was produced or the checks fail."""
     round_dir = Path(round_dir)
-    shared_dir_path = Path(shared_dir) if shared_dir else None
     worker_name = worker_brief["worker_name"]
     worker_dir = round_dir / worker_name
     worker_dir.mkdir(parents=True, exist_ok=True)
-
     scratch_dir = worker_dir / "sandbox"
     if scratch_dir.exists():
         shutil.rmtree(scratch_dir, ignore_errors=True)
-    scratch_dir.mkdir(parents=True, exist_ok=True)
-    shared_runtime_manifest = _load_shared_runtime_manifest(shared_dir)
+    (scratch_dir / "logs").mkdir(parents=True, exist_ok=True)
 
-    _write_worker_context(
-        scratch_dir,
-        worker_brief=worker_brief,
-        program_text=program_text,
-        shared_dir=shared_dir_path,
-        shared_runtime_manifest=shared_runtime_manifest,
-    )
+    plan = {
+        k: worker_brief.get(k)
+        for k in ("candidate_id", "scientific_question", "approach", "variations", "baseline_variation", "notes", "rationale")
+    }
+    (scratch_dir / "plan.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
 
+    def emit(event: dict[str, Any]) -> None:
+        if on_event:
+            try:
+                on_event(event)
+            except Exception:
+                pass
+
+    instructions = load_prompt("worker.md", spec) + "\n\n# Research question\n" + spec.question
+    public_cohort = write_public_cohort(spec, data_dir, worker_dir / "cohort_public.csv")
     session = SandboxSession(
-        scratch_dir,
-        data_dir=data_dir,
-        shared_dir=shared_dir,
-        backend=sandbox_backend,
-        image=sandbox_image,
-        auto_build=sandbox_auto_build,
-        command_timeout_sec=command_timeout_sec,
+        scratch_dir, data_dir=data_dir, shared_dir=shared_dir, command_timeout_sec=command_timeout_sec,
+        file_overlays={f"/data/{spec.cohort_file}": public_cohort},
     )
-    prompt = _load_prompt("worker_prompt.md")
-    turn_summaries: list[dict] = []
-    deadline = time.monotonic() + max(60, int(worker_wall_clock_sec))
-    final_buffer = max(30, int(final_synthesis_buffer_sec))
-    pending_input: Any = (
-        "Start the worker task by reading /scratch/context_bundle.json. "
-        "Use shell_exec freely to inspect the data and validate your biomarker logic. "
-        "Start from the pre-seeded /scratch/result.py template instead of writing from an empty file. "
-        "Do not re-discover basic dataset context if it is already in /scratch/context_bundle.json. "
-        f"Return DONE only after writing /scratch/{RESULT_NAME}."
-    )
+    state: dict[str, Any] = {"turns": 0, "rewrites": 0, "error": None}
+    result_path_sb = scratch_dir / RESULT_NAME
+    deadline = time.monotonic() + max(120, int(worker_wall_clock_sec))
     previous_response: Optional[str] = None
+    pending_input: Any = _kickoff_message(plan)
+    last_mtime = 0.0
+    nudged = False
+    done = False
 
-    session.start()
     stop_cancel_watch = session.watch_cancel(cancel_event)
     try:
-        turn_id = 1
-        sent_wrapup = False
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                raise RuntimeError(f"{worker_name} cancelled")
-            remaining = max(1, int(deadline - time.monotonic()))
-
-            # Hard wrap-up: override pending_input with a forceful instruction and
-            # reset the conversation chain so the model treats it as urgent.
-            if remaining <= final_buffer and not sent_wrapup:
-                sent_wrapup = True
-                pending_input = (
-                    f"TIME IS ALMOST UP — you have roughly {remaining} seconds left. "
-                    f"STOP all new analysis immediately. "
-                    f"Write /scratch/{RESULT_NAME} RIGHT NOW "
-                    f"using whatever biomarker logic you have so far — a partial result is far better than none. "
-                    f"Use a single shell_exec call if possible, then respond DONE."
-                )
-                previous_response = None
-
-            # Escalating synthesis pressure (soft hints, complement to the hard wrap-up)
-            hints: list[str] = []
-            if len(turn_summaries) >= 4:
-                hints.append("You have enough context. Prefer writing a first-pass result over more exploration.")
-            if len(turn_summaries) >= 6:
-                hints.append("Wrap up soon. Only run another command if it directly validates your result.")
-                if len(turn_summaries) >= 8:
-                    hints.append(
-                    "Stop exploring. Write /scratch/result.py, then respond DONE."
-                    )
-
-            payload_context = {
-                "context_bundle_path": "/scratch/context_bundle.json",
-                "program_path": "/scratch/program.md",
-                "result_template_path": f"/scratch/{RESULT_NAME}",
-                "data_root": session.describe()["data_root"],
-                "remaining_wall_clock_sec": remaining,
-                "tool_calls_completed": len(turn_summaries),
-                "completion_hint": " ".join(hints).strip(),
-            }
-            prompt_text = prompt + "\n\n" + json.dumps(payload_context, indent=2)
-
-            # Save turn artifacts
-            turn_prefix = worker_dir / f"turn_{turn_id:02d}"
-            (turn_prefix.with_suffix(".prompt.txt")).write_text(prompt_text)
-
-            try:
-                api_payload = {
+        session.start()
+        try:
+            for turn_id in range(1, MAX_TURNS + 1):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError(f"{worker_name} cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining < 60:
+                    state["error"] = "wall clock exhausted"
+                    break
+                payload = {
                     "model": model,
-                    "instructions": prompt_text,
+                    "instructions": instructions,
                     "input": pending_input,
-                    "tools": TOOL_SPECS,
-                    "parallel_tool_calls": True,
+                    "tools": [SHELL_TOOL_SPEC],
+                    "parallel_tool_calls": False,
                     "store": True,
                     "reasoning": {"effort": reasoning_effort, "summary": "auto"},
                 }
                 if previous_response:
-                    api_payload["previous_response_id"] = previous_response
-
-                response = responses_create(api_payload, timeout=min(remaining, 300))
-            except Exception as exc:
-                (turn_prefix.with_suffix(".error.json")).write_text(
-                    json.dumps({"error": str(exc), "traceback": traceback.format_exc()}, indent=2)
-                )
-                raise RuntimeError(
-                    f"{worker_name} failed on turn {turn_id}: {exc}"
-                ) from exc
-
-            (turn_prefix.with_suffix(".response.json")).write_text(json.dumps(response, indent=2))
-            output = output_text(response)
-            (turn_prefix.with_suffix(".output.txt")).write_text(output)
-            tool_calls_list = custom_tool_calls(response)
-            previous_response = response_id(response)
-
-            # Handle tool calls
-            if tool_calls_list:
-                shell_calls = [call for call in tool_calls_list if call.get("name") == SHELL_TOOL_NAME]
-                unknown_calls = [
-                    call for call in tool_calls_list
-                    if call.get("name") != SHELL_TOOL_NAME
-                ]
-                if unknown_calls:
-                    raise RuntimeError(
-                        f"{worker_name} returned unknown tool calls on turn {turn_id}: "
-                        + ", ".join(str(call.get("name")) for call in unknown_calls)
+                    payload["previous_response_id"] = previous_response
+                prefix = worker_dir / f"turn_{turn_id:02d}"
+                response = responses_create(payload, timeout=int(min(1800, max(120, remaining))))
+                prefix.with_suffix(".response.json").write_text(json.dumps(response, indent=2, default=str), encoding="utf-8")
+                previous_response = response_id(response)
+                state["turns"] = turn_id
+                text = output_text(response)
+                calls = custom_tool_calls(response, SHELL_TOOL_NAME)
+                if not calls:
+                    if is_done(text):
+                        done = True
+                        break
+                    pending_input = (
+                        "Use the shell_exec tool to continue (write/run /scratch/result.py), "
+                        "or reply exactly DONE if result.py is finished and ran successfully."
                     )
-                if len(shell_calls) > 1:
-                    raise RuntimeError(
-                        f"{worker_name} returned {len(shell_calls)} shell_exec calls on turn {turn_id}"
-                    )
-
-                thought = _extract_thought(response)
+                    continue
                 tool_outputs = []
-                tool_trace: list[dict[str, Any]] = []
-
-                if shell_calls:
-                    tool_call = shell_calls[0]
-                    command = str(tool_call.get("input", "")).strip()
-                    if not command:
-                        raise RuntimeError(f"{worker_name} returned empty shell_exec on turn {turn_id}")
-
-                    (turn_prefix.with_suffix(".command.sh")).write_text(command + "\n")
-                    exec_timeout = min(command_timeout_sec, max(1, int(deadline - time.monotonic())))
-
-                    if on_event:
-                        on_event({
-                            "type": "worker_tool_call",
-                            "worker_name": worker_name,
-                            "turn_id": turn_id,
-                            "tool_name": SHELL_TOOL_NAME,
-                            "thought": thought,
-                            "command_preview": command.splitlines()[0][:160] if command else "",
-                        })
-
-                    result = session.exec(command, timeout_sec=exec_timeout)
-                    (turn_prefix.with_suffix(".exec.json")).write_text(json.dumps(result, indent=2))
-                    tool_trace.append(
-                        {
-                            "tool_name": SHELL_TOOL_NAME,
-                            "input": command,
-                            "output_preview": json.dumps(
-                                {
-                                    "exit_code": result.get("exit_code"),
-                                    "stdout": (result.get("stdout", "") or "")[:500],
-                                    "stderr": (result.get("stderr", "") or "")[:500],
-                                },
-                                ensure_ascii=True,
-                            ),
-                        }
-                    )
-
-                    if on_event:
-                        on_event({
-                            "type": "worker_tool_result",
-                            "worker_name": worker_name,
-                            "turn_id": turn_id,
-                            "tool_name": SHELL_TOOL_NAME,
-                            "exit_code": result.get("exit_code"),
-                        })
-
-                    tool_outputs.append(
-                        custom_tool_call_output(
-                            str(tool_call.get("call_id", "")),
-                            {
-                                "exit_code": result.get("exit_code"),
-                                "stdout": result.get("stdout", ""),
-                                "stderr": result.get("stderr", ""),
-                            },
+                for call in calls:
+                    command = str(call.get("input") or "")
+                    prefix.with_suffix(".command.sh").write_text(command + "\n", encoding="utf-8")
+                    remaining = deadline - time.monotonic()
+                    timeout = int(min(command_timeout_sec, max(MIN_COMMAND_TIMEOUT, remaining)))
+                    emit({"type": "worker_tool_call", "worker_name": worker_name, "turn_id": turn_id,
+                          "tool_name": SHELL_TOOL_NAME, "command_preview": command[:120]})
+                    result = session.exec(command, timeout_sec=timeout)
+                    (scratch_dir / "logs" / f"turn_{turn_id:02d}.stdout.txt").write_text(str(result.get("stdout") or ""), encoding="utf-8")
+                    (scratch_dir / "logs" / f"turn_{turn_id:02d}.stderr.txt").write_text(str(result.get("stderr") or ""), encoding="utf-8")
+                    emit({"type": "worker_tool_result", "worker_name": worker_name, "turn_id": turn_id,
+                          "tool_name": SHELL_TOOL_NAME, "exit_code": result.get("exit_code")})
+                    note = ""
+                    if result_path_sb.exists():
+                        mt = result_path_sb.stat().st_mtime
+                        if mt != last_mtime:
+                            if last_mtime:
+                                state["rewrites"] += 1
+                            last_mtime = mt
+                    if state["rewrites"] >= MAX_REWRITES and not nudged:
+                        nudged = True
+                        note = (
+                            f"CONTROLLER NOTE: result.py has been rewritten {state['rewrites']} times. "
+                            "Stop refactoring. If the last run succeeded, reply DONE now; otherwise fix "
+                            "only the specific error and run once more."
                         )
-                    )
-
-                if tool_trace:
-                    (turn_prefix.with_suffix(".tools.json")).write_text(json.dumps(tool_trace, indent=2))
-                turn_summaries.append(
-                    {
-                        "turn_id": turn_id,
-                        "tool_names": [SHELL_TOOL_NAME] if shell_calls else [],
-                        "kind": "shell",
+                    payload_out = {
+                        "exit_code": result.get("exit_code"),
+                        "stdout": bounded_tool_text(result.get("stdout"), 6000),
+                        "stderr": bounded_tool_text(result.get("stderr"), 3000),
+                        "full_stdout": f"/scratch/logs/turn_{turn_id:02d}.stdout.txt",
+                        "full_stderr": f"/scratch/logs/turn_{turn_id:02d}.stderr.txt",
                     }
-                )
-
+                    if note:
+                        payload_out["controller_note"] = note
+                    tool_outputs.append(custom_tool_call_output(str(call.get("call_id", "")), payload_out))
                 pending_input = tool_outputs
-                turn_id += 1
-
-                if time.monotonic() >= deadline:
-                    if not sent_wrapup:
-                        # Let the wrap-up logic fire on next iteration
-                        continue
-                    raise RuntimeError(f"{worker_name} exceeded wall-clock budget")
-                continue
-
-            # Check if worker is done
-            if _is_done(output):
-                result_src = scratch_dir / RESULT_NAME
-                results_src = scratch_dir / RESULTS_NAME
-                report_src = scratch_dir / REPORT_NAME
-                if not result_src.exists():
-                    raise RuntimeError(
-                        f"{worker_name} responded DONE without writing {RESULT_NAME}"
-                    )
-                result_path = worker_dir / RESULT_NAME
-                shutil.copy2(result_src, result_path)
-                results_path = None
-                if results_src.exists():
-                    results_path = worker_dir / RESULTS_NAME
-                    shutil.copy2(results_src, results_path)
-                    raw_results = json.loads(results_path.read_text(encoding="utf-8"))
-                    normalized_results = coerce_results_payload(raw_results)
-                    normalized_results = _persist_scratch_artifacts(
-                        worker_dir=worker_dir,
-                        scratch_dir=scratch_dir,
-                        results=normalized_results,
-                    )
-                    write_results_payload(results_path, normalized_results)
-                report_path = None
-                if report_src.exists():
-                    report_path = worker_dir / REPORT_NAME
-                    shutil.copy2(report_src, report_path)
-                report = _parse_report(report_path) if report_path is not None else _fallback_worker_summary(worker_brief)
-                return {
-                    "worker_name": worker_name,
-                    "worker_dir": str(worker_dir),
-                    "results_path": str(results_path) if results_path is not None else "",
-                    "result_path": str(result_path),
-                    "report_path": str(report_path) if report_path is not None else "",
-                    "summary": report["summary"],
-                    "rationale": report["rationale"],
-                    "results_text": results_path.read_text() if results_path is not None else "",
-                    "report_text": report["report_text"],
-                    "result_text": result_path.read_text(),
-                    "turn_summaries": turn_summaries,
-                }
-
-            raise RuntimeError(
-                f"{worker_name} response on turn {turn_id} was neither a tool call nor DONE"
+            else:
+                state["error"] = f"turn cap {MAX_TURNS} reached"
+        except Exception as exc:  # conversation died; fall through to materialization
+            if cancel_event is not None and cancel_event.is_set():
+                raise
+            state["error"] = f"{type(exc).__name__}: {exc}"
+            (worker_dir / "worker_failure.json").write_text(
+                json.dumps({"error": str(exc), "traceback": traceback.format_exc()}, indent=2), encoding="utf-8"
             )
+
+        if not result_path_sb.exists():
+            raise RuntimeError(f"{worker_name}: no result.py produced ({state.get('error') or 'worker ended without writing it'})")
+        # ---- controller materialization (whether the conversation ended in DONE or not)
+        (scratch_dir / MATERIALIZE_SCRIPT).write_text(_materialize_script(plan), encoding="utf-8")
+        emit({"type": "worker_materialize", "worker_name": worker_name})
+        mat = session.exec(f"cd /scratch && python {MATERIALIZE_SCRIPT}", timeout_sec=max(command_timeout_sec, MATERIALIZE_TIMEOUT))
+        (worker_dir / "materialize.exec.json").write_text(json.dumps(mat, indent=2, default=str), encoding="utf-8")
     finally:
         stop_cancel_watch()
         session.stop()
+
+    report_path_sb = scratch_dir / MATERIALIZE_REPORT
+    mreport = (
+        json.loads(report_path_sb.read_text(encoding="utf-8"))
+        if report_path_sb.exists()
+        else {"status": "no_report", "coverage": {}, "errors": {}}
+    )
+    primary = str(plan.get("baseline_variation") or (plan.get("variations") or [{}])[0].get("name") or "")
+    names = [v.get("name", "") for v in plan.get("variations", [])]
+    table_sb = scratch_dir / TABLE_NAME
+    checks: dict[str, Any] = {
+        "result_py_exists": True,
+        "import_ok": mreport.get("status") == "ok",
+        "table_written": table_sb.exists(),
+        "planned_columns_present": False,
+        "no_duplicate_donors": False,
+        "primary_coverage": float((mreport.get("coverage") or {}).get(primary, 0.0) or 0.0),
+        "primary_coverage_ok": False,
+        "donor_errors": int(mreport.get("n_errors", len(mreport.get("errors", {})))),
+    }
+    if table_sb.exists():
+        table = pd.read_csv(table_sb, dtype={"donor_id": str})
+        checks["planned_columns_present"] = all(n in table.columns for n in names) and "donor_id" in table.columns
+        checks["no_duplicate_donors"] = bool("donor_id" in table.columns and not table["donor_id"].duplicated().any())
+        checks["primary_coverage_ok"] = checks["primary_coverage"] >= MIN_COVERAGE
+    # Leak audit: worker code and shell commands must never name the outcome or covariates.
+    scripts = _worker_scripts(scratch_dir)
+    refs = outcome_references(worker_dir, scripts, spec.protected_names)
+    checks["outcome_reference_free"] = not refs
+    checks["outcome_references"] = refs
+    violations = class_rule_violations(scripts, spec)
+    checks["class_rules_ok"] = not violations
+    checks["class_rule_violations"] = violations
+    passed = all(
+        checks[key]
+        for key in ("import_ok", "table_written", "planned_columns_present", "no_duplicate_donors",
+                    "primary_coverage_ok", "outcome_reference_free", "class_rules_ok")
+    )
+
+    result_path = worker_dir / RESULT_NAME
+    shutil.copy2(result_path_sb, result_path)
+    results_path = worker_dir / RESULTS_NAME
+    results_payload = {
+        "status": "ok" if passed else "failed",
+        "feature_name": plan.get("candidate_id") or primary,
+        "feature_column": primary,
+        "outcome": spec.outcome,
+        "covariates": list(spec.covariates),
+        "artifacts": {"donor_feature_table": f"/scratch/{TABLE_NAME}"},
+        "controller_checks": checks,
+        "materialize_report": {k: v for k, v in mreport.items() if k != "errors"},
+        "worker_state": {"turns": state["turns"], "rewrites": state["rewrites"], "error": state["error"], "done_said": done},
+    }
+    results_path.write_text(json.dumps(results_payload, indent=2), encoding="utf-8")
+    summary = (
+        f"{'OK' if passed else 'FAILED CHECKS'}: primary={primary} coverage={checks['primary_coverage']:.2f} "
+        f"turns={state['turns']} rewrites={state['rewrites']} done_said={done} errors={checks['donor_errors']}"
+        + ("" if checks["class_rules_ok"] else f" CLASS_RULE={[h.split(': ', 1)[1][:60] for h in violations][:2]}")
+        + ("" if checks["outcome_reference_free"] else " OUTCOME_REFERENCE")
+    )
+    if not passed:
+        raise ControllerChecksFailed(f"{worker_name}: controller checks failed -> {summary}")
+    return {
+        "worker_name": worker_name,
+        "worker_dir": str(worker_dir),
+        "results_path": str(results_path),
+        "result_path": str(result_path),
+        "summary": summary,
+        "results": results_payload,
+        "controller_checks": checks,
+    }

@@ -1,23 +1,23 @@
 """
 OpenAI Responses API client for the discovery loop.
 
-The scout and workers drive custom tool calls chained by previous_response_id,
+The proposer and worker drive custom tool calls chained by previous_response_id,
 which only OpenAI's Responses API provides — a Chat Completions endpoint
 (OPENAI_BASE_URL pointing at vLLM, Ollama, …) cannot run this loop.
 """
 
 from __future__ import annotations
 
+import base64
 import json
-import logging
+import mimetypes
 import os
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, List, Optional
 
 from openai import OpenAI
 
 from app.services import llm_config
-
-logger = logging.getLogger(__name__)
 
 _client: Optional[OpenAI] = None
 
@@ -105,26 +105,30 @@ def custom_tool_call_output(call_id: str, output: Any) -> dict:
     }
 
 
-def call_model(
-    prompt_text: str,
+def input_image_message(
+    image_path: str | Path,
     *,
-    model: Optional[str] = None,
-    reasoning_effort: str = "high",
-    tools: Optional[List[dict]] = None,
-    tool_input: Optional[Any] = None,
-    previous_response_id: Optional[str] = None,
+    text: str = "Inspect this image.",
+    max_bytes: int = 20 * 1024 * 1024,
 ) -> dict:
-    """High-level helper for a single Responses API call."""
-    payload: Dict[str, Any] = {
-        "model": model or discovery_model(),
-        "instructions": prompt_text,
-        "input": tool_input or prompt_text,
-        "store": True,
-        "reasoning": {"effort": reasoning_effort},
+    """A Responses API user message carrying one local image (inspect_image tool)."""
+    path = Path(image_path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    size = path.stat().st_size
+    if size <= 0:
+        raise ValueError(f"Image is empty: {path}")
+    if size > max_bytes:
+        raise ValueError(f"Image exceeds {max_bytes} bytes: {path} ({size} bytes)")
+    mime_type, _ = mimetypes.guess_type(path.name)
+    if mime_type not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+        raise ValueError(f"Unsupported image type for {path}: {mime_type}")
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return {
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": text},
+            {"type": "input_image", "image_url": f"data:{mime_type};base64,{encoded}", "detail": "original"},
+        ],
     }
-    if tools:
-        payload["tools"] = tools
-        payload["parallel_tool_calls"] = False
-    if previous_response_id:
-        payload["previous_response_id"] = previous_response_id
-    return responses_create(payload, timeout=300)

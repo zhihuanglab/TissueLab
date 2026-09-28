@@ -1,96 +1,232 @@
-"""Discovery loop internals that the Open port changed or fixed.
+"""Discovery runtime: the worker's controller, the round loop, cancellation,
+sandbox lifecycle helpers, and the LLM client limits.
 
-No Docker, no LLM: the sandbox and the model are stubbed. Covers the result.py
-replay (sandboxed, persisted, cached), the loop's cancel / off-event-loop
-behaviour, sandbox lifecycle helpers, and the LLM client limits.
+No Docker, no LLM: the sandbox and the model are stubbed.
 """
 import asyncio
 import json
 import subprocess
-import sys
 import threading
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from conftest import SERVICE_DIR
+PROBLEM = """---
+outcome: slope
+covariates: [age]
+excluded_classes: [Debris]
+---
+Which measurements track the slope?
+"""
 
 
-class FakeSandbox:
-    """Stands in for the Docker sandbox; exec writes what the replay helper would."""
+def _spec():
+    from app.services.agent.discovery.problem import parse_problem
 
-    instances = []
-    table = "donor_id,f\nd1,1.0\n"
-    metadata = "{}"
+    return parse_problem(PROBLEM)
 
-    def __init__(self, scratch_dir, *, data_dir, shared_dir, command_timeout_sec):
-        self.scratch = scratch_dir
-        self.command = None
-        self.cancel_event = None
-        self.started = self.stopped = False
-        FakeSandbox.instances.append(self)
 
-    def watch_cancel(self, cancel_event):
-        self.cancel_event = cancel_event
-        return lambda: None
+def _workspace(tmp_path: Path) -> Path:
+    data = tmp_path / "data"
+    data.mkdir()
+    pd.DataFrame({"donor_id": ["d1", "d2", "d3"], "slide_name": ["a.zarr", "b.zarr", "c.zarr"],
+                  "slope": [0.1, 0.2, 0.3], "age": [70, 71, 72]}).to_csv(data / "training_cohort.csv", index=False)
+    return data
+
+
+# ── the worker's controller ───────────────────────────────────────────────────
+
+class ScriptedSandbox:
+    """The worker writes result.py via a shell command; materialization writes the donor table."""
+
+    result_py = "def compute_donor_features(donor_id, data_root):\n    return {'a': 1.0, 'b': 2.0}\n"
+    table = "donor_id,a,b\nd1,1.0,2.0\nd2,1.5,2.5\nd3,2.0,3.0\n"
+    instances: list = []
+
+    def __init__(self, scratch_dir, *, data_dir, shared_dir, command_timeout_sec, file_overlays):
+        self.scratch = Path(scratch_dir)
+        self.file_overlays = file_overlays
+        self.stopped = False
+        ScriptedSandbox.instances.append(self)
 
     def start(self):
-        self.started = True
+        pass
 
-    def exec(self, command, timeout_sec=None):
-        self.command = command
-        (self.scratch / "donor_feature_table.csv").write_text(FakeSandbox.table)
-        (self.scratch / "__materialized_interface_metadata.json").write_text(FakeSandbox.metadata)
-        return {"exit_code": 0, "stdout": "", "stderr": ""}
+    def watch_cancel(self, cancel_event):
+        return lambda: None
 
     def stop(self):
         self.stopped = True
 
+    def exec(self, command, timeout_sec=None):
+        if ".tl_materialize.py" in command:
+            (self.scratch / "donor_feature_table.csv").write_text(self.table)
+            (self.scratch / "materialize_report.json").write_text(json.dumps(
+                {"status": "ok", "errors": {}, "rows": 3, "coverage": {"a": 1.0, "b": 1.0}, "n_errors": 0}))
+        else:
+            (self.scratch / "result.py").write_text(self.result_py)
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+
+def _worker_responses():
+    tool = {"id": "r1", "output": [{"type": "custom_tool_call", "name": "shell_exec", "call_id": "c1",
+                                    "input": "cat > /scratch/result.py <<EOF ... EOF && python result.py"}]}
+    done = {"id": "r2", "output": [{"type": "message", "content": [{"type": "output_text", "text": "DONE"}]}]}
+    return iter([tool, done])
+
 
 @pytest.fixture
-def fake_sandbox(monkeypatch):
-    import app.services.agent.discovery.deterministic_evaluator as evaluator
+def scripted_worker(monkeypatch):
+    from app.services.agent.discovery import worker
 
-    FakeSandbox.instances = []
-    FakeSandbox.table = "donor_id,f\nd1,1.0\n"
-    FakeSandbox.metadata = "{}"
-    monkeypatch.setattr(evaluator, "SandboxSession", FakeSandbox)
-    return FakeSandbox
-
-
-def _write_worker(tmp_path, body="def compute_donor_score(*a, **k):\n    return 1.0\n"):
-    worker_dir = tmp_path / "round_0001" / "round_0001_worker"
-    worker_dir.mkdir(parents=True)
-    (worker_dir / "result.py").write_text(body)
-    return worker_dir
+    ScriptedSandbox.instances = []
+    ScriptedSandbox.result_py = "def compute_donor_features(donor_id, data_root):\n    return {'a': 1.0, 'b': 2.0}\n"
+    responses = _worker_responses()
+    monkeypatch.setattr(worker, "SandboxSession", ScriptedSandbox)
+    monkeypatch.setattr(worker, "responses_create", lambda payload, timeout=0: next(responses))
+    return worker
 
 
-# ── service process / shared library ────────────────────────────────────────
-
-def test_service_process_does_not_load_sandbox_only_packages():
-    # scikit-learn lives only in the worker image; importing the loop and the
-    # routes must not pull it into the service.
-    code = (
-        "import sys, app.api.discovery, app.services.agent.discovery.deterministic_evaluator; "
-        "print('sklearn' in sys.modules)"
+def _run_worker(worker, tmp_path, data):
+    return worker.run_worker(
+        worker_brief={"worker_name": "round_0001_worker", "candidate_id": "cand", "baseline_variation": "a",
+                      "variations": [{"name": "a"}, {"name": "b"}]},
+        round_dir=tmp_path / "run" / "round_0001", spec=_spec(), data_dir=data,
+        shared_dir=tmp_path / "run" / "shared", model="m",
     )
-    out = subprocess.run([sys.executable, "-c", code], cwd=SERVICE_DIR, capture_output=True, text=True)
-    assert out.returncode == 0, out.stderr
-    assert out.stdout.strip().splitlines()[-1] == "False"
 
 
-def test_shared_analysis_exports_resolve_lazily():
-    from app.services.agent.discovery.shared_lib_source import shared_analysis
+def test_worker_controller_materializes_and_passes_a_clean_script(scripted_worker, tmp_path):
+    data = _workspace(tmp_path)
+    result = _run_worker(scripted_worker, tmp_path, data)
+    assert result["controller_checks"]["primary_coverage"] == 1.0
+    assert result["results"]["feature_column"] == "a" and result["results"]["outcome"] == "slope"
+    box = ScriptedSandbox.instances[0]
+    assert box.stopped
+    # the sandbox's cohort file carries identifiers only
+    public = Path(box.file_overlays["/data/training_cohort.csv"]).read_text()
+    assert public.splitlines()[0] == "donor_id,slide_name"
+    assert json.loads(Path(result["results_path"]).read_text())["status"] == "ok"
 
-    assert "partial_correlation" in shared_analysis.__all__
-    assert callable(shared_analysis.partial_correlation)
-    assert shared_analysis.stats.partial_correlation is shared_analysis.partial_correlation
-    with pytest.raises(AttributeError):
-        shared_analysis.not_an_export  # noqa: B018
+
+@pytest.mark.parametrize("code, failure", [
+    ("def compute_donor_features(d, r):\n    return {'a': df['slope'], 'b': 1}\n", "OUTCOME_REFERENCE"),
+    ("def compute_donor_features(d, r):\n    x = cells[cells.cell_type == 'Debris']\n    return {'a': 1, 'b': 1}\n", "CLASS_RULE"),
+])
+def test_worker_controller_rejects_outcome_contact_and_class_rule_breaks(scripted_worker, tmp_path, code, failure):
+    ScriptedSandbox.result_py = code
+    data = _workspace(tmp_path)
+    with pytest.raises(scripted_worker.ControllerChecksFailed, match=failure):
+        _run_worker(scripted_worker, tmp_path, data)
+    assert ScriptedSandbox.instances[0].stopped
+
+
+# ── the loop ──────────────────────────────────────────────────────────────────
+
+def test_loop_runs_stages_off_the_event_loop_and_writes_findings(tmp_path, monkeypatch):
+    import app.services.agent.discovery.loop as loop
+
+    data = _workspace(tmp_path)
+    threads, events = {}, []
+    cancel = threading.Event()
+    proposals = iter([RuntimeError("model unavailable"), {"candidate_id": "cand", "scientific_question": "q",
+                                                          "variations": [{"name": "a"}], "baseline_variation": "a"}])
+
+    def fake_intuition(spec, data_dir, shared_dir):
+        threads["intuition"] = threading.get_ident()
+        # state is written before the slides are measured: a cancel here leaves a resumable run
+        assert (tmp_path / "run" / "run_state.json").exists()
+        (Path(shared_dir) / "data_intuition.md").write_text("brief")
+        return {"n_donors": 3}
+
+    def fake_proposer(**kwargs):
+        threads["proposer"] = threading.get_ident()
+        assert loop.run_folder_busy(tmp_path / "run")   # counted while the thread runs
+        assert kwargs["cancel_event"] is cancel and kwargs["data_intuition_text"] == "brief"
+        item = next(proposals)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def fake_worker(**kwargs):
+        threads["worker"] = threading.get_ident()
+        assert kwargs["cancel_event"] is cancel and kwargs["spec"].outcome == "slope"
+        return {"worker_name": kwargs["worker_brief"]["worker_name"], "worker_dir": str(tmp_path / "w"),
+                "results_path": "", "summary": "ok", "results": {"feature_name": "cand", "feature_column": "a"}}
+
+    def fake_judge(**kwargs):
+        threads["judge"] = threading.get_ident()
+        results = {"feature_name": "cand", "feature_column": "a", "panel_candidate_rmse": 0.05,
+                   "mean_rmse_improvement": 0.004}
+        return {"decision": "keep", "reason": "predictive_cv_improved", "keep": True, "chosen_variation": "a",
+                "chosen_review": {"action": "add", "slot": None, "evaluation": {"results": results}},
+                "accepted_panel_rmse": 0.05, "variation_summaries": []}
+
+    monkeypatch.setattr(loop, "build_data_intuition", fake_intuition)
+    monkeypatch.setattr(loop, "run_proposer", fake_proposer)
+    monkeypatch.setattr(loop, "run_worker", fake_worker)
+    monkeypatch.setattr(loop, "review_candidate", fake_judge)
+
+    async def emit(event):
+        events.append(event["type"])
+
+    async def scenario():
+        threads["loop"] = threading.get_ident()
+        return await loop.run_discovery(
+            spec=_spec(), data_dir=data, run_root=tmp_path / "run", emit=emit, rounds=2, model="m",
+            cancel_event=cancel,
+        )
+
+    result = asyncio.run(scenario())
+    assert not loop.run_folder_busy(tmp_path / "run")
+
+    for stage in ("intuition", "proposer", "worker", "judge"):
+        assert threads[stage] != threads["loop"], f"{stage} ran on the event loop"
+    # round 1: the proposer failed and cost only that round
+    assert events.count("proposer_failed") == 1 and events.count("round_completed") == 2
+    assert "judging" in events
+    rows = pd.read_csv(tmp_path / "run" / "results.tsv", sep="\t")
+    assert rows["status"].tolist() == ["proposer_failed", "completed"]
+    assert rows["decision"].tolist() == ["discard", "keep"]
+    assert result["accepted_panel"]["members"][0]["feature_column"] == "a"
+    findings = (tmp_path / "run" / "research_findings.md").read_text()
+    assert findings == result["answer"] and "Outcome: slope" in findings and "- cand [a]" in findings
+    # the sandbox's loaders and the outcome-free layout are in place
+    shared = tmp_path / "run" / "shared"
+    assert (shared / "lib" / "shared_analysis" / "slides.py").exists()
+    assert json.loads((shared / "dataset.json").read_text())["cohort_file"] == "training_cohort.csv"
+    assert "slope" not in (shared / "dataset.json").read_text()
+
+
+def test_a_judge_failure_is_reported_not_swallowed(tmp_path, monkeypatch):
+    import app.services.agent.discovery.loop as loop
+
+    data = _workspace(tmp_path)
+    monkeypatch.setattr(loop, "build_data_intuition",
+                        lambda spec, data_dir, shared_dir: (Path(shared_dir) / "data_intuition.md").write_text("b"))
+    monkeypatch.setattr(loop, "run_proposer", lambda **kw: {"candidate_id": "cand", "variations": [{"name": "a"}],
+                                                          "baseline_variation": "a"})
+    monkeypatch.setattr(loop, "run_worker", lambda **kw: {"worker_name": "w", "worker_dir": str(tmp_path / "w"),
+                                                        "results_path": "", "summary": "ok", "results": {}})
+
+    def broken_judge(**kwargs):
+        raise ValueError("Covariate contains missing or non-numeric values: age")
+
+    monkeypatch.setattr(loop, "review_candidate", broken_judge)
+
+    async def emit(event):
+        pass
+
+    asyncio.run(loop.run_discovery(spec=_spec(), data_dir=data, run_root=tmp_path / "run", emit=emit, rounds=1, model="m"))
+    row = pd.read_csv(tmp_path / "run" / "results.tsv", sep="\t").iloc[0]
+    assert row["decision"] == "discard" and "judge failed: ValueError: Covariate" in row["error"]
+    feedback = json.loads((tmp_path / "run" / "round_0001" / "round_feedback.json").read_text())
+    assert "judge failed" in loop.render_feedback_text(feedback)   # the next proposer sees why
 
 
 def test_copy_tree_skips_bytecode(tmp_path):
-    from app.services.agent.discovery.shared_runtime import copy_tree
+    from app.services.agent.discovery.loop import copy_tree
 
     src = tmp_path / "src"
     (src / "__pycache__").mkdir(parents=True)
@@ -100,115 +236,17 @@ def test_copy_tree_skips_bytecode(tmp_path):
     assert [p.name for p in (tmp_path / "dst").rglob("*")] == ["mod.py"]
 
 
-# ── result.py replay ────────────────────────────────────────────────────────
+# ── sandbox lifecycle ─────────────────────────────────────────────────────────
 
-def test_result_script_replay_runs_in_the_sandbox(tmp_path, fake_sandbox):
-    import app.services.agent.discovery.deterministic_evaluator as evaluator
+def test_sandbox_image_tag_follows_the_dockerfile():
+    import hashlib
 
-    worker_dir = _write_worker(tmp_path)
-    scratch, shared = tmp_path / "scratch", tmp_path / "shared"
-    scratch.mkdir()
-    shared.mkdir()
-    cancel = threading.Event()
+    from app.services.agent.discovery import sandbox
 
-    table, _, issues = evaluator.materialize_donor_table_via_script_interface(
-        script_path=worker_dir / "result.py",
-        data_dir=tmp_path,
-        shared_dir=shared,
-        scratch_dir=scratch,
-        timeout_sec=30,
-        cancel_event=cancel,
-    )
+    digest = hashlib.sha256(sandbox.DOCKERFILE_TEMPLATE.encode()).hexdigest()[:12]
+    assert sandbox.DEFAULT_IMAGE == f"tissuelab-discovery-worker:{digest}"
+    assert '"zarr>=3,<4"' in sandbox.DOCKERFILE_TEMPLATE
 
-    assert issues == []
-    assert table == scratch / "donor_feature_table.csv"
-    box = fake_sandbox.instances[0]
-    assert box.started and box.stopped
-    assert box.cancel_event is cancel
-    assert box.command.startswith(
-        "/usr/local/bin/python3 -B /scratch/__materialize_donor_table.py /scratch/result.py /data /shared /scratch"
-    )
-    assert sys.executable not in box.command
-    assert (scratch / "result.py").exists()
-
-
-def test_replayed_table_outlives_the_evaluation_and_is_reused(tmp_path, fake_sandbox):
-    import app.services.agent.discovery.deterministic_evaluator as evaluator
-
-    worker_dir = _write_worker(tmp_path)
-    kwargs = dict(worker_dir=worker_dir, script_path=worker_dir / "result.py", data_dir=tmp_path, cancel_event=None)
-
-    table, _, issues = evaluator._replay_donor_table(**kwargs)
-    assert issues == [] and table.exists()
-    assert table.is_relative_to(worker_dir / "replay")
-
-    again, _, _ = evaluator._replay_donor_table(**kwargs)
-    assert again == table
-    assert len(fake_sandbox.instances) == 1  # second evaluation reused the replay
-
-    (worker_dir / "result.py").write_text("def compute_donor_score(*a, **k):\n    return 2.0\n")
-    evaluator._replay_donor_table(**kwargs)
-    assert len(fake_sandbox.instances) == 2  # a changed script replays again
-
-
-def test_cancelled_replay_is_not_recorded(tmp_path, fake_sandbox):
-    # A replay killed by cancel/shutdown says nothing about the script; a
-    # recorded failure would drop that candidate for good on resume.
-    import app.services.agent.discovery.deterministic_evaluator as evaluator
-
-    worker_dir = _write_worker(tmp_path)
-    cancelled = threading.Event()
-    cancelled.set()
-    evaluator._replay_donor_table(
-        worker_dir=worker_dir, script_path=worker_dir / "result.py", data_dir=tmp_path, cancel_event=cancelled,
-    )
-    assert not (worker_dir / "replay" / evaluator.REPLAY_RECORD_NAME).exists()
-
-
-def test_replay_only_candidate_gets_a_panel_score(tmp_path, fake_sandbox):
-    # Regression: the replayed table used to live in a TemporaryDirectory that
-    # was gone by the time the panel score read it, so every worker relying on
-    # replay was discarded with no panel score.
-    import app.services.agent.discovery.deterministic_evaluator as evaluator
-
-    n = 32
-    donors = [f"d{i}" for i in range(n)]
-    outcome = [0.3 * i + (0.5 if i % 3 == 0 else -0.2) for i in range(n)]
-    pd.DataFrame({
-        "donor_id": donors,
-        "slide_name": [f"{d}.svs.zarr" for d in donors],
-        "slope_zmem0": outcome,
-        "max_age_vis": [70 + (i % 9) for i in range(n)],
-        "braak_numeric": [i % 6 for i in range(n)],
-        "cerad_ordinal": [i % 4 for i in range(n)],
-        "sex": ["male" if i % 2 else "female" for i in range(n)],
-    }).to_csv(tmp_path / "training_cohort.csv", index=False)
-
-    feature = [v + (0.4 if i % 2 else -0.4) for i, v in enumerate(outcome)]
-    FakeSandbox.table = pd.DataFrame({
-        "donor_id": donors,
-        "slide_name": [f"{d}.svs.zarr" for d in donors],
-        "cand": feature,
-    }).to_csv(index=False)
-    FakeSandbox.metadata = json.dumps({"feature_name": "cand", "feature_column": "cand"})
-
-    worker_dir = _write_worker(tmp_path)
-    evaluation = evaluator.evaluate_worker_artifacts(
-        worker_name="round_0001_worker",
-        worker_dir=worker_dir,
-        data_dir=tmp_path,
-        results_path=None,
-        primary_outcome="slope_zmem0",
-        panel_state={"members": []},
-    )
-
-    results = evaluation["results"]
-    table_path = results["artifacts"]["donor_feature_table"]
-    assert table_path.startswith(str(worker_dir / "replay"))
-    assert results.get("panel_candidate_score") is not None, evaluation.get("summary")
-
-
-# ── sandbox lifecycle ───────────────────────────────────────────────────────
 
 def test_watch_cancel_kills_the_container_until_stopped(tmp_path, monkeypatch):
     from app.services.agent.discovery.sandbox import SandboxSession
@@ -238,9 +276,9 @@ def test_owned_container_cleanup_respects_live_owners(monkeypatch):
 
     live_other = 424242
     listing = "\n".join([
-        f"tl-autoresearch-mine\t{os.getpid()}",
-        "tl-autoresearch-orphan\t999999",
-        f"tl-autoresearch-other\t{live_other}",
+        f"tl-discovery-mine\t{os.getpid()}",
+        "tl-discovery-orphan\t999999",
+        f"tl-discovery-other\t{live_other}",
     ])
     removed = []
 
@@ -257,7 +295,7 @@ def test_owned_container_cleanup_respects_live_owners(monkeypatch):
 
     assert sandbox.remove_owned_containers(current_process=True) == 1
     assert sandbox.remove_owned_containers(current_process=False) == 1
-    assert removed == [["tl-autoresearch-mine"], ["tl-autoresearch-orphan"]]
+    assert removed == [["tl-discovery-mine"], ["tl-discovery-orphan"]]
 
 
 def test_docker_preflight_reasons(monkeypatch):
@@ -283,69 +321,19 @@ def test_request_shutdown_signals_threads_and_cancels_tasks():
     from app.services.agent.discovery.run_manager import DiscoveryRunManager
 
     async def scenario():
-        manager = DiscoveryRunManager(store=None)
+        manager = DiscoveryRunManager()
         manager._tasks["run_a"] = asyncio.create_task(asyncio.sleep(30))
+        manager._cancel_events["run_a"] = threading.Event()
         stopping = manager.request_shutdown()
         await asyncio.wait(stopping, timeout=2)
         return manager, stopping
 
     manager, stopping = asyncio.run(scenario())
-    assert manager._cancel_event("run_a").is_set()
+    assert manager._cancel_events["run_a"].is_set()
     assert all(task.cancelled() for task in stopping)
 
 
-# ── the loop ────────────────────────────────────────────────────────────────
-
-def test_loop_runs_blocking_stages_off_the_event_loop_and_writes_findings(tmp_path, monkeypatch):
-    import app.services.agent.discovery.simple_loop as loop
-
-    threads = {}
-    cancel = threading.Event()
-
-    def record(stage):
-        threads[stage] = threading.get_ident()
-
-    def fake_worker(**kwargs):
-        record("worker")
-        assert kwargs["cancel_event"] is cancel
-        return {"worker_name": kwargs["worker_brief"]["worker_name"], "worker_dir": str(tmp_path / "w"),
-                "results_path": "", "summary": "ok"}
-
-    def fake_evaluate(**kwargs):
-        record("evaluate")
-        assert kwargs["cancel_event"] is cancel
-        return {"results": {"feature_name": "cand", "panel_candidate_score": 0.5,
-                            "panel_baseline_score": 0.1, "delta_panel_score": 0.4}, "summary": "scored"}
-
-    monkeypatch.setattr(loop, "ensure_shared_runtime", lambda **kw: record("shared_runtime") or {})
-    monkeypatch.setattr(loop, "_propose_candidate", lambda **kw: {"candidate_id": "cand", "scientific_question": "q"})
-    monkeypatch.setattr(loop, "run_worker", fake_worker)
-    monkeypatch.setattr(loop, "evaluate_worker_artifacts", fake_evaluate)
-
-    events = []
-
-    async def emit(event):
-        events.append(event["type"])
-
-    async def scenario():
-        threads["loop"] = threading.get_ident()
-        return await loop.run_autoresearch(
-            program_text="p", data_dir=tmp_path, run_root=tmp_path / "run", emit=emit,
-            rounds=1, dataset_scout_enabled=False, cancel_event=cancel,
-        )
-
-    result = asyncio.run(scenario())
-
-    for stage in ("shared_runtime", "worker", "evaluate"):
-        assert threads[stage] != threads["loop"], f"{stage} ran on the event loop"
-    assert events[-3:] == ["worker_completed", "round_summary", "round_completed"]
-    assert result["accepted_panel"]["members"][0]["feature_name"] == "cand"
-    findings = (tmp_path / "run" / "research_findings.md").read_text()
-    assert findings == result["answer"]
-    assert "- cand (round 1" in findings
-
-
-# ── LLM client ──────────────────────────────────────────────────────────────
+# ── LLM client ────────────────────────────────────────────────────────────────
 
 def test_responses_api_is_required(monkeypatch):
     from app.services.agent.discovery import client as discovery_client
@@ -380,3 +368,15 @@ def test_responses_calls_carry_the_callers_timeout(monkeypatch):
     discovery_client.responses_create({"model": "m", "input": "hi"}, timeout=42)
     assert seen["options"] == {"timeout": 42, "max_retries": 1}
     assert seen["payload"] == {"model": "m", "input": "hi"}
+
+
+def test_image_messages_embed_the_file(tmp_path):
+    from app.services.agent.discovery.client import input_image_message
+
+    png = tmp_path / "plot.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n")
+    message = input_image_message(png, text="look")
+    assert message["content"][1]["image_url"].startswith("data:image/png;base64,")
+    with pytest.raises(ValueError):
+        (tmp_path / "notes.txt").write_text("x")
+        input_image_message(tmp_path / "notes.txt")

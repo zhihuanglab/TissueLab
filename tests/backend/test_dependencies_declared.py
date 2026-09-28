@@ -21,11 +21,6 @@ OPTIONAL = {"resource", "docker", "pylibCZIrw", "pythoncom", "pywintypes", "win3
 ALIASES = {"cv2": {"opencv-python", "opencv-python-headless"}, "PIL": {"pillow"}, "yaml": {"pyyaml"},
            "dotenv": {"python-dotenv"}, "multipart": {"python-multipart"}, "dateutil": {"python-dateutil"},
            "tissuelab_sdk": {"tissuelab-sdk", "tissuelab_sdk"}, "sklearn": {"scikit-learn"}}
-# Source copied into the discovery worker's Docker sandbox and imported there,
-# against the image's own packages (scikit-learn, …). The service process loads
-# only its artifacts/stats/sea_ad_lfb modules; their imports (pandas, numpy,
-# scipy, zarr, matplotlib) are declared, which test_discovery_host_imports checks.
-SANDBOX_ONLY = SERVICE_DIR / "app" / "services" / "agent" / "discovery" / "shared_lib_source"
 # Modules imported directly but installed as hard dependencies of a declared package.
 TRANSITIVE = {"starlette": "fastapi", "anyio": "fastapi", "httpx": "openai", "numcodecs": "zarr",
               "cffi": "pyvips"}
@@ -35,8 +30,6 @@ def _third_party_imports():
     stdlib = set(sys.stdlib_module_names)
     found = {}
     for path in (SERVICE_DIR / "app").rglob("*.py"):
-        if SANDBOX_ONLY in path.parents:
-            continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             names = []
