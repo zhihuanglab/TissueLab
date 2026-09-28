@@ -45,9 +45,10 @@ test.describe('Preferences: AI models', () => {
     await expect(dialog.getByLabel('Agent API key')).toHaveAttribute('placeholder', /^•••• \(from \.env\.local\)$/);
 
     await dialog.getByLabel('Agent model').fill('e2e-model');
-    await dialog.getByLabel('Agent API key').fill(KEY);
-    // The eye reveals what was typed, and hides it again.
+    // The eye appears only while a key is being typed; it reveals it and hides it again.
     const keyBox = dialog.getByLabel('Agent API key');
+    await expect(dialog.getByRole('button', { name: 'Show API key' })).toHaveCount(0);
+    await keyBox.fill(KEY);
     await expect(keyBox).toHaveAttribute('type', 'password');
     await dialog.getByRole('button', { name: 'Show API key' }).first().click();
     await expect(keyBox).toHaveAttribute('type', 'text');
@@ -63,6 +64,7 @@ test.describe('Preferences: AI models', () => {
     await expect(status).toContainText('Agent: ready (e2e-model, Chat Completions)');
     await expect(status).toContainText('Research: ready (gpt-5.4-mini)');
     await expect(dialog.getByLabel('Agent API key')).toHaveValue('');
+    await expect(dialog.getByRole('button', { name: 'Show API key' })).toHaveCount(0);
     await expect(dialog.getByLabel('Agent API key')).toHaveAttribute('placeholder', 'Saved ••••2222 — type to replace');
     expect(JSON.parse(fs.readFileSync(settingsFile(), 'utf8'))).toMatchObject({ LLM_MODEL: 'e2e-model', OPENAI_API_KEY: KEY });
 

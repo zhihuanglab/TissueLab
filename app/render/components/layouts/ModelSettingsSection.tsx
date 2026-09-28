@@ -120,12 +120,16 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
             aria-label={name === 'OPENAI_API_KEY' ? 'Agent API key' : 'Research API key'}
             placeholder={placeholder}
             value={keys[name]}
-            className="pr-9"
+            className={keys[name] ? 'pr-9' : undefined}
             onChange={(e) => {
               setSaved(false)
               setKeys((prev) => ({ ...prev, [name]: e.target.value }))
+              // Emptied: the next key starts hidden again.
+              if (!e.target.value) setShowKeys((prev) => ({ ...prev, [name]: false }))
             }}
           />
+          {/* Only while typing: there is nothing to reveal otherwise. */}
+          {keys[name] && (
           <button
             type="button"
             aria-label={shown ? 'Hide API key' : 'Show API key'}
@@ -135,6 +139,7 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
           >
             {shown ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
           </button>
+          )}
         </div>
         {field?.set && !cleared && (
           <Button
