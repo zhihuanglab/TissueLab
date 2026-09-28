@@ -7,7 +7,7 @@
 # PYTHONNOUSERSITE=1 specifically so this env's packages cannot leak into it.
 # So torch and the rest of the DL stack must NOT be installed here — verified:
 # the service source imports none of torch / open-clip / clip-interrogator /
-# csbdeep / instanseg / datasets / fairscale / einops, nor pandas / scikit-image /
+# csbdeep / instanseg / datasets / fairscale / einops, nor scikit-image /
 # scikit-learn / shapely / rasterio / slideio / xarray / dask / s3fs / numba.
 #
 # Versions resolved 2026-08-28 for Python 3.11; the full app import graph was
@@ -26,6 +26,8 @@ numpy==2.4.6
 opencv-python-headless==5.0.0.93
 Pillow==12.3.0
 scipy==1.17.1
+# Discovery evaluator (app/services/agent/discovery): donor tables and cohort stats
+pandas==3.0.6
 h5py==3.16.0
 matplotlib==3.11.1
 
