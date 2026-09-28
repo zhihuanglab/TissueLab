@@ -717,6 +717,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="TLAgent">Agent</SelectItem>
+                <SelectItem value="TL Coscientist">Research</SelectItem>
               </SelectContent>
             </Select>
           </div>

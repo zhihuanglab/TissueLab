@@ -18,6 +18,7 @@ from app.core.auth import AuthUser, get_auth_user
 from app.core.errors import AppErrors
 from app.core.logger import logger
 from app.core.response import error_response, success_response
+from app.api.discovery import discovery_router
 from app.services.agent.workflow_agent import (
     AgentNotConfigured,
     WorkflowAgent,
@@ -29,6 +30,8 @@ from app.services.feedback import get_feedback_service
 from app.utils.workflow.model_store import model_store
 
 agent_router = APIRouter()
+# Research panel (discovery / autoresearch): /v1/coscientist/*
+agent_router.include_router(discovery_router)
 
 
 class AgentRequest(BaseModel):

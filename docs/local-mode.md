@@ -70,6 +70,7 @@ authentication in front of it.
 │   └── samples/            # public read-only samples
 ├── users/local/            # profile.json, avatar, workflow_history/, knowledge_base.json
 ├── workflow_preferences/   # feedback preference store
+├── discovery_sessions/     # Research panel sessions (runs themselves live in <workspace>/autoresearch_runs/)
 ├── model_registry.json     # installed task nodes
 ├── nodes/, tasknode_logs/  # task node bundles and their logs
 └── logs/                   # service log
