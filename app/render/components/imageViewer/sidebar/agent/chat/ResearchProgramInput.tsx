@@ -245,17 +245,11 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
         className="min-h-[150px] text-[13px] leading-relaxed resize-none border-border/60 focus:border-primary/50 focus:ring-primary/20 bg-background"
       />
 
-      {/* What the text amounts to on this folder's data */}
+      {/* What the text amounts to on this folder's data (nothing to show: no box) */}
+      {(!workspaceDir || isHeader || cohort) && (
       <div className="mt-2 rounded-md border border-border/60 bg-muted/30 px-2.5 py-2 text-[11px] space-y-2" data-testid="program-summary">
         {!workspaceDir && (
           <div className="text-muted-foreground">Open a slide first: its folder is the workspace, which holds the cohort table and the analysed slides.</div>
-        )}
-
-        {workspaceDir && setup && setup.cohorts.length === 0 && !isHeader && (
-          <div className="text-amber-600">
-            No table of patients (CSV) in this folder: Research needs one, with each patient&apos;s slide and the
-            value to predict.
-          </div>
         )}
 
         {isHeader && (
@@ -344,6 +338,7 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
           </>
         )}
       </div>
+      )}
 
       {notice && <Hint tone="warn">{notice}</Hint>}
       <Hint>
