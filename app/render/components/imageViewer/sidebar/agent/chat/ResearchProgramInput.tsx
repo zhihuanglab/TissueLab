@@ -54,6 +54,7 @@ type Resolved = {
   mode: "text" | "header"
   fields: ProblemFields | null
   detected_by: "text" | "model" | "header" | null
+  covariates_by?: "text" | "model" | null
   error: string | null
 }
 type AuthedFetch = (url: string, options: RequestInit) => Promise<{ ok: boolean; status: number; data: any }>
@@ -176,13 +177,16 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
     if (!detected) return null
     const sameCohort = (saved.cohort_file ?? detected.cohort_file) === detected.cohort_file
     const fromSaved = sameCohort ? saved : {}
+    const outcome = picked.outcome ?? (detected.outcome || fromSaved.outcome || "")
+    const covariates = picked.covariates ?? (detected.covariates.length ? detected.covariates : fromSaved.covariates ?? [])
     return {
       ...detected,
       id_column: picked.id_column ?? fromSaved.id_column ?? detected.id_column,
       slide_column: picked.slide_column ?? fromSaved.slide_column ?? detected.slide_column,
       mpp_column: picked.mpp_column ?? fromSaved.mpp_column ?? detected.mpp_column,
-      outcome: picked.outcome ?? (detected.outcome || fromSaved.outcome || ""),
-      covariates: picked.covariates ?? (detected.covariates.length ? detected.covariates : fromSaved.covariates ?? []),
+      outcome,
+      // the outcome is never also adjusted for (e.g. after picking a former covariate)
+      covariates: covariates.filter((c) => c !== outcome),
       excluded_classes: fromSaved.excluded_classes ?? [],
       exclude_only_classes: fromSaved.exclude_only_classes ?? [],
       question: text.trim(),
@@ -191,7 +195,7 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
 
   const outcomeSource =
     picked.outcome ? "your choice"
-      : detected?.outcome ? (resolved?.detected_by === "model" ? "matched by AI from your text" : "named in your text")
+      : detected?.outcome ? (resolved?.detected_by === "model" ? "chosen by AI" : "named in your text")
         : effective?.outcome ? "from the last saved problem.md"
           : null
 
@@ -265,7 +269,7 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
           typedRef.current = true
           setText(e.target.value)
         }}
-        placeholder={`Describe what to look for, e.g.\nFind tissue and cell-composition features that predict ${example}, adjusting for age and sex.`}
+        placeholder={"Describe the research program: what to look for in these slides.\nNo need to name the outcome or covariates; they are chosen from the cohort table and shown below."}
         className="min-h-[150px] text-[13px] leading-relaxed resize-none border-border/60 focus:border-primary/50 focus:ring-primary/20 bg-background"
       />
 
@@ -315,7 +319,7 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
                     )}
                   </>
                 ) : (
-                  <span>Name the column to predict in your program, e.g. &quot;predict {example}&quot;.</span>
+                  <span>Could not choose a column to predict: pick one below, or name it in the program (e.g. &quot;predict {example}&quot;).</span>
                 )}
                 <div className="text-[10px] mt-0.5">
                   {cohort.file} · {cohort.rows} patients · {cohort.slides_found} slides found

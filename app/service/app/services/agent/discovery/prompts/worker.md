@@ -35,6 +35,8 @@ Then reply with the single word `DONE`.
   (`baseline_variation`), support rules.
 - `/shared/data_intuition.md` — per-region cell counts, class fractions and
   spacings measured on these slides.
+- `/shared/dataset_guide.md` (when the dataset scout ran) — the folder's files,
+  slide structure, conventions and pitfalls, with loading snippets.
 - `/data/` — the cohort file (identifier, slide and mpp columns only — no
   outcomes or covariates exist inside the sandbox) and the slide `.zarr` stores.
 - `/shared/lib` (on PYTHONPATH) — audited loaders. Use them:

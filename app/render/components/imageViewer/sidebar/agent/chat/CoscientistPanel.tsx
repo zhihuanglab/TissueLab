@@ -5,6 +5,7 @@ import {
   FlaskConical, Users, History, Plus, FolderOpen, Search, FileText, RotateCcw,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { Progress } from "@/components/ui/progress"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
@@ -35,6 +36,16 @@ type ToolCallEntry = {
   status: "running" | "done" | "error"
 }
 
+// The dataset scout: explores the folder once, before round 1, and writes a guide.
+type ScoutState = {
+  status: "idle" | "running" | "done" | "failed"
+  calls: ToolCallEntry[]
+  note?: string
+  reusedFrom?: string
+}
+const SCOUT_IDLE: ScoutState = { status: "idle", calls: [] }
+const NEW_GUIDE = "__new__"
+
 type WorkerStatus = {
   name: string
   question: string
@@ -63,6 +74,7 @@ type WorkspaceRun = {
   updated_at?: string
   rounds: number
   next_round_id: number
+  has_guide?: boolean
 }
 
 type ResumeInfo = {
@@ -150,6 +162,9 @@ export const CoscientistPanel: React.FC = () => {
   const [reasoningEffort, setReasoningEffort] = useState<"low" | "medium" | "high">("high")
   const [workerTimeLimitMin, setWorkerTimeLimitMin] = useState(30)
   const [showAdvanced, setShowAdvanced] = useState(false)
+  const [datasetScout, setDatasetScout] = useState(true)
+  // Which earlier run's guide to reuse ("" = explore anew); null = the newest one there is.
+  const [guideChoice, setGuideChoice] = useState<string | null>(null)
 
   // Workspace run state
   const [workspaceRuns, setWorkspaceRuns] = useState<WorkspaceRun[]>([])
@@ -165,6 +180,7 @@ export const CoscientistPanel: React.FC = () => {
   const [selectedWorker, setSelectedWorker] = useState<string | null>(null)
   const [roundPhase, setRoundPhase] = useState<"proposing" | "workers" | "materializing" | "evaluating" | "done" | null>(null)
   const [measureStatus, setMeasureStatus] = useState<"idle" | "running" | "done">("idle")
+  const [scout, setScout] = useState<ScoutState>(SCOUT_IDLE)
   const [finalSummary, setFinalSummary] = useState<string | null>(null)
   const [expandedJournalIdx, setExpandedJournalIdx] = useState<number | null>(null)
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
@@ -245,7 +261,7 @@ export const CoscientistPanel: React.FC = () => {
     setPhase("running")
     setJournal([])
     setCurrentRound(null)
-    setMeasureStatus("idle")
+    setMeasureStatus("idle"); setScout(SCOUT_IDLE)
     setFinalSummary(null)
     setActiveRunId(null)
 
@@ -269,6 +285,12 @@ export const CoscientistPanel: React.FC = () => {
 
   useEffect(() => { fetchWorkspaceRuns() }, [fetchWorkspaceRuns])
 
+  // Earlier runs here that wrote a dataset guide (newest first): reusing one skips the scout.
+  const guideRuns = workspaceRuns.filter(r => r.has_guide)
+  const reuseGuideFrom = !datasetScout ? ""
+    : guideChoice === null ? (guideRuns[0]?.run_id ?? "")
+      : guideRuns.some(r => r.run_id === guideChoice) ? guideChoice : ""
+
   // ─── Start research ──────────────────────────────────────────────────────
 
   const startResearch = async () => {
@@ -282,7 +304,7 @@ export const CoscientistPanel: React.FC = () => {
     setPhase("running")
     setJournal([])
     setCurrentRound(null)
-    setMeasureStatus("idle")
+    setMeasureStatus("idle"); setScout(SCOUT_IDLE)
     setFinalSummary(null)
     setActiveRunId(null)
 
@@ -295,6 +317,8 @@ export const CoscientistPanel: React.FC = () => {
           rounds,
           reasoning_effort: reasoningEffort,
           worker_wall_clock_sec: workerTimeLimitMin * 60,
+          dataset_scout: datasetScout,
+          ...(reuseGuideFrom ? { reuse_guide_from: reuseGuideFrom } : {}),
         }),
       })
       if (!res.ok || res.data?.code !== 0) throw new Error(res.data?.message || "Failed to start run")
@@ -358,6 +382,32 @@ export const CoscientistPanel: React.FC = () => {
 
       case "data_intuition_done":
         setMeasureStatus("done")
+        break
+
+      case "scout_started":
+        setScout({ status: "running", calls: [] })
+        break
+
+      case "scout_tool_call":
+        setScout(prev => ({ ...prev, calls: [...prev.calls, { turnId: event.turn_id, thought: "", command: event.command_preview || "", status: "running" }] }))
+        break
+
+      case "scout_tool_result":
+        setScout(prev => ({
+          ...prev,
+          calls: prev.calls.map((c, i) => i === prev.calls.length - 1
+            ? { ...c, status: event.exit_code === 0 ? "done" : "error", exitCode: event.exit_code } : c),
+        }))
+        break
+
+      case "scout_done":
+        if (event.status === "reused") {
+          setScout({ status: "done", calls: [], reusedFrom: event.from })
+          break
+        }
+        setScout(prev => event.status === "completed"
+          ? { ...prev, status: "done" }
+          : { ...prev, status: "failed", note: event.error || "it finished without writing a guide" })
         break
 
       case "round_started":
@@ -640,7 +690,7 @@ export const CoscientistPanel: React.FC = () => {
             <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="Run history" onClick={() => { if (!showHistory) void fetchWorkspaceRuns(); setShowHistory(!showHistory) }}>
               <History className="h-4 w-4" />
             </Button>
-            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="New research task" onClick={() => { setPhase("input"); setFormResetKey(k => k + 1); setCurrentRound(null); setJournal([]); setError(null); setResumeInfo(null); setActiveRunId(null); setMeasureStatus("idle"); setFinalSummary(null); }}>
+            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="New research task" onClick={() => { setPhase("input"); setFormResetKey(k => k + 1); setCurrentRound(null); setJournal([]); setError(null); setResumeInfo(null); setActiveRunId(null); setMeasureStatus("idle"); setScout(SCOUT_IDLE); setFinalSummary(null); }}>
               <Plus className="h-4 w-4" />
             </Button>
           </div>
@@ -681,7 +731,7 @@ export const CoscientistPanel: React.FC = () => {
                     setJournal([])
                     setFinalSummary(null)
                     setError(null)
-                    setMeasureStatus("idle")
+                    setMeasureStatus("idle"); setScout(SCOUT_IDLE)
                     setResumeInfo(null)
                     void loadWorkspaceRun(run.run_root_path)
                   }}
@@ -736,6 +786,30 @@ export const CoscientistPanel: React.FC = () => {
                 />
               </div>
             </div>
+
+            {/* Dataset scout */}
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <label htmlFor="dataset-scout" className="text-xs font-medium text-foreground">Dataset scout</label>
+                <div className="text-[10px] text-muted-foreground">
+                  Before round 1, an agent explores the folder and writes a dataset guide for the others. Adds a few minutes.
+                </div>
+              </div>
+              <Switch id="dataset-scout" checked={datasetScout} onCheckedChange={setDatasetScout} />
+            </div>
+            {datasetScout && guideRuns.length > 0 && (
+              <Select value={reuseGuideFrom || NEW_GUIDE} onValueChange={v => setGuideChoice(v === NEW_GUIDE ? "" : v)}>
+                <SelectTrigger aria-label="Dataset guide" className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {guideRuns.map(r => (
+                    <SelectItem key={r.run_id} value={r.run_id} className="text-xs">
+                      Reuse the guide from {r.run_id} · {formatRelativeTime(r.updated_at)}
+                    </SelectItem>
+                  ))}
+                  <SelectItem value={NEW_GUIDE} className="text-xs">Explore the folder anew</SelectItem>
+                </SelectContent>
+              </Select>
+            )}
 
             {/* Advanced parameters (collapsible) */}
             <Collapsible open={showAdvanced} onOpenChange={setShowAdvanced}>
@@ -1004,7 +1078,7 @@ export const CoscientistPanel: React.FC = () => {
               <Button
                 variant="outline"
                 className="w-full h-9 text-xs border-primary/30 text-primary hover:bg-primary/5"
-                onClick={() => { setPhase("input"); setCurrentRound(null); setActiveRunId(null); setMeasureStatus("idle"); setFinalSummary(null); }}
+                onClick={() => { setPhase("input"); setCurrentRound(null); setActiveRunId(null); setMeasureStatus("idle"); setScout(SCOUT_IDLE); setFinalSummary(null); }}
               >
                 <Plus className="h-3.5 w-3.5 mr-1.5" />
                 New Research Task
@@ -1022,6 +1096,35 @@ export const CoscientistPanel: React.FC = () => {
                 <span className="text-xs text-muted-foreground">
                   {measureStatus === "running" ? "Measuring the slides (cells, classes, regions, spacings)..." : "Slides measured."}
                 </span>
+              </div>
+            )}
+
+            {/* Dataset scout card: once per run, after the slides are measured */}
+            {scout.status !== "idle" && !currentRound && (
+              <div className="px-3 py-2 rounded-lg bg-muted/30 border border-border/40 space-y-1.5" data-testid="scout-card">
+                <div className="flex items-center gap-2">
+                  {scout.status === "running" ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-primary shrink-0" />
+                  ) : (
+                    <FileText className={cn("h-3.5 w-3.5 shrink-0", scout.status === "failed" ? "text-amber-600" : "text-primary")} />
+                  )}
+                  <span className="text-xs text-muted-foreground">
+                    {scout.status === "running" && "Dataset scout: exploring the data folder..."}
+                    {scout.status === "done" && (scout.reusedFrom
+                      ? `Reusing the dataset guide from ${scout.reusedFrom}.`
+                      : `Dataset guide written (${scout.calls.length} commands).`)}
+                    {scout.status === "failed" && `Dataset scout: no guide (${scout.note}). Continuing without it.`}
+                  </span>
+                </div>
+                {scout.calls.length > 0 && (
+                  <div className="space-y-0.5 pl-5">
+                    {scout.calls.slice(-5).map((c, i) => (
+                      <div key={i} className="font-mono text-[10px] text-muted-foreground truncate" title={c.command}>
+                        <span className={cn(c.status === "error" ? "text-amber-600" : c.status === "running" ? "text-primary" : "")}>$</span> {c.command}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 

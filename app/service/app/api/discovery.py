@@ -37,6 +37,7 @@ from app.services.agent.discovery.workspace_scan import (
     write_cohort_template,
 )
 from app.services.agent.discovery.run_manager import PROBLEM_FILENAME
+from app.services.agent.discovery.scout import GUIDE_NAME
 from app.services.agent.discovery.sandbox import RUNS_DIRNAME, docker_unavailable_reason
 from app.services.file_manager.common import (
     assert_can_access_path,
@@ -53,6 +54,9 @@ class StartRunRequest(BaseModel):
     rounds: int = Field(3, ge=1, le=50)
     reasoning_effort: str = "high"
     worker_wall_clock_sec: int = Field(1800, ge=120, le=7200)
+    dataset_scout: bool = True      # explore the folder first, write a dataset guide
+    # instead of exploring: the guide of an earlier run in this workspace (its run id)
+    reuse_guide_from: Optional[str] = None
 
 
 class ResumeRunRequest(BaseModel):
@@ -85,6 +89,8 @@ def _run_summary(run_root: Path) -> Dict[str, Any]:
         "status": status,
         "rounds": rounds,
         "next_round_id": next_round_id,
+        # its scout's guide, which a new run here may reuse
+        "has_guide": (run_root / "shared" / GUIDE_NAME).is_file(),
     }
 
 
@@ -218,6 +224,8 @@ async def start_run(request: StartRunRequest, auth_user: AuthUser = Depends(get_
             rounds=request.rounds,
             reasoning_effort=request.reasoning_effort,
             worker_wall_clock_sec=request.worker_wall_clock_sec,
+            dataset_scout=request.dataset_scout,
+            reuse_guide_from=request.reuse_guide_from,
         )
     except ProblemError as exc:
         raise AppErrors.PARAMS_ERROR(str(exc))

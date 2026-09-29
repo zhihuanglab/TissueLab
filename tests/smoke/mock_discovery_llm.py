@@ -1,11 +1,13 @@
 """A scripted OpenAI Responses API server that plays the discovery proposer and worker.
 
-It is what DISCOVERY_BASE_URL points at in the end-to-end tests: every round the
+It is what DISCOVERY_BASE_URL points at in the end-to-end tests. Before round 1
+the dataset scout probes the folder once and writes its guide; every round the
 proposer inspects the data once (a shell tool call run in the real sandbox) and
 then commits to a plan; the worker writes result.py with the shared loaders,
 runs it, and says DONE. The data it expects is the synthetic cohort written by
 tests/frontend/e2e/make_discovery_dataset.py (cell classes Alpha / Beta, one
-region "Inner"). `--delay` slows every reply so a test can stop a run midway.
+region "Inner"). The panel's column choice for a program that names no column
+gets score / age, sex. `--delay` slows every reply so a test can stop a run midway.
 
     python tests/smoke/mock_discovery_llm.py --port 18081 --delay 1
     DISCOVERY_BASE_URL=http://127.0.0.1:18081/v1 DISCOVERY_API_KEY=dummy python main.py
@@ -56,6 +58,14 @@ if __name__ == "__main__":
     for d in donor_ids("/data"):
         print(d, compute_donor_features(d, "/data"), flush=True)
 '''
+SCOUT_GUIDE = (
+    "head -3 /data/cases.csv; "
+    "cat > /scratch/dataset_guide.md <<'MDEOF'\n"
+    "# Dataset guide\n\nSlides: discovery_slides/sNN.zarr, cell classes Alpha / Beta, one region Inner.\n"
+    "MDEOF"
+)
+COLUMN_CHOICE = {"outcome": "score", "covariates": ["age", "sex"]}
+
 WRITE_AND_RUN = f"cat > /scratch/result.py <<'PYEOF'\n{RESULT_PY}\nPYEOF\ncd /scratch && python result.py | tail -3"
 
 
@@ -71,6 +81,10 @@ def reply_items(body: dict) -> list:
     """The scripted turn for a request: a tool call on the first turn, then the answer."""
     instructions = str(body.get("instructions") or "")
     first_turn = isinstance(body.get("input"), str) and not body.get("previous_response_id")
+    if "# Dataset Scout" in instructions:
+        return [_tool_call(SCOUT_GUIDE)] if first_turn else [_text("DONE")]
+    if isinstance(body.get("input"), str) and body["input"].startswith("You set up a predictive analysis"):
+        return [_text(json.dumps(COLUMN_CHOICE))]
     if "# Candidate Proposer" in instructions:
         return [_tool_call(PROBE)] if first_turn else [_text(json.dumps(PLAN))]
     if "# Biomarker Worker" in instructions:

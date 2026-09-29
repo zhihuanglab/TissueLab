@@ -139,6 +139,9 @@ def test_resolve_reads_outcome_and_covariates_off_the_text(client, workspace):
 
 def test_resolve_asks_the_model_with_column_names_only(client, workspace, monkeypatch):
     import app.services.agent.discovery.client as client_mod
+    import app.services.agent.discovery.workspace_scan as scan
+
+    monkeypatch.setattr(scan, "_MODEL_ANSWERS", {})
 
     seen = []
     monkeypatch.setattr(client_mod, "unavailable_reason", lambda: None)
@@ -150,6 +153,31 @@ def test_resolve_asks_the_model_with_column_names_only(client, workspace, monkey
     assert (r["fields"]["outcome"], r["fields"]["covariates"]) == ("slope", ["age"])
     prompt = seen[0]["input"]
     assert "slope" in prompt and "-0.1" not in prompt and "80" not in prompt  # names, never values
+
+
+def test_resolve_lets_the_model_choose_what_the_program_leaves_open(client, workspace, monkeypatch):
+    # the first panel's way: a program that names no column still runs
+    import app.services.agent.discovery.client as client_mod
+    import app.services.agent.discovery.workspace_scan as scan
+
+    monkeypatch.setattr(scan, "_MODEL_ANSWERS", {})
+    calls = []
+    monkeypatch.setattr(client_mod, "unavailable_reason", lambda: None)
+    monkeypatch.setattr(client_mod, "responses_create", lambda payload, timeout=0: calls.append(payload) or {
+        "output_text": '{"outcome": "slope", "covariates": ["age"]}'
+    })
+    text = "# Program\nIterative biomarker discovery on this cohort.\n## Goal\nFind robust tissue features."
+    r = _resolve(client, workspace, text, use_model=True)
+    assert (r["fields"]["outcome"], r["fields"]["covariates"]) == ("slope", ["age"])
+    assert (r["detected_by"], r["covariates_by"]) == ("model", "model")
+    # the panel resolves on every pause in typing: one model call per text
+    _resolve(client, workspace, text, use_model=True)
+    assert len(calls) == 1
+
+    # what the text names wins; the model fills in only the rest
+    r = _resolve(client, workspace, "Which tissue features predict age?", use_model=True)
+    assert (r["fields"]["outcome"], r["detected_by"]) == ("age", "text")
+    assert r["fields"]["covariates"] == [] and r["covariates_by"] is None  # the model's "age" is the outcome
 
 
 def test_resolve_takes_a_full_problem_md_as_is(client, workspace):
@@ -234,6 +262,33 @@ def test_run_streams_loop_events_and_completes(client, workspace, llm_ready, fak
     # the submitted problem is saved to the workspace and the run folder
     assert (workspace / "problem.md").read_text() == PROBLEM
     assert (workspace / "autoresearch_runs" / run_id / "problem.md").read_text() == PROBLEM
+
+
+def test_a_new_run_can_reuse_an_earlier_runs_dataset_guide(client, workspace, llm_ready, fake_loop):
+    earlier = workspace / "autoresearch_runs" / "run_earlier"
+    (earlier / "shared").mkdir(parents=True)
+    (earlier / "run_state.json").write_text(json.dumps({"next_round_id": 2, "config": {"rounds": 1}}))
+    (earlier / "shared" / "dataset_guide.md").write_text("# Guide from before\n")
+    runs = client.get(f"{API}/runs", params={"workspace_path": str(workspace)}).json()["data"]["runs"]
+    assert [(r["run_id"], r["has_guide"]) for r in runs] == [("run_earlier", True)]
+
+    body = _start(client, workspace, reuse_guide_from="run_earlier")
+    assert body["code"] == 0, body
+    run_root = workspace / "autoresearch_runs" / body["data"]["run_id"]
+    _events(client, body["data"]["run_id"])
+    # copied in before the loop starts, so the loop skips the scout and says where the guide came from
+    assert (run_root / "shared" / "dataset_guide.md").read_text() == "# Guide from before\n"
+    assert fake_loop["calls"][-1]["guide_from"] == "run_earlier"
+
+
+@pytest.mark.parametrize("run_id, message", [
+    ("../elsewhere", "Not a run id"),
+    ("run_missing", "has no dataset guide"),
+])
+def test_reusing_a_guide_needs_an_earlier_run_here_that_has_one(client, workspace, llm_ready, fake_loop, run_id, message):
+    body = _start(client, workspace, reuse_guide_from=run_id)
+    assert body["code"] == 400 and message in body["message"]
+    assert not (workspace / "autoresearch_runs").exists() or not any((workspace / "autoresearch_runs").iterdir())
 
 
 def test_submitted_problem_replaces_existing_problem_md(client, workspace, llm_ready, fake_loop):

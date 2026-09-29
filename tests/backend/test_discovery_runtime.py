@@ -144,6 +144,7 @@ def test_loop_runs_stages_off_the_event_loop_and_writes_findings(tmp_path, monke
         threads["proposer"] = threading.get_ident()
         assert loop.run_folder_busy(tmp_path / "run")   # counted while the thread runs
         assert kwargs["cancel_event"] is cancel and kwargs["data_intuition_text"] == "brief"
+        assert kwargs["dataset_guide_text"] == "guide"
         item = next(proposals)
         if isinstance(item, Exception):
             raise item
@@ -163,7 +164,15 @@ def test_loop_runs_stages_off_the_event_loop_and_writes_findings(tmp_path, monke
                 "chosen_review": {"action": "add", "slot": None, "evaluation": {"results": results}},
                 "accepted_panel_rmse": 0.05, "variation_summaries": []}
 
+    def fake_scout(**kwargs):
+        threads["scout"] = threading.get_ident()
+        # after the brief, which it reads
+        assert (Path(kwargs["shared_dir"]) / "data_intuition.md").exists()
+        (Path(kwargs["shared_dir"]) / "dataset_guide.md").write_text("guide")
+        return {"status": "completed", "turns": 3}
+
     monkeypatch.setattr(loop, "build_data_intuition", fake_intuition)
+    monkeypatch.setattr(loop, "run_scout", fake_scout)
     monkeypatch.setattr(loop, "run_proposer", fake_proposer)
     monkeypatch.setattr(loop, "run_worker", fake_worker)
     monkeypatch.setattr(loop, "review_candidate", fake_judge)
@@ -181,10 +190,12 @@ def test_loop_runs_stages_off_the_event_loop_and_writes_findings(tmp_path, monke
     result = asyncio.run(scenario())
     assert not loop.run_folder_busy(tmp_path / "run")
 
-    for stage in ("intuition", "proposer", "worker", "judge"):
+    for stage in ("intuition", "scout", "proposer", "worker", "judge"):
         assert threads[stage] != threads["loop"], f"{stage} ran on the event loop"
     # round 1: the proposer failed and cost only that round
     assert events.count("proposer_failed") == 1 and events.count("round_completed") == 2
+    assert events.index("scout_started") < events.index("scout_done") < events.index("round_started")
+    assert json.loads((tmp_path / "run" / "run_state.json").read_text())["config"]["dataset_scout"] is True
     assert "judging" in events
     rows = pd.read_csv(tmp_path / "run" / "results.tsv", sep="\t")
     assert rows["status"].tolist() == ["proposer_failed", "completed"]
@@ -218,11 +229,72 @@ def test_a_judge_failure_is_reported_not_swallowed(tmp_path, monkeypatch):
     async def emit(event):
         pass
 
-    asyncio.run(loop.run_discovery(spec=_spec(), data_dir=data, run_root=tmp_path / "run", emit=emit, rounds=1, model="m"))
+    asyncio.run(loop.run_discovery(spec=_spec(), data_dir=data, run_root=tmp_path / "run", emit=emit, rounds=1,
+                                   model="m", dataset_scout=False))
     row = pd.read_csv(tmp_path / "run" / "results.tsv", sep="\t").iloc[0]
     assert row["decision"] == "discard" and "judge failed: ValueError: Covariate" in row["error"]
     feedback = json.loads((tmp_path / "run" / "round_0001" / "round_feedback.json").read_text())
     assert "judge failed" in loop.render_feedback_text(feedback)   # the next proposer sees why
+
+
+# ── the dataset scout ─────────────────────────────────────────────────────────
+
+class ScoutSandbox(ScriptedSandbox):
+    """The scout's commands; the one naming the guide writes it."""
+
+    def exec(self, command, timeout_sec=None):
+        self.commands = getattr(self, "commands", []) + [command]
+        if "dataset_guide.md" in command:
+            (self.scratch / "dataset_guide.md").write_text("# Guide\n" + "x" * 20000)
+        return {"exit_code": 0, "stdout": "ok", "stderr": ""}
+
+
+def _message(text, rid):
+    return {"id": rid, "output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]}
+
+
+def _shell(command, rid):
+    return {"id": rid, "output": [{"type": "custom_tool_call", "name": "shell_exec", "call_id": rid, "input": command}]}
+
+
+def test_scout_writes_the_guide_into_shared_from_an_outcome_blind_sandbox(tmp_path, monkeypatch):
+    from app.services.agent.discovery import scout
+
+    data = _workspace(tmp_path)
+    shared = tmp_path / "run" / "shared"
+    shared.mkdir(parents=True)
+    ScriptedSandbox.instances = []
+    replies = iter([_shell("ls /data", "r1"), _shell("cat > /scratch/dataset_guide.md <<'EOF' ... EOF", "r2"),
+                    _message("DONE", "r3")])
+    requests, events = [], []
+    monkeypatch.setattr(scout, "SandboxSession", ScoutSandbox)
+    monkeypatch.setattr(scout, "responses_create", lambda payload, timeout=0: requests.append(payload) or next(replies))
+
+    result = scout.run_scout(spec=_spec(), data_dir=data, shared_dir=shared, run_root=tmp_path / "run",
+                             model="m", on_event=events.append)
+    assert result == {"status": "completed", "turns": 2}
+    guide = (shared / "dataset_guide.md").read_text()
+    assert guide.startswith("# Guide") and len(guide) == scout.GUIDE_MAX_CHARS
+    box = ScriptedSandbox.instances[0]
+    assert box.stopped and box.commands[0] == "ls /data"
+    # the cohort it sees has no outcome / covariate columns
+    public = pd.read_csv(box.file_overlays["/data/training_cohort.csv"])
+    assert list(public.columns) == ["donor_id", "slide_name"]
+    assert "Which measurements track the slope?" in requests[0]["instructions"]
+    assert [e["type"] for e in events] == ["scout_tool_call", "scout_tool_result"] * 2
+
+
+def test_scout_without_a_guide_reports_it(tmp_path, monkeypatch):
+    from app.services.agent.discovery import scout
+
+    data = _workspace(tmp_path)
+    shared = tmp_path / "run" / "shared"
+    shared.mkdir(parents=True)
+    replies = iter([_message("DONE", f"r{i}") for i in range(3)])
+    monkeypatch.setattr(scout, "SandboxSession", ScoutSandbox)
+    monkeypatch.setattr(scout, "responses_create", lambda payload, timeout=0: next(replies))
+    result = scout.run_scout(spec=_spec(), data_dir=data, shared_dir=shared, run_root=tmp_path / "run", model="m")
+    assert result["status"] == "no_guide" and not (shared / "dataset_guide.md").exists()
 
 
 def test_copy_tree_skips_bytecode(tmp_path):

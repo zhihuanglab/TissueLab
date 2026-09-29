@@ -215,6 +215,7 @@ def run_proposer(
     max_tool_turns: int = 8,
     wall_clock_sec: int = 600,
     command_timeout_sec: int = 120,
+    dataset_guide_text: str = "",
     on_event: Optional[Callable[[dict[str, Any]], None]] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> dict[str, Any]:
@@ -239,6 +240,8 @@ def run_proposer(
         + TOOL_SECTION.format(max_tool_turns=max_tool_turns)
         + "\n\n# Research question\n" + spec.question
         + "\n\n# Data-intuition brief (outcome-blind)\n" + (data_intuition_text or "(not available)")[:20000]
+        + ("\n\n# Dataset guide (written by the dataset scout, outcome-blind)\n" + dataset_guide_text[:12000]
+           if dataset_guide_text else "")
     )
     payload = {
         "accepted_panel": accepted_panel_summary,

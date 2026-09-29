@@ -29,6 +29,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from .client import discovery_model
 from .data_intuition import build_data_intuition
+from .scout import GUIDE_NAME, run_scout
 from .judge import review_candidate
 from .panel_cv import PredictivePanelConfig
 from .problem import ProblemSpec, write_dataset_layout
@@ -461,9 +462,15 @@ async def run_discovery(
     model: Optional[str] = None,
     reasoning_effort: str = "high",
     worker_wall_clock_sec: int = DEFAULT_WORKER_WALL_CLOCK,
+    dataset_scout: bool = True,
+    guide_from: Optional[str] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> dict[str, Any]:
     """Run `rounds` rounds in run_root (resuming from run_state.json if present).
+
+    dataset_scout: before round 1, an agent explores the data folder and writes
+    shared/dataset_guide.md for the proposer and workers (once per run).
+    guide_from: the run whose guide was copied in instead (the scout is skipped).
 
     cancel_event stops the proposer / worker threads and their sandboxes: the
     awaiting coroutine can be cancelled, but the threads it waits on cannot.
@@ -478,7 +485,8 @@ async def run_discovery(
     state = _load_or_init_state(
         run_root=run_root,
         config={"rounds": rounds, "model": model, "reasoning_effort": reasoning_effort,
-                "worker_wall_clock_sec": worker_wall_clock_sec},
+                "worker_wall_clock_sec": worker_wall_clock_sec, "dataset_scout": dataset_scout,
+                "guide_from": guide_from},
     )
     accepted_panel = _load_or_init_accepted_panel(run_root)
     await asyncio.to_thread(copy_tree, SHARED_LIB_SOURCE, shared_dir / "lib" / "shared_analysis")
@@ -501,6 +509,24 @@ async def run_discovery(
         await emit({"type": "data_intuition_done"})
     data_intuition_text = intuition_path.read_text(encoding="utf-8")
 
+    # The scout reads the brief above, so it goes second; a failed scout costs the guide, not the run.
+    guide_path = shared_dir / GUIDE_NAME
+    if guide_from and guide_path.exists() and int(state.get("next_round_id", 1) or 1) == 1:
+        await emit({"type": "scout_done", "status": "reused", "from": guide_from})
+    elif dataset_scout and not guide_path.exists():
+        await emit({"type": "scout_started"})
+        try:
+            scouted = await _in_thread(
+                run_root, run_scout, spec=spec, data_dir=data_dir, shared_dir=shared_dir, run_root=run_root,
+                model=model, on_event=forward, cancel_event=cancel_event,
+            )
+            await emit({"type": "scout_done", **scouted})
+        except Exception as exc:
+            if cancel_event is not None and cancel_event.is_set():
+                raise
+            await emit({"type": "scout_done", "status": "error", "error": f"{type(exc).__name__}: {exc}"})
+    dataset_guide_text = guide_path.read_text(encoding="utf-8") if guide_path.exists() else ""
+
     next_round_id = int(state.get("next_round_id", 1) or 1)
     rounds_done = 0
     for round_id in range(next_round_id, next_round_id + rounds):
@@ -515,6 +541,7 @@ async def run_discovery(
                 round_dir=round_dir,
                 spec=spec,
                 data_intuition_text=data_intuition_text,
+                dataset_guide_text=dataset_guide_text,
                 accepted_panel_summary=accepted_panel_summary(accepted_panel),
                 results_log_text=load_feedback_history(run_root),
                 round_id=round_id,

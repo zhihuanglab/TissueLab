@@ -49,7 +49,7 @@ SANDBOX_PIDS_LIMIT = os.environ.get("TL_SANDBOX_PIDS_LIMIT", "512")
 SANDBOX_TMPFS_SIZE = os.environ.get("TL_SANDBOX_TMPFS_SIZE", "512m")
 
 OWNER_LABEL = "tissuelab.discovery.pid"
-SHARED_READ_ONLY = ("lib", "dataset.json", "data_intuition.md")
+SHARED_READ_ONLY = ("lib", "dataset.json", "data_intuition.md", "dataset_guide.md")
 # Runs live under <data folder>/autoresearch_runs; the sandbox masks it.
 RUNS_DIRNAME = "autoresearch_runs"
 SANDBOX_PYTHON = "/usr/local/bin/python3"

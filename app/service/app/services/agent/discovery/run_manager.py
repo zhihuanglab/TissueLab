@@ -8,6 +8,7 @@ folder name.
 from __future__ import annotations
 
 import asyncio
+import shutil
 import threading
 import uuid
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Any, Dict, Optional
 from app.services.agent.discovery.loop import DEFAULT_WORKER_WALL_CLOCK, read_run_state, run_discovery, run_folder_busy
 from app.services.agent.discovery.problem import ProblemError, parse_problem, validate_against_data
 from app.services.agent.discovery.sandbox import RUNS_DIRNAME
+from app.services.agent.discovery.scout import GUIDE_NAME
 from app.utils import resolve_path
 
 PROBLEM_FILENAME = "problem.md"
@@ -44,6 +46,16 @@ def run_folder(run_root_path: str) -> Path:
     return run_root
 
 
+def _earlier_guide(data_dir: Path, run_id: str) -> Path:
+    """The dataset guide an earlier run in this data folder wrote, found by its run id."""
+    if not run_id or run_id != Path(run_id).name or run_id.startswith("."):
+        raise ProblemError(f"Not a run id: {run_id!r}")
+    guide = data_dir / RUNS_DIRNAME / run_id / "shared" / GUIDE_NAME
+    if not guide.is_file():
+        raise ProblemError(f"Run {run_id} in this folder has no dataset guide to reuse")
+    return guide
+
+
 class DiscoveryRunManager:
     def __init__(self) -> None:
         self._tasks: Dict[str, asyncio.Task] = {}
@@ -62,12 +74,15 @@ class DiscoveryRunManager:
 
     async def start_run(
         self, *, task: str, workspace_path: str, rounds: int, reasoning_effort: str, worker_wall_clock_sec: int,
+        dataset_scout: bool = True,
+        reuse_guide_from: Optional[str] = None,
     ) -> str:
         """Start a run; `task` is the full problem.md text. Raises ProblemError when it
         does not parse or does not match the data folder."""
         data_dir = workspace_data_dir(workspace_path)
         spec = parse_problem(task)
         await asyncio.to_thread(validate_against_data, spec, data_dir)
+        earlier_guide = _earlier_guide(data_dir, reuse_guide_from) if reuse_guide_from else None
         # The submitted text is the problem: saved to the workspace (the panel
         # pre-fills from it) and into the run folder (resume re-reads it).
         run_id = f"run_{uuid.uuid4().hex[:10]}"
@@ -75,9 +90,14 @@ class DiscoveryRunManager:
         run_root.mkdir(parents=True)
         for path in (data_dir / PROBLEM_FILENAME, run_root / PROBLEM_FILENAME):
             await asyncio.to_thread(path.write_text, task, encoding="utf-8")
+        if earlier_guide:
+            # In place before the loop starts: it finds a guide and skips the scout.
+            (run_root / "shared").mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(shutil.copyfile, earlier_guide, run_root / "shared" / GUIDE_NAME)
         await self._launch(
             run_id, run_root, spec=spec, data_dir=data_dir, rounds=rounds,
             reasoning_effort=reasoning_effort, worker_wall_clock_sec=worker_wall_clock_sec,
+            dataset_scout=dataset_scout, guide_from=reuse_guide_from if earlier_guide else None,
         )
         return run_id
 
@@ -100,6 +120,8 @@ class DiscoveryRunManager:
             reasoning_effort=str(config.get("reasoning_effort", "high")),
             worker_wall_clock_sec=int(config.get("worker_wall_clock_sec", DEFAULT_WORKER_WALL_CLOCK)),
             model=config.get("model"),
+            # the guide is in shared/ already when the run was scouted
+            dataset_scout=bool(config.get("dataset_scout", False)),
         )
         return run_root.name
 

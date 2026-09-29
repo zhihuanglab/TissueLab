@@ -182,9 +182,9 @@ def write_cohort_template(data_dir: Path) -> str:
 #
 # The panel takes one free-text program, as it always did; the judge still needs
 # to know which cohort column to predict and which to adjust for. They are read
-# off the text by matching the cohort's column names, and — when that does not
-# settle it and a model is configured — by asking the model with the column
-# names only (never a value), then shown to the user to confirm or change.
+# off the text by matching the cohort's column names; whatever the text leaves
+# open, the model chooses from the column names alone (never a value). The panel
+# shows the result, to confirm or change.
 
 _ADJUST = re.compile(
     r"adjust|control(?:ling|led)?\s+for|account(?:ing)?\s+for|covariat|confound|correct(?:ing)?\s+for"
@@ -225,24 +225,27 @@ def match_columns(text: str, cohort: dict[str, Any]) -> dict[str, Any]:
         name for name, at in sorted(mentioned.items(), key=lambda kv: kv[1])
         if name in cohort["outcome_candidates"] and name not in covariates
     ]
-    return {
-        "outcome": outcomes[0] if outcomes else "",
-        "covariates": covariates,
-        # "adjust for age" with no column called age: worth asking the model.
-        "unmatched_adjustment": bool(adjust_spans) and not covariates,
-    }
+    return {"outcome": outcomes[0] if outcomes else "", "covariates": covariates}
 
 
-_ASK_MODEL = """You map a research question onto a cohort table's columns.
+_ASK_MODEL = """You set up a predictive analysis from a research program and a cohort table's column names.
 
-Question:
+Research program:
 {question}
 
 Columns that can be the outcome (numeric, complete): {outcomes}
 Columns that can be covariates: {covariates}
 
-Return JSON only: {{"outcome": "<one outcome column, or null if the question does not say>", "covariates": ["<columns the question says to adjust / control for>"]}}.
-Use exact column names from the lists; map plain words to them (e.g. "age" -> "age_years") only when the match is clear."""
+Choose:
+- "outcome": the column the program wants to predict or explain. If the program names or describes it,
+  use that column. If it does not, choose the most plausible primary target among the outcome columns
+  (not an identifier, a demographic, or a technical/batch variable).
+- "covariates": the columns the program says to adjust or control for. If it says none, choose the
+  plain confounders among the covariate columns (demographics such as age or sex, site / batch), never
+  another candidate outcome. May be empty.
+
+Return JSON only: {{"outcome": "<column>", "covariates": ["<column>", ...]}}. Use exact column names
+from the lists; map plain words to them (e.g. "age" -> "age_years") when the match is clear."""
 
 
 def ask_model_for_columns(text: str, cohort: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -270,6 +273,24 @@ def ask_model_for_columns(text: str, cohort: dict[str, Any]) -> Optional[dict[st
     return {"outcome": outcome, "covariates": list(dict.fromkeys(covariates))}
 
 
+_MODEL_ANSWERS: dict[tuple, dict[str, Any]] = {}
+_MODEL_ANSWERS_MAX = 64
+
+
+def _ask_model_cached(text: str, outcomes: tuple[str, ...], covariates: tuple[str, ...]) -> Optional[dict[str, Any]]:
+    """The panel re-resolves on every pause in typing: the same text asks once
+    (answers only — a failed call is asked again)."""
+    key = (text, outcomes, covariates)
+    if key not in _MODEL_ANSWERS:
+        answer = ask_model_for_columns(text, {"outcome_candidates": list(outcomes), "covariate_candidates": list(covariates)})
+        if answer is None:
+            return None
+        if len(_MODEL_ANSWERS) >= _MODEL_ANSWERS_MAX:
+            _MODEL_ANSWERS.pop(next(iter(_MODEL_ANSWERS)))
+        _MODEL_ANSWERS[key] = answer
+    return _MODEL_ANSWERS[key]
+
+
 def resolve_program(text: str, data_dir: Path, cohort_file: Optional[str] = None, use_model: bool = True) -> dict[str, Any]:
     """What a free-text program amounts to on this folder's data.
 
@@ -287,13 +308,17 @@ def resolve_program(text: str, data_dir: Path, cohort_file: Optional[str] = None
         return {"mode": "text", "fields": None, "detected_by": None, "error": "No cohort table in this folder"}
     found = match_columns(text, cohort)
     detected_by = "text" if found["outcome"] else None
-    if use_model and text.strip() and (not found["outcome"] or found["unmatched_adjustment"]):
-        asked = ask_model_for_columns(text, cohort)
+    covariates_by = "text" if found["covariates"] else None
+    # The program need not name anything: what it leaves open, the model fills in
+    # from the column names (as the panel always worked — write the program, press start).
+    if use_model and text.strip() and (not found["outcome"] or not found["covariates"]):
+        asked = _ask_model_cached(text.strip(), tuple(cohort["outcome_candidates"]), tuple(cohort["covariate_candidates"]))
         if asked:
             if not found["outcome"] and asked["outcome"]:
                 found["outcome"], detected_by = asked["outcome"], "model"
             if not found["covariates"]:
                 found["covariates"] = [c for c in asked["covariates"] if c != found["outcome"]]
+                covariates_by = "model" if found["covariates"] else None
     fields = {
         "outcome": found["outcome"],
         "question": text.strip(),
@@ -305,4 +330,4 @@ def resolve_program(text: str, data_dir: Path, cohort_file: Optional[str] = None
         "excluded_classes": [],
         "exclude_only_classes": [],
     }
-    return {"mode": "text", "fields": fields, "detected_by": detected_by, "error": None}
+    return {"mode": "text", "fields": fields, "detected_by": detected_by, "covariates_by": covariates_by, "error": None}
