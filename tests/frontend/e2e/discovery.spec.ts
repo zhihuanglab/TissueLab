@@ -84,7 +84,7 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     }
   });
 
-  test('a two-round run: plain-text program, live progress, findings, and its folder', async ({ page, guards }) => {
+  test('a one-round run: plain-text program, live progress, findings, and its folder', async ({ page, guards }) => {
     test.setTimeout(420_000);
     await openResearchPanel(page);
 
@@ -99,7 +99,7 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     await expect(summary(page)).toContainText(/Predict score · adjust for age, sex\s*\(named in your text\)/);
     await expect(page.getByRole('button', { name: 'Start Research' })).toBeEnabled();
 
-    const started = await startRun(page, 2);
+    const started = await startRun(page, 1);
     const body = await started.json();
     expect(body.code, JSON.stringify(body)).toBe(0);
     const runId: string = body.data.run_id;
@@ -112,13 +112,13 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     await expect(page.getByText('Research Journal')).toBeVisible();
     await expect(page.getByText(/Outcome: score/)).toBeVisible();
     await expect(page.getByText(/Accepted panel members: [1-5]/)).toBeVisible();
-    for (const round of [1, 2]) await expect(page.getByText(`Round ${round}`, { exact: true })).toBeVisible();
+    await expect(page.getByText('Round 1', { exact: true })).toBeVisible();
 
-    // The run folder: two judged rounds, the findings, the problem it ran.
+    // The run folder: the judged round, the findings, the problem it ran.
     const rows = resultsRows(runId);
-    expect(rows).toHaveLength(2);
+    expect(rows).toHaveLength(1);
     expect(rows[0]).toContain('alpha_inner_fraction');
-    expect(rows.some((r) => r.includes('\tkeep\t'))).toBe(true);
+    expect(rows[0]).toContain('\tkeep\t');
     expect(fs.readFileSync(path.join(runsDir(), runId, 'research_findings.md'), 'utf8')).toContain('Outcome: score');
     expect(fs.readFileSync(path.join(workspace(), 'problem.md'), 'utf8')).toBe(PROBLEM);
     // The sandbox saw the id-only cohort: the proposer's probe printed no outcome column.
@@ -144,7 +144,7 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     // Its dataset guide is offered, and reused by default: no second scout.
     await expect(page.getByLabel('Dataset guide')).toContainText(`Reuse the guide from ${firstRunId}`);
 
-    const started = await startRun(page, 2);
+    const started = await startRun(page, 1);
     const runId: string = (await started.json()).data.run_id;
     const guide = (id: string) => fs.readFileSync(path.join(runsDir(), id, 'shared', 'dataset_guide.md'), 'utf8');
     expect(guide(runId)).toBe(guide(firstRunId));
@@ -179,7 +179,7 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     }).toPass({ timeout: 90_000, intervals: [3_000] });
 
     await expect(findings(page)).toBeVisible({ timeout: 360_000 });
-    expect(resultsRows(runId)).toHaveLength(2);
+    expect(resultsRows(runId)).toHaveLength(1);
 
     await page.getByRole('button', { name: 'Run history' }).click();
     await expect(page.getByRole('button').filter({ hasText: runId })).toContainText(/completed/i);

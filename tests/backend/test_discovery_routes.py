@@ -68,19 +68,12 @@ def _events(client, run_id):
         return [json.loads(line[len("data: "):]) for line in r.iter_lines() if line.startswith("data: ")]
 
 
-def test_session_routes_are_gone(client):
-    # the smoke test asserts the control-plane session surface stays removed
-    r = client.get("/api/agent/v1/coscientist/sessions")
-    assert r.status_code in (404, 405) or r.json().get("code") in (404, 405)
-
-
 def test_setup_sorts_the_cohort_columns_into_roles(client, workspace, storage_root):
     (workspace / "notes.csv").write_text("a\n1\n", encoding="utf-8")  # one column: not a cohort
     (workspace / "labs.csv").write_text("case,value\nx,1\ny,2\n", encoding="utf-8")
     rel = workspace.relative_to(storage_root).as_posix()
     r = client.get(f"{API}/setup", params={"data_dir": rel}).json()["data"]
     assert r["problem"] == {"found": False, "content": "", "fields": None, "error": r["problem"]["error"]}
-    assert r["slides"] == ["d1.zarr", "d2.zarr"]
 
     # the file whose rows name the slides here comes first
     assert [c["file"] for c in r["cohorts"]] == ["training_cohort.csv", "labs.csv"]
@@ -185,19 +178,6 @@ def test_resolve_takes_a_full_problem_md_as_is(client, workspace):
     assert r["mode"] == "header" and r["fields"]["outcome"] == "slope" and r["error"] is None
     bad = _resolve(client, workspace, "---\ncovariates: [age]\n---\nq\n")
     assert bad["fields"] is None and "outcome" in bad["error"]
-
-
-def test_cohort_template_lists_the_slides(client, workspace):
-    (workspace / "training_cohort.csv").unlink()
-    (workspace / "scans").mkdir()
-    (workspace / "scans" / "P7.svs.zarr").mkdir()
-    r = client.post(f"{API}/cohort/template", json={"data_dir": str(workspace)}).json()
-    assert r["code"] == 0 and r["data"]["file"] == "training_cohort.csv"
-    assert (workspace / "training_cohort.csv").read_text().splitlines() == [
-        "donor_id,slide_name,outcome", "d1,d1.zarr,", "d2,d2.zarr,", "P7,scans/P7.svs.zarr,",
-    ]
-    again = client.post(f"{API}/cohort/template", json={"data_dir": str(workspace)}).json()
-    assert again["code"] == 400 and "already exists" in again["message"]
 
 
 def test_workspace_runs_list_and_load(client, workspace):

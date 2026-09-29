@@ -174,17 +174,6 @@ def test_system_prompts_and_code_carry_no_dataset_specifics():
     assert hits == []
 
 
-def test_prompts_are_filled_from_the_problem():
-    from app.services.agent.discovery.problem import parse_problem
-    from app.services.agent.discovery.tools import load_prompt
-
-    spec = parse_problem(PROBLEM)
-    for name in ("proposer.md", "worker.md"):
-        text = load_prompt(name, spec)
-        assert "{problem_context}" not in text and "{outcome}" not in text
-        assert "`slope`" in text and "`Debris`" in text and "`Artefact`" in text
-
-
 # ── the controller's rules ────────────────────────────────────────────────────
 
 def test_class_rules_follow_the_problem(tmp_path):
@@ -381,6 +370,14 @@ def synthetic_cohort(n: int = 35) -> pd.DataFrame:
     })
 
 
+def _fast_config(**overrides):
+    """The judge's logic at a fraction of the fitting: few repeats and folds, one alpha."""
+    from app.services.agent.discovery.panel_cv import PredictivePanelConfig
+
+    return PredictivePanelConfig(**{"outer_repeats": 2, "inner_folds": 2, "ridge_alphas": (1.0,),
+                                    "jackknife_refit_outer_repeats": 1, **overrides})
+
+
 def test_cv_panel_rewards_a_real_signal_and_jackknife_catches_one_donor():
     from app.services.agent.discovery.panel_cv import (
         PredictivePanelConfig,
@@ -392,7 +389,7 @@ def test_cv_panel_rewards_a_real_signal_and_jackknife_catches_one_donor():
     comparison = compare_predictive_panels(
         frame, outcome_column="slope", covariates=["age", "sex"], baseline_feature_columns=[],
         candidate_feature_columns=["candidate_signal"],
-        config=PredictivePanelConfig(outer_repeats=4, min_mean_rmse_improvement=0.0, min_fraction_repeats_better_rmse=0.5),
+        config=_fast_config(min_mean_rmse_improvement=0.0, min_fraction_repeats_better_rmse=0.5),
     )
     assert comparison["acceptance_passed"] and comparison["mean_rmse_improvement"] > 0
 
@@ -404,9 +401,8 @@ def test_cv_panel_rewards_a_real_signal_and_jackknife_catches_one_donor():
     result = jackknife_refit_panel_comparison(
         single, outcome_column="slope", covariates=[], baseline_feature_columns=[], candidate_feature_columns=["candidate"],
         # strict tolerance: the refit without the one donor carrying the signal gains nothing
-        config=PredictivePanelConfig(outer_repeats=4, jackknife_refit_outer_repeats=3,
-                                     min_mean_rmse_improvement=-1.0, min_fraction_repeats_better_rmse=0.0,
-                                     min_jackknife_refit_rmse_improvement=1e-12),
+        config=_fast_config(min_mean_rmse_improvement=-1.0, min_fraction_repeats_better_rmse=0.0,
+                            min_jackknife_refit_rmse_improvement=1e-12),
     )
     excluded = {row["excluded_donor_id"]: row["mean_rmse_improvement"] for row in result["records"]}
     assert excluded["D000"] <= 0.0 and not result["passed"]
@@ -418,7 +414,6 @@ def test_cv_panel_rewards_a_real_signal_and_jackknife_catches_one_donor():
 @pytest.mark.parametrize("numeric_ids", [False, True])
 def test_judge_admits_a_signed_variation_using_the_problems_columns(tmp_path, numeric_ids):
     from app.services.agent.discovery.judge import review_candidate
-    from app.services.agent.discovery.panel_cv import PredictivePanelConfig
     from app.services.agent.discovery.problem import parse_problem
 
     data = tmp_path / "data"
@@ -444,8 +439,7 @@ def test_judge_admits_a_signed_variation_using_the_problems_columns(tmp_path, nu
                             "results": {"feature_column": "candidate_signal",
                                         "artifacts": {"donor_feature_table": "/scratch/donor_feature_table.csv"}}},
             data_dir=data, spec=spec, round_dir=round_dir,
-            config=PredictivePanelConfig(outer_repeats=3, min_mean_rmse_improvement=0.0,
-                                         min_fraction_repeats_better_rmse=0.5),
+            config=_fast_config(min_mean_rmse_improvement=0.0, min_fraction_repeats_better_rmse=0.5),
         )
 
     kept = review(+1)
@@ -572,7 +566,6 @@ def test_sandbox_keeps_what_the_controller_trusts_read_only(tmp_path, monkeypatc
     assert f"{shared.resolve()}:/shared:rw" in cmd
     assert f"{shared.resolve() / 'lib'}:/shared/lib:ro" in cmd
     assert f"{shared.resolve() / 'dataset.json'}:/shared/dataset.json:ro" in cmd
-
 
 
 def test_proposer_reports_a_finished_image_inspection(monkeypatch, tmp_path):

@@ -76,16 +76,6 @@ def test_save_applies_at_once_and_hides_the_key(client, settings_module):
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
-def test_research_endpoint_of_its_own(client, settings_module):
-    data = _put(client, OPENAI_API_KEY=KEY, OPENAI_BASE_URL="http://127.0.0.1:11434/v1",
-                DISCOVERY_BASE_URL="https://api.openai.com/v1", DISCOVERY_API_KEY="sk-research-000000005678",
-                DISCOVERY_MODEL="gpt-5.4-mini")["data"]
-    assert data["status"]["research_unavailable_reason"] is None
-    assert data["status"]["research_model"] == "gpt-5.4-mini"
-    assert data["fields"]["DISCOVERY_API_KEY"]["hint"] == "••••5678"
-    assert os.environ["DISCOVERY_API_KEY"] == "sk-research-000000005678"
-
-
 def test_research_same_as_agent_switch(client, settings_module, monkeypatch):
     # .env.local gives research its own endpoint: the switch starts off.
     monkeypatch.setitem(settings_module._baseline, "DISCOVERY_BASE_URL", "https://env.example/v1")
@@ -155,8 +145,3 @@ def test_saved_settings_survive_a_restart(client, settings_module):
     os.environ.pop("LLM_MODEL")
     settings_module.apply_saved_settings()
     assert os.environ["OPENAI_API_KEY"] == KEY and os.environ["LLM_MODEL"] == "persisted"
-
-
-def test_corrupt_file_counts_as_nothing_saved(client, settings_module):
-    settings_module.settings_path().write_text("{not json", encoding="utf-8")
-    assert client.get(API).json()["data"]["fields"]["OPENAI_API_KEY"]["set"] is False

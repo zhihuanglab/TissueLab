@@ -34,14 +34,12 @@ from app.services.agent.discovery.workspace_scan import (
     problem_fields,
     resolve_program,
     scan_workspace,
-    write_cohort_template,
 )
 from app.services.agent.discovery.run_manager import PROBLEM_FILENAME
 from app.services.agent.discovery.scout import GUIDE_NAME
 from app.services.agent.discovery.sandbox import RUNS_DIRNAME, docker_unavailable_reason
 from app.services.file_manager.common import (
     assert_can_access_path,
-    assert_can_access_path_async,
     assert_can_write_path_async,
 )
 
@@ -126,10 +124,6 @@ class ResolveProgramRequest(BaseModel):
     use_model: bool = True
 
 
-class CohortTemplateRequest(BaseModel):
-    data_dir: str
-
-
 def _parsed(text: str) -> Dict[str, Any]:
     """problem.md text as the form's fields, or why it does not parse."""
     try:
@@ -169,17 +163,6 @@ def resolve_problem(request: ResolveProgramRequest, auth_user: AuthUser = Depend
         raise
     except Exception as exc:
         return error_response(str(exc))
-
-
-@discovery_router.post("/v1/discovery/cohort/template")
-async def create_cohort_template(request: CohortTemplateRequest, auth_user: AuthUser = Depends(get_auth_user)):
-    """Start training_cohort.csv from the slides in the folder; the user fills in the outcome."""
-    await assert_can_write_path_async(auth_user, request.data_dir, "create cohort file")
-    try:
-        name = await asyncio.to_thread(write_cohort_template, workspace_data_dir(request.data_dir))
-    except ProblemError as exc:
-        raise AppErrors.PARAMS_ERROR(str(exc))
-    return success_response({"file": name})
 
 
 # Sync handlers (FastAPI runs them in its threadpool): they read run folders from disk.

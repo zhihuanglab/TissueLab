@@ -11,23 +11,19 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
 
 from .problem import ProblemError, ProblemSpec, _relative_inside, parse_problem
-from .sandbox import RUNS_DIRNAME
 
 MAX_COHORT_FILES = 20
 MAX_COHORT_BYTES = 50 * 1024 * 1024
-MAX_SLIDES_LISTED = 2000
 _DEFAULT_SPEC = ProblemSpec(outcome="-", question="-")
-TEMPLATE_COHORT = _DEFAULT_SPEC.cohort_file
 
 _ID_NAME = re.compile(r"(^|_)(id|case|donor|patient|subject|sample|participant)s?($|_)", re.IGNORECASE)
 _SLIDE_NAME = re.compile(r"slide|zarr|path|file|image|wsi", re.IGNORECASE)
-_SLIDE_SUFFIX = ".zarr"
 
 
 def _column_info(values: pd.Series) -> dict[str, Any]:
@@ -111,25 +107,6 @@ def inspect_cohort(data_dir: Path, path: Path) -> Optional[dict[str, Any]]:
     }
 
 
-def find_slides(data_dir: Path) -> list[str]:
-    """.zarr stores in the folder and one level down (relative paths)."""
-    found: list[str] = []
-    for level in (data_dir.iterdir(), *(p.iterdir() for p in data_dir.iterdir() if _is_subfolder(p))):
-        for entry in level:
-            if entry.is_dir() and entry.name.endswith(_SLIDE_SUFFIX):
-                found.append(entry.relative_to(data_dir).as_posix())
-    return sorted(found)[:MAX_SLIDES_LISTED]
-
-
-def _is_subfolder(path: Path) -> bool:
-    return (
-        path.is_dir()
-        and not path.name.startswith(".")
-        and not path.name.endswith(_SLIDE_SUFFIX)
-        and path.name != RUNS_DIRNAME
-    )
-
-
 def scan_workspace(data_dir: Path) -> dict[str, Any]:
     csvs = sorted(
         p for p in data_dir.iterdir()
@@ -138,7 +115,7 @@ def scan_workspace(data_dir: Path) -> dict[str, Any]:
     cohorts = [info for info in (inspect_cohort(data_dir, p) for p in csvs) if info]
     # Most slides matched first: that is the cohort file.
     cohorts.sort(key=lambda c: (-c["slides_found"], c["file"]))
-    return {"cohorts": cohorts, "slides": find_slides(data_dir)}
+    return {"cohorts": cohorts}
 
 
 def problem_fields(spec: ProblemSpec) -> dict[str, Any]:
@@ -154,28 +131,6 @@ def problem_fields(spec: ProblemSpec) -> dict[str, Any]:
         "excluded_classes": list(spec.excluded_classes),
         "exclude_only_classes": list(spec.exclude_only_classes),
     }
-
-
-def _donor_id(slide: str) -> str:
-    """P001.svs.zarr -> P001."""
-    name = PurePosixPath(slide).name
-    return name.split(".", 1)[0] or name
-
-
-def write_cohort_template(data_dir: Path) -> str:
-    """Start a cohort file from the slides here: one row per slide, the outcome to fill in."""
-    target = data_dir / TEMPLATE_COHORT
-    if target.exists():
-        raise ProblemError(f"{TEMPLATE_COHORT} already exists in this folder")
-    slides = find_slides(data_dir)
-    if not slides:
-        raise ProblemError("No .zarr slides in this folder (or one level down) to list")
-    ids = [_donor_id(s) for s in slides]
-    if len(set(ids)) != len(ids):
-        ids = [PurePosixPath(s).with_suffix("").as_posix().replace("/", "_") for s in slides]
-    frame = pd.DataFrame({"donor_id": ids, "slide_name": slides, "outcome": [""] * len(slides)})
-    frame.to_csv(target, index=False)
-    return TEMPLATE_COHORT
 
 
 # ─── The research program in plain words -> outcome / covariates ───────────────

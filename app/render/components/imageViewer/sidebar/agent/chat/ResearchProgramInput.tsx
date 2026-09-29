@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Loader2, RefreshCw, Sparkles } from "lucide-react"
-import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { cn } from "@/utils/common/twMerge"
@@ -48,7 +47,6 @@ type ProblemFields = {
 type Setup = {
   problem: { found: boolean; content: string; fields: ProblemFields | null; error: string | null }
   cohorts: Cohort[]
-  slides: string[]
 }
 type Resolved = {
   mode: "text" | "header"
@@ -108,7 +106,6 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
   const [result, setResult] = useState<{ key: string; value: Resolved | null } | null>(null)
   const [showDetails, setShowDetails] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
-  const [creating, setCreating] = useState(false)
 
   const load = useCallback(async () => {
     if (!workspaceDir) {
@@ -204,31 +201,6 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
   useEffect(() => { onChange(task, ready) }, [task, ready]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const pick = (patch: Partial<ProblemFields>) => setPicked((prev) => ({ ...prev, ...patch }))
-  const pickCohort = (file: string) => {
-    const next = setup?.cohorts.find((c) => c.file === file)
-    if (!next) return
-    // A different table: its own id / slide columns; outcome and covariates are re-read from the text.
-    setPicked({
-      cohort_file: next.file,
-      ...(next.id_column ? { id_column: next.id_column } : {}),
-      ...(next.slide_column ? { slide_column: next.slide_column } : {}),
-    })
-  }
-
-  const createCohort = async () => {
-    setCreating(true)
-    try {
-      const res = await authedFetch(`${API()}/cohort/template`, { method: "POST", body: JSON.stringify({ data_dir: workspaceDir }) })
-      if (!res.ok || res.data?.code !== 0) throw new Error(res.data?.message || "Could not create the cohort file")
-      await load()
-      setNotice(`Created ${res.data.data.file}: fill in the outcome column (one value per slide), then press Rescan.`)
-    } catch (e: any) {
-      setNotice(e?.message ?? String(e))
-    } finally {
-      setCreating(false)
-    }
-  }
-
   // The text stays (typed, or problem.md's again); so do the picks.
   const rescan = async () => {
     const keep = picked
@@ -280,19 +252,9 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
         )}
 
         {workspaceDir && setup && setup.cohorts.length === 0 && !isHeader && (
-          <div className="space-y-2">
-            <div className="text-amber-600">
-              No cohort table (CSV) in this folder. Research needs one row per patient: an ID, the path of that
-              patient&apos;s analysed slide (.zarr), and the value to predict.
-            </div>
-            {setup.slides.length > 0 ? (
-              <Button size="sm" variant="outline" className="h-7 text-xs" disabled={creating} onClick={createCohort}>
-                {creating && <Loader2 className="h-3 w-3 mr-1 animate-spin" />}
-                Create {DEFAULTS.cohort_file} from the {setup.slides.length} slide{setup.slides.length > 1 ? "s" : ""} here
-              </Button>
-            ) : (
-              <div className="text-muted-foreground">No analysed slides (.zarr) here either: run segmentation / classification first.</div>
-            )}
+          <div className="text-amber-600">
+            No table of patients (CSV) in this folder: Research needs one, with each patient&apos;s slide and the
+            value to predict.
           </div>
         )}
 
@@ -377,35 +339,6 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
                     </div>
                   </div>
                 )}
-                <div className="grid grid-cols-3 gap-2">
-                  <div>
-                    <FieldLabel>Cohort table</FieldLabel>
-                    <Select value={cohort.file} onValueChange={pickCohort}>
-                      <SelectTrigger aria-label="Cohort table" className="h-8 text-xs"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        {setup!.cohorts.map((c) => <SelectItem key={c.file} value={c.file} className="text-xs">{c.file}</SelectItem>)}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div>
-                    <FieldLabel>Patient ID</FieldLabel>
-                    <Select value={effective?.id_column ?? cohort.id_column ?? undefined} onValueChange={(v) => pick({ id_column: v })}>
-                      <SelectTrigger aria-label="Patient ID column" className="h-8 text-xs"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        {cohort.columns.map((c) => <SelectItem key={c.name} value={c.name} className="text-xs">{c.name}</SelectItem>)}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div>
-                    <FieldLabel>Slide</FieldLabel>
-                    <Select value={effective?.slide_column ?? cohort.slide_column ?? undefined} onValueChange={(v) => pick({ slide_column: v })}>
-                      <SelectTrigger aria-label="Slide column" className="h-8 text-xs"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        {cohort.columns.map((c) => <SelectItem key={c.name} value={c.name} className="text-xs">{c.name}</SelectItem>)}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
               </div>
             )}
           </>

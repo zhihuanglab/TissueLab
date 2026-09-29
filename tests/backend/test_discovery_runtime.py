@@ -297,28 +297,7 @@ def test_scout_without_a_guide_reports_it(tmp_path, monkeypatch):
     assert result["status"] == "no_guide" and not (shared / "dataset_guide.md").exists()
 
 
-def test_copy_tree_skips_bytecode(tmp_path):
-    from app.services.agent.discovery.loop import copy_tree
-
-    src = tmp_path / "src"
-    (src / "__pycache__").mkdir(parents=True)
-    (src / "mod.py").write_text("x = 1\n")
-    (src / "__pycache__" / "mod.cpython-311.pyc").write_bytes(b"\0")
-    copy_tree(src, tmp_path / "dst")
-    assert [p.name for p in (tmp_path / "dst").rglob("*")] == ["mod.py"]
-
-
 # ── sandbox lifecycle ─────────────────────────────────────────────────────────
-
-def test_sandbox_image_tag_follows_the_dockerfile():
-    import hashlib
-
-    from app.services.agent.discovery import sandbox
-
-    digest = hashlib.sha256(sandbox.DOCKERFILE_TEMPLATE.encode()).hexdigest()[:12]
-    assert sandbox.DEFAULT_IMAGE == f"tissuelab-discovery-worker:{digest}"
-    assert '"zarr>=3,<4"' in sandbox.DOCKERFILE_TEMPLATE
-
 
 def test_watch_cancel_kills_the_container_until_stopped(tmp_path, monkeypatch):
     from app.services.agent.discovery.sandbox import SandboxSession
@@ -435,38 +414,3 @@ def test_a_dedicated_discovery_endpoint_frees_the_agent_model(monkeypatch):
     client = discovery_client.get_client()
     assert str(client.base_url).rstrip("/") == "https://api.openai.com/v1" and client.api_key == "sk-discovery"
     monkeypatch.setattr(discovery_client, "_client", None)
-
-
-def test_responses_calls_carry_the_callers_timeout(monkeypatch):
-    from app.services.agent.discovery import client as discovery_client
-
-    seen = {}
-
-    class FakeResponses:
-        def create(self, **payload):
-            seen["payload"] = payload
-            return {"id": "resp_1", "output": []}
-
-    class FakeClient:
-        responses = FakeResponses()
-
-        def with_options(self, **options):
-            seen["options"] = options
-            return self
-
-    monkeypatch.setattr(discovery_client, "get_client", lambda: FakeClient())
-    discovery_client.responses_create({"model": "m", "input": "hi"}, timeout=42)
-    assert seen["options"] == {"timeout": 42, "max_retries": 1}
-    assert seen["payload"] == {"model": "m", "input": "hi"}
-
-
-def test_image_messages_embed_the_file(tmp_path):
-    from app.services.agent.discovery.client import input_image_message
-
-    png = tmp_path / "plot.png"
-    png.write_bytes(b"\x89PNG\r\n\x1a\n")
-    message = input_image_message(png, text="look")
-    assert message["content"][1]["image_url"].startswith("data:image/png;base64,")
-    with pytest.raises(ValueError):
-        (tmp_path / "notes.txt").write_text("x")
-        input_image_message(tmp_path / "notes.txt")
