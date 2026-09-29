@@ -16,7 +16,7 @@ import { RootState, AppDispatch } from "@/store"
 import { setSelectedAgent, type AgentName } from "@/store/slices/chat/agentSlice"
 import { formatPath } from "@/utils/common/path.utils"
 import { CTRL_SERVICE_API_ENDPOINT } from "@/config/api.config"
-import { ResearchProblemForm } from "./ResearchProblemForm"
+import { ResearchProgramInput } from "./ResearchProgramInput"
 import { getAuthToken } from "@/utils/common/authToken"
 import {
   isResearchCancelling,
@@ -714,8 +714,8 @@ export const CoscientistPanel: React.FC = () => {
               </div>
             )}
 
-            {/* Research problem: picked from the workspace's cohort table */}
-            <ResearchProblemForm
+            {/* Research program: free text; the outcome / covariates are read off it */}
+            <ResearchProgramInput
               workspaceDir={workspaceDir}
               authedFetch={authedFetch}
               resetKey={formResetKey}

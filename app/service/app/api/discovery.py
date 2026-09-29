@@ -32,6 +32,7 @@ from app.services.agent.discovery.loop import (
 from app.services.agent.discovery.problem import parse_problem
 from app.services.agent.discovery.workspace_scan import (
     problem_fields,
+    resolve_program,
     scan_workspace,
     write_cohort_template,
 )
@@ -112,8 +113,11 @@ def _load_run(run_root: Path) -> Dict[str, Any]:
     }
 
 
-class ParseProblemRequest(BaseModel):
+class ResolveProgramRequest(BaseModel):
+    data_dir: str
     text: str
+    cohort_file: Optional[str] = None   # the user's pick; default: the best match
+    use_model: bool = True
 
 
 class CohortTemplateRequest(BaseModel):
@@ -146,9 +150,19 @@ def get_setup(data_dir: str, auth_user: AuthUser = Depends(get_auth_user)):
         return error_response(str(exc))
 
 
-@discovery_router.post("/v1/discovery/problem/parse")
-def parse_problem_text(request: ParseProblemRequest, auth_user: AuthUser = Depends(get_auth_user)):
-    return success_response(_parsed(request.text))
+@discovery_router.post("/v1/discovery/problem/resolve")
+def resolve_problem(request: ResolveProgramRequest, auth_user: AuthUser = Depends(get_auth_user)):
+    """A free-text program read against the folder's cohort table: the outcome and
+    covariates it names (by column name, or via the model with column names only).
+    A text starting with a YAML header is problem.md and is parsed as is."""
+    try:
+        assert_can_access_path(auth_user, request.data_dir, "read research setup")
+        folder = workspace_data_dir(request.data_dir)
+        return success_response(resolve_program(request.text, folder, request.cohort_file, request.use_model))
+    except AppError:
+        raise
+    except Exception as exc:
+        return error_response(str(exc))
 
 
 @discovery_router.post("/v1/discovery/cohort/template")

@@ -116,10 +116,46 @@ def test_setup_accepts_the_open_slides_path_with_either_separator(client, worksp
         assert r["data_dir"] == str(workspace)
 
 
-def test_parse_problem_text(client):
-    ok = client.post(f"{API}/problem/parse", json={"text": PROBLEM}).json()["data"]
-    assert ok["error"] is None and ok["fields"]["outcome"] == "slope"
-    bad = client.post(f"{API}/problem/parse", json={"text": "---\ncovariates: [age]\n---\nq\n"}).json()["data"]
+def _resolve(client, workspace, text, **extra):
+    body = {"data_dir": str(workspace), "text": text, "use_model": False, **extra}
+    return client.post(f"{API}/problem/resolve", json=body).json()["data"]
+
+
+def test_resolve_reads_outcome_and_covariates_off_the_text(client, workspace):
+    r = _resolve(client, workspace, "Which tissue measurements predict the slope, adjusting for age?")
+    assert r["mode"] == "text" and r["detected_by"] == "text"
+    f = r["fields"]
+    assert (f["outcome"], f["covariates"]) == ("slope", ["age"])
+    assert (f["cohort_file"], f["id_column"], f["slide_column"]) == ("training_cohort.csv", "donor_id", "slide_name")
+    assert f["question"] == "Which tissue measurements predict the slope, adjusting for age?"
+
+    # nothing named: no outcome, and the panel asks
+    r = _resolve(client, workspace, "Find tissue features that matter.")
+    assert r["fields"]["outcome"] == "" and r["detected_by"] is None
+
+    # "age" is a column here, so it can be the outcome when not after "adjust"
+    assert _resolve(client, workspace, "Does tissue predict age?")["fields"]["outcome"] == "age"
+
+
+def test_resolve_asks_the_model_with_column_names_only(client, workspace, monkeypatch):
+    import app.services.agent.discovery.client as client_mod
+
+    seen = []
+    monkeypatch.setattr(client_mod, "unavailable_reason", lambda: None)
+    monkeypatch.setattr(client_mod, "responses_create", lambda payload, timeout=0: seen.append(payload) or {
+        "output_text": 'Sure: {"outcome": "slope", "covariates": ["age", "not_a_column"]}'
+    })
+    r = _resolve(client, workspace, "找出能预测记忆衰退速度的组织特征，校正年龄", use_model=True)
+    assert r["detected_by"] == "model"
+    assert (r["fields"]["outcome"], r["fields"]["covariates"]) == ("slope", ["age"])
+    prompt = seen[0]["input"]
+    assert "slope" in prompt and "-0.1" not in prompt and "80" not in prompt  # names, never values
+
+
+def test_resolve_takes_a_full_problem_md_as_is(client, workspace):
+    r = _resolve(client, workspace, PROBLEM)
+    assert r["mode"] == "header" and r["fields"]["outcome"] == "slope" and r["error"] is None
+    bad = _resolve(client, workspace, "---\ncovariates: [age]\n---\nq\n")
     assert bad["fields"] is None and "outcome" in bad["error"]
 
 
