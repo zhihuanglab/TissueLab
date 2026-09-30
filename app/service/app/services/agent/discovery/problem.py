@@ -2,8 +2,7 @@
 
 Everything dataset-specific lives here, never in the system prompts or code
 defaults: which cohort column is the outcome, which covariates every
-comparison adjusts for, where the cohort file and slides are, and which cell
-classes a feature may not use. Example:
+comparison adjusts for, and where the cohort file and slides are. Example:
 
     ---
     outcome: slope_zmem0
@@ -11,8 +10,6 @@ classes a feature may not use. Example:
     cohort_file: training_cohort.csv
     id_column: donor_id
     slide_column: slide_name
-    excluded_classes: [Corpora Amylacea, Lymphocytes]
-    exclude_only_classes: [Negative control]
     ---
     Find donor-level tissue measurements that predict ...
 
@@ -54,10 +51,6 @@ class ProblemSpec:
     # Optional microns-per-pixel column; when absent, loaders fall back to
     # metadata/<id>.json next to the slides, else report pixels.
     mpp_column: str = "mpp"
-    # Cell classes a feature may not use at all, and classes that may only be
-    # used to exclude cells (e.g. an artefact class).
-    excluded_classes: tuple[str, ...] = ()
-    exclude_only_classes: tuple[str, ...] = ()
 
     @property
     def protected_names(self) -> list[str]:
@@ -88,22 +81,11 @@ class ProblemSpec:
             f"`{self.slide_column}` and, if present, `{self.mpp_column}`)",
             f"- Each row's slide: `/data/<{self.slide_column}>` (a TissueLab .zarr)",
         ]
-        if self.excluded_classes:
-            lines.append(
-                "- Excluded cell classes (may not appear in feature code at all): "
-                + ", ".join(f"`{c}`" for c in self.excluded_classes)
-            )
-        if self.exclude_only_classes:
-            lines.append(
-                "- Classes that may only be used to exclude cells (`!=`, `~isin`), never selected: "
-                + ", ".join(f"`{c}`" for c in self.exclude_only_classes)
-            )
         return "\n".join(lines)
 
 
 HEADER_KEYS = frozenset({
     "outcome", "covariates", "cohort_file", "id_column", "slide_column", "mpp_column",
-    "excluded_classes", "exclude_only_classes",
 })
 
 
@@ -180,8 +162,6 @@ def parse_problem(text: str) -> ProblemSpec:
         id_column=str(header.get("id_column") or defaults.id_column).strip(),
         slide_column=str(header.get("slide_column") or defaults.slide_column).strip(),
         mpp_column=str(header.get("mpp_column") or defaults.mpp_column).strip(),
-        excluded_classes=_string_list(header.get("excluded_classes"), "excluded_classes"),
-        exclude_only_classes=_string_list(header.get("exclude_only_classes"), "exclude_only_classes"),
     )
     _relative_inside(spec.cohort_file, "cohort_file")
     return spec

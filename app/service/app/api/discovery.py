@@ -25,7 +25,7 @@ from app.services.agent.discovery import (
 from app.services.agent.discovery.client import unavailable_reason
 from app.services.agent.discovery.loop import (
     FINDINGS_NAME,
-    ROUND_FEEDBACK_NAME,
+    feedback_path,
     load_results_rows,
     read_run_state,
 )
@@ -55,6 +55,8 @@ class StartRunRequest(BaseModel):
     dataset_scout: bool = True      # explore the folder first, write a dataset guide
     # instead of exploring: the guide of an earlier run in this workspace (its run id)
     reuse_guide_from: Optional[str] = None
+    # plans (and parallel workers) per round; at most one candidate per round is admitted
+    workers_per_round: int = Field(1, ge=1, le=5)
 
 
 class ResumeRunRequest(BaseModel):
@@ -98,10 +100,10 @@ def _load_run(run_root: Path) -> Dict[str, Any]:
     journal: List[Dict[str, Any]] = []
     for row in load_results_rows(run_root):
         round_id = int(row.get("round_id") or 0)
-        feedback_path = run_root / f"round_{round_id:04d}" / ROUND_FEEDBACK_NAME
+        fb_path = feedback_path(run_root / f"round_{round_id:04d}", row.get("worker"))
         summary = ""
-        if feedback_path.exists():
-            summary = json.loads(feedback_path.read_text(encoding="utf-8")).get("summary", "")
+        if fb_path.exists():
+            summary = json.loads(fb_path.read_text(encoding="utf-8")).get("summary", "")
         journal.append({
             "roundId": round_id,
             "focus": row.get("description", ""),
@@ -209,6 +211,7 @@ async def start_run(request: StartRunRequest, auth_user: AuthUser = Depends(get_
             worker_wall_clock_sec=request.worker_wall_clock_sec,
             dataset_scout=request.dataset_scout,
             reuse_guide_from=request.reuse_guide_from,
+            workers_per_round=request.workers_per_round,
         )
     except ProblemError as exc:
         raise AppErrors.PARAMS_ERROR(str(exc))

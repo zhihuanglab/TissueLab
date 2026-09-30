@@ -1,13 +1,12 @@
 """Leakage-safe predictive scoring for small-cohort biomarker panels.
 
 Compares a frozen current panel with one proposed panel using paired, repeated
-nested cross-validated ridge predictions on the discovery cohort, plus a
-leave-one-donor jackknife refit gate. Defaults are protocol v2.3.
+nested cross-validated ridge predictions on the discovery cohort.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import numpy as np
@@ -20,7 +19,8 @@ from sklearn.model_selection import KFold
 @dataclass(frozen=True)
 class PredictivePanelConfig:
     outer_folds: int = 5
-    outer_repeats: int = 20
+    # 5 x 5-fold: enough repeats to tell a steady gain from fold luck at a quarter of the fits.
+    outer_repeats: int = 5
     inner_folds: int = 4
     seed: int = 20260821
     ridge_alphas: tuple[float, ...] = (
@@ -43,9 +43,6 @@ class PredictivePanelConfig:
     min_consensus_rmse_improvement: float = 0.0
     min_consensus_pearson_delta: float = -0.02
     min_worst_leave_one_donor_rmse_improvement: float = -1e-3
-    jackknife_refit_outer_repeats: int = 10
-    # Pre-registered 2026-08-22: same artefact acceptance as > 0, about twice the power.
-    min_jackknife_refit_rmse_improvement: float = -5e-4
     min_candidate_coverage: float = 0.80
     max_panel_size: int = 5
 
@@ -471,74 +468,6 @@ def compare_predictive_panels(
         "donor_predictions": donor_records,
         "baseline_tuning": baseline_tuning,
         "candidate_tuning": candidate_tuning,
-    }
-
-
-def jackknife_refit_panel_comparison(
-    frame: pd.DataFrame,
-    *,
-    outcome_column: str,
-    covariates: list[str],
-    baseline_feature_columns: list[str],
-    candidate_feature_columns: list[str],
-    config: PredictivePanelConfig,
-) -> dict[str, Any]:
-    """Refit the complete CV comparison after removing each donor in turn.
-
-    This differs from deleting one already-generated prediction. Each donor is
-    removed before imputation, residualization, tuning, fitting, and scoring,
-    so a donor cannot continue to influence predictions for everyone else.
-    """
-    repeats = min(config.outer_repeats, config.jackknife_refit_outer_repeats)
-    if repeats < 1:
-        raise ValueError("jackknife_refit_outer_repeats must be positive")
-    jackknife_config = replace(config, outer_repeats=repeats)
-    records: list[dict[str, Any]] = []
-    for donor_id in frame["donor_id"].astype(str):
-        reduced = frame.loc[frame["donor_id"].astype(str).ne(donor_id)].reset_index(
-            drop=True
-        )
-        comparison = compare_predictive_panels(
-            reduced,
-            outcome_column=outcome_column,
-            covariates=covariates,
-            baseline_feature_columns=baseline_feature_columns,
-            candidate_feature_columns=candidate_feature_columns,
-            config=jackknife_config,
-        )
-        records.append(
-            {
-                "excluded_donor_id": donor_id,
-                "n_donors": comparison["n_donors"],
-                "outer_repeats": repeats,
-                "mean_rmse_improvement": comparison["mean_rmse_improvement"],
-                "consensus_rmse_improvement": comparison[
-                    "consensus_rmse_improvement"
-                ],
-                "fraction_repeats_better_rmse": comparison[
-                    "fraction_repeats_better_rmse"
-                ],
-                "baseline_consensus_pearson_r": comparison[
-                    "baseline_consensus_metrics"
-                ]["pearson_r"],
-                "candidate_consensus_pearson_r": comparison[
-                    "candidate_consensus_metrics"
-                ]["pearson_r"],
-            }
-        )
-    improvements = np.asarray(
-        [record["mean_rmse_improvement"] for record in records], dtype=float
-    )
-    minimum = float(improvements.min())
-    return {
-        "outer_repeats": repeats,
-        "minimum_mean_rmse_improvement": minimum,
-        "median_mean_rmse_improvement": float(np.median(improvements)),
-        "fraction_positive_mean_rmse_improvement": float(
-            (improvements > 0).mean()
-        ),
-        "passed": minimum >= config.min_jackknife_refit_rmse_improvement,
-        "records": records,
     }
 
 

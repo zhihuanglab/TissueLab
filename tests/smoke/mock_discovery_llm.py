@@ -1,10 +1,9 @@
-"""A scripted OpenAI Responses API server that plays the discovery proposer and worker.
+"""A scripted OpenAI Responses API server that plays the discovery agents.
 
 It is what DISCOVERY_BASE_URL points at in the end-to-end tests. Before round 1
-the dataset scout probes the folder once and writes its guide; every round the
-proposer inspects the data once (a shell tool call run in the real sandbox) and
-then commits to a plan; the worker writes result.py with the shared loaders,
-runs it, and says DONE. The data it expects is the synthetic cohort written by
+the dataset scout probes the folder (a shell tool call run in the real sandbox)
+and writes its guide; every proposer call returns the plan; the worker writes
+result.py with the shared loaders, runs it, and says DONE. The data it expects is the synthetic cohort written by
 tests/frontend/e2e/make_discovery_dataset.py (cell classes Alpha / Beta, one
 region "Inner"). The panel's column choice for a program that names no column
 gets score / age, sex. `--delay` slows every reply so a test can stop a run midway.
@@ -59,7 +58,7 @@ if __name__ == "__main__":
         print(d, compute_donor_features(d, "/data"), flush=True)
 '''
 SCOUT_GUIDE = (
-    "head -3 /data/cases.csv; "
+    PROBE + "; "
     "cat > /scratch/dataset_guide.md <<'MDEOF'\n"
     "# Dataset guide\n\nSlides: discovery_slides/sNN.zarr, cell classes Alpha / Beta, one region Inner.\n"
     "MDEOF"
@@ -86,7 +85,7 @@ def reply_items(body: dict) -> list:
     if isinstance(body.get("input"), str) and body["input"].startswith("You set up a predictive analysis"):
         return [_text(json.dumps(COLUMN_CHOICE))]
     if "# Candidate Proposer" in instructions:
-        return [_tool_call(PROBE)] if first_turn else [_text(json.dumps(PLAN))]
+        return [_text(json.dumps(PLAN))]
     if "# Biomarker Worker" in instructions:
         return [_tool_call(WRITE_AND_RUN)] if first_turn else [_text("DONE")]
     return [_text("unrecognised caller")]

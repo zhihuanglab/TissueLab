@@ -1,17 +1,19 @@
-"""The discovery loop (protocol v2.3, "Loop A").
+"""The discovery loop.
 
-Each round:
-1. the proposer inspects the slides (outcome-blind) and commits to one hypothesis
-   with a primary formula and pre-specified variations, each with an expected sign;
-2. the worker writes result.py; the controller runs it in the sandbox over every
-   donor and checks coverage, outcome references and class rules;
+Before round 1 the dataset scout (optional) explores the folder and writes a
+dataset guide. Each round:
+1. the proposer (one model call per worker) commits to a hypothesis with a
+   primary formula and pre-specified variations, each with an expected sign;
+   with several workers the plans are asked in turn so that they differ;
+2. the workers, in parallel sandboxes, write result.py; the controller runs each
+   over every donor and checks coverage and outcome references;
 3. the judge scores every variation against the accepted panel with paired
    repeated nested CV (add while a slot is free, else replace a member) plus the
-   expected-sign, coverage and jackknife gates, and admits the best eligible one;
+   expected-sign and coverage gates; at most one candidate per round is admitted;
 4. structured feedback on every variation goes back to the next proposer.
 
 State lives in the run folder: run_state.json, accepted_panel.json, results.tsv,
-round_NNNN/ (plan, proposer and worker traces, judge CSVs, feedback), and
+round_NNNN/ (plans, proposer and worker traces, judge CSVs, feedback), and
 research_findings.md at the end.
 """
 
@@ -28,7 +30,6 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Awaitable, Callable, Optional
 
 from .client import discovery_model
-from .data_intuition import build_data_intuition
 from .scout import GUIDE_NAME, run_scout
 from .judge import review_candidate
 from .panel_cv import PredictivePanelConfig
@@ -38,8 +39,7 @@ from .worker import ControllerChecksFailed, run_worker
 
 DEFAULT_WORKER_WALL_CLOCK = 1800
 WORKER_COMMAND_TIMEOUT = 900
-PROPOSER_TOOL_TURNS = 8
-PROPOSER_WALL_CLOCK = 600
+MAX_WORKERS_PER_ROUND = 5
 RESULTS_TSV_NAME = "results.tsv"
 ACCEPTED_PANEL_NAME = "accepted_panel.json"
 ROUND_FEEDBACK_NAME = "round_feedback.json"
@@ -48,6 +48,7 @@ SHARED_LIB_SOURCE = Path(__file__).parent / "shared_lib_source" / "shared_analys
 
 RESULTS_HEADERS = [
     "round_id",
+    "worker",
     "candidate_id",
     "feature_name",
     "chosen_variation",
@@ -194,7 +195,6 @@ def build_round_feedback(
                 "fraction_repeats_better_rmse": v.get("fraction_repeats_better_rmse"),
                 "consensus_pearson_delta": v.get("consensus_pearson_delta"),
                 "worst_leave_one_donor_rmse_improvement": v.get("worst_leave_one_donor_rmse_improvement"),
-                "jackknife_min_rmse_improvement": v.get("jackknife_refit_minimum_mean_rmse_improvement"),
                 "gates": gates,
                 "gates_passed": f"{v.get('cv_gates_passed')}/{v.get('cv_gates_total')}",
                 "eligible": bool(v.get("eligible")),
@@ -241,7 +241,6 @@ def render_feedback_text(fb: dict[str, Any]) -> str:
         )
     for v in fb.get("variations") or []:
         g = v.get("gates") or {}
-        # jackknife_refit is None when it never ran (a CV gate failed first); only False is a failure
         fails = [k for k, ok in g.items() if ok is False]
         tested = v.get("tested_as") or "add"
         if v.get("replaced_feature"):
@@ -257,7 +256,7 @@ def render_feedback_text(fb: dict[str, Any]) -> str:
             f"{_fmt((v.get('partial_r_loo_range') or [None, None])[1])}] top_donor_share={_fmt(v.get('top_influence_share'), 2)} "
             f"| CV: dRMSE={_fmt(v.get('mean_rmse_improvement'), 5)} repeats_better={_fmt(v.get('fraction_repeats_better_rmse'), 2)} "
             f"consensus_dr={_fmt(v.get('consensus_pearson_delta'))} worst_LODO={_fmt(v.get('worst_leave_one_donor_rmse_improvement'), 5)} "
-            f"jackknife_min={_fmt(v.get('jackknife_min_rmse_improvement'), 5)} gates={v.get('gates_passed')} "
+            f"gates={v.get('gates_passed')} "
             f"failed={fails or 'none'} eligible={v.get('eligible')}{' NEAR_MISS' if v.get('near_miss') else ''}"
         )
     if not fb.get("variations"):
@@ -274,7 +273,7 @@ def load_feedback_history(run_root: Path) -> str:
     """Structured feedback for every prior round."""
     lines: list[str] = []
     for row in load_results_rows(run_root):
-        fb_path = run_root / f"round_{int(row.get('round_id') or 0):04d}" / ROUND_FEEDBACK_NAME
+        fb_path = feedback_path(run_root / f"round_{int(row.get('round_id') or 0):04d}", row.get("worker"))
         if fb_path.exists():
             try:
                 lines.append(render_feedback_text(_read_json(fb_path)))
@@ -311,9 +310,11 @@ def accepted_panel_summary(accepted_panel: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _build_worker_brief(*, round_id: int, plan: dict[str, Any], accepted_panel: dict[str, Any]) -> dict[str, Any]:
+def _build_worker_brief(
+    *, round_id: int, plan: dict[str, Any], accepted_panel: dict[str, Any], slot: int = 1, workers: int = 1,
+) -> dict[str, Any]:
     return {
-        "worker_name": f"round_{round_id:04d}_worker",
+        "worker_name": f"round_{round_id:04d}_worker" + (f"_{slot}" if workers > 1 else ""),
         "round_id": round_id,
         "candidate_id": plan.get("candidate_id", ""),
         "accepted_panel": {
@@ -395,13 +396,31 @@ def findings_markdown(accepted_panel: dict[str, Any], spec: ProblemSpec) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _persist_round(
-    *, run_root: Path, round_dir: Path, accepted_panel: dict[str, Any], state: dict[str, Any],
-    next_round_id: int, feedback: dict[str, Any], results_row: dict[str, Any],
-) -> dict[str, Any]:
-    _write_json(run_root / ACCEPTED_PANEL_NAME, accepted_panel)
+def _numbered(name: str, slot: int, workers: int) -> str:
+    """plan.json with one worker per round; plan_2.json for the second of several."""
+    if workers <= 1:
+        return name
+    stem, dot, ext = name.partition(".")
+    return f"{stem}_{slot}{dot}{ext}"
+
+
+def feedback_path(round_dir: Path, worker: Any) -> Path:
+    """A candidate's feedback file (rows of single-worker runs have no worker number)."""
+    worker = str(worker or "").strip()
+    return round_dir / (ROUND_FEEDBACK_NAME if worker in ("", "0") else _numbered(ROUND_FEEDBACK_NAME, int(worker), 2))
+
+
+def _record_candidate(
+    *, run_root: Path, round_dir: Path, slot: int, workers: int, feedback: dict[str, Any], results_row: dict[str, Any],
+) -> None:
+    if workers <= 1:
+        results_row = {**results_row, "worker": ""}
     _append_results_row(run_root, results_row)
-    _write_json(round_dir / ROUND_FEEDBACK_NAME, feedback)
+    _write_json(feedback_path(round_dir, results_row.get("worker")), feedback)
+
+
+def _finish_round(*, run_root: Path, accepted_panel: dict[str, Any], state: dict[str, Any], next_round_id: int) -> dict[str, Any]:
+    _write_json(run_root / ACCEPTED_PANEL_NAME, accepted_panel)
     persisted = {"next_round_id": next_round_id, "config": dict(state.get("config") or {})}
     _write_json(run_root / "run_state.json", persisted)
     return persisted
@@ -464,6 +483,7 @@ async def run_discovery(
     worker_wall_clock_sec: int = DEFAULT_WORKER_WALL_CLOCK,
     dataset_scout: bool = True,
     guide_from: Optional[str] = None,
+    workers_per_round: int = 1,
     cancel_event: Optional[threading.Event] = None,
 ) -> dict[str, Any]:
     """Run `rounds` rounds in run_root (resuming from run_state.json if present).
@@ -471,6 +491,7 @@ async def run_discovery(
     dataset_scout: before round 1, an agent explores the data folder and writes
     shared/dataset_guide.md for the proposer and workers (once per run).
     guide_from: the run whose guide was copied in instead (the scout is skipped).
+    workers_per_round: plans (and workers, in parallel) per round; at most one is admitted.
 
     cancel_event stops the proposer / worker threads and their sandboxes: the
     awaiting coroutine can be cancelled, but the threads it waits on cannot.
@@ -481,13 +502,14 @@ async def run_discovery(
     run_root = Path(run_root)
     shared_dir = run_root / "shared"
     shared_dir.mkdir(parents=True, exist_ok=True)
-    # State first: a run cancelled while the slides are measured is still listed and resumable.
+    # State first: a run cancelled before round 1 is still listed and resumable.
     state = _load_or_init_state(
         run_root=run_root,
         config={"rounds": rounds, "model": model, "reasoning_effort": reasoning_effort,
                 "worker_wall_clock_sec": worker_wall_clock_sec, "dataset_scout": dataset_scout,
-                "guide_from": guide_from},
+                "guide_from": guide_from, "workers_per_round": workers_per_round},
     )
+    workers = max(1, min(MAX_WORKERS_PER_ROUND, int(workers_per_round)))
     accepted_panel = _load_or_init_accepted_panel(run_root)
     await asyncio.to_thread(copy_tree, SHARED_LIB_SOURCE, shared_dir / "lib" / "shared_analysis")
     write_dataset_layout(spec, shared_dir)
@@ -499,17 +521,7 @@ async def run_discovery(
         except Exception:
             pass
 
-    intuition_path = shared_dir / "data_intuition.md"
-    if not intuition_path.exists():
-        await emit({"type": "data_intuition_started"})
-        try:
-            await _in_thread(run_root, build_data_intuition, spec=spec, data_dir=data_dir, shared_dir=shared_dir)
-        except Exception as exc:
-            _write_text_atomic(intuition_path, f"(The data-intuition brief could not be built: {exc})\n")
-        await emit({"type": "data_intuition_done"})
-    data_intuition_text = intuition_path.read_text(encoding="utf-8")
-
-    # The scout reads the brief above, so it goes second; a failed scout costs the guide, not the run.
+    # A failed scout costs the guide, not the run.
     guide_path = shared_dir / GUIDE_NAME
     if guide_from and guide_path.exists() and int(state.get("next_round_id", 1) or 1) == 1:
         await emit({"type": "scout_done", "status": "reused", "from": guide_from})
@@ -532,172 +544,198 @@ async def run_discovery(
     for round_id in range(next_round_id, next_round_id + rounds):
         round_dir = run_root / f"round_{round_id:04d}"
         round_dir.mkdir(parents=True, exist_ok=True)
-        await emit({"type": "round_started", "round_id": round_id, "total_rounds": next_round_id + rounds - 1})
+        await emit({"type": "round_started", "round_id": round_id, "total_rounds": next_round_id + rounds - 1,
+                    "workers": workers})
 
-        try:
-            plan = await _in_thread(
-                run_root,
-                run_proposer,
-                round_dir=round_dir,
-                spec=spec,
-                data_intuition_text=data_intuition_text,
-                dataset_guide_text=dataset_guide_text,
-                accepted_panel_summary=accepted_panel_summary(accepted_panel),
-                results_log_text=load_feedback_history(run_root),
-                round_id=round_id,
-                model=model,
-                reasoning_effort=reasoning_effort,
-                data_dir=data_dir,
-                shared_dir=shared_dir,
-                max_tool_turns=PROPOSER_TOOL_TURNS,
-                wall_clock_sec=PROPOSER_WALL_CLOCK,
-                on_event=forward,
-                cancel_event=cancel_event,
-            )
-        except Exception as exc:
-            # A failed proposer costs one round, not the run.
-            _write_json(round_dir / "proposer_failure.json",
-                        {"error_type": type(exc).__name__, "error": str(exc), "traceback": traceback.format_exc()})
-            await emit({"type": "proposer_failed", "round_id": round_id, "error": f"{type(exc).__name__}: {exc}"})
-            summary_text = f"proposer failed: {type(exc).__name__}: {exc}"
-            state = _persist_round(
-                run_root=run_root, round_dir=round_dir, accepted_panel=accepted_panel, state=state,
-                next_round_id=round_id + 1,
-                feedback={"round_id": round_id, "decision": "discard", "reason": "proposer_failed",
-                          "worker_status": "not_run", "summary": summary_text},
-                results_row={"round_id": round_id, "status": "proposer_failed", "decision": "discard", "error": summary_text},
-            )
-            await emit({"type": "round_summary", "round_id": round_id, "summary": summary_text})
-            await emit({"type": "round_completed", "round_id": round_id})
-            rounds_done += 1
-            continue
-        _write_json(round_dir / "plan.json", plan)
-        await emit({
-            "type": "candidate_proposed",
-            "round_id": round_id,
-            "candidate_id": plan.get("candidate_id", ""),
-            "scientific_question": plan.get("scientific_question", ""),
-        })
-
-        worker_brief = _build_worker_brief(round_id=round_id, plan=plan, accepted_panel=accepted_panel)
-        await emit({"type": "worker_started", "worker_name": worker_brief["worker_name"],
-                    "scientific_question": worker_brief["scientific_question"]})
-        try:
-            worker_result = await _in_thread(
-                run_root,
-                run_worker,
-                worker_brief=worker_brief,
-                round_dir=round_dir,
-                spec=spec,
-                data_dir=data_dir,
-                shared_dir=shared_dir,
-                model=model,
-                reasoning_effort=reasoning_effort,
-                worker_wall_clock_sec=worker_wall_clock_sec,
-                command_timeout_sec=WORKER_COMMAND_TIMEOUT,
-                on_event=forward,
-                cancel_event=cancel_event,
-            )
-            worker_status = "completed"
-        except Exception as exc:
-            worker_dir = round_dir / worker_brief["worker_name"]
-            worker_dir.mkdir(parents=True, exist_ok=True)
-            if not isinstance(exc, ControllerChecksFailed):
-                _write_json(worker_dir / "worker_failure.json",
-                            {"error_type": type(exc).__name__, "error": str(exc), "traceback": traceback.format_exc()})
-            worker_result = {
-                "worker_name": worker_brief["worker_name"],
-                "worker_dir": str(worker_dir),
-                "summary": f"FAILED: {exc}",
-                "results_path": "",
-                "result_path": "",
-                "results": {},
-            }
-            worker_status = "failed"
-        await emit({"type": f"worker_{worker_status}", "worker_name": worker_result.get("worker_name", ""),
-                    "summary": worker_result.get("summary", "")})
-
-        worker_roundup = {**worker_result, "status": worker_status}
-        # Why nothing was admitted, when it was not the judge's verdict.
-        problem_note = "" if worker_status == "completed" else str(worker_result.get("summary", ""))
-        if worker_status == "completed":
-            await emit({"type": "judging", "round_id": round_id})
+        # 1. One plan per worker, asked in turn so that each differs from those before it.
+        plans: list[tuple[int, dict[str, Any]]] = []
+        proposer_failures: list[tuple[int, str]] = []
+        for slot in range(1, workers + 1):
             try:
-                review = await _in_thread(
+                plan = await _in_thread(
                     run_root,
-                    review_candidate,
-                    accepted_panel=accepted_panel,
-                    worker_brief=worker_brief,
-                    worker_roundup=worker_roundup,
-                    data_dir=data_dir,
-                    spec=spec,
+                    run_proposer,
                     round_dir=round_dir,
-                    config=panel_config,
+                    spec=spec,
+                    dataset_guide_text=dataset_guide_text,
+                    accepted_panel_summary=accepted_panel_summary(accepted_panel),
+                    results_log_text=load_feedback_history(run_root),
+                    round_id=round_id,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    proposed_this_round=[p for _, p in plans],
+                    slot=slot,
+                    cancel_event=cancel_event,
                 )
             except Exception as exc:
-                _write_json(round_dir / "judge_failure.json",
+                if cancel_event is not None and cancel_event.is_set():
+                    raise
+                # A failed proposer costs one worker's slot, not the round.
+                _write_json(round_dir / _numbered("proposer_failure.json", slot, workers),
                             {"error_type": type(exc).__name__, "error": str(exc), "traceback": traceback.format_exc()})
-                review = _discard_review(accepted_panel, "judge_error")
-                problem_note = f"judge failed: {type(exc).__name__}: {exc}"
-        else:
-            review = _discard_review(accepted_panel, "worker_failed")
+                note = f"proposer failed: {type(exc).__name__}: {exc}"
+                await emit({"type": "proposer_failed", "round_id": round_id, "slot": slot, "error": note})
+                proposer_failures.append((slot, note))
+                continue
+            _write_json(round_dir / _numbered("plan.json", slot, workers), plan)
+            plans.append((slot, plan))
+            await emit({
+                "type": "candidate_proposed",
+                "round_id": round_id,
+                "slot": slot,
+                "candidate_id": plan.get("candidate_id", ""),
+                "scientific_question": plan.get("scientific_question", ""),
+            })
 
-        chosen_evaluation = (review.get("chosen_review") or {}).get("evaluation") or {}
-        if chosen_evaluation.get("results"):
-            worker_roundup["results"] = chosen_evaluation["results"]
-            if worker_result.get("results_path"):
-                _write_json(Path(worker_result["results_path"]), worker_roundup["results"])
-        results = worker_roundup.get("results") or {}
+        # 2. The workers run side by side, each in its own sandbox.
+        briefs = [
+            (slot, plan, _build_worker_brief(round_id=round_id, plan=plan, accepted_panel=accepted_panel,
+                                             slot=slot, workers=workers))
+            for slot, plan in plans
+        ]
+        for _, _, brief in briefs:
+            await emit({"type": "worker_started", "worker_name": brief["worker_name"],
+                        "scientific_question": brief["scientific_question"]})
 
-        decision = str(review.get("decision") or "discard")
-        reason = str(review.get("reason") or "no_improvement")
-        if review.get("keep"):
+        async def work(brief: dict[str, Any]) -> dict[str, Any]:
+            try:
+                result = await _in_thread(
+                    run_root,
+                    run_worker,
+                    worker_brief=brief,
+                    round_dir=round_dir,
+                    spec=spec,
+                    data_dir=data_dir,
+                    shared_dir=shared_dir,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    worker_wall_clock_sec=worker_wall_clock_sec,
+                    command_timeout_sec=WORKER_COMMAND_TIMEOUT,
+                    on_event=forward,
+                    cancel_event=cancel_event,
+                )
+                status = "completed"
+            except Exception as exc:
+                worker_dir = round_dir / brief["worker_name"]
+                worker_dir.mkdir(parents=True, exist_ok=True)
+                if not isinstance(exc, ControllerChecksFailed):
+                    _write_json(worker_dir / "worker_failure.json",
+                                {"error_type": type(exc).__name__, "error": str(exc), "traceback": traceback.format_exc()})
+                result = {"worker_name": brief["worker_name"], "worker_dir": str(worker_dir),
+                          "summary": f"FAILED: {exc}", "results_path": "", "result_path": "", "results": {}}
+                status = "failed"
+            await emit({"type": f"worker_{status}", "worker_name": result.get("worker_name", ""),
+                        "summary": result.get("summary", "")})
+            return {**result, "status": status}
+
+        roundups = await asyncio.gather(*(work(brief) for _, _, brief in briefs))
+
+        # 3. Each finished worker is judged against the same panel.
+        if any(r["status"] == "completed" for r in roundups):
+            await emit({"type": "judging", "round_id": round_id})
+        candidates: list[dict[str, Any]] = []
+        for (slot, plan, brief), roundup in zip(briefs, roundups):
+            # Why nothing was admitted, when it was not the judge's verdict.
+            note = "" if roundup["status"] == "completed" else str(roundup.get("summary", ""))
+            if roundup["status"] == "completed":
+                try:
+                    review = await _in_thread(
+                        run_root,
+                        review_candidate,
+                        accepted_panel=accepted_panel,
+                        worker_brief=brief,
+                        worker_roundup=roundup,
+                        data_dir=data_dir,
+                        spec=spec,
+                        round_dir=Path(roundup["worker_dir"]),
+                        config=panel_config,
+                    )
+                except Exception as exc:
+                    _write_json(Path(roundup["worker_dir"]) / "judge_failure.json",
+                                {"error_type": type(exc).__name__, "error": str(exc), "traceback": traceback.format_exc()})
+                    review = _discard_review(accepted_panel, "judge_error")
+                    note = f"judge failed: {type(exc).__name__}: {exc}"
+            else:
+                review = _discard_review(accepted_panel, "worker_failed")
+            chosen_evaluation = (review.get("chosen_review") or {}).get("evaluation") or {}
+            if chosen_evaluation.get("results"):
+                roundup["results"] = chosen_evaluation["results"]
+                if roundup.get("results_path"):
+                    _write_json(Path(roundup["results_path"]), roundup["results"])
+            candidates.append({"slot": slot, "plan": plan, "roundup": roundup, "review": review, "note": note})
+
+        # 4. At most one enters the panel: the eligible candidate with the lowest panel RMSE.
+        eligible = [c for c in candidates if c["review"].get("keep")]
+        winner = min(eligible, key=lambda c: _safe_float(c["review"].get("accepted_panel_rmse")) or float("inf"),
+                     default=None)
+        for c in eligible:
+            if c is not winner:
+                c["review"] = {**c["review"], "decision": "discard", "reason": "another_worker_better", "keep": False,
+                               "accepted_panel_rmse": accepted_panel.get("best_panel_rmse"),
+                               "accepted_panel_score": accepted_panel.get("best_panel_score")}
+        if winner:
             accepted_panel = _apply_panel_review(
-                accepted_panel=accepted_panel, round_id=round_id, plan=plan,
-                worker_roundup=worker_roundup, review=review,
+                accepted_panel=accepted_panel, round_id=round_id, plan=winner["plan"],
+                worker_roundup=winner["roundup"], review=winner["review"],
             )
 
-        summary_text = _round_summary_text(plan, results, decision, reason, review)
-        feedback = build_round_feedback(
-            round_id=round_id, plan=plan, worker_status=worker_status, decision=decision, reason=reason,
-            review=review, worker_summary=problem_note,
-        )
-        feedback["summary"] = summary_text
-        chosen = review.get("chosen_review") or {}
-        state = _persist_round(
-            run_root=run_root, round_dir=round_dir, accepted_panel=accepted_panel, state=state,
-            next_round_id=round_id + 1,
-            feedback=feedback,
-            results_row={
-                "round_id": round_id,
-                "candidate_id": plan.get("candidate_id", ""),
-                "feature_name": results.get("feature_name", plan.get("candidate_id", "")),
-                "chosen_variation": review.get("chosen_variation") or "",
-                "status": worker_status,
-                "decision": decision,
-                "review_action": chosen.get("action", ""),
-                "review_slot": chosen.get("slot", ""),
-                "accepted_panel_score": review.get("accepted_panel_score"),
-                "baseline_panel_score": results.get("panel_baseline_score"),
-                "candidate_panel_score": results.get("panel_candidate_score"),
-                "accepted_panel_delta": review.get("accepted_panel_delta"),
-                "delta_panel_score": results.get("delta_panel_score"),
-                # partial r of the variation the judge chose (the RMSE columns refer to it too)
-                "partial_r": next(
-                    (v.get("partial_r") for v in (review.get("variation_summaries") or [])
-                     if v.get("variation") == review.get("chosen_variation")),
-                    None,
-                ),
-                "accepted_panel_rmse": review.get("accepted_panel_rmse"),
-                "candidate_panel_rmse": results.get("panel_candidate_rmse"),
-                "mean_rmse_improvement": results.get("mean_rmse_improvement"),
-                "fraction_repeats_better_rmse": results.get("fraction_repeats_better_rmse"),
-                "description": plan.get("scientific_question", ""),
-                "artifact_dir": worker_result.get("worker_dir", ""),
-                "error": problem_note,
-            },
-        )
-        await emit({"type": "round_summary", "round_id": round_id, "summary": summary_text})
+        summaries = []
+        for slot, note in proposer_failures:
+            summaries.append(note)
+            _record_candidate(
+                run_root=run_root, round_dir=round_dir, slot=slot, workers=workers,
+                feedback={"round_id": round_id, "decision": "discard", "reason": "proposer_failed",
+                          "worker_status": "not_run", "summary": note},
+                results_row={"round_id": round_id, "worker": slot, "status": "proposer_failed", "decision": "discard",
+                             "error": note},
+            )
+        for c in candidates:
+            plan, roundup, review = c["plan"], c["roundup"], c["review"]
+            results = roundup.get("results") or {}
+            decision = str(review.get("decision") or "discard")
+            reason = str(review.get("reason") or "no_improvement")
+            summary_text = _round_summary_text(plan, results, decision, reason, review)
+            summaries.append(summary_text)
+            feedback = build_round_feedback(
+                round_id=round_id, plan=plan, worker_status=roundup["status"], decision=decision, reason=reason,
+                review=review, worker_summary=c["note"],
+            )
+            feedback["summary"] = summary_text
+            chosen = review.get("chosen_review") or {}
+            _record_candidate(
+                run_root=run_root, round_dir=round_dir, slot=c["slot"], workers=workers, feedback=feedback,
+                results_row={
+                    "round_id": round_id,
+                    "worker": c["slot"],
+                    "candidate_id": plan.get("candidate_id", ""),
+                    "feature_name": results.get("feature_name", plan.get("candidate_id", "")),
+                    "chosen_variation": review.get("chosen_variation") or "",
+                    "status": roundup["status"],
+                    "decision": decision,
+                    "review_action": chosen.get("action", ""),
+                    "review_slot": chosen.get("slot", ""),
+                    "accepted_panel_score": review.get("accepted_panel_score"),
+                    "baseline_panel_score": results.get("panel_baseline_score"),
+                    "candidate_panel_score": results.get("panel_candidate_score"),
+                    "accepted_panel_delta": review.get("accepted_panel_delta"),
+                    "delta_panel_score": results.get("delta_panel_score"),
+                    # partial r of the variation the judge chose (the RMSE columns refer to it too)
+                    "partial_r": next(
+                        (v.get("partial_r") for v in (review.get("variation_summaries") or [])
+                         if v.get("variation") == review.get("chosen_variation")),
+                        None,
+                    ),
+                    "accepted_panel_rmse": review.get("accepted_panel_rmse"),
+                    "candidate_panel_rmse": results.get("panel_candidate_rmse"),
+                    "mean_rmse_improvement": results.get("mean_rmse_improvement"),
+                    "fraction_repeats_better_rmse": results.get("fraction_repeats_better_rmse"),
+                    "description": plan.get("scientific_question", ""),
+                    "artifact_dir": roundup.get("worker_dir", ""),
+                    "error": c["note"],
+                },
+            )
+        state = _finish_round(run_root=run_root, accepted_panel=accepted_panel, state=state, next_round_id=round_id + 1)
+        await emit({"type": "round_summary", "round_id": round_id, "summary": "\n".join(summaries)})
         await emit({"type": "round_completed", "round_id": round_id})
         rounds_done += 1
 

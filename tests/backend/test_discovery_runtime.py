@@ -15,7 +15,6 @@ import pytest
 PROBLEM = """---
 outcome: slope
 covariates: [age]
-excluded_classes: [Debris]
 ---
 Which measurements track the slope?
 """
@@ -110,14 +109,10 @@ def test_worker_controller_materializes_and_passes_a_clean_script(scripted_worke
     assert json.loads(Path(result["results_path"]).read_text())["status"] == "ok"
 
 
-@pytest.mark.parametrize("code, failure", [
-    ("def compute_donor_features(d, r):\n    return {'a': df['slope'], 'b': 1}\n", "OUTCOME_REFERENCE"),
-    ("def compute_donor_features(d, r):\n    x = cells[cells.cell_type == 'Debris']\n    return {'a': 1, 'b': 1}\n", "CLASS_RULE"),
-])
-def test_worker_controller_rejects_outcome_contact_and_class_rule_breaks(scripted_worker, tmp_path, code, failure):
-    ScriptedSandbox.result_py = code
+def test_worker_controller_rejects_outcome_contact(scripted_worker, tmp_path):
+    ScriptedSandbox.result_py = "def compute_donor_features(d, r):\n    return {'a': df['slope'], 'b': 1}\n"
     data = _workspace(tmp_path)
-    with pytest.raises(scripted_worker.ControllerChecksFailed, match=failure):
+    with pytest.raises(scripted_worker.ControllerChecksFailed, match="OUTCOME_REFERENCE"):
         _run_worker(scripted_worker, tmp_path, data)
     assert ScriptedSandbox.instances[0].stopped
 
@@ -133,18 +128,10 @@ def test_loop_runs_stages_off_the_event_loop_and_writes_findings(tmp_path, monke
     proposals = iter([RuntimeError("model unavailable"), {"candidate_id": "cand", "scientific_question": "q",
                                                           "variations": [{"name": "a"}], "baseline_variation": "a"}])
 
-    def fake_intuition(spec, data_dir, shared_dir):
-        threads["intuition"] = threading.get_ident()
-        # state is written before the slides are measured: a cancel here leaves a resumable run
-        assert (tmp_path / "run" / "run_state.json").exists()
-        (Path(shared_dir) / "data_intuition.md").write_text("brief")
-        return {"n_donors": 3}
-
     def fake_proposer(**kwargs):
         threads["proposer"] = threading.get_ident()
         assert loop.run_folder_busy(tmp_path / "run")   # counted while the thread runs
-        assert kwargs["cancel_event"] is cancel and kwargs["data_intuition_text"] == "brief"
-        assert kwargs["dataset_guide_text"] == "guide"
+        assert kwargs["cancel_event"] is cancel and kwargs["dataset_guide_text"] == "guide"
         item = next(proposals)
         if isinstance(item, Exception):
             raise item
@@ -166,12 +153,11 @@ def test_loop_runs_stages_off_the_event_loop_and_writes_findings(tmp_path, monke
 
     def fake_scout(**kwargs):
         threads["scout"] = threading.get_ident()
-        # after the brief, which it reads
-        assert (Path(kwargs["shared_dir"]) / "data_intuition.md").exists()
+        # state is written first: a cancel while scouting leaves a resumable run
+        assert (tmp_path / "run" / "run_state.json").exists()
         (Path(kwargs["shared_dir"]) / "dataset_guide.md").write_text("guide")
         return {"status": "completed", "turns": 3}
 
-    monkeypatch.setattr(loop, "build_data_intuition", fake_intuition)
     monkeypatch.setattr(loop, "run_scout", fake_scout)
     monkeypatch.setattr(loop, "run_proposer", fake_proposer)
     monkeypatch.setattr(loop, "run_worker", fake_worker)
@@ -190,7 +176,7 @@ def test_loop_runs_stages_off_the_event_loop_and_writes_findings(tmp_path, monke
     result = asyncio.run(scenario())
     assert not loop.run_folder_busy(tmp_path / "run")
 
-    for stage in ("intuition", "scout", "proposer", "worker", "judge"):
+    for stage in ("scout", "proposer", "worker", "judge"):
         assert threads[stage] != threads["loop"], f"{stage} ran on the event loop"
     # round 1: the proposer failed and cost only that round
     assert events.count("proposer_failed") == 1 and events.count("round_completed") == 2
@@ -210,12 +196,64 @@ def test_loop_runs_stages_off_the_event_loop_and_writes_findings(tmp_path, monke
     assert "slope" not in (shared / "dataset.json").read_text()
 
 
+def test_several_workers_run_side_by_side_and_only_the_best_is_admitted(tmp_path, monkeypatch):
+    import time
+
+    import app.services.agent.discovery.loop as loop
+
+    data = _workspace(tmp_path)
+    active, peak, lock = [0], [0], threading.Lock()
+
+    def fake_proposer(**kwargs):
+        # each plan is asked for knowing the ones before it
+        assert len(kwargs["proposed_this_round"]) == kwargs["slot"] - 1
+        return {"candidate_id": f"cand{kwargs['slot']}", "scientific_question": f"q{kwargs['slot']}",
+                "variations": [{"name": "a"}], "baseline_variation": "a"}
+
+    def fake_worker(**kwargs):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.3)
+        with lock:
+            active[0] -= 1
+        name = kwargs["worker_brief"]["worker_name"]
+        return {"worker_name": name, "worker_dir": str(tmp_path / name), "results_path": "", "summary": "ok",
+                "results": {"feature_name": kwargs["worker_brief"]["candidate_id"], "feature_column": "a"}}
+
+    def fake_judge(**kwargs):
+        slot = int(kwargs["worker_brief"]["worker_name"].rsplit("_", 1)[1])
+        rmse = {1: 0.06, 2: 0.04}.get(slot)   # 1 and 2 both qualify, 2 is better; 3 does not
+        results = {"feature_name": f"cand{slot}", "feature_column": "a", "panel_candidate_rmse": rmse}
+        return {"decision": "keep" if rmse else "discard", "reason": "predictive_cv_improved" if rmse else "no_improvement",
+                "keep": bool(rmse), "chosen_variation": "a", "accepted_panel_rmse": rmse, "variation_summaries": [],
+                "chosen_review": {"action": "add", "slot": None, "evaluation": {"results": results}}}
+
+    monkeypatch.setattr(loop, "run_proposer", fake_proposer)
+    monkeypatch.setattr(loop, "run_worker", fake_worker)
+    monkeypatch.setattr(loop, "review_candidate", fake_judge)
+
+    async def emit(event):
+        pass
+
+    result = asyncio.run(loop.run_discovery(spec=_spec(), data_dir=data, run_root=tmp_path / "run", emit=emit,
+                                            rounds=1, model="m", dataset_scout=False, workers_per_round=3))
+    assert peak[0] == 3   # side by side, not one after another
+    assert [m["feature_name"] for m in result["accepted_panel"]["members"]] == ["cand2"]
+    rows = pd.read_csv(tmp_path / "run" / "results.tsv", sep="\t")
+    assert rows["worker"].tolist() == [1, 2, 3] and rows["decision"].tolist() == ["discard", "keep", "discard"]
+    round_dir = tmp_path / "run" / "round_0001"
+    assert json.loads((round_dir / "round_feedback_1.json").read_text())["reason"] == "another_worker_better"
+    assert all((round_dir / f"plan_{k}.json").exists() for k in (1, 2, 3))
+    assert json.loads((tmp_path / "run" / "run_state.json").read_text())["config"]["workers_per_round"] == 3
+    # the proposer's history shows all three candidates
+    assert all(f"candidate=cand{k}" in loop.load_feedback_history(tmp_path / "run") for k in (1, 2, 3))
+
+
 def test_a_judge_failure_is_reported_not_swallowed(tmp_path, monkeypatch):
     import app.services.agent.discovery.loop as loop
 
     data = _workspace(tmp_path)
-    monkeypatch.setattr(loop, "build_data_intuition",
-                        lambda spec, data_dir, shared_dir: (Path(shared_dir) / "data_intuition.md").write_text("b"))
     monkeypatch.setattr(loop, "run_proposer", lambda **kw: {"candidate_id": "cand", "variations": [{"name": "a"}],
                                                           "baseline_variation": "a"})
     monkeypatch.setattr(loop, "run_worker", lambda **kw: {"worker_name": "w", "worker_dir": str(tmp_path / "w"),

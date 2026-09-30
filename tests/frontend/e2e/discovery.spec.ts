@@ -52,8 +52,9 @@ async function openResearchPanel(page: Page): Promise<void> {
 const programBox = (page: Page) => page.getByLabel('Research Program');
 const summary = (page: Page) => page.getByTestId('program-summary');
 
-async function startRun(page: Page, rounds: number): Promise<Response> {
+async function startRun(page: Page, rounds: number, workers = 1): Promise<Response> {
   await page.locator('input[type="number"]').first().fill(String(rounds));
+  await page.getByLabel('Workers').fill(String(workers));
   const started = page.waitForResponse((r) => r.url().endsWith('/agent/v1/discovery/runs') && r.request().method() === 'POST');
   await page.getByRole('button', { name: 'Start Research' }).click();
   return started;
@@ -99,7 +100,8 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     await expect(summary(page)).toContainText(/Predict score · adjust for age, sex\s*\(named in your text\)/);
     await expect(page.getByRole('button', { name: 'Start Research' })).toBeEnabled();
 
-    const started = await startRun(page, 1);
+    // Two workers: two hypotheses a round, side by side in their own sandboxes.
+    const started = await startRun(page, 1, 2);
     const body = await started.json();
     expect(body.code, JSON.stringify(body)).toBe(0);
     const runId: string = body.data.run_id;
@@ -107,25 +109,22 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
 
     // Live progress: the hypothesis the proposer committed to, both agents, the journal.
     await expect(page.getByText(QUESTION).first()).toBeVisible({ timeout: 120_000 });
-    await expect(page.getByText('Proposer & Worker')).toBeVisible();
+    await expect(page.getByText('Proposer & Workers')).toBeVisible();
     await expect(findings(page)).toBeVisible({ timeout: 360_000 });
     await expect(page.getByText('Research Journal')).toBeVisible();
     await expect(page.getByText(/Outcome: score/)).toBeVisible();
     await expect(page.getByText(/Accepted panel members: [1-5]/)).toBeVisible();
     await expect(page.getByText('Round 1', { exact: true })).toBeVisible();
 
-    // The run folder: the judged round, the findings, the problem it ran.
+    // The run folder: both judged candidates (one admitted), the findings, the problem it ran.
     const rows = resultsRows(runId);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toContain('alpha_inner_fraction');
-    expect(rows[0]).toContain('\tkeep\t');
+    expect(rows).toHaveLength(2);
+    expect(rows.every((r) => r.includes('alpha_inner_fraction'))).toBe(true);
+    expect(rows.filter((r) => r.includes('\tkeep\t'))).toHaveLength(1);
+    for (const k of [1, 2]) expect(fs.existsSync(path.join(runsDir(), runId, 'round_0001', `round_0001_worker_${k}`))).toBe(true);
     expect(fs.readFileSync(path.join(runsDir(), runId, 'research_findings.md'), 'utf8')).toContain('Outcome: score');
     expect(fs.readFileSync(path.join(workspace(), 'problem.md'), 'utf8')).toBe(PROBLEM);
-    // The sandbox saw the id-only cohort: the proposer's probe printed no outcome column.
-    const probe = fs.readFileSync(path.join(runsDir(), runId, 'round_0001', 'proposer', 'sandbox', 'logs', 'turn_01.stdout.txt'), 'utf8');
-    expect(probe).toContain('case,slide,mpp');
-    expect(probe).not.toContain('score');
-    // The dataset scout ran first, as outcome-blind as the proposer, and its guide is shared.
+    // The dataset scout ran first in a sandbox that holds the id-only cohort, and its guide is shared.
     const scoutProbe = fs.readFileSync(path.join(runsDir(), runId, 'scout', 'sandbox', 'logs', 'turn_01.stdout.txt'), 'utf8');
     expect(scoutProbe).toContain('case,slide,mpp');
     expect(scoutProbe).not.toContain('score');

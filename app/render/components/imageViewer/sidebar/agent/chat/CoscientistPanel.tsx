@@ -2,7 +2,7 @@ import { usePathWriteAccess } from "@/hooks/usePathWriteAccess"
 import React, { useState, useRef, useEffect, useCallback } from "react"
 import {
   Loader2, Play, Square, ChevronDown, ChevronRight,
-  FlaskConical, Users, History, Plus, FolderOpen, Search, FileText, RotateCcw,
+  FlaskConical, Users, History, Plus, FolderOpen, FileText, RotateCcw,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Switch } from "@/components/ui/switch"
@@ -159,6 +159,8 @@ export const CoscientistPanel: React.FC = () => {
   const [programReady, setProgramReady] = useState(false)
   const [formResetKey, setFormResetKey] = useState(0)
   const [rounds, setRounds] = useState(3)
+  // Hypotheses (and parallel workers, one sandbox each) per round; at most one is admitted.
+  const [workersPerRound, setWorkersPerRound] = useState(1)
   const [reasoningEffort, setReasoningEffort] = useState<"low" | "medium" | "high">("high")
   const [workerTimeLimitMin, setWorkerTimeLimitMin] = useState(30)
   const [showAdvanced, setShowAdvanced] = useState(false)
@@ -179,7 +181,6 @@ export const CoscientistPanel: React.FC = () => {
   const [error, setError] = useState<string | null>(null)
   const [selectedWorker, setSelectedWorker] = useState<string | null>(null)
   const [roundPhase, setRoundPhase] = useState<"proposing" | "workers" | "materializing" | "evaluating" | "done" | null>(null)
-  const [measureStatus, setMeasureStatus] = useState<"idle" | "running" | "done">("idle")
   const [scout, setScout] = useState<ScoutState>(SCOUT_IDLE)
   const [finalSummary, setFinalSummary] = useState<string | null>(null)
   const [expandedJournalIdx, setExpandedJournalIdx] = useState<number | null>(null)
@@ -261,7 +262,7 @@ export const CoscientistPanel: React.FC = () => {
     setPhase("running")
     setJournal([])
     setCurrentRound(null)
-    setMeasureStatus("idle"); setScout(SCOUT_IDLE)
+    setScout(SCOUT_IDLE)
     setFinalSummary(null)
     setActiveRunId(null)
 
@@ -304,7 +305,7 @@ export const CoscientistPanel: React.FC = () => {
     setPhase("running")
     setJournal([])
     setCurrentRound(null)
-    setMeasureStatus("idle"); setScout(SCOUT_IDLE)
+    setScout(SCOUT_IDLE)
     setFinalSummary(null)
     setActiveRunId(null)
 
@@ -315,6 +316,7 @@ export const CoscientistPanel: React.FC = () => {
           task: program,
           workspace_path: workspacePath,
           rounds,
+          workers_per_round: workersPerRound,
           reasoning_effort: reasoningEffort,
           worker_wall_clock_sec: workerTimeLimitMin * 60,
           dataset_scout: datasetScout,
@@ -376,14 +378,6 @@ export const CoscientistPanel: React.FC = () => {
 
   const handleEvent = (event: any) => {
     switch (event.type) {
-      case "data_intuition_started":
-        setMeasureStatus("running")
-        break
-
-      case "data_intuition_done":
-        setMeasureStatus("done")
-        break
-
       case "scout_started":
         setScout({ status: "running", calls: [] })
         break
@@ -417,34 +411,26 @@ export const CoscientistPanel: React.FC = () => {
           totalRounds: event.total_rounds || rounds,
           focus: "",
           // The proposer inspects the data first; it is listed with the worker.
-          workers: [{ name: "proposer", question: "Inspecting the data before proposing a hypothesis", status: "running", toolCalls: [] }],
+          workers: [{ name: "proposer", question: event.workers > 1 ? `Proposing ${event.workers} different hypotheses` : "Proposing a hypothesis", status: "running", toolCalls: [] }],
         })
         break
 
       case "candidate_proposed":
-        setRoundPhase("workers")
+        // One per worker; the proposer is done once the workers start.
         setCurrentRound(prev => prev ? {
           ...prev,
-          focus: event.scientific_question || event.candidate_id || "",
-          workers: prev.workers.map(w => w.name === "proposer" ? { ...w, status: "completed", summary: event.candidate_id } : w),
+          focus: prev.focus || event.scientific_question || event.candidate_id || "",
+          workers: prev.workers.map(w => w.name === "proposer"
+            ? { ...w, summary: [w.summary, event.candidate_id].filter(Boolean).join(", ") } : w),
         } : prev)
         break
 
       case "proposer_failed":
         setCurrentRound(prev => prev ? {
           ...prev,
-          workers: prev.workers.map(w => w.name === "proposer" ? { ...w, status: "failed", summary: event.error } : w),
+          workers: prev.workers.map(w => w.name === "proposer" ? { ...w, summary: [w.summary, event.error].filter(Boolean).join("; ") } : w),
         } : prev)
         break
-
-      case "proposer_tool_call":
-        handleEvent({ ...event, type: "worker_tool_call", worker_name: "proposer",
-                      command_preview: event.command_preview || (event.image_path ? `inspect ${event.image_path}` : "") })
-        return
-
-      case "proposer_tool_result":
-        handleEvent({ ...event, type: "worker_tool_result", worker_name: "proposer" })
-        return
 
       case "worker_materialize":
         setRoundPhase("materializing")
@@ -455,11 +441,12 @@ export const CoscientistPanel: React.FC = () => {
         break
 
       case "worker_started":
+        setRoundPhase("workers")
         setCurrentRound(prev => {
           if (!prev) return prev
           return {
             ...prev,
-            workers: [...prev.workers, {
+            workers: [...prev.workers.map(w => w.name === "proposer" && w.status === "running" ? { ...w, status: "completed" as const } : w), {
               name: event.worker_name,
               question: event.scientific_question || "",
               status: "running",
@@ -690,7 +677,7 @@ export const CoscientistPanel: React.FC = () => {
             <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="Run history" onClick={() => { if (!showHistory) void fetchWorkspaceRuns(); setShowHistory(!showHistory) }}>
               <History className="h-4 w-4" />
             </Button>
-            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="New research task" onClick={() => { setPhase("input"); setFormResetKey(k => k + 1); setCurrentRound(null); setJournal([]); setError(null); setResumeInfo(null); setActiveRunId(null); setMeasureStatus("idle"); setScout(SCOUT_IDLE); setFinalSummary(null); }}>
+            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="New research task" onClick={() => { setPhase("input"); setFormResetKey(k => k + 1); setCurrentRound(null); setJournal([]); setError(null); setResumeInfo(null); setActiveRunId(null); setScout(SCOUT_IDLE); setFinalSummary(null); }}>
               <Plus className="h-4 w-4" />
             </Button>
           </div>
@@ -731,7 +718,7 @@ export const CoscientistPanel: React.FC = () => {
                     setJournal([])
                     setFinalSummary(null)
                     setError(null)
-                    setMeasureStatus("idle"); setScout(SCOUT_IDLE)
+                    setScout(SCOUT_IDLE)
                     setResumeInfo(null)
                     void loadWorkspaceRun(run.run_root_path)
                   }}
@@ -782,6 +769,19 @@ export const CoscientistPanel: React.FC = () => {
                   max={20}
                   value={rounds}
                   onChange={e => setRounds(Math.max(1, Math.min(20, parseInt(e.target.value) || 1)))}
+                  className="w-full h-8 rounded-md border border-border bg-background px-2.5 text-xs font-medium text-foreground focus:border-primary/50 focus:ring-1 focus:ring-primary/20 focus:outline-none"
+                />
+              </div>
+              <div className="flex-1">
+                <label htmlFor="workers-per-round" className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1 block">Workers</label>
+                <input
+                  id="workers-per-round"
+                  type="number"
+                  min={1}
+                  max={5}
+                  title="Hypotheses tested side by side each round, each in its own sandbox; the best one is kept"
+                  value={workersPerRound}
+                  onChange={e => setWorkersPerRound(Math.max(1, Math.min(5, parseInt(e.target.value) || 1)))}
                   className="w-full h-8 rounded-md border border-border bg-background px-2.5 text-xs font-medium text-foreground focus:border-primary/50 focus:ring-1 focus:ring-primary/20 focus:outline-none"
                 />
               </div>
@@ -904,7 +904,9 @@ export const CoscientistPanel: React.FC = () => {
               <div className="rounded-lg border border-border/60 overflow-hidden">
                 <div className="px-3 py-2 bg-muted/30 border-b border-border/40 flex items-center gap-2">
                   <Users className="h-3.5 w-3.5 text-muted-foreground" />
-                  <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">Proposer &amp; Worker</span>
+                  <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
+                    Proposer &amp; {currentRound.workers.length > 2 ? "Workers" : "Worker"}
+                  </span>
                   <span className="text-[10px] text-muted-foreground ml-auto">
                     {currentRound.workers.filter(w => w.status === "completed").length}/{currentRound.workers.length}
                   </span>
@@ -1007,8 +1009,10 @@ export const CoscientistPanel: React.FC = () => {
               <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-muted/30 border border-border/40">
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-primary shrink-0" />
                 <span className="text-xs text-muted-foreground">
-                  {roundPhase === "proposing" && "Proposer is inspecting the data and choosing a hypothesis..."}
-                  {roundPhase === "workers" && "Worker is implementing the plan as result.py..."}
+                  {roundPhase === "proposing" && "Proposer is choosing a hypothesis..."}
+                  {roundPhase === "workers" && ((currentRound?.workers.length ?? 0) > 2
+                    ? "Workers are implementing their plans side by side..."
+                    : "Worker is implementing the plan as result.py...")}
                   {roundPhase === "materializing" && "Running result.py on every donor and checking it..."}
                   {roundPhase === "evaluating" && "Judge is scoring the variations with nested cross-validation..."}
                 </span>
@@ -1078,28 +1082,14 @@ export const CoscientistPanel: React.FC = () => {
               <Button
                 variant="outline"
                 className="w-full h-9 text-xs border-primary/30 text-primary hover:bg-primary/5"
-                onClick={() => { setPhase("input"); setCurrentRound(null); setActiveRunId(null); setMeasureStatus("idle"); setScout(SCOUT_IDLE); setFinalSummary(null); }}
+                onClick={() => { setPhase("input"); setCurrentRound(null); setActiveRunId(null); setScout(SCOUT_IDLE); setFinalSummary(null); }}
               >
                 <Plus className="h-3.5 w-3.5 mr-1.5" />
                 New Research Task
               </Button>
             )}
 
-            {/* Data-intuition card: the slides are measured once per run, before round 1 */}
-            {measureStatus !== "idle" && !currentRound && (
-              <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-muted/30 border border-border/40">
-                {measureStatus === "running" ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin text-primary shrink-0" />
-                ) : (
-                  <Search className="h-3.5 w-3.5 text-primary shrink-0" />
-                )}
-                <span className="text-xs text-muted-foreground">
-                  {measureStatus === "running" ? "Measuring the slides (cells, classes, regions, spacings)..." : "Slides measured."}
-                </span>
-              </div>
-            )}
-
-            {/* Dataset scout card: once per run, after the slides are measured */}
+            {/* Dataset scout card: once per run, before round 1 */}
             {scout.status !== "idle" && !currentRound && (
               <div className="px-3 py-2 rounded-lg bg-muted/30 border border-border/40 space-y-1.5" data-testid="scout-card">
                 <div className="flex items-center gap-2">
@@ -1129,7 +1119,7 @@ export const CoscientistPanel: React.FC = () => {
             )}
 
             {/* Running indicator — only when not scouting and no round yet */}
-            {isRunning && !currentRound && measureStatus === "idle" && (
+            {isRunning && !currentRound && scout.status === "idle" && (
               <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-muted/30 border border-border/40">
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-primary shrink-0" />
                 <span className="text-xs text-muted-foreground">Initializing research...</span>

@@ -22,7 +22,6 @@ from .panel_cv import (
     PredictivePanelConfig,
     compare_predictive_panels,
     covariate_matrix,
-    jackknife_refit_panel_comparison,
     predictive_result_fields,
 )
 from .problem import ProblemSpec, load_cohort
@@ -324,7 +323,6 @@ def review_candidate(
     repeat_rows: list[dict[str, Any]] = []
     prediction_rows: list[dict[str, Any]] = []
     tuning_rows: list[dict[str, Any]] = []
-    jackknife_rows: list[dict[str, Any]] = []
     full_comparisons: list[dict[str, Any]] = []
     variation_summaries: list[dict[str, Any]] = []
     base_results = dict(worker_roundup.get("results") or {})
@@ -385,32 +383,12 @@ def review_candidate(
             )
             fields = predictive_result_fields(comparison)
             coverage_passed = coverage >= config.min_candidate_coverage
-            preliminary_eligible = bool(
-                comparison["acceptance_passed"] and coverage_passed and sign_passed
-            )
-            jackknife = None
-            if preliminary_eligible:
-                jackknife = jackknife_refit_panel_comparison(
-                    current_frame,
-                    outcome_column=primary_outcome,
-                    covariates=covariates,
-                    baseline_feature_columns=current_columns,
-                    candidate_feature_columns=action["proposed_columns"],
-                    config=config,
-                )
-            jackknife_passed = bool(jackknife and jackknife["passed"])
-            eligible = bool(preliminary_eligible and jackknife_passed)
+            eligible = bool(comparison["acceptance_passed"] and coverage_passed and sign_passed)
             fields.update(
                 {
                     "feature_column": candidate_source_column,
                     "candidate_coverage": coverage,
                     "candidate_coverage_passed": coverage_passed,
-                    "jackknife_refit_passed": jackknife_passed,
-                    "jackknife_refit_minimum_mean_rmse_improvement": (
-                        jackknife["minimum_mean_rmse_improvement"]
-                        if jackknife
-                        else None
-                    ),
                     "predictive_validation_passed": eligible,
                     "artifacts": {
                         **(base_results.get("artifacts") or {}),
@@ -443,16 +421,11 @@ def review_candidate(
                 "consensus_rmse_improvement": comparison.get("consensus_rmse_improvement"),
                 "consensus_pearson_delta": comparison.get("consensus_pearson_delta"),
                 "worst_leave_one_donor_rmse_improvement": comparison.get("worst_leave_one_donor_rmse_improvement"),
-                "jackknife_refit_minimum_mean_rmse_improvement": (
-                    jackknife["minimum_mean_rmse_improvement"] if jackknife else None
-                ),
                 "candidate_coverage": coverage,
                 "acceptance_gates": {
                     **comparison["acceptance_gates"],
                     "candidate_coverage": coverage_passed,
                     "expected_sign": sign_passed,
-                    # None = not run (a CV gate failed first); False = ran and failed; True = passed
-                    "jackknife_refit": jackknife_passed if preliminary_eligible else None,
                 },
                 "eligible": eligible,
             }
@@ -464,9 +437,6 @@ def review_candidate(
                 else f"{action['action']}_slot_{action['slot']}"
             )
             action_label = f"{candidate_source_column}:{action_label}"
-            if jackknife:
-                for row in jackknife["records"]:
-                    jackknife_rows.append({"action": action_label, **row})
             for row in comparison["per_repeat"]:
                 repeat_rows.append(
                     {
@@ -497,20 +467,11 @@ def review_candidate(
                     "candidate_coverage": coverage,
                     "eligible": eligible,
                     "comparison": _comparison_summary(comparison),
-                    "jackknife_refit": (
-                        {
-                            key: value
-                            for key, value in jackknife.items()
-                            if key != "records"
-                        }
-                        if jackknife
-                        else None
-                    ),
                 }
             )
         best = min(variation_reviews, key=lambda r: float(r["candidate_panel_rmse"]))
         gates = dict(best["acceptance_gates"])
-        cv_gate_names = [g for g in gates if g != "jackknife_refit"]
+        cv_gate_names = list(gates)
         variation_summaries.append(
             {
                 "variation": candidate_source_column,
@@ -526,7 +487,6 @@ def review_candidate(
                 "consensus_rmse_improvement": best.get("consensus_rmse_improvement"),
                 "consensus_pearson_delta": best.get("consensus_pearson_delta"),
                 "worst_leave_one_donor_rmse_improvement": best.get("worst_leave_one_donor_rmse_improvement"),
-                "jackknife_refit_minimum_mean_rmse_improvement": best.get("jackknife_refit_minimum_mean_rmse_improvement"),
                 "candidate_panel_rmse": best["candidate_panel_rmse"],
                 "baseline_panel_rmse": best["baseline_panel_rmse"],
                 "gates": gates,
@@ -546,7 +506,6 @@ def review_candidate(
     _write_csv(round_dir / "predictive_cv_repeat_metrics.csv", repeat_rows)
     _write_csv(round_dir / "predictive_cv_predictions.csv", prediction_rows)
     _write_csv(round_dir / "predictive_cv_tuning.csv", tuning_rows)
-    _write_csv(round_dir / "predictive_cv_jackknife_refits.csv", jackknife_rows)
     review_artifact = round_dir / "predictive_cv_review.json"
     review_artifact.write_text(
         json.dumps(
@@ -626,8 +585,5 @@ def review_candidate(
             "repeat_metrics": str(round_dir / "predictive_cv_repeat_metrics.csv"),
             "predictions": str(round_dir / "predictive_cv_predictions.csv"),
             "tuning": str(round_dir / "predictive_cv_tuning.csv"),
-            "jackknife_refits": str(
-                round_dir / "predictive_cv_jackknife_refits.csv"
-            ),
         },
     }

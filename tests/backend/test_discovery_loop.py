@@ -24,8 +24,6 @@ covariates: [age, sex]
 cohort_file: cases.csv
 id_column: case
 slide_column: slide
-excluded_classes: [Debris]
-exclude_only_classes: [Artefact]
 ---
 Which spatial arrangements track the slope?
 """
@@ -80,7 +78,6 @@ def test_problem_parses_header_and_question():
     spec = parse_problem(PROBLEM)
     assert spec.outcome == "slope" and spec.covariates == ("age", "sex")
     assert (spec.cohort_file, spec.id_column, spec.slide_column) == ("cases.csv", "case", "slide")
-    assert spec.excluded_classes == ("Debris",) and spec.exclude_only_classes == ("Artefact",)
     assert spec.question == "Which spatial arrangements track the slope?"
     assert spec.protected_names == ["slope", "age", "sex"]
 
@@ -162,46 +159,16 @@ def test_sandbox_cohort_copy_holds_no_outcome_or_covariates(tmp_path):
 
 def test_system_prompts_and_code_carry_no_dataset_specifics():
     """Everything dataset-specific belongs in problem.md, never in the system."""
-    from app.services.agent.discovery.proposer import TOOL_SECTION
-
     banned = ["slope_zmem0", "SEA-AD", "sea_ad", "CA1", "Astrocyte", "Pyramidal", "braak", "cerad",
               "max_age_vis", "Corpora", "Lymphocyte", "A12-LFB", "35 donors", "hippocamp"]
     sources = {p.relative_to(DISCOVERY_DIR).as_posix(): p.read_text(encoding="utf-8")
                for p in DISCOVERY_DIR.rglob("*") if p.suffix in {".py", ".md"} and "__pycache__" not in p.parts}
-    sources["proposer.TOOL_SECTION"] = TOOL_SECTION
     hits = [(name, word) for name, text in sources.items() for word in banned
             if word.lower() in text.lower() and name != "problem.py"]
     assert hits == []
 
 
 # ── the controller's rules ────────────────────────────────────────────────────
-
-def test_class_rules_follow_the_problem(tmp_path):
-    from app.services.agent.discovery.problem import parse_problem
-    from app.services.agent.discovery.worker import class_rule_violations
-
-    spec = parse_problem(PROBLEM.replace("[Debris]", "[Debris, Astro]"))
-    ok = tmp_path / "ok.py"
-    ok.write_text(
-        "ARTEFACT = 'Artefact'\n"
-        "x = cells[cells.cell_type != ARTEFACT]\n"
-        "x2 = cells[cells.cell_type.ne('Artefact')]\n"
-        "y = cells[cells.cell_type.isin(['Astrocyte', 'Beta'])]\n"
-        "# Debris only in a comment\n"
-    )
-    assert class_rule_violations([ok], spec) == []
-    bad = tmp_path / "helper.py"
-    bad.write_text(
-        "d = cells[cells.cell_type == 'Debris']\n"
-        "a = cells[cells.cell_type == 'Artefact']\n"
-        "b = cells[cells.cell_type.isin(['Alpha', 'Artefact'])]\n"
-        "n = cells[cells.class_id == 2]\n"
-    )
-    hits = class_rule_violations([ok, bad], spec)
-    assert [h.split(":")[:2] for h in hits] == [["helper.py", "1"], ["helper.py", "2"], ["helper.py", "3"], ["helper.py", "4"]]
-    # no class rules in the problem: nothing to enforce
-    assert class_rule_violations([bad], parse_problem("---\noutcome: slope\n---\nq")) == []
-
 
 def test_outcome_references_scan_scripts_and_commands(tmp_path):
     from app.services.agent.discovery.worker import outcome_references
@@ -224,27 +191,6 @@ PLAN = {
 }
 
 
-class FakeSession:
-    commands: list = []
-    kwargs: dict = {}
-
-    def __init__(self, *args, **kwargs):
-        FakeSession.kwargs = kwargs
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def watch_cancel(self, cancel_event):
-        return lambda: None
-
-    def exec(self, command, timeout_sec=None):
-        FakeSession.commands.append(command)
-        return {"exit_code": 0, "stdout": f"ran: {command}", "stderr": ""}
-
-
 def _resp(rid, *, tool_command=None, text="", usage_in=10):
     output = [{"type": "reasoning", "summary": [{"type": "summary_text", "text": f"think {rid}"}]}]
     if tool_command is not None:
@@ -256,7 +202,7 @@ def _resp(rid, *, tool_command=None, text="", usage_in=10):
                       "output_tokens_details": {"reasoning_tokens": 2}}}
 
 
-def _run_proposer(monkeypatch, tmp_path, responses, max_tool_turns=8):
+def _run_proposer(monkeypatch, tmp_path, responses, **extra):
     from app.services.agent.discovery import proposer
     from app.services.agent.discovery.problem import parse_problem
 
@@ -267,45 +213,32 @@ def _run_proposer(monkeypatch, tmp_path, responses, max_tool_turns=8):
         requests.append(payload)
         return next(it)
 
-    FakeSession.commands = []
     monkeypatch.setattr(proposer, "responses_create", fake_create)
-    monkeypatch.setattr(proposer, "SandboxSession", FakeSession)
-    data = make_workspace(tmp_path)
     plan = proposer.run_proposer(
-        round_dir=tmp_path / "round_0001", spec=parse_problem(PROBLEM), data_intuition_text="I",
+        round_dir=tmp_path / "round_0001", spec=parse_problem(PROBLEM), dataset_guide_text="GUIDE: classes Alpha, Beta",
         accepted_panel_summary={"members": []}, results_log_text="", round_id=1,
-        model="gpt-test", reasoning_effort="high", data_dir=data, shared_dir=tmp_path / "shared",
-        max_tool_turns=max_tool_turns, wall_clock_sec=600,
+        model="gpt-test", reasoning_effort="high", **extra,
     )
     return plan, requests
 
 
-def test_proposer_runs_a_tool_turn_then_returns_the_plan(monkeypatch, tmp_path):
-    plan, requests = _run_proposer(monkeypatch, tmp_path, [
-        _resp("r1", tool_command="python -c 'print(1)'"),
-        _resp("r2", text=json.dumps(PLAN)),
-    ])
-    assert plan["candidate_id"] == "pilot" and plan["proposer_tool_turns"] == 1
-    assert FakeSession.commands == ["python -c 'print(1)'"]
-    assert plan["proposer_usage"]["input_tokens"] == 20 and plan["proposer_usage"]["calls"] == 2
-    assert plan["proposer_reasoning_summary"] == ["think r1", "think r2"]
-    assert "tools" in requests[0] and requests[1]["previous_response_id"] == "r1"
-    assert requests[1]["input"][0]["type"] == "custom_tool_call_output"
+def test_proposer_is_one_call_with_the_question_and_the_guide(monkeypatch, tmp_path):
+    plan, requests = _run_proposer(monkeypatch, tmp_path, [_resp("r1", text=json.dumps(PLAN))])
+    assert plan["candidate_id"] == "pilot" and len(requests) == 1
+    assert "tools" not in requests[0]   # it never touches the data
     assert "Which spatial arrangements track the slope?" in requests[0]["instructions"]
-    prop = tmp_path / "round_0001" / "proposer"
-    assert (prop / "turn_01.command.sh").exists() and (prop / "turn_02.response.json").exists()
-    # the sandbox sees an outcome-free cohort file in place of the real one
-    overlay = FakeSession.kwargs["file_overlays"]["/data/cases.csv"]
-    assert "slope" not in Path(overlay).read_text()
+    assert "GUIDE: classes Alpha, Beta" in requests[0]["instructions"]
+    assert plan["proposer_usage"]["calls"] == 1 and plan["proposer_reasoning_summary"] == ["think r1"]
+    assert (tmp_path / "round_0001" / "proposer" / "slot_1" / "turn_01.response.json").exists()
 
 
-def test_proposer_tool_budget_is_enforced(monkeypatch, tmp_path):
-    plan, requests = _run_proposer(monkeypatch, tmp_path, [
-        _resp("r1", tool_command="ls"),
-        _resp("r2", tool_command="ls"),
-        _resp("r3", text=json.dumps(PLAN)),
-    ], max_tool_turns=2)
-    assert plan["proposer_tool_turns"] == 2 and "tools" not in requests[2]
+def test_a_later_worker_is_told_what_was_already_proposed(monkeypatch, tmp_path):
+    earlier = {"candidate_id": "first", "scientific_question": "q1", "approach": "a1"}
+    _, requests = _run_proposer(monkeypatch, tmp_path, [_resp("r1", text=json.dumps(PLAN))],
+                                proposed_this_round=[earlier], slot=2)
+    payload = json.loads(requests[0]["input"].split("\n\n")[0])
+    assert payload["already_proposed_this_round"] == [earlier]
+    assert (tmp_path / "round_0001" / "proposer" / "slot_2").is_dir()
 
 
 def test_proposer_is_nudged_for_json_and_missing_signs(monkeypatch, tmp_path):
@@ -374,16 +307,11 @@ def _fast_config(**overrides):
     """The judge's logic at a fraction of the fitting: few repeats and folds, one alpha."""
     from app.services.agent.discovery.panel_cv import PredictivePanelConfig
 
-    return PredictivePanelConfig(**{"outer_repeats": 2, "inner_folds": 2, "ridge_alphas": (1.0,),
-                                    "jackknife_refit_outer_repeats": 1, **overrides})
+    return PredictivePanelConfig(**{"outer_repeats": 2, "inner_folds": 2, "ridge_alphas": (1.0,), **overrides})
 
 
-def test_cv_panel_rewards_a_real_signal_and_jackknife_catches_one_donor():
-    from app.services.agent.discovery.panel_cv import (
-        PredictivePanelConfig,
-        compare_predictive_panels,
-        jackknife_refit_panel_comparison,
-    )
+def test_cv_panel_rewards_a_real_signal():
+    from app.services.agent.discovery.panel_cv import PredictivePanelConfig, compare_predictive_panels
 
     frame = synthetic_cohort().rename(columns={"case": "donor_id"})
     comparison = compare_predictive_panels(
@@ -392,23 +320,8 @@ def test_cv_panel_rewards_a_real_signal_and_jackknife_catches_one_donor():
         config=_fast_config(min_mean_rmse_improvement=0.0, min_fraction_repeats_better_rmse=0.5),
     )
     assert comparison["acceptance_passed"] and comparison["mean_rmse_improvement"] > 0
-
-    rng = np.random.default_rng(23)
-    outcome = rng.normal(scale=0.02, size=24)
-    candidate = np.zeros(24)
-    candidate[0], outcome[0] = 12.0, -0.30
-    single = pd.DataFrame({"donor_id": [f"D{i:03d}" for i in range(24)], "slope": outcome, "candidate": candidate})
-    result = jackknife_refit_panel_comparison(
-        single, outcome_column="slope", covariates=[], baseline_feature_columns=[], candidate_feature_columns=["candidate"],
-        # strict tolerance: the refit without the one donor carrying the signal gains nothing
-        config=_fast_config(min_mean_rmse_improvement=-1.0, min_fraction_repeats_better_rmse=0.0,
-                            min_jackknife_refit_rmse_improvement=1e-12),
-    )
-    excluded = {row["excluded_donor_id"]: row["mean_rmse_improvement"] for row in result["records"]}
-    assert excluded["D000"] <= 0.0 and not result["passed"]
-    # protocol v2.3 defaults (pre-registered 2026-08-22)
     defaults = PredictivePanelConfig()
-    assert (defaults.max_panel_size, defaults.min_jackknife_refit_rmse_improvement, defaults.seed) == (5, -5e-4, 20260821)
+    assert (defaults.max_panel_size, defaults.outer_repeats, defaults.seed) == (5, 5, 20260821)
 
 
 @pytest.mark.parametrize("numeric_ids", [False, True])
@@ -477,21 +390,6 @@ def test_slide_metadata_takes_mpp_from_the_cohort_then_the_zarr(tmp_path):
     assert slide_path(tmp_path, "b", layout) == tmp_path / "b.zarr"
     assert load_slide_metadata(tmp_path, "b", layout)["mpp_x"] == 0.5
     assert load_slide_metadata(tmp_path, "a", layout)["mpp_x"] == 0.25
-
-
-def test_data_intuition_is_built_from_what_the_slides_contain(tmp_path):
-    from app.services.agent.discovery.data_intuition import build_data_intuition
-    from app.services.agent.discovery.problem import parse_problem
-
-    data = make_workspace(tmp_path)
-    info = build_data_intuition(parse_problem(PROBLEM), data, tmp_path / "shared")
-    assert info["n_donors"] == 6
-    brief = (tmp_path / "shared" / "data_intuition.md").read_text()
-    assert sorted(p.name for p in (tmp_path / "shared").iterdir()) == ["data_intuition.md"]
-    assert "Cell classes (by total count):" in brief and "Alpha" in brief and "Beta" in brief
-    assert "Regions: Inner, Outer" in brief
-    assert "Distances in µm" in brief
-    assert "slope" not in brief and "age" not in brief.split("Per-donor")[0].lower().replace("average", "")
 
 
 # ── sandbox mounts ────────────────────────────────────────────────────────────
@@ -566,27 +464,3 @@ def test_sandbox_keeps_what_the_controller_trusts_read_only(tmp_path, monkeypatc
     assert f"{shared.resolve()}:/shared:rw" in cmd
     assert f"{shared.resolve() / 'lib'}:/shared/lib:ro" in cmd
     assert f"{shared.resolve() / 'dataset.json'}:/shared/dataset.json:ro" in cmd
-
-
-def test_proposer_reports_a_finished_image_inspection(monkeypatch, tmp_path):
-    from app.services.agent.discovery import proposer
-    from app.services.agent.discovery.problem import parse_problem
-
-    scratch = tmp_path / "round_0001" / "proposer" / "sandbox"
-    scratch.mkdir(parents=True)
-    (scratch / "plot.png").write_bytes(b"\x89PNG\r\n\x1a\n")
-    replies = iter([
-        {"id": "r1", "output": [{"type": "custom_tool_call", "name": "inspect_image", "call_id": "c1",
-                                 "input": "/scratch/plot.png"}]},
-        _resp("r2", text=json.dumps(PLAN)),
-    ])
-    monkeypatch.setattr(proposer, "responses_create", lambda payload, timeout=0: next(replies))
-    monkeypatch.setattr(proposer, "SandboxSession", FakeSession)
-    events = []
-    proposer.run_proposer(
-        round_dir=tmp_path / "round_0001", spec=parse_problem(PROBLEM), data_intuition_text="I",
-        accepted_panel_summary={"members": []}, results_log_text="", round_id=1, model="m",
-        reasoning_effort="high", data_dir=make_workspace(tmp_path), shared_dir=tmp_path / "shared",
-        on_event=events.append,
-    )
-    assert [e["type"] for e in events] == ["proposer_tool_call", "proposer_tool_result"]

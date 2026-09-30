@@ -1,4 +1,4 @@
-"""Pieces the proposer and the worker share: tool specs, prompt loading, text limits."""
+"""Pieces the agents share: the shell tool spec, prompt loading, text limits."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from .problem import ProblemSpec
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 SHELL_TOOL_NAME = "shell_exec"
-IMAGE_TOOL_NAME = "inspect_image"
 
 SHELL_TOOL_SPEC = {
     "type": "custom",
@@ -20,16 +19,6 @@ SHELL_TOOL_SPEC = {
         "Use it to inspect the data folder, run analysis scripts, and write files into /scratch. "
         "Input must be raw shell text, not JSON. The response contains at most 6,000 "
         "characters; complete stdout and stderr are saved under /scratch/logs."
-    ),
-    "format": {"type": "text"},
-}
-IMAGE_TOOL_SPEC = {
-    "type": "custom",
-    "name": IMAGE_TOOL_NAME,
-    "description": (
-        "Visually inspect one PNG, JPEG, WEBP, or non-animated GIF generated inside /scratch. "
-        "Input must be only its /scratch path as raw text. The image will be attached to your "
-        "next turn. Use shell_exec first to render crops, montages, or heatmaps."
     ),
     "format": {"type": "text"},
 }

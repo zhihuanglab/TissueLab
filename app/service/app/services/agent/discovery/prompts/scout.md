@@ -16,8 +16,6 @@ anything yourself.
   do not describe or guess their values.
 - `/shared/lib` (on PYTHONPATH): the audited loaders, `shared_analysis.slides`
   (`donor_ids`, `slide_path`, `load_slide_metadata`, `build_cell_table`, …).
-- `/shared/data_intuition.md`: per-slide statistics already computed for you.
-  Do not repeat them; add what they do not cover.
 - `/scratch` (writable): your working folder.
 
 ## Steps
@@ -27,15 +25,19 @@ anything yourself.
 2. Open a few slides with the shared loaders: which groups and arrays they hold
    (segmentation, classification, embeddings, annotations / regions), shapes,
    dtypes, class names, coordinate units.
-3. Note conventions and pitfalls: naming, missing pieces on some slides,
+3. Measure what the proposer needs to calibrate its parameters, on a handful of
+   slides: cells per class and class fractions, per region; region sizes; the
+   typical nearest-neighbour distance between cells (in microns when the mpp is
+   known). Give ranges across slides, not one slide's numbers.
+4. Note conventions and pitfalls: naming, missing pieces on some slides,
    coordinate systems, how regions are stored, anything a feature script could
    get wrong.
-4. Point out which structures look most relevant to the research question, and
+5. Point out which structures look most relevant to the research question, and
    why — in terms of what can be measured, never in terms of the outcome.
-5. Write the guide to `/scratch/dataset_guide.md` (Markdown, at most about 8,000
-   characters): overview, file inventory, schema per data type, conventions and
-   pitfalls, the most relevant structures, and short loading snippets that use
-   `shared_analysis.slides`.
+6. Write the guide to `/scratch/dataset_guide.md` (Markdown, at most about 8,000
+   characters): overview, file inventory, schema per data type, the measured
+   ranges from step 3, conventions and pitfalls, the most relevant structures,
+   and short loading snippets that use `shared_analysis.slides`.
 
 Use the shell tool one command batch at a time. When `/scratch/dataset_guide.md`
 is written, reply with exactly DONE.

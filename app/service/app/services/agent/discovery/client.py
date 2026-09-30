@@ -12,11 +12,8 @@ uses OPENAI_BASE_URL / OPENAI_API_KEY like the agent.
 
 from __future__ import annotations
 
-import base64
 import json
-import mimetypes
 import os
-from pathlib import Path
 from typing import Any, List, Optional
 
 from openai import OpenAI
@@ -117,33 +114,4 @@ def custom_tool_call_output(call_id: str, output: Any) -> dict:
         "type": "custom_tool_call_output",
         "call_id": call_id,
         "output": rendered,
-    }
-
-
-def input_image_message(
-    image_path: str | Path,
-    *,
-    text: str = "Inspect this image.",
-    max_bytes: int = 20 * 1024 * 1024,
-) -> dict:
-    """A Responses API user message carrying one local image (inspect_image tool)."""
-    path = Path(image_path)
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    size = path.stat().st_size
-    if size <= 0:
-        raise ValueError(f"Image is empty: {path}")
-    if size > max_bytes:
-        raise ValueError(f"Image exceeds {max_bytes} bytes: {path} ({size} bytes)")
-    mime_type, _ = mimetypes.guess_type(path.name)
-    if mime_type not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
-        raise ValueError(f"Unsupported image type for {path}: {mime_type}")
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return {
-        "type": "message",
-        "role": "user",
-        "content": [
-            {"type": "input_text", "text": text},
-            {"type": "input_image", "image_url": f"data:{mime_type};base64,{encoded}", "detail": "original"},
-        ],
     }

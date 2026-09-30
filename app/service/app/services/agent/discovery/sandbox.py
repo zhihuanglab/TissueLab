@@ -49,7 +49,7 @@ SANDBOX_PIDS_LIMIT = os.environ.get("TL_SANDBOX_PIDS_LIMIT", "512")
 SANDBOX_TMPFS_SIZE = os.environ.get("TL_SANDBOX_TMPFS_SIZE", "512m")
 
 OWNER_LABEL = "tissuelab.discovery.pid"
-SHARED_READ_ONLY = ("lib", "dataset.json", "data_intuition.md", "dataset_guide.md")
+SHARED_READ_ONLY = ("lib", "dataset.json", "dataset_guide.md")
 # Runs live under <data folder>/autoresearch_runs; the sandbox masks it.
 RUNS_DIRNAME = "autoresearch_runs"
 SANDBOX_PYTHON = "/usr/local/bin/python3"
@@ -610,7 +610,7 @@ class SandboxSession:
         if self.shared_dir:
             cmd.extend(["-v", f"{self.shared_dir}:/shared:rw"])
             # What the controller trusts stays read-only: the loaders, the cohort
-            # layout and the brief. The rest of /shared (e.g. proposer_cache) is writable.
+            # layout and the dataset guide. The rest of /shared is writable.
             for name in SHARED_READ_ONLY:
                 if (self.shared_dir / name).exists():
                     cmd.extend(["-v", f"{self.shared_dir / name}:/shared/{name}:ro"])

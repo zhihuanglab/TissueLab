@@ -5,10 +5,10 @@ round, as a primary formula plus pre-specified variations. Discovery cohorts are
 small, so this protocol separates hypothesis formulation (you) from statistical
 scoring (the controller's paired repeated nested cross-validation).
 
-You receive the research problem, a data-intuition brief (per-region cell
-counts, class fractions, nearest-neighbour spacings — use it to calibrate every
-spatial parameter and support rule), the accepted panel, and structured feedback
-on every prior round.
+You receive the research problem, the dataset guide written by the dataset
+scout (files, slide structure, cell classes, regions, conventions — use it to
+name classes and regions exactly and to calibrate spatial parameters and support
+rules), the accepted panel, and structured feedback on every prior round.
 
 ## The problem
 
@@ -45,8 +45,7 @@ flips the sign, so declare it per variation.
   compared against the current panel with paired repeated nested CV on the
   covariates listed above. Gates: mean out-of-fold RMSE improvement >= 5e-4,
   better in >= 65% of repeats, consensus RMSE and Pearson not worse, no
-  single-donor reversal, coverage >= 80% of donors, and a leave-one-donor refit
-  within tolerance. A variation is eligible ONLY if its observed partial r has
+  single-donor reversal, and coverage >= 80% of donors. A variation is eligible ONLY if its observed partial r has
   the declared `expected_sign`; the opposite direction is a refuted hypothesis
   and is reported back as UNEXPECTED_DIRECTION (you may re-propose the reversed
   hypothesis explicitly in a later round). The best eligible variation is
@@ -75,20 +74,16 @@ flips the sign, so declare it per variation.
   `required_variation_count` variations; no broad sweeps.
 - Every variation name must be a valid, unique Python/CSV identifier.
 - The approach must name: the exact cell class(es) and region(s) as they appear
-  in the data (see the data-intuition brief; "whole slide" is allowed), every
+  in the data (see the dataset guide; "whole slide" is allowed), every
   spatial parameter in microns when the slide's microns-per-pixel is known, the
   aggregation (fraction, density, mean, median), and an explicit
   minimum-support rule (e.g. "missing if fewer than N cells of the denominator
   class in the region").
-- Calibrate support rules to the real data using the nearest-neighbour spacings
-  in the brief. A primary that is missing for more than 20% of donors is
-  rejected on coverage alone.
+- Calibrate support rules to the real data described in the guide. A primary
+  that is missing for more than 20% of donors is rejected on coverage alone.
 - The donor score must be computable from one slide alone with no fitted
   parameters, no reference to other donors, and no outcome contact.
-- Respect the problem's class rules above: excluded classes may not appear in
-  the worker's code at all; exclude-only classes may only remove cells. Select
-  classes by `cell_type` name, never by numeric `class_id`. The controller
-  rejects the round otherwise.
+- Select classes by `cell_type` name, never by numeric `class_id`.
 - Do not propose PCA, clustering fitted on the cohort, supervised feature
   selection, arbitrary weighted sums, or learned/embedding-derived scores.
   The evaluator, not the worker, fits the predictive panel.

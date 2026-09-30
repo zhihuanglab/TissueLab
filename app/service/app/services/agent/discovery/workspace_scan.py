@@ -128,8 +128,6 @@ def problem_fields(spec: ProblemSpec) -> dict[str, Any]:
         "id_column": spec.id_column,
         "slide_column": spec.slide_column,
         "mpp_column": spec.mpp_column,
-        "excluded_classes": list(spec.excluded_classes),
-        "exclude_only_classes": list(spec.exclude_only_classes),
     }
 
 
@@ -282,7 +280,5 @@ def resolve_program(text: str, data_dir: Path, cohort_file: Optional[str] = None
         "id_column": cohort["id_column"] or _DEFAULT_SPEC.id_column,
         "slide_column": cohort["slide_column"] or _DEFAULT_SPEC.slide_column,
         "mpp_column": cohort["mpp_column"] or _DEFAULT_SPEC.mpp_column,
-        "excluded_classes": [],
-        "exclude_only_classes": [],
     }
     return {"mode": "text", "fields": fields, "detected_by": detected_by, "covariates_by": covariates_by, "error": None}

@@ -41,8 +41,6 @@ type ProblemFields = {
   id_column: string
   slide_column: string
   mpp_column: string
-  excluded_classes: string[]
-  exclude_only_classes: string[]
 }
 type Setup = {
   problem: { found: boolean; content: string; fields: ProblemFields | null; error: string | null }
@@ -68,8 +66,6 @@ export function composeProblem(f: ProblemFields): string {
   if (f.id_column && f.id_column !== DEFAULTS.id_column) lines.push(`id_column: ${yamlString(f.id_column)}`)
   if (f.slide_column && f.slide_column !== DEFAULTS.slide_column) lines.push(`slide_column: ${yamlString(f.slide_column)}`)
   if (f.mpp_column && f.mpp_column !== DEFAULTS.mpp_column) lines.push(`mpp_column: ${yamlString(f.mpp_column)}`)
-  if (f.excluded_classes.length) lines.push(`excluded_classes: ${yamlList(f.excluded_classes)}`)
-  if (f.exclude_only_classes.length) lines.push(`exclude_only_classes: ${yamlList(f.exclude_only_classes)}`)
   return `---\n${lines.join("\n")}\n---\n${f.question.trim()}\n`
 }
 
@@ -184,8 +180,6 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
       outcome,
       // the outcome is never also adjusted for (e.g. after picking a former covariate)
       covariates: covariates.filter((c) => c !== outcome),
-      excluded_classes: fromSaved.excluded_classes ?? [],
-      exclude_only_classes: fromSaved.exclude_only_classes ?? [],
       question: text.trim(),
     }
   }, [detected, saved, picked, text])

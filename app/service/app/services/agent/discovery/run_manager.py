@@ -76,6 +76,7 @@ class DiscoveryRunManager:
         self, *, task: str, workspace_path: str, rounds: int, reasoning_effort: str, worker_wall_clock_sec: int,
         dataset_scout: bool = True,
         reuse_guide_from: Optional[str] = None,
+        workers_per_round: int = 1,
     ) -> str:
         """Start a run; `task` is the full problem.md text. Raises ProblemError when it
         does not parse or does not match the data folder."""
@@ -98,6 +99,7 @@ class DiscoveryRunManager:
             run_id, run_root, spec=spec, data_dir=data_dir, rounds=rounds,
             reasoning_effort=reasoning_effort, worker_wall_clock_sec=worker_wall_clock_sec,
             dataset_scout=dataset_scout, guide_from=reuse_guide_from if earlier_guide else None,
+            workers_per_round=workers_per_round,
         )
         return run_id
 
@@ -122,6 +124,7 @@ class DiscoveryRunManager:
             model=config.get("model"),
             # the guide is in shared/ already when the run was scouted
             dataset_scout=bool(config.get("dataset_scout", False)),
+            workers_per_round=int(config.get("workers_per_round", 1) or 1),
         )
         return run_root.name
 

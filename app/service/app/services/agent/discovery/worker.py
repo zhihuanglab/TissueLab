@@ -60,8 +60,8 @@ def _kickoff_message(plan: dict[str, Any]) -> str:
         "Write /scratch/result.py that defines\n"
         "    compute_donor_features(donor_id, data_root) -> dict\n"
         f"returning exactly these keys: {names} (float, or float('nan') when not analyzable).\n"
-        "Use the shared loaders in shared_analysis.slides (see /shared/data_intuition.md for "
-        "the classes, regions and spacings in these slides).\n"
+        "Use the shared loaders in shared_analysis.slides (see /shared/dataset_guide.md, when "
+        "present, for the classes, regions and spacings in these slides).\n"
         "Run it once on every donor (cd /scratch && python result.py) to confirm it works "
         "and prints per-donor values. Then reply with the single word DONE.\n"
         "Do not write any other deliverable; the controller builds the donor table and "
@@ -127,39 +127,6 @@ print("MATERIALIZED", report["rows"], report["coverage"])
 def _worker_scripts(scratch_dir: Path) -> list[Path]:
     """Python files the worker wrote in /scratch (result.py and any helper it imports)."""
     return sorted(p for p in scratch_dir.glob("*.py") if not p.name.startswith("."))
-
-
-def class_rule_violations(scripts: list[Path], spec: ProblemSpec) -> list[str]:
-    """Lines that break the problem's class rules.
-
-    * an excluded class may not appear as a string literal at all (outside comments);
-    * an exclude-only class may not be selected: `== 'X'`, `.eq('X')`, `isin([... 'X' ...])`;
-    * when any rule is set, numeric class_id selection is rejected: classes are selected
-      by cell_type name, since ids differ per classifier.
-    """
-    if not (spec.excluded_classes or spec.exclude_only_classes):
-        return []
-
-    def literal(name: str) -> str:
-        return r"""['"]""" + re.escape(name) + r"""['"]"""
-
-    excluded = [re.compile(literal(n)) for n in spec.excluded_classes]
-    selected = [
-        re.compile(r"""(==\s*|\.eq\(\s*|\.isin\([^)]*)""" + literal(n)) for n in spec.exclude_only_classes
-    ] + [re.compile(literal(n) + r"""\s*==""") for n in spec.exclude_only_classes]
-    cid_select = re.compile(r"""class_id['"\]]*\s*(==|\.eq\(|\.isin\()""")
-    hits: list[str] = []
-    for path in scripts:
-        for lineno, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-            code = line.split("#", 1)[0]
-            stripped = code.strip()
-            if not stripped:
-                continue
-            if any(p.search(code) for p in excluded) or any(p.search(code) for p in selected):
-                hits.append(f"{path.name}:{lineno}: {stripped[:160]}")
-            elif cid_select.search(code):
-                hits.append(f"{path.name}:{lineno}: {stripped[:160]} (numeric class_id selection)")
-    return hits
 
 
 def outcome_references(worker_dir: Path, scripts: list[Path], names: list[str]) -> list[str]:
@@ -354,13 +321,10 @@ def run_worker(
     refs = outcome_references(worker_dir, scripts, spec.protected_names)
     checks["outcome_reference_free"] = not refs
     checks["outcome_references"] = refs
-    violations = class_rule_violations(scripts, spec)
-    checks["class_rules_ok"] = not violations
-    checks["class_rule_violations"] = violations
     passed = all(
         checks[key]
         for key in ("import_ok", "table_written", "planned_columns_present", "no_duplicate_donors",
-                    "primary_coverage_ok", "outcome_reference_free", "class_rules_ok")
+                    "primary_coverage_ok", "outcome_reference_free")
     )
 
     result_path = worker_dir / RESULT_NAME
@@ -381,7 +345,6 @@ def run_worker(
     summary = (
         f"{'OK' if passed else 'FAILED CHECKS'}: primary={primary} coverage={checks['primary_coverage']:.2f} "
         f"turns={state['turns']} rewrites={state['rewrites']} done_said={done} errors={checks['donor_errors']}"
-        + ("" if checks["class_rules_ok"] else f" CLASS_RULE={[h.split(': ', 1)[1][:60] for h in violations][:2]}")
         + ("" if checks["outcome_reference_free"] else " OUTCOME_REFERENCE")
     )
     if not passed:

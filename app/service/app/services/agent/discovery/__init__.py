@@ -11,8 +11,8 @@ under paired repeated nested cross-validation.
 
 Layout:
 - problem — problem.md parsing and validation (all dataset specifics live here)
-- loop — the round loop; proposer, worker, judge (+ panel_cv), data_intuition
-  are its stages; sandbox runs every piece of model-written code
+- loop — the round loop; scout, proposer, worker, judge (+ panel_cv) are its
+  stages; sandbox runs every piece of model-written code
 - run_manager — one task per run folder and its event stream
 - shared_lib_source — loaders copied into each run's /shared/lib
 """

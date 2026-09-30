@@ -33,8 +33,6 @@ Then reply with the single word `DONE`.
 
 - `/scratch/plan.json` — the hypothesis, the variation names, the primary
   (`baseline_variation`), support rules.
-- `/shared/data_intuition.md` — per-region cell counts, class fractions and
-  spacings measured on these slides.
 - `/shared/dataset_guide.md` (when the dataset scout ran) — the folder's files,
   slide structure, conventions and pitfalls, with loading snippets.
 - `/data/` — the cohort file (identifier, slide and mpp columns only — no
@@ -86,8 +84,7 @@ if __name__ == "__main__":
 - Microns everywhere when mpp is known (`* mpp`). A pixel radius is a bug then.
 - Return `nan` (not 0, not a sentinel) when the plan's support rule is not met.
 - Never read or name `{outcome}` or any covariate; never compute correlations.
-- Respect the problem's class rules above; select classes by `cell_type` name,
-  never by numeric `class_id`.
+- Select classes by `cell_type` name, never by numeric `class_id`.
 - Implement only the planned variations; do not add others.
 - Keep it simple: load, filter, compute, return. No caching frameworks, no
   argument parsing, no wrappers. At most 4 exploration commands before writing
