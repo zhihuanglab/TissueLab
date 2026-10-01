@@ -1,6 +1,6 @@
 import React from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 vi.mock('react-redux', () => ({
   useDispatch: () => vi.fn(),
@@ -9,16 +9,6 @@ vi.mock('react-redux', () => ({
 vi.mock('@/utils/viewer/slidePath', () => ({ useActiveSlidePath: () => '/data/ws/slide.svs' }));
 vi.mock('@/hooks/usePathWriteAccess', () => ({ usePathWriteAccess: () => ({ allowed: true, tooltip: undefined }) }));
 vi.mock('@/utils/common/authToken', () => ({ getAuthToken: vi.fn(async () => 'token') }));
-// The program form has its own test: here it simply reports a ready program.
-vi.mock('@/components/imageViewer/sidebar/agent/chat/ResearchProgramInput', async () => {
-  const { useEffect } = await import('react');
-  return {
-    ResearchProgramInput: ({ onChange }: { onChange: (t: string, r: boolean) => void }) => {
-      useEffect(() => { onChange('program', true); }, []); // eslint-disable-line react-hooks/exhaustive-deps
-      return null;
-    },
-  };
-});
 
 import { CoscientistPanel } from '@/components/imageViewer/sidebar/agent/chat/CoscientistPanel';
 
@@ -53,18 +43,27 @@ type Stream = ReturnType<typeof sseStream> & { signal: AbortSignal };
 
 const RUNNING = { run_id: 'run-live', run_root_path: '/data/ws/autoresearch_runs/run-live', status: 'running', rounds: 3, next_round_id: 2 };
 
-function mockService({ runs = [] as object[], streamStatus = 200 } = {}) {
+/** program: the saved program the box is pre-filled with; null = each request waits for `answerProgram`. */
+function mockService({ runs = [] as object[], streamStatus = 200, program = 'program' as string | null } = {}) {
   const streams: Stream[] = [];
   const cancels: string[] = [];
+  const programRequests: ((text: string) => void)[] = [];
+  const startBodies: Record<string, unknown>[] = [];
   let releaseStart: ((runId: string) => void) | null = null;
   const fetchMock = vi.fn(async (url: string, init: RequestInit = {}) => {
     const method = init.method ?? 'GET';
     if (url.includes('/discovery/runs?workspace_path=')) return ok({ runs });
+    if (url.includes('/discovery/program?data_dir=')) {
+      expect(url).toContain(`data_dir=${encodeURIComponent('/data/ws')}`);
+      if (program !== null) return ok({ text: program });
+      return new Promise((resolve) => { programRequests.push((text) => resolve(ok({ text }))); });
+    }
     if (url.includes('/discovery/runs/load?')) {
       return ok({ ...RUNNING, journal: [{ roundId: 1, focus: 'first round', summary: 'r1' }], final_summary: null });
     }
     if (url.endsWith('/stream') && streamStatus !== 200) return { ok: false, status: streamStatus, body: null };
     if (url.endsWith('/discovery/runs') && method === 'POST') {
+      startBodies.push(JSON.parse(String(init.body)));
       return new Promise((resolve) => { releaseStart = (runId) => resolve(ok({ run_id: runId })); });
     }
     const cancel = url.match(/\/runs\/([^/]+)\/cancel$/);
@@ -80,13 +79,23 @@ function mockService({ runs = [] as object[], streamStatus = 200 } = {}) {
   return {
     streams,
     cancels,
+    programRequests,
+    startBodies,
+    answerProgram: async (i: number, text: string) => {
+      await waitFor(() => expect(programRequests.length).toBeGreaterThan(i));
+      await act(async () => programRequests[i](text));
+    },
     startReturns: async (runId: string) => { await waitFor(() => expect(releaseStart).not.toBeNull()); await act(async () => releaseStart!(runId)); },
   };
 }
 
 const start = () => fireEvent.click(screen.getByRole('button', { name: /Start Research/ }));
 const newTask = () => screen.getByRole('button', { name: 'New research task' });
+const programBox = () => screen.getByLabelText('Research Program') as HTMLTextAreaElement;
+const startButton = () => screen.getByRole('button', { name: /Start Research/ });
 
+// jsdom has no Element.scrollTo: the panel auto-scrolls on each event (a timer that may outlive a test).
+beforeAll(() => { Element.prototype.scrollTo = () => {}; });
 afterEach(() => { vi.restoreAllMocks(); });
 
 describe('CoscientistPanel run lifecycle', () => {
@@ -184,5 +193,45 @@ describe('CoscientistPanel run lifecycle', () => {
       expect(streamCalls).toHaveLength(1);
       unmount();
     }
+  });
+});
+
+describe('CoscientistPanel research program', () => {
+  it('is pre-filled from the workspace and sent as typed; Start needs text', async () => {
+    const svc = mockService({ program: '' });
+    render(<CoscientistPanel />);
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/discovery/program?'), expect.anything()));
+    expect(programBox().value).toBe('');
+    expect(startButton()).toBeDisabled();
+
+    fireEvent.change(programBox(), { target: { value: '   ' } });
+    expect(startButton()).toBeDisabled();
+    fireEvent.change(programBox(), { target: { value: 'Find features that predict survival.' } });
+    expect(startButton()).toBeEnabled();
+
+    start();
+    await waitFor(() => expect(svc.startBodies).toHaveLength(1));
+    expect(svc.startBodies[0]).toMatchObject({ task: 'Find features that predict survival.', workspace_path: '/data/ws/slide.svs', dataset_scout: true });
+    expect(svc.startBodies[0]).not.toHaveProperty('reuse_guide_from');
+  });
+
+  it('a pre-fill that arrives after typing does not overwrite the text', async () => {
+    const svc = mockService({ program: null });
+    render(<CoscientistPanel />);
+    fireEvent.change(programBox(), { target: { value: 'typed by hand' } });
+    await svc.answerProgram(0, 'saved program');
+    expect(programBox().value).toBe('typed by hand');
+  });
+
+  it('a stale pre-fill is ignored: only the newest request writes', async () => {
+    const svc = mockService({ program: null });
+    render(<CoscientistPanel />);
+    await waitFor(() => expect(svc.programRequests).toHaveLength(1));
+    fireEvent.click(newTask());   // "+" starts over: a second request
+    await svc.answerProgram(1, 'new program');
+    expect(programBox().value).toBe('new program');
+    await svc.answerProgram(0, 'old program');
+    expect(programBox().value).toBe('new program');
+    expect(startButton()).toBeEnabled();
   });
 });

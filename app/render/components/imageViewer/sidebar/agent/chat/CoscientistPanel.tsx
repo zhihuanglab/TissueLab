@@ -17,7 +17,6 @@ import { RootState, AppDispatch } from "@/store"
 import { setSelectedAgent, type AgentName } from "@/store/slices/chat/agentSlice"
 import { formatPath } from "@/utils/common/path.utils"
 import { CTRL_SERVICE_API_ENDPOINT } from "@/config/api.config"
-import { ResearchProgramInput } from "./ResearchProgramInput"
 import { getAuthToken } from "@/utils/common/authToken"
 import {
   isResearchCancelling,
@@ -38,7 +37,6 @@ import {
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 const SCOUT_IDLE: ScoutState = { status: "idle", calls: [] }
-const NEW_GUIDE = "__new__"
 const CANCEL_TIMEOUT_MS = 15_000
 const BUSY_TITLE = "Stop the running research first"
 
@@ -49,7 +47,6 @@ type WorkspaceRun = {
   updated_at?: string
   rounds: number
   next_round_id: number
-  has_guide?: boolean
 }
 
 type ResumeInfo = {
@@ -129,9 +126,8 @@ export const CoscientistPanel: React.FC = () => {
   const [phase, setPhase] = useState<ResearchPhase>("input")
 
   // Input state
-  // problem.md as the form composes it; ready = outcome and question are set
+  // The research program in plain words (or problem.md with its header); the service works out the rest.
   const [program, setProgram] = useState("")
-  const [programReady, setProgramReady] = useState(false)
   const [formResetKey, setFormResetKey] = useState(0)
   const [rounds, setRounds] = useState(3)
   // Hypotheses (and parallel workers, one sandbox each) per round; at most one is admitted.
@@ -140,8 +136,6 @@ export const CoscientistPanel: React.FC = () => {
   const [workerTimeLimitMin, setWorkerTimeLimitMin] = useState(30)
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [datasetScout, setDatasetScout] = useState(true)
-  // Which earlier run's guide to reuse ("" = explore anew); null = the newest one there is.
-  const [guideChoice, setGuideChoice] = useState<string | null>(null)
 
   // Workspace run state
   const [workspaceRuns, setWorkspaceRuns] = useState<WorkspaceRun[]>([])
@@ -170,6 +164,10 @@ export const CoscientistPanel: React.FC = () => {
   const stoppedTokenRef = useRef(-1)
   const roundSummaryRef = useRef<string>("")
   const runsSeqRef = useRef(0)
+  // The program box: typed into since the last reset (a slow pre-fill must not overwrite
+  // it), and the newest pre-fill request (only it may write).
+  const programTypedRef = useRef(false)
+  const programSeqRef = useRef(0)
 
   const workspacePath = formatPath(currentPath ?? "")
   // The open slide's folder; formatPath yields "\\" separators on Windows.
@@ -311,19 +309,33 @@ export const CoscientistPanel: React.FC = () => {
   }
 
   useEffect(() => { fetchWorkspaceRuns() }, [fetchWorkspaceRuns])
-  // A guide picked in one folder means nothing in the next.
-  useEffect(() => { setGuideChoice(null) }, [workspaceDir])
 
-  // Earlier runs here that wrote a dataset guide (newest first): reusing one skips the scout.
-  const guideRuns = workspaceRuns.filter(r => r.has_guide)
-  const reuseGuideFrom = !datasetScout ? ""
-    : guideChoice === null ? (guideRuns[0]?.run_id ?? "")
-      : guideRuns.some(r => r.run_id === guideChoice) ? guideChoice : ""
+  // Pre-fill the program from the workspace's problem.md (the last run's), on a new
+  // workspace and on "+".
+  useEffect(() => {
+    programTypedRef.current = false
+    const seq = ++programSeqRef.current
+    if (!workspaceDir) return
+    void (async () => {
+      let text = ""
+      try {
+        const res = await authedFetch(
+          `${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/program?data_dir=${encodeURIComponent(workspaceDir)}`,
+          { method: "GET" }
+        )
+        if (res.ok && res.data?.code === 0) text = String(res.data.data?.text ?? "")
+      } catch {}
+      if (seq !== programSeqRef.current || programTypedRef.current) return
+      setProgram(text)
+    })()
+  }, [authedFetch, workspaceDir, formResetKey])
+
+  const canStart = Boolean(workspaceDir && program.trim() && pathWritable)
 
   // ─── Start research ──────────────────────────────────────────────────────
 
   const startResearch = async () => {
-    if (!programReady) return
+    if (!workspaceDir || !program.trim()) return
     if (!pathWritable) {
       setError(writeBlockTitle || 'Not allowed here.')
       return
@@ -348,7 +360,6 @@ export const CoscientistPanel: React.FC = () => {
           reasoning_effort: reasoningEffort,
           worker_wall_clock_sec: workerTimeLimitMin * 60,
           dataset_scout: datasetScout,
-          ...(reuseGuideFrom ? { reuse_guide_from: reuseGuideFrom } : {}),
         }),
       })
       if (!res.ok || res.data?.code !== 0) throw new Error(res.data?.message || "Failed to start run")
@@ -822,13 +833,20 @@ export const CoscientistPanel: React.FC = () => {
               </div>
             )}
 
-            {/* Research program: free text; the outcome / covariates are read off it */}
-            <ResearchProgramInput
-              workspaceDir={workspaceDir}
-              authedFetch={authedFetch}
-              resetKey={formResetKey}
-              onChange={(text, ready) => { setProgram(text); setProgramReady(ready) }}
-            />
+            {/* Research program */}
+            <div>
+              <label htmlFor="research-program" className="text-xs font-semibold text-foreground mb-1.5 block">Research Program</label>
+              <Textarea
+                id="research-program"
+                value={program}
+                onChange={e => { programTypedRef.current = true; setProgram(e.target.value) }}
+                placeholder="Describe the research program: what to look for in these slides."
+                className="min-h-[150px] text-[13px] leading-relaxed resize-none border-border/60 focus:border-primary/50 focus:ring-primary/20 bg-background"
+              />
+              <div className="text-[10px] text-muted-foreground mt-1">
+                This will be saved as <span className="font-mono">problem.md</span> in your workspace.
+              </div>
+            </div>
 
             {/* Config */}
             <div className="flex gap-3">
@@ -857,30 +875,6 @@ export const CoscientistPanel: React.FC = () => {
                 />
               </div>
             </div>
-
-            {/* Dataset scout */}
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <label htmlFor="dataset-scout" className="text-xs font-medium text-foreground">Dataset scout</label>
-                <div className="text-[10px] text-muted-foreground">
-                  Before round 1, an agent explores the folder and writes a dataset guide for the others. Adds a few minutes.
-                </div>
-              </div>
-              <Switch id="dataset-scout" checked={datasetScout} onCheckedChange={setDatasetScout} />
-            </div>
-            {datasetScout && guideRuns.length > 0 && (
-              <Select value={reuseGuideFrom || NEW_GUIDE} onValueChange={v => setGuideChoice(v === NEW_GUIDE ? "" : v)}>
-                <SelectTrigger aria-label="Dataset guide" className="h-8 text-xs"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {guideRuns.map(r => (
-                    <SelectItem key={r.run_id} value={r.run_id} className="text-xs">
-                      Reuse the guide from {r.run_id} · {formatRelativeTime(r.updated_at)}
-                    </SelectItem>
-                  ))}
-                  <SelectItem value={NEW_GUIDE} className="text-xs">Explore the folder anew</SelectItem>
-                </SelectContent>
-              </Select>
-            )}
 
             {/* Advanced parameters (collapsible) */}
             <Collapsible open={showAdvanced} onOpenChange={setShowAdvanced}>
@@ -928,6 +922,14 @@ export const CoscientistPanel: React.FC = () => {
                     </div>
                   </div>
 
+                  {/* Dataset scout */}
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <label htmlFor="dataset-scout" className="text-xs font-medium text-foreground">Dataset Scout</label>
+                      <div className="text-[10px] text-muted-foreground">Explore data and write a guide before starting</div>
+                    </div>
+                    <Switch id="dataset-scout" checked={datasetScout} onCheckedChange={setDatasetScout} />
+                  </div>
                 </div>
               </CollapsibleContent>
             </Collapsible>
@@ -937,8 +939,8 @@ export const CoscientistPanel: React.FC = () => {
             {/* Start button */}
             <Button
               onClick={startResearch}
-              disabled={!programReady || !pathWritable}
-              title={writeBlockTitle}
+              disabled={!canStart}
+              title={workspaceDir ? writeBlockTitle : "Open a slide first"}
               className="w-full h-10 bg-primary hover:bg-primary/90 text-primary-foreground font-medium shadow-sm"
             >
               <Play className="h-4 w-4 mr-2" />

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -29,6 +30,7 @@ from typing import Any
 import pandas as pd
 import yaml
 
+PROBLEM_FILENAME = "problem.md"
 EXAMPLE_HEADER = """---
 outcome: survival_months
 covariates: [age, sex]
@@ -168,6 +170,34 @@ def parse_problem(text: str) -> ProblemSpec:
     )
     _relative_inside(spec.cohort_file, "cohort_file")
     return spec
+
+
+_PLAIN_SCALAR = re.compile(r"[A-Za-z0-9_.\-/]+")
+
+
+def _yaml_scalar(value: str) -> str:
+    """A name as YAML reads it back unchanged (quoted unless plainly a string)."""
+    try:
+        if _PLAIN_SCALAR.fullmatch(value) and yaml.safe_load(value) == value:
+            return value
+    except yaml.YAMLError:
+        pass
+    return json.dumps(value)
+
+
+def compose_problem(fields: dict[str, Any]) -> str:
+    """problem.md from its fields: the header holds only what differs from the defaults."""
+    question = str(fields.get("question") or "").strip()
+    defaults = ProblemSpec(outcome="-", question="-")
+    lines = [f"outcome: {_yaml_scalar(str(fields['outcome']))}"]
+    covariates = [str(c) for c in fields.get("covariates") or ()]
+    if covariates:
+        lines.append(f"covariates: [{', '.join(_yaml_scalar(c) for c in covariates)}]")
+    for key in ("cohort_file", "id_column", "slide_column", "mpp_column"):
+        value = fields.get(key)
+        if value and value != getattr(defaults, key):
+            lines.append(f"{key}: {_yaml_scalar(str(value))}")
+    return "---\n" + "\n".join(lines) + "\n---\n" + question + "\n"
 
 
 def load_cohort(spec: ProblemSpec, data_dir: str | Path) -> pd.DataFrame:

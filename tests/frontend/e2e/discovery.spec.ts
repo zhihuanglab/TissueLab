@@ -16,7 +16,7 @@ import type { Page, Response } from '@playwright/test';
 import { e2eEnv, expect, test } from './fixtures';
 import { openAgentChat, openSlide } from './helpers';
 
-// The program the first test types, and the problem.md the panel writes from it.
+// The program the first test types, and the problem.md the service writes from it.
 const PROGRAM = 'Which cell-composition measurements predict the score? Adjust for age and sex.';
 const PROBLEM = `---
 outcome: score
@@ -50,7 +50,12 @@ async function openResearchPanel(page: Page): Promise<void> {
 }
 
 const programBox = (page: Page) => page.getByLabel('Research Program');
-const summary = (page: Page) => page.getByTestId('program-summary');
+// Dataset Scout sits under Advanced Parameters.
+const scoutSwitch = async (page: Page) => {
+  const sw = page.getByRole('switch', { name: 'Dataset Scout' });
+  if (!(await sw.isVisible())) await page.getByText('Advanced Parameters').click();
+  return sw;
+};
 
 async function startRun(page: Page, rounds: number, workers = 1): Promise<Response> {
   await page.locator('input[type="number"]').first().fill(String(rounds));
@@ -61,8 +66,6 @@ async function startRun(page: Page, rounds: number, workers = 1): Promise<Respon
 }
 
 const findings = (page: Page) => page.getByText('Research Findings');
-// The first test's run: the later ones reuse its dataset guide.
-let firstRunId = '';
 
 function resultsRows(runId: string): string[] {
   const file = path.join(runsDir(), runId, 'results.tsv');
@@ -89,15 +92,14 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     test.setTimeout(420_000);
     await openResearchPanel(page);
 
-    // No problem.md yet: an empty program, and the cohort table already found.
+    // No problem.md yet: an empty program, nothing to start; the scout is on by default.
     await expect(programBox(page)).toHaveValue('');
-    await expect(summary(page)).toContainText('cases.csv · 14 patients · 14 slides found');
-    await expect(page.getByRole('switch', { name: 'Dataset scout' })).toBeChecked();
+    await expect(page.getByText('This will be saved as problem.md in your workspace.')).toBeVisible();
+    await expect(await scoutSwitch(page)).toBeChecked();
     await expect(page.getByRole('button', { name: 'Start Research' })).toBeDisabled();
 
-    // Plain words: the outcome and covariates are read off the column names it mentions.
+    // Plain words: the service reads the outcome and covariates off the column names it mentions.
     await programBox(page).fill(PROGRAM);
-    await expect(summary(page)).toContainText(/Predict score · adjust for age, sex\s*\(named in your text\)/);
     await expect(page.getByRole('button', { name: 'Start Research' })).toBeEnabled();
 
     // Two workers: two hypotheses a round, side by side in their own sandboxes.
@@ -105,7 +107,6 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     const body = await started.json();
     expect(body.code, JSON.stringify(body)).toBe(0);
     const runId: string = body.data.run_id;
-    firstRunId = runId;
 
     // Live progress: the hypothesis the proposer committed to, both agents, the journal.
     await expect(page.getByText(QUESTION).first()).toBeVisible({ timeout: 120_000 });
@@ -137,17 +138,17 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     test.setTimeout(420_000);
     await openResearchPanel(page);
 
-    // The previous run saved problem.md: its text is back, and what it predicts.
+    // The previous run saved problem.md: its program is back in the box.
     await expect(programBox(page)).toHaveValue(PROGRAM);
-    await expect(summary(page)).toContainText('Predict score · adjust for age, sex');
-    // Its dataset guide is offered, and reused by default: no second scout.
-    await expect(page.getByLabel('Dataset guide')).toContainText(`Reuse the guide from ${firstRunId}`);
+    // Without the scout this time.
+    await (await scoutSwitch(page)).click();
+    await expect(await scoutSwitch(page)).not.toBeChecked();
 
     const started = await startRun(page, 1);
     const runId: string = (await started.json()).data.run_id;
-    const guide = (id: string) => fs.readFileSync(path.join(runsDir(), id, 'shared', 'dataset_guide.md'), 'utf8');
-    expect(guide(runId)).toBe(guide(firstRunId));
     expect(fs.existsSync(path.join(runsDir(), runId, 'scout'))).toBe(false);
+    // problem.md is written from the same program again.
+    expect(fs.readFileSync(path.join(workspace(), 'problem.md'), 'utf8')).toBe(PROBLEM);
     await expect(page.getByText(QUESTION).first()).toBeVisible({ timeout: 120_000 });
 
     const cancel = page.waitForResponse((r) => r.url().endsWith(`/runs/${runId}/cancel`));
@@ -192,24 +193,12 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     await page.getByRole('button', { name: 'New research task', exact: true }).click();
     await expect(programBox(page)).toHaveValue(PROGRAM);
 
-    // A program that names no column, as in the first panel: the model chooses from the column names.
-    await programBox(page).fill('# Program\nIterative biomarker discovery on these slides.\n## Goal\nFind robust tissue features.');
-    await expect(summary(page)).toContainText(/Predict score · adjust for age, sex\s*\(chosen by AI\)/, { timeout: 15_000 });
     await expect(page.getByRole('button', { name: 'Start Research' })).toBeEnabled();
-    // "Change" overrides it.
-    await summary(page).getByRole('button', { name: 'Change' }).click();
-    await page.getByLabel('Outcome').click();
-    await page.getByRole('option', { name: /^age/ }).click();
-    await expect(summary(page)).toContainText(/Predict age · adjust for sex\s*\(your choice\)/);
-
-    // "Explore the folder anew" is one choice away.
-    await page.getByLabel('Dataset guide').click();
-    await page.getByRole('option', { name: 'Explore the folder anew' }).click();
-    await expect(page.getByLabel('Dataset guide')).toContainText('Explore the folder anew');
+    await programBox(page).fill('  ');
+    await expect(page.getByRole('button', { name: 'Start Research' })).toBeDisabled();
 
     // A full problem.md goes as written; a column the cohort lacks is refused.
     await programBox(page).fill(PROBLEM.replace('outcome: score', 'outcome: survival'));
-    await expect(summary(page)).toContainText('Using the problem.md header as written: predict survival');
     const before = fs.readdirSync(runsDir()).length;
     const started = await startRun(page, 1);
     expect((await started.json()).code).toBe(400);

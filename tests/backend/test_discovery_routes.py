@@ -1,4 +1,4 @@
-"""Discovery routes: problem.md, the on-disk run listing, and the run lifecycle
+"""Discovery routes: the program / problem.md, the on-disk run listing, and the run lifecycle
 (start / stream / cancel / resume). The loop itself is stubbed; its internals
 are covered by test_discovery_loop.py and test_discovery_runtime.py.
 """
@@ -68,116 +68,124 @@ def _events(client, run_id):
         return [json.loads(line[len("data: "):]) for line in r.iter_lines() if line.startswith("data: ")]
 
 
-def test_setup_sorts_the_cohort_columns_into_roles(client, workspace, storage_root):
-    (workspace / "notes.csv").write_text("a\n1\n", encoding="utf-8")  # one column: not a cohort
-    (workspace / "labs.csv").write_text("case,value\nx,1\ny,2\n", encoding="utf-8")
-    rel = workspace.relative_to(storage_root).as_posix()
-    r = client.get(f"{API}/setup", params={"data_dir": rel}).json()["data"]
-    assert r["problem"] == {"found": False, "content": "", "fields": None, "error": r["problem"]["error"]}
+@pytest.fixture
+def no_model(monkeypatch):
+    """The column-choosing model gives no answer (as without a key)."""
+    import app.services.agent.discovery.workspace_scan as scan
 
-    # the file whose rows name the slides here comes first
-    assert [c["file"] for c in r["cohorts"]] == ["training_cohort.csv", "labs.csv"]
-    cohort = r["cohorts"][0]
-    assert cohort["rows"] == 2 and cohort["slides_found"] == 2
-    assert (cohort["id_column"], cohort["slide_column"], cohort["mpp_column"]) == ("donor_id", "slide_name", None)
-    assert cohort["outcome_candidates"] == ["slope", "age"]
-    assert cohort["covariate_candidates"] == ["slope", "age"]
-    slope = next(c for c in cohort["columns"] if c["name"] == "slope")
-    assert slope["numeric"] and (slope["min"], slope["max"]) == (-0.1, 0.2)
-    assert r["cohorts"][1]["slide_column"] is None and r["cohorts"][1]["id_column"] == "case"
+    monkeypatch.setattr(scan, "_MODEL_ANSWERS", {})
+    monkeypatch.setattr(scan, "ask_model_for_columns", lambda text, cohort: None)
 
 
-def test_setup_returns_problem_md_parsed_for_the_form(client, workspace, storage_root):
-    (workspace / "problem.md").write_text(PROBLEM, encoding="utf-8")
-    rel = workspace.relative_to(storage_root).as_posix()
-    problem = client.get(f"{API}/setup", params={"data_dir": rel}).json()["data"]["problem"]
-    assert problem["found"] is True and problem["content"] == PROBLEM and problem["error"] is None
-    assert problem["fields"]["outcome"] == "slope"
-    assert problem["fields"]["covariates"] == ["age"]
-    assert problem["fields"]["cohort_file"] == "training_cohort.csv"
-    assert problem["fields"]["question"] == "Which tissue measurements track the slope?"
+def _started_problem(client, workspace, fake_loop, text):
+    """Start a run from a plain-text program; the problem.md it was turned into, and the spec."""
+    body = _start(client, workspace, task=text)
+    assert body["code"] == 0, body
+    _events(client, body["data"]["run_id"])
+    run_problem = (workspace / "autoresearch_runs" / body["data"]["run_id"] / "problem.md").read_text()
+    assert (workspace / "problem.md").read_text() == run_problem
+    return run_problem, fake_loop["calls"][-1]["spec"]
 
 
-def test_setup_accepts_the_open_slides_path_with_either_separator(client, workspace, storage_root):
-    # the panel sends the open slide's path; on Windows formatPath uses "\\"
+def test_get_program_returns_the_saved_question(client, workspace, storage_root):
+    rel = (workspace / "slide.svs").relative_to(storage_root).as_posix()
+    assert client.get(f"{API}/program", params={"data_dir": rel}).json()["data"] == {"text": ""}
+
     (workspace / "problem.md").write_text(PROBLEM, encoding="utf-8")
     (workspace / "slide.svs").write_bytes(b"x")
-    rel = (workspace / "slide.svs").relative_to(storage_root).as_posix()
-    for data_dir in (rel, rel.replace("/", "\\")):
-        r = client.get(f"{API}/setup", params={"data_dir": data_dir}).json()["data"]
-        assert r["problem"]["content"] == PROBLEM, data_dir
-        assert r["data_dir"] == str(workspace)
+    # the open slide's path, with either separator (formatPath uses "\\" on Windows)
+    for data_dir in (rel, rel.replace("/", "\\"), str(workspace)):
+        r = client.get(f"{API}/program", params={"data_dir": data_dir}).json()
+        assert r["data"] == {"text": "Which tissue measurements track the slope?"}, data_dir
+
+    # a problem.md that does not parse comes back as written
+    (workspace / "problem.md").write_text("---\ncovariates: [age]\n---\nq\n", encoding="utf-8")
+    assert client.get(f"{API}/program", params={"data_dir": str(workspace)}).json()["data"]["text"] == \
+        "---\ncovariates: [age]\n---\nq\n"
 
 
-def _resolve(client, workspace, text, **extra):
-    body = {"data_dir": str(workspace), "text": text, "use_model": False, **extra}
-    return client.post(f"{API}/problem/resolve", json=body).json()["data"]
+def test_plain_program_names_its_outcome_and_covariates(client, workspace, llm_ready, fake_loop, no_model):
+    text = "Which tissue measurements predict the slope, adjusting for age?"
+    problem, spec = _started_problem(client, workspace, fake_loop, text)
+    assert problem == f"---\noutcome: slope\ncovariates: [age]\n---\n{text}\n"
+    assert (spec.outcome, spec.covariates, spec.question) == ("slope", ("age",), text)
+    # "age" can be the outcome too, when not after "adjust"
+    _, spec = _started_problem(client, workspace, fake_loop, "Does tissue predict age?")
+    assert (spec.outcome, spec.covariates) == ("age", ())
 
 
-def test_resolve_reads_outcome_and_covariates_off_the_text(client, workspace):
-    r = _resolve(client, workspace, "Which tissue measurements predict the slope, adjusting for age?")
-    assert r["mode"] == "text" and r["detected_by"] == "text"
-    f = r["fields"]
-    assert (f["outcome"], f["covariates"]) == ("slope", ["age"])
-    assert (f["cohort_file"], f["id_column"], f["slide_column"]) == ("training_cohort.csv", "donor_id", "slide_name")
-    assert f["question"] == "Which tissue measurements predict the slope, adjusting for age?"
-
-    # nothing named: no outcome, and the panel asks
-    r = _resolve(client, workspace, "Find tissue features that matter.")
-    assert r["fields"]["outcome"] == "" and r["detected_by"] is None
-
-    # "age" is a column here, so it can be the outcome when not after "adjust"
-    assert _resolve(client, workspace, "Does tissue predict age?")["fields"]["outcome"] == "age"
-
-
-def test_resolve_asks_the_model_with_column_names_only(client, workspace, monkeypatch):
+def test_plain_program_lets_the_model_choose_from_column_names(client, workspace, llm_ready, fake_loop, monkeypatch):
     import app.services.agent.discovery.client as client_mod
     import app.services.agent.discovery.workspace_scan as scan
 
     monkeypatch.setattr(scan, "_MODEL_ANSWERS", {})
-
     seen = []
     monkeypatch.setattr(client_mod, "unavailable_reason", lambda: None)
     monkeypatch.setattr(client_mod, "responses_create", lambda payload, timeout=0: seen.append(payload) or {
         "output_text": 'Sure: {"outcome": "slope", "covariates": ["age", "not_a_column"]}'
     })
-    r = _resolve(client, workspace, "找出能预测记忆衰退速度的组织特征，校正年龄", use_model=True)
-    assert r["detected_by"] == "model"
-    assert (r["fields"]["outcome"], r["fields"]["covariates"]) == ("slope", ["age"])
+    text = "找出能预测记忆衰退速度的组织特征，校正年龄"
+    problem, spec = _started_problem(client, workspace, fake_loop, text)
+    assert (spec.outcome, spec.covariates) == ("slope", ("age",))
+    assert problem.startswith("---\noutcome: slope\ncovariates: [age]\n---\n")
     prompt = seen[0]["input"]
     assert "slope" in prompt and "-0.1" not in prompt and "80" not in prompt  # names, never values
+    # the same program asks once
+    _started_problem(client, workspace, fake_loop, text)
+    assert len(seen) == 1
 
 
-def test_resolve_lets_the_model_choose_what_the_program_leaves_open(client, workspace, monkeypatch):
-    # the first panel's way: a program that names no column still runs
-    import app.services.agent.discovery.client as client_mod
-    import app.services.agent.discovery.workspace_scan as scan
+def test_plain_program_falls_back_to_the_saved_header(client, workspace, llm_ready, fake_loop, no_model):
+    (workspace / "problem.md").write_text("---\noutcome: age\ncovariates: [slope]\n---\nold question\n")
+    problem, spec = _started_problem(client, workspace, fake_loop, "Find tissue features that matter.")
+    assert (spec.outcome, spec.covariates) == ("age", ("slope",))
+    assert problem == "---\noutcome: age\ncovariates: [slope]\n---\nFind tissue features that matter.\n"
 
-    monkeypatch.setattr(scan, "_MODEL_ANSWERS", {})
-    calls = []
-    monkeypatch.setattr(client_mod, "unavailable_reason", lambda: None)
-    monkeypatch.setattr(client_mod, "responses_create", lambda payload, timeout=0: calls.append(payload) or {
-        "output_text": '{"outcome": "slope", "covariates": ["age"]}'
+
+def test_saved_header_for_another_table_is_not_used(client, workspace, llm_ready, fake_loop, no_model):
+    (workspace / "problem.md").write_text("---\noutcome: age\ncohort_file: other.csv\n---\nq\n")
+    body = _start(client, workspace, task="Find tissue features that matter.")
+    assert body["code"] == 400 and "Couldn't tell which column to predict" in body["message"]
+
+
+def test_plain_program_takes_the_only_outcome_candidate(client, workspace, llm_ready, fake_loop, no_model):
+    (workspace / "training_cohort.csv").write_text(
+        "donor_id,slide_name,slope,sex\nd1,d1.zarr,-0.1,F\nd2,d2.zarr,0.2,M\n", encoding="utf-8"
+    )
+    _, spec = _started_problem(client, workspace, fake_loop, "Find tissue features that matter.")
+    assert spec.outcome == "slope"
+
+
+def test_ambiguous_plain_program_says_what_to_name(client, workspace, llm_ready, fake_loop, no_model):
+    body = _start(client, workspace, task="Find tissue features that matter.")
+    assert body["code"] == 400, body
+    assert body["message"] == (
+        'Couldn\'t tell which column to predict. Name it in the program, e.g. "predict slope". Columns: slope, age'
+    )
+    assert fake_loop["calls"] == [] and not (workspace / "problem.md").exists()
+
+
+def test_plain_program_needs_a_cohort_table_with_an_outcome(client, workspace, llm_ready, fake_loop, no_model):
+    (workspace / "training_cohort.csv").unlink()
+    body = _start(client, workspace, task="Find tissue features.")
+    assert body["code"] == 400 and body["message"] == "No patient table (CSV) found in this folder"
+
+    (workspace / "cases.csv").write_text("donor_id,slide_name,group\nd1,d1.zarr,a\nd2,d2.zarr,b\n", encoding="utf-8")
+    body = _start(client, workspace, task="Find tissue features.")
+    assert body["code"] == 400 and "numeric with a value in every row of cases.csv" in body["message"]
+    assert fake_loop["calls"] == []
+
+
+def test_compose_problem_quotes_what_yaml_would_misread():
+    from app.services.agent.discovery.problem import compose_problem, parse_problem
+
+    text = compose_problem({
+        "outcome": "null", "covariates": ["age (y)", "true"], "question": " q ",
+        "cohort_file": "c d.csv", "id_column": "donor_id", "slide_column": "slide_name", "mpp_column": "mpp",
     })
-    text = "# Program\nIterative biomarker discovery on this cohort.\n## Goal\nFind robust tissue features."
-    r = _resolve(client, workspace, text, use_model=True)
-    assert (r["fields"]["outcome"], r["fields"]["covariates"]) == ("slope", ["age"])
-    assert (r["detected_by"], r["covariates_by"]) == ("model", "model")
-    # the panel resolves on every pause in typing: one model call per text
-    _resolve(client, workspace, text, use_model=True)
-    assert len(calls) == 1
-
-    # what the text names wins; the model fills in only the rest
-    r = _resolve(client, workspace, "Which tissue features predict age?", use_model=True)
-    assert (r["fields"]["outcome"], r["detected_by"]) == ("age", "text")
-    assert r["fields"]["covariates"] == [] and r["covariates_by"] is None  # the model's "age" is the outcome
-
-
-def test_resolve_takes_a_full_problem_md_as_is(client, workspace):
-    r = _resolve(client, workspace, PROBLEM)
-    assert r["mode"] == "header" and r["fields"]["outcome"] == "slope" and r["error"] is None
-    bad = _resolve(client, workspace, "---\ncovariates: [age]\n---\nq\n")
-    assert bad["fields"] is None and "outcome" in bad["error"]
+    assert text == '---\noutcome: "null"\ncovariates: ["age (y)", "true"]\ncohort_file: "c d.csv"\n---\nq\n'
+    spec = parse_problem(text)
+    assert (spec.outcome, spec.covariates, spec.cohort_file) == ("null", ("age (y)", "true"), "c d.csv")
 
 
 def test_workspace_runs_list_and_load(client, workspace):
@@ -214,13 +222,14 @@ def test_start_run_without_docker_is_501(client, workspace, monkeypatch):
 
 
 @pytest.mark.parametrize("task, message", [
-    ("just a question", "YAML header"),
+    ("just a question", "Couldn't tell which column to predict"),
+    ("   ", "Describe the research program first"),
     ("---\ncovariates: [age]\n---\nq", "set `outcome`"),
     ("---\noutcome: missing_col\n---\nq", "lacks column(s) ['missing_col']"),
     ("---\noutcome: slope\ncovariate: [age]\n---\nq", "unknown setting(s) ['covariate']"),
     ("---\noutcome: slope\ncohort_file: Training_Cohort.csv\n---\nq", "names are case-sensitive"),
 ])
-def test_bad_problem_is_rejected_before_the_run(client, workspace, llm_ready, fake_loop, task, message):
+def test_bad_problem_is_rejected_before_the_run(client, workspace, llm_ready, fake_loop, no_model, task, message):
     body = _start(client, workspace, task=task)
     assert body["code"] == 400, body
     assert message in body["message"]
@@ -272,7 +281,7 @@ def test_reusing_a_guide_needs_an_earlier_run_here_that_has_one(client, workspac
     assert not (workspace / "autoresearch_runs").exists() or not any((workspace / "autoresearch_runs").iterdir())
 
 
-def test_submitted_problem_replaces_existing_problem_md(client, workspace, llm_ready, fake_loop):
+def test_a_problem_md_header_goes_as_written(client, workspace, llm_ready, fake_loop):
     (workspace / "problem.md").write_text("---\noutcome: slope\n---\nold question\n")
     _events(client, _start(client, workspace)["data"]["run_id"])
     assert (workspace / "problem.md").read_text() == PROBLEM

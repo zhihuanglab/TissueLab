@@ -17,12 +17,14 @@ from typing import Any, AsyncIterator, Dict, Optional, Tuple
 from app.services.agent.discovery.loop import (
     DEFAULT_WORKER_WALL_CLOCK, guide_recorded, read_run_state, run_discovery, run_folder_busy,
 )
-from app.services.agent.discovery.problem import ProblemError, parse_problem, validate_against_data
+from app.services.agent.discovery.problem import (
+    PROBLEM_FILENAME, ProblemError, parse_problem, validate_against_data,
+)
 from app.services.agent.discovery.sandbox import RUNS_DIRNAME
 from app.services.agent.discovery.scout import GUIDE_NAME
+from app.services.agent.discovery.workspace_scan import program_problem
 from app.utils import resolve_path
 
-PROBLEM_FILENAME = "problem.md"
 # Events kept for a stream that is not reading; past this the oldest are dropped.
 EVENT_BACKLOG = 1000
 # How long a finished run's events wait for a stream to collect them.
@@ -156,14 +158,17 @@ class DiscoveryRunManager:
         reuse_guide_from: Optional[str] = None,
         workers_per_round: int = 1,
     ) -> str:
-        """Start a run; `task` is the full problem.md text. Raises ProblemError when it
-        does not parse or does not match the data folder."""
+        """Start a run. `task` is problem.md itself when it starts with a `---` header,
+        else the program in plain words, whose header is worked out from the cohort
+        table. Raises ProblemError when it does not parse or does not match the data folder."""
         data_dir = workspace_data_dir(workspace_path)
+        if not task.lstrip("\ufeff").startswith("---"):
+            task = await asyncio.to_thread(program_problem, task, data_dir)
         spec = parse_problem(task)
         await asyncio.to_thread(validate_against_data, spec, data_dir)
         earlier_guide = _earlier_guide(data_dir, reuse_guide_from) if reuse_guide_from else None
-        # The submitted text is the problem: saved to the workspace (the panel
-        # pre-fills from it) and into the run folder (resume re-reads it).
+        # The problem is saved to the workspace (the panel pre-fills from it) and
+        # into the run folder (resume re-reads it).
         run_id = f"run_{uuid.uuid4().hex[:10]}"
         run_root = data_dir / RUNS_DIRNAME / run_id
         run_root.mkdir(parents=True)

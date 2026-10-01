@@ -1,9 +1,9 @@
-"""What the Research panel works out before a run: the cohort files in a data
+"""What starting a run from a plain-text program works out: the cohort files in a data
 folder, which of their columns look like the id / slide / mpp columns, which
 could be the outcome or covariates, and which of those a free-text program
 names — so problem.md's header is written for the user, not by them.
 
-Host-side and for the panel only: none of this reaches the agents (they get
+Host-side only: none of this reaches the agents (they get
 problem.md, and inside the sandbox the id / slide / mpp columns alone). The one
 model call here (resolving plain words to columns) sees column names, never values.
 """
@@ -17,7 +17,14 @@ from typing import Any, Optional
 import pandas as pd
 
 from .panel_cv import covariate_matrix
-from .problem import ProblemError, ProblemSpec, _relative_inside, parse_problem
+from .problem import (
+    PROBLEM_FILENAME,
+    ProblemError,
+    ProblemSpec,
+    _relative_inside,
+    compose_problem,
+    parse_problem,
+)
 
 MAX_COHORT_FILES = 20
 MAX_COHORT_BYTES = 50 * 1024 * 1024
@@ -131,26 +138,13 @@ def scan_workspace(data_dir: Path) -> dict[str, Any]:
     return {"cohorts": cohorts}
 
 
-def problem_fields(spec: ProblemSpec) -> dict[str, Any]:
-    """A parsed problem.md as the panel's form holds it."""
-    return {
-        "outcome": spec.outcome,
-        "question": spec.question,
-        "covariates": list(spec.covariates),
-        "cohort_file": spec.cohort_file,
-        "id_column": spec.id_column,
-        "slide_column": spec.slide_column,
-        "mpp_column": spec.mpp_column,
-    }
-
-
 # ─── The research program in plain words -> outcome / covariates ───────────────
 #
 # The panel takes one free-text program, as it always did; the judge still needs
 # to know which cohort column to predict and which to adjust for. They are read
 # off the text by matching the cohort's column names; whatever the text leaves
-# open, the model chooses from the column names alone (never a value). The panel
-# shows the result, to confirm or change.
+# open, the model chooses from the column names alone (never a value). Starting a
+# run turns the result into problem.md's header.
 
 _ADJUST = re.compile(
     r"adjust|control(?:ling|led)?\s+for|account(?:ing)?\s+for|covariat|confound|correct(?:ing)?\s+for"
@@ -244,8 +238,7 @@ _MODEL_ANSWERS_MAX = 64
 
 
 def _ask_model_cached(text: str, outcomes: tuple[str, ...], covariates: tuple[str, ...]) -> Optional[dict[str, Any]]:
-    """The panel re-resolves on every pause in typing: the same text asks once
-    (answers only — a failed call is asked again)."""
+    """The same program asks once per process (answers only — a failed call is asked again)."""
     key = (text, outcomes, covariates)
     if key not in _MODEL_ANSWERS:
         answer = ask_model_for_columns(text, {"outcome_candidates": list(outcomes), "covariate_candidates": list(covariates)})
@@ -258,40 +251,71 @@ def _ask_model_cached(text: str, outcomes: tuple[str, ...], covariates: tuple[st
 
 
 def resolve_program(text: str, data_dir: Path, cohort_file: Optional[str] = None, use_model: bool = True) -> dict[str, Any]:
-    """What a free-text program amounts to on this folder's data.
-
-    A text that starts with a YAML header is problem.md itself and is parsed as
-    such; plain text is matched against the chosen (or best) cohort table.
-    """
-    if text.lstrip("﻿").startswith("---"):
-        try:
-            return {"mode": "header", "fields": problem_fields(parse_problem(text)), "detected_by": "header", "error": None}
-        except ProblemError as exc:
-            return {"mode": "header", "fields": None, "detected_by": None, "error": str(exc)}
+    """What a free-text program names on this folder's data: the cohort table used
+    (the given one if it is here, else the best match; None when there is none),
+    and the outcome / covariates read off the text or, for what it leaves open,
+    chosen by the model."""
     cohorts = scan_workspace(data_dir)["cohorts"]
     cohort = next((c for c in cohorts if c["file"] == cohort_file), cohorts[0] if cohorts else None)
     if cohort is None:
-        return {"mode": "text", "fields": None, "detected_by": None, "error": "No cohort table in this folder"}
+        return {"cohort": None, "outcome": "", "covariates": []}
     found = match_columns(text, cohort)
-    detected_by = "text" if found["outcome"] else None
-    covariates_by = "text" if found["covariates"] else None
-    # The program need not name anything: what it leaves open, the model fills in
-    # from the column names (as the panel always worked — write the program, press start).
     if use_model and text.strip() and (not found["outcome"] or not found["covariates"]):
         asked = _ask_model_cached(text.strip(), tuple(cohort["outcome_candidates"]), tuple(cohort["covariate_candidates"]))
         if asked:
-            if not found["outcome"] and asked["outcome"]:
-                found["outcome"], detected_by = asked["outcome"], "model"
+            if not found["outcome"]:
+                found["outcome"] = asked["outcome"]
             if not found["covariates"]:
                 found["covariates"] = [c for c in asked["covariates"] if c != found["outcome"]]
-                covariates_by = "model" if found["covariates"] else None
-    fields = {
-        "outcome": found["outcome"],
-        "question": text.strip(),
-        "covariates": found["covariates"],
+    return {"cohort": cohort, **found}
+
+
+def _saved_problem(data_dir: Path) -> Optional[ProblemSpec]:
+    """The workspace's problem.md (the last run's problem), if it parses."""
+    try:
+        return parse_problem((data_dir / PROBLEM_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ProblemError):
+        return None
+
+
+def program_problem(text: str, data_dir: Path) -> str:
+    """problem.md for a plain-text program: its header worked out from the cohort
+    table. What the text (or the model) leaves open comes from the saved
+    problem.md when it used the same table, or is the table's only candidate.
+    Raises ProblemError with what to do when no outcome can be chosen."""
+    question = text.strip()
+    if not question:
+        raise ProblemError("Describe the research program first")
+    saved = _saved_problem(data_dir)
+    found = resolve_program(question, data_dir, saved.cohort_file if saved else None)
+    cohort = found["cohort"]
+    if cohort is None:
+        raise ProblemError("No patient table (CSV) found in this folder")
+    candidates = cohort["outcome_candidates"]
+    if not candidates:
+        raise ProblemError(
+            f"No column can be predicted: it must be numeric with a value in every row of {cohort['file']}"
+        )
+    same_table = saved if saved is not None and saved.cohort_file == cohort["file"] else None
+    outcome = found["outcome"]
+    if not outcome and same_table and same_table.outcome in candidates:
+        outcome = same_table.outcome
+    if not outcome and len(candidates) == 1:
+        outcome = candidates[0]
+    if not outcome:
+        raise ProblemError(
+            f'Couldn\'t tell which column to predict. Name it in the program, e.g. "predict {candidates[0]}". '
+            f"Columns: {', '.join(candidates)}"
+        )
+    covariates = found["covariates"] or (
+        [c for c in same_table.covariates if c in cohort["covariate_candidates"]] if same_table else []
+    )
+    return compose_problem({
+        "outcome": outcome,
+        "question": question,
+        "covariates": [c for c in dict.fromkeys(covariates) if c != outcome],
         "cohort_file": cohort["file"],
         "id_column": cohort["id_column"] or _DEFAULT_SPEC.id_column,
         "slide_column": cohort["slide_column"] or _DEFAULT_SPEC.slide_column,
         "mpp_column": cohort["mpp_column"] or _DEFAULT_SPEC.mpp_column,
-    }
-    return {"mode": "text", "fields": fields, "detected_by": detected_by, "covariates_by": covariates_by, "error": None}
+    })

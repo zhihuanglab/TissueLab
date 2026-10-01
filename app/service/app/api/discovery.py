@@ -31,13 +31,7 @@ from app.services.agent.discovery.loop import (
     load_results_rows,
     read_run_state,
 )
-from app.services.agent.discovery.problem import parse_problem
-from app.services.agent.discovery.workspace_scan import (
-    problem_fields,
-    resolve_program,
-    scan_workspace,
-)
-from app.services.agent.discovery.run_manager import PROBLEM_FILENAME
+from app.services.agent.discovery.problem import PROBLEM_FILENAME, parse_problem
 from app.services.agent.discovery.scout import GUIDE_NAME
 from app.services.agent.discovery.sandbox import RUNS_DIRNAME, docker_unavailable_reason
 from app.services.file_manager.common import (
@@ -50,7 +44,7 @@ discovery_router = APIRouter()
 
 
 class StartRunRequest(BaseModel):
-    task: str                       # the full problem.md text
+    task: str                       # the program in plain words, or problem.md with its header
     workspace_path: str
     rounds: int = Field(3, ge=1, le=50)
     reasoning_effort: str = "high"
@@ -122,48 +116,19 @@ def _load_run(run_root: Path) -> Dict[str, Any]:
     }
 
 
-class ResolveProgramRequest(BaseModel):
-    data_dir: str
-    text: str
-    cohort_file: Optional[str] = None   # the user's pick; default: the best match
-    use_model: bool = True
-
-
-def _parsed(text: str) -> Dict[str, Any]:
-    """problem.md text as the form's fields, or why it does not parse."""
+@discovery_router.get("/v1/discovery/program")
+def get_program(data_dir: str, auth_user: AuthUser = Depends(get_auth_user)):
+    """The program saved in a data folder's (or a slide's folder's) problem.md, for
+    the panel to pre-fill: its question, or the file as written when it does not parse."""
     try:
-        return {"fields": problem_fields(parse_problem(text)), "error": None}
-    except ProblemError as exc:
-        return {"fields": None, "error": str(exc)}
-
-
-@discovery_router.get("/v1/discovery/setup")
-def get_setup(data_dir: str, auth_user: AuthUser = Depends(get_auth_user)):
-    """What the panel needs to set up a run in a data folder (or a slide's folder):
-    its problem.md, and the cohort files with their columns sorted into the likely
-    id / slide / outcome / covariate roles."""
-    try:
-        assert_can_access_path(auth_user, data_dir, "read research setup")
-        folder = workspace_data_dir(data_dir)
-        problem_path = folder / PROBLEM_FILENAME
-        content = problem_path.read_text(encoding="utf-8") if problem_path.exists() else ""
-        problem = {"found": problem_path.exists(), "content": content, **_parsed(content)}
-        return success_response({"data_dir": str(folder), "problem": problem, **scan_workspace(folder)})
-    except AppError:
-        raise
-    except Exception as exc:
-        return error_response(str(exc))
-
-
-@discovery_router.post("/v1/discovery/problem/resolve")
-def resolve_problem(request: ResolveProgramRequest, auth_user: AuthUser = Depends(get_auth_user)):
-    """A free-text program read against the folder's cohort table: the outcome and
-    covariates it names (by column name, or via the model with column names only).
-    A text starting with a YAML header is problem.md and is parsed as is."""
-    try:
-        assert_can_access_path(auth_user, request.data_dir, "read research setup")
-        folder = workspace_data_dir(request.data_dir)
-        return success_response(resolve_program(request.text, folder, request.cohort_file, request.use_model))
+        assert_can_access_path(auth_user, data_dir, "read research program")
+        problem_path = workspace_data_dir(data_dir) / PROBLEM_FILENAME
+        content = problem_path.read_text(encoding="utf-8") if problem_path.is_file() else ""
+        try:
+            text = parse_problem(content).question
+        except ProblemError:
+            text = content
+        return success_response({"text": text})
     except AppError:
         raise
     except Exception as exc:
