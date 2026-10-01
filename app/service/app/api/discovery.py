@@ -91,6 +91,14 @@ def _run_summary(run_root: Path) -> Dict[str, Any]:
     }
 
 
+def _run_outcome(run_root: Optional[Path]) -> Optional[str]:
+    """The column the run predicts (from its problem.md), for the panel to show."""
+    try:
+        return parse_problem((run_root / PROBLEM_FILENAME).read_text(encoding="utf-8")).outcome
+    except (TypeError, OSError, UnicodeDecodeError, ProblemError):
+        return None
+
+
 def _load_run(run_root: Path) -> Dict[str, Any]:
     if not (run_root / "run_state.json").exists():
         raise FileNotFoundError(f"Not a discovery run: {run_root}")
@@ -111,6 +119,7 @@ def _load_run(run_root: Path) -> Dict[str, Any]:
     return {
         **_run_summary(run_root),
         "problem_text": problem_path.read_text(encoding="utf-8") if problem_path.exists() else "",
+        "outcome": _run_outcome(run_root),
         "journal": journal,
         "final_summary": findings_path.read_text(encoding="utf-8") if findings_path.exists() else None,
     }
@@ -186,7 +195,7 @@ async def start_run(request: StartRunRequest, auth_user: AuthUser = Depends(get_
         )
     except ProblemError as exc:
         raise AppErrors.PARAMS_ERROR(str(exc))
-    return success_response({"run_id": run_id})
+    return success_response({"run_id": run_id, "outcome": _run_outcome(get_discovery_run_manager().run_root(run_id))})
 
 
 @discovery_router.post("/v1/discovery/runs/resume")
@@ -199,7 +208,7 @@ async def resume_run(request: ResumeRunRequest, auth_user: AuthUser = Depends(ge
         )
     except ProblemError as exc:
         raise AppErrors.PARAMS_ERROR(str(exc))
-    return success_response({"run_id": run_id})
+    return success_response({"run_id": run_id, "outcome": _run_outcome(get_discovery_run_manager().run_root(run_id))})
 
 
 @discovery_router.get("/v1/discovery/runs/{run_id}/stream")

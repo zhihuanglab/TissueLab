@@ -49,7 +49,7 @@ function mockService({ runs = [] as object[], streamStatus = 200, program = 'pro
   const cancels: string[] = [];
   const programRequests: ((text: string) => void)[] = [];
   const startBodies: Record<string, unknown>[] = [];
-  let releaseStart: ((runId: string) => void) | null = null;
+  let releaseStart: ((reply: object) => void) | null = null;
   const fetchMock = vi.fn(async (url: string, init: RequestInit = {}) => {
     const method = init.method ?? 'GET';
     if (url.includes('/discovery/runs?workspace_path=')) return ok({ runs });
@@ -64,7 +64,7 @@ function mockService({ runs = [] as object[], streamStatus = 200, program = 'pro
     if (url.endsWith('/stream') && streamStatus !== 200) return { ok: false, status: streamStatus, body: null };
     if (url.endsWith('/discovery/runs') && method === 'POST') {
       startBodies.push(JSON.parse(String(init.body)));
-      return new Promise((resolve) => { releaseStart = (runId) => resolve(ok({ run_id: runId })); });
+      return new Promise((resolve) => { releaseStart = resolve; });
     }
     const cancel = url.match(/\/runs\/([^/]+)\/cancel$/);
     if (cancel) { cancels.push(cancel[1]); return ok({ cancelled: true }); }
@@ -85,7 +85,14 @@ function mockService({ runs = [] as object[], streamStatus = 200, program = 'pro
       await waitFor(() => expect(programRequests.length).toBeGreaterThan(i));
       await act(async () => programRequests[i](text));
     },
-    startReturns: async (runId: string) => { await waitFor(() => expect(releaseStart).not.toBeNull()); await act(async () => releaseStart!(runId)); },
+    startReturns: async (runId: string, outcome?: string) => {
+      await waitFor(() => expect(releaseStart).not.toBeNull());
+      await act(async () => releaseStart!(ok({ run_id: runId, outcome })));
+    },
+    startFails: async (message: string) => {
+      await waitFor(() => expect(releaseStart).not.toBeNull());
+      await act(async () => releaseStart!({ ok: false, status: 400, json: async () => ({ code: 400, message, data: null }) }));
+    },
   };
 }
 
@@ -233,5 +240,31 @@ describe('CoscientistPanel research program', () => {
     await svc.answerProgram(0, 'old program');
     expect(programBox().value).toBe('new program');
     expect(startButton()).toBeEnabled();
+  });
+});
+
+describe('CoscientistPanel start outcome', () => {
+  it('a start the service refuses keeps the form and the typed program, with the reason above Start', async () => {
+    const svc = mockService();
+    render(<CoscientistPanel />);
+    await waitFor(() => expect(programBox().value).toBe('program'));
+    fireEvent.change(programBox(), { target: { value: 'what predicts decline?' } });
+    start();
+    await svc.startFails('Couldn\'t tell which column to predict.');
+
+    expect(await screen.findByText("Couldn't tell which column to predict.")).toBeInTheDocument();
+    expect(programBox().value).toBe('what predicts decline?');
+    expect(startButton()).toBeEnabled();
+    expect(svc.streams).toHaveLength(0);
+  });
+
+  it('shows the column the run predicts', async () => {
+    const svc = mockService();
+    render(<CoscientistPanel />);
+    await waitFor(() => expect(startButton()).toBeEnabled());
+    start();
+    await svc.startReturns('run-a', 'slope');
+    expect(await screen.findByText('slope')).toBeInTheDocument();
+    expect(screen.getByText(/Predicting/)).toBeInTheDocument();
   });
 });

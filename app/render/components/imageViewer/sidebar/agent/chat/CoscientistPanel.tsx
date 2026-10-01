@@ -168,6 +168,8 @@ export const CoscientistPanel: React.FC = () => {
   // it), and the newest pre-fill request (only it may write).
   const programTypedRef = useRef(false)
   const programSeqRef = useRef(0)
+  // The cohort column the run in view predicts (the service picks it at start).
+  const [outcome, setOutcome] = useState<string | null>(null)
 
   const workspacePath = formatPath(currentPath ?? "")
   // The open slide's folder; formatPath yields "\\" separators on Windows.
@@ -244,6 +246,7 @@ export const CoscientistPanel: React.FC = () => {
     if (isStale(token)) return
     setJournal((payload.journal || []) as JournalEntry[])
     setFinalSummary(payload.final_summary || null)
+    setOutcome(payload.outcome || null)
     setCurrentRound(null)
     setActiveRunId(null)
     setRoundPhase(null)
@@ -296,6 +299,7 @@ export const CoscientistPanel: React.FC = () => {
       const runId = res.data.data?.run_id
       if (!runId) throw new Error("Run ID missing")
       if (cancelIfStopped(runId, token)) return
+      setOutcome(res.data.data?.outcome || null)
       setResumeInfo(null)
       setActiveRunId(runId)
       await consumeStream(runId, token)
@@ -348,6 +352,8 @@ export const CoscientistPanel: React.FC = () => {
     setScout(SCOUT_IDLE)
     setFinalSummary(null)
     setActiveRunId(null)
+    setOutcome(null)
+    let started = false
 
     try {
       const res = await authedFetch(`${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/runs`, {
@@ -367,6 +373,8 @@ export const CoscientistPanel: React.FC = () => {
       const runId = res.data.data?.run_id
       if (!runId) throw new Error("Run ID missing")
       if (cancelIfStopped(runId, token)) return
+      started = true
+      setOutcome(res.data.data?.outcome || null)
       setActiveRunId(runId)
       await consumeStream(runId, token)
     } catch (err: any) {
@@ -374,7 +382,8 @@ export const CoscientistPanel: React.FC = () => {
       setError(err.message)
       setCurrentRound(stopRunningRows)
       setScout(stopRunningScout)
-      setPhase("complete")
+      // Not started (e.g. no column to predict): back to the form, the program as typed.
+      setPhase(started ? "complete" : "input")
     }
   }
 
@@ -936,6 +945,12 @@ export const CoscientistPanel: React.FC = () => {
 
             {resumeCard}
 
+            {error && (
+              <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700">
+                {error}
+              </div>
+            )}
+
             {/* Start button */}
             <Button
               onClick={startResearch}
@@ -952,6 +967,12 @@ export const CoscientistPanel: React.FC = () => {
         {/* ─── PHASE 2: Live Dashboard ────────────────────────────────── */}
         {(phase === "running" || phase === "cancelling" || phase === "complete") && (
           <div className="p-4 space-y-3">
+            {outcome && (
+              <div className="text-xs text-muted-foreground">
+                Predicting <b className="font-mono text-foreground">{outcome}</b>
+              </div>
+            )}
+
             {/* Error */}
             {error && (
               <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700">

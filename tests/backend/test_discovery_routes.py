@@ -81,10 +81,19 @@ def _started_problem(client, workspace, fake_loop, text):
     """Start a run from a plain-text program; the problem.md it was turned into, and the spec."""
     body = _start(client, workspace, task=text)
     assert body["code"] == 0, body
+    assert body["data"]["outcome"] == fake_loop_outcome(body, workspace)
     _events(client, body["data"]["run_id"])
     run_problem = (workspace / "autoresearch_runs" / body["data"]["run_id"] / "problem.md").read_text()
     assert (workspace / "problem.md").read_text() == run_problem
     return run_problem, fake_loop["calls"][-1]["spec"]
+
+
+def fake_loop_outcome(body, workspace):
+    """The outcome the start reply names is the one in the run's problem.md."""
+    from app.services.agent.discovery.problem import parse_problem
+
+    run_problem = workspace / "autoresearch_runs" / body["data"]["run_id"] / "problem.md"
+    return parse_problem(run_problem.read_text()).outcome
 
 
 def test_get_program_returns_the_saved_question(client, workspace, storage_root):
@@ -201,6 +210,7 @@ def test_workspace_runs_list_and_load(client, workspace):
 
     loaded = client.get(f"{API}/runs/load", params={"run_root_path": str(run_root)}).json()["data"]
     assert loaded["problem_text"] == PROBLEM
+    assert loaded["outcome"] == "slope"   # the panel shows what the run predicts
     assert loaded["journal"] == [{"roundId": 1, "focus": "Q1", "summary": "kept cand_1"}]
     assert loaded["status"] == "incomplete" and loaded["final_summary"] is None
 
@@ -335,7 +345,7 @@ def test_resume_rereads_the_problem_and_refuses_a_running_folder(client, workspa
     ))
     try:
         resumed = client.post(f"{API}/runs/resume", json={"run_root_path": str(run_root)}).json()
-        assert resumed["code"] == 0 and resumed["data"] == {"run_id": first}
+        assert resumed["code"] == 0 and resumed["data"] == {"run_id": first, "outcome": "slope"}
         call = fake_loop["calls"][-1]
         assert call["run_root"] == run_root and call["data_dir"] == workspace
         assert call["spec"].outcome == "slope" and call["rounds"] == 2   # rounds 2..3 remain
