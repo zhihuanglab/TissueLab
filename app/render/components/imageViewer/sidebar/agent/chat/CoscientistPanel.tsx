@@ -733,14 +733,15 @@ export const CoscientistPanel: React.FC = () => {
   return (
     <div className="flex flex-col h-full bg-background">
       {/* Header */}
-      <div className="sticky top-0 z-10 bg-background border-b border-border px-4 py-3">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2.5">
-            <div className="w-7 h-7 rounded-lg bg-primary/15 flex items-center justify-center">
-              <FlaskConical className="h-4 w-4 text-primary" />
+      {/* Same height and layout as the Agent chat's toolbar: switching between them must not jump */}
+      <div className="sticky top-0 z-10 bg-background border-b border-border px-3 py-2">
+        <div className="min-h-8 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="w-6 h-6 rounded-full bg-primary/15 flex items-center justify-center">
+              <FlaskConical className="h-3.5 w-3.5 text-primary" />
             </div>
             <Select value={selectedAgent} onValueChange={(value: AgentName) => { if (value !== selectedAgent) dispatch(setSelectedAgent(value)) }}>
-              <SelectTrigger className="h-7 w-[150px] border border-border/50 shadow-sm bg-background text-sm font-medium text-foreground hover:bg-muted/50 focus:ring-1 focus:ring-primary/30">
+              <SelectTrigger className="h-7 w-[170px] border border-border/50 shadow-sm bg-background text-sm font-medium text-foreground hover:bg-muted/50 focus:ring-1 focus:ring-primary/30">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -773,7 +774,7 @@ export const CoscientistPanel: React.FC = () => {
 
         {/* Progress bar during run */}
         {isRunning && currentRound && (
-          <div className="mt-2.5 space-y-1">
+          <div className="mt-2 space-y-1">
             <div className="flex justify-between text-[10px] text-muted-foreground">
               <span>Round {currentRound.roundId}/{currentRound.totalRounds}</span>
             </div>
