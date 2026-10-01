@@ -247,7 +247,8 @@ def test_run_streams_loop_events_and_completes(client, workspace, llm_ready, fak
 def test_a_new_run_can_reuse_an_earlier_runs_dataset_guide(client, workspace, llm_ready, fake_loop):
     earlier = workspace / "autoresearch_runs" / "run_earlier"
     (earlier / "shared").mkdir(parents=True)
-    (earlier / "run_state.json").write_text(json.dumps({"next_round_id": 2, "config": {"rounds": 1}}))
+    # "guide": its scout recorded writing the guide (a worker could write the file too)
+    (earlier / "run_state.json").write_text(json.dumps({"next_round_id": 2, "config": {"rounds": 1}, "guide": True}))
     (earlier / "shared" / "dataset_guide.md").write_text("# Guide from before\n")
     runs = client.get(f"{API}/runs", params={"workspace_path": str(workspace)}).json()["data"]["runs"]
     assert [(r["run_id"], r["has_guide"]) for r in runs] == [("run_earlier", True)]

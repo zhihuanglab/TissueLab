@@ -6,21 +6,30 @@ which only OpenAI's Responses API provides — a Chat Completions endpoint
 (OPENAI_BASE_URL pointing at vLLM, Ollama, …) cannot run this loop.
 
 DISCOVERY_BASE_URL / DISCOVERY_API_KEY give discovery its own Responses
-endpoint, so the chat agent can stay on a self-hosted model; unset, discovery
-uses OPENAI_BASE_URL / OPENAI_API_KEY like the agent.
+endpoint, so the chat agent can stay on a self-hosted model; with no
+DISCOVERY_BASE_URL, discovery uses OPENAI_BASE_URL / OPENAI_API_KEY like the
+agent. Endpoint and key are taken as a pair, so a key never goes to a host it
+was not saved for.
+
+A run pins the client it started with (pin_run_client): a Preferences save
+mid-run must not move its previous_response_id chains to another endpoint.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from typing import Any, List, Optional
+from contextvars import ContextVar
+from typing import Any, List, Optional, Tuple
 
 from openai import OpenAI
 
 from app.services import llm_config
 
 _client: Optional[OpenAI] = None
+# The run's client, once its first request made one (a list so that the
+# threads a run starts, which copy its context, fill in the same holder).
+_run_client: ContextVar[Optional[list]] = ContextVar("discovery_run_client", default=None)
 
 # The loop's prompts were tuned against this model; DISCOVERY_MODEL overrides it.
 DEFAULT_DISCOVERY_MODEL = "gpt-5.4"
@@ -34,13 +43,35 @@ def _discovery_env(name: str) -> str:
     return (os.getenv(f"DISCOVERY_{name}") or "").strip()
 
 
-def unavailable_reason() -> Optional[str]:
-    """Why a discovery run cannot start with the current LLM settings, or None."""
-    if not (_discovery_env("API_KEY") or os.getenv("OPENAI_API_KEY")):
-        return (
+def _connection() -> Tuple[Optional[str], Optional[str]]:
+    """(base_url, api_key) for discovery; raises RuntimeError when the key is missing."""
+    base_url = _discovery_env("BASE_URL")
+    if base_url:
+        api_key = _discovery_env("API_KEY")
+        agent_url = llm_config.base_url() or "https://api.openai.com/v1"
+        if not api_key and base_url.rstrip("/") == agent_url.rstrip("/"):
+            api_key = (os.getenv("OPENAI_API_KEY") or "").strip()   # the agent's own endpoint
+        if not api_key:
+            raise RuntimeError(
+                "Research has its own endpoint (DISCOVERY_BASE_URL) but no API key for it: add one in "
+                "Preferences > AI Models (or set DISCOVERY_API_KEY)."
+            )
+        return base_url, api_key
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError(
             "Research is not configured: add an API key in Preferences > AI Models "
             "(or set OPENAI_API_KEY in .env.local)."
         )
+    return llm_config.base_url() or None, api_key
+
+
+def unavailable_reason() -> Optional[str]:
+    """Why a discovery run cannot start with the current LLM settings, or None."""
+    try:
+        _connection()
+    except RuntimeError as exc:
+        return str(exc)
     # A dedicated DISCOVERY_BASE_URL is declared to speak the Responses API.
     if not _discovery_env("BASE_URL") and llm_config.api_mode() != "responses":
         return (
@@ -54,12 +85,14 @@ def unavailable_reason() -> Optional[str]:
 def get_client() -> OpenAI:
     global _client
     if _client is None:
-        # None falls back to OPENAI_BASE_URL / OPENAI_API_KEY.
-        _client = OpenAI(
-            base_url=_discovery_env("BASE_URL") or None,
-            api_key=_discovery_env("API_KEY") or None,
-        )
+        base_url, api_key = _connection()
+        _client = OpenAI(base_url=base_url, api_key=api_key)
     return _client
+
+
+def pin_run_client() -> None:
+    """From here on, this task and the threads it starts keep the first client they use."""
+    _run_client.set([])
 
 
 def responses_create(payload: dict, timeout: int = 180) -> dict:
@@ -68,7 +101,14 @@ def responses_create(payload: dict, timeout: int = 180) -> dict:
     timeout bounds each attempt, and one retry keeps a worker's wall clock
     meaningful: the SDK default (600s, two retries) could hold a call ~30 min.
     """
-    client = get_client().with_options(timeout=timeout, max_retries=1)
+    pinned = _run_client.get()
+    if pinned is None:
+        client = get_client()
+    else:
+        if not pinned:
+            pinned.append(get_client())
+        client = pinned[0]
+    client = client.with_options(timeout=timeout, max_retries=1)
     response = client.responses.create(**payload)
     if hasattr(response, "model_dump"):
         return response.model_dump(mode="json", warnings="none")

@@ -6,8 +6,8 @@ Determines whether problems are in workflow planning, model output, or coding st
 """
 
 import os
-import re
 import json
+import threading
 from typing import Dict, Any, List, Optional
 from openai import OpenAI
 
@@ -113,76 +113,47 @@ class VerificationAgent:
         
         # Helper function to add image to content
         def add_image_to_content(image_path: str):
-            if image_path and os.path.exists(image_path):
-                import base64
+            if not image_path or not os.path.exists(image_path):
+                return
+            import base64
             with open(image_path, "rb") as image_file:
-                image_data = image_file.read()
-                image_base64 = base64.b64encode(image_data).decode('utf-8')
-                
-                # Determine image MIME type
-                image_ext = os.path.splitext(image_path)[1].lower()
-                if image_ext in ['.jpg', '.jpeg']:
-                    mime_type = 'image/jpeg'
-                elif image_ext == '.png':
-                    mime_type = 'image/png'
-                else:
-                    mime_type = 'image/jpeg'  # Default to jpeg
-                
-                    content.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime_type};base64,{image_base64}"
-                    }
-                })
-        
+                image_base64 = base64.b64encode(image_file.read()).decode('utf-8')
+
+            # Determine image MIME type
+            image_ext = os.path.splitext(image_path)[1].lower()
+            mime_type = 'image/png' if image_ext == '.png' else 'image/jpeg'  # Default to jpeg
+
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime_type};base64,{image_base64}"
+                }
+            })
+
         # Add original thumbnail first, then result overlay thumbnail
         add_image_to_content(original_thumbnail_path)
         add_image_to_content(result_overlay_thumbnail_path)
-        
+
         # Call OpenAI API
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [
                 {
                     "role": "user",
                     "content": content
                 }
             ],
-            temperature=0.3,
-            max_tokens=1000
-        )
-        
+        }
+        # gpt-5 models only accept the default temperature (and no max_tokens).
+        if not llm_config.is_gpt5(self.model):
+            kwargs["temperature"] = 0.3
+            kwargs["max_tokens"] = 1000
+        response = self.client.chat.completions.create(**kwargs)
+
         # Parse response
         response_text = response.choices[0].message.content
-        
-        # Try to extract JSON from response
-        json_match = re.search(r'\{[^{}]*\}', response_text, re.DOTALL)
-        if json_match:
-            try:
-                result = json.loads(json_match.group())
-                # Validate result structure
-                if "issue_stage" not in result:
-                    result["issue_stage"] = "none"
-                if "confidence" not in result:
-                    result["confidence"] = "low"
-                if "reasoning" not in result:
-                    result["reasoning"] = response_text[:200] if response_text else "Unable to provide detailed reasoning"
-                if "suggestions" not in result:
-                    result["suggestions"] = []
-                if "stage_details" not in result:
-                    result["stage_details"] = {}
-                
-                return result
-            except json.JSONDecodeError:
-                # If parsing fails, return structured response based on text
-                return {
-                    "issue_stage": "none",
-                    "confidence": "low",
-                    "reasoning": response_text[:200] if response_text else "Unable to parse LLM response",
-                    "suggestions": [],
-                    "stage_details": {}
-                }
-        else:
+        result = _parse_json_object(response_text)
+        if result is None:
             # If no JSON found, return based on text response
             return {
                 "issue_stage": "none",
@@ -192,16 +163,62 @@ class VerificationAgent:
                 "stage_details": {}
             }
 
+        # Validate result structure
+        result.setdefault("issue_stage", "none")
+        result.setdefault("confidence", "low")
+        result.setdefault("reasoning", response_text[:200])
+        result.setdefault("suggestions", [])
+        result.setdefault("stage_details", {})
+        return result
+
+
+def _parse_json_object(text: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The JSON object in an LLM reply: the whole text, else its outermost {...}
+    (which also covers a ```json fenced block and nested objects)."""
+    if not text:
+        return None
+    candidates = [text]
+    start, end = text.find("{"), text.rfind("}")
+    if 0 <= start < end:
+        candidates.append(text[start:end + 1])
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
 
 # Singleton instance
 _verification_agent: Optional[VerificationAgent] = None
+# Bumped by reset_verification_agent(): an agent built from settings that
+# Preferences replaced meanwhile is never cached. The lock only guards these
+# two names (never held while building).
+_agent_generation = 0
+_agent_lock = threading.Lock()
+
+
+def reset_verification_agent() -> None:
+    global _verification_agent, _agent_generation
+    with _agent_lock:
+        _agent_generation += 1
+        _verification_agent = None
 
 
 def get_verification_agent() -> VerificationAgent:
     """Get or create the verification agent instance"""
     global _verification_agent
-    if _verification_agent is None:
-        model = llm_config.model_for("OPENAI_VISION_MODEL")
-        _verification_agent = VerificationAgent(model=model)
-    return _verification_agent
+    agent = _verification_agent
+    if agent is not None:
+        return agent
+    generation = _agent_generation
+    agent = VerificationAgent()
+    with _agent_lock:
+        if generation != _agent_generation:
+            return agent
+        if _verification_agent is None:
+            _verification_agent = agent
+        return _verification_agent
 

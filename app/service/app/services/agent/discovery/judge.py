@@ -237,8 +237,7 @@ def _influence_stats(
     if n < 6:
         return {"partial_r": None, "partial_r_loo_min": None, "partial_r_loo_max": None,
                 "top_influence_donor": None, "top_influence_share": None, "n_used": int(n)}
-    X = covariate_matrix(data, covariates)
-    X = np.column_stack([np.ones(n), X])
+    X = covariate_matrix(data, covariates)   # already carries the intercept column
     y = data[outcome_column].to_numpy(dtype=float)
     x = data[feature_column].to_numpy(dtype=float)
 

@@ -25,47 +25,22 @@ import {
   transitionResearchPhase,
   type ResearchPhase,
 } from "@/utils/agent/research/phaseStateMachine"
+import {
+  appendJournalEntry,
+  failPendingProposer,
+  stopRunningRows,
+  stopRunningScout,
+  type JournalEntry,
+  type RoundState,
+  type ScoutState,
+} from "./researchRunState"
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-type ToolCallEntry = {
-  turnId: number
-  thought: string
-  command: string
-  exitCode?: number
-  status: "running" | "done" | "error"
-}
-
-// The dataset scout: explores the folder once, before round 1, and writes a guide.
-type ScoutState = {
-  status: "idle" | "running" | "done" | "failed"
-  calls: ToolCallEntry[]
-  note?: string
-  reusedFrom?: string
-}
 const SCOUT_IDLE: ScoutState = { status: "idle", calls: [] }
 const NEW_GUIDE = "__new__"
-
-type WorkerStatus = {
-  name: string
-  question: string
-  status: "running" | "completed" | "failed"
-  summary?: string
-  toolCalls: ToolCallEntry[]
-}
-
-type RoundState = {
-  roundId: number
-  totalRounds: number
-  focus: string
-  workers: WorkerStatus[]
-}
-
-type JournalEntry = {
-  roundId: number
-  focus: string
-  summary: string
-}
+const CANCEL_TIMEOUT_MS = 15_000
+const BUSY_TITLE = "Stop the running research first"
 
 type WorkspaceRun = {
   run_id: string
@@ -188,13 +163,33 @@ export const CoscientistPanel: React.FC = () => {
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
-  // Set by Stop: the aborted stream then rejects, and that is not an error.
-  const stoppingRef = useRef(false)
+  // Bumped whenever the view changes run (start, resume, history, new task, unmount):
+  // a stream or request begun under an older token must not write state.
+  const runTokenRef = useRef(0)
+  // The token Stop was pressed under: the aborted stream then rejects, and that is not an error.
+  const stoppedTokenRef = useRef(-1)
   const roundSummaryRef = useRef<string>("")
+  const runsSeqRef = useRef(0)
 
   const workspacePath = formatPath(currentPath ?? "")
   // The open slide's folder; formatPath yields "\\" separators on Windows.
   const workspaceDir = workspacePath ? workspacePath.replace(/[\\/][^\\/]+$/, "") || workspacePath : ""
+
+  // A new run in view: drop the old stream (if any) and hand out a fresh token.
+  const beginRun = () => {
+    abortRef.current?.abort()
+    abortRef.current = null
+    roundSummaryRef.current = ""
+    return ++runTokenRef.current
+  }
+  const isStale = (token: number) => token !== runTokenRef.current || stoppedTokenRef.current === token
+
+  // Unmounted (e.g. the header switched to Agent): stop listening; the run itself
+  // goes on and can be reopened from the history.
+  useEffect(() => () => {
+    runTokenRef.current++
+    abortRef.current?.abort()
+  }, [])
 
   // ─── API helpers ─────────────────────────────────────────────────────────
 
@@ -212,44 +207,70 @@ export const CoscientistPanel: React.FC = () => {
   // ─── Runs ────────────────────────────────────────────────────────────────
 
   const fetchWorkspaceRuns = useCallback(async () => {
+    // Only the newest request (this folder) may write the list.
+    const seq = ++runsSeqRef.current
     if (!workspaceDir) {
       setWorkspaceRuns([])
+      setRunsLoading(false)
       return
     }
     setRunsLoading(true)
+    let runs: WorkspaceRun[] = []
     try {
       const res = await authedFetch(
         `${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/runs?workspace_path=${encodeURIComponent(workspaceDir)}`,
         { method: "GET" }
       )
-      if (res.ok && res.data?.code === 0) {
-        setWorkspaceRuns((res.data.data?.runs || []) as WorkspaceRun[])
-      }
+      if (res.ok && res.data?.code === 0) runs = (res.data.data?.runs || []) as WorkspaceRun[]
     } catch {}
+    if (seq !== runsSeqRef.current) return
+    setWorkspaceRuns(runs)
     setRunsLoading(false)
   }, [authedFetch, workspaceDir])
+  // For callbacks that outlive a render (a run's stream, Stop): always this folder's.
+  const fetchRunsRef = useRef(fetchWorkspaceRuns)
+  fetchRunsRef.current = fetchWorkspaceRuns
 
-  const loadWorkspaceRun = useCallback(async (runRootPath: string) => {
+  const loadWorkspaceRun = async (runRootPath: string, token: number) => {
+    let payload: any
     try {
       const res = await authedFetch(
         `${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/runs/load?run_root_path=${encodeURIComponent(runRootPath)}`,
         { method: "GET" }
       )
       if (!res.ok || res.data?.code !== 0) return
-      const payload = res.data.data || {}
-      setJournal((payload.journal || []) as JournalEntry[])
-      setFinalSummary(payload.final_summary || null)
-      setCurrentRound(null)
-      setActiveRunId(null)
-      setRoundPhase(null)
-      setResumeInfo(payload.status === "incomplete"
-        ? { runId: payload.run_id, runRootPath: payload.run_root_path, nextRoundId: payload.next_round_id }
-        : null)
-      // offer the rounds the run still had planned
-      setResumeRounds(Math.max(1, (payload.rounds || 1) - (payload.next_round_id || 1) + 1))
+      payload = res.data.data || {}
+    } catch {
+      return
+    }
+    if (isStale(token)) return
+    setJournal((payload.journal || []) as JournalEntry[])
+    setFinalSummary(payload.final_summary || null)
+    setCurrentRound(null)
+    setActiveRunId(null)
+    setRoundPhase(null)
+    setResumeInfo(payload.status === "incomplete"
+      ? { runId: payload.run_id, runRootPath: payload.run_root_path, nextRoundId: payload.next_round_id }
+      : null)
+    // offer the rounds the run still had planned
+    setResumeRounds(Math.max(1, (payload.rounds || 1) - (payload.next_round_id || 1) + 1))
+    if (payload.status !== "running" || !payload.run_id) {
       setPhase("complete")
-    } catch {}
-  }, [authedFetch])
+      return
+    }
+    // Still running (e.g. the panel was closed meanwhile): watch it again, so it can be stopped.
+    setActiveRunId(payload.run_id)
+    setPhase("running")
+    try {
+      await consumeStream(payload.run_id, token, true)
+    } catch {
+      if (isStale(token)) return
+      // Gone after all: what was loaded stays.
+      setActiveRunId(null)
+      setCurrentRound(stopRunningRows)
+      setPhase("complete")
+    }
+  }
 
   const resumeResearch = async () => {
     if (!resumeInfo) return
@@ -257,10 +278,12 @@ export const CoscientistPanel: React.FC = () => {
       setError(writeBlockTitle || 'Not allowed here.')
       return
     }
+    const token = beginRun()
+    const { runRootPath, nextRoundId } = resumeInfo
     setError(null)
-    stoppingRef.current = false
     setPhase("running")
-    setJournal([])
+    // The rounds done so far stay in the journal; the resumed run adds to them.
+    setJournal(prev => prev.filter(j => j.roundId < nextRoundId))
     setCurrentRound(null)
     setScout(SCOUT_IDLE)
     setFinalSummary(null)
@@ -269,22 +292,27 @@ export const CoscientistPanel: React.FC = () => {
     try {
       const res = await authedFetch(`${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/runs/resume`, {
         method: "POST",
-        body: JSON.stringify({ run_root_path: resumeInfo.runRootPath, additional_rounds: resumeRounds }),
+        body: JSON.stringify({ run_root_path: runRootPath, additional_rounds: resumeRounds }),
       })
       if (!res.ok || res.data?.code !== 0) throw new Error(res.data?.message || "Failed to resume run")
       const runId = res.data.data?.run_id
       if (!runId) throw new Error("Run ID missing")
+      if (cancelIfStopped(runId, token)) return
       setResumeInfo(null)
       setActiveRunId(runId)
-      await consumeStream(runId)
+      await consumeStream(runId, token)
     } catch (err: any) {
-      if (stoppingRef.current) return
+      if (isStale(token)) return
       setError(err.message)
+      setCurrentRound(stopRunningRows)
+      setScout(stopRunningScout)
       setPhase("complete")
     }
   }
 
   useEffect(() => { fetchWorkspaceRuns() }, [fetchWorkspaceRuns])
+  // A guide picked in one folder means nothing in the next.
+  useEffect(() => { setGuideChoice(null) }, [workspaceDir])
 
   // Earlier runs here that wrote a dataset guide (newest first): reusing one skips the scout.
   const guideRuns = workspaceRuns.filter(r => r.has_guide)
@@ -300,8 +328,8 @@ export const CoscientistPanel: React.FC = () => {
       setError(writeBlockTitle || 'Not allowed here.')
       return
     }
+    const token = beginRun()
     setError(null)
-    stoppingRef.current = false
     setPhase("running")
     setJournal([])
     setCurrentRound(null)
@@ -327,21 +355,39 @@ export const CoscientistPanel: React.FC = () => {
 
       const runId = res.data.data?.run_id
       if (!runId) throw new Error("Run ID missing")
+      if (cancelIfStopped(runId, token)) return
       setActiveRunId(runId)
-      await consumeStream(runId)
+      await consumeStream(runId, token)
     } catch (err: any) {
-      if (stoppingRef.current) return
+      if (isStale(token)) return
       setError(err.message)
+      setCurrentRound(stopRunningRows)
+      setScout(stopRunningScout)
       setPhase("complete")
     }
   }
 
+  // The start / resume request came back after the view moved on: Stop was pressed
+  // before the run had an id (cancel it now), or the panel left it (leave it running,
+  // it is in the history). Either way its stream is not ours to read.
+  const cancelIfStopped = (runId: string, token: number) => {
+    if (stoppedTokenRef.current === token) {
+      void authedFetch(`${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/runs/${runId}/cancel`, { method: "POST" })
+        .catch(() => { /* best effort */ })
+        .finally(() => { void fetchRunsRef.current() })
+      return true
+    }
+    return token !== runTokenRef.current
+  }
+
   // ─── SSE stream consumer ─────────────────────────────────────────────────
 
-  const consumeStream = async (runId: string) => {
+  // reattach: a run listed as running may have just ended; then its "not found" is no error.
+  const consumeStream = async (runId: string, token: number, reattach = false) => {
     const authToken = await getAuthToken().catch(() => null)
     const headers: Record<string, string> = { "Content-Type": "application/json" }
     if (authToken) headers["Authorization"] = `Bearer ${authToken}`
+    if (token !== runTokenRef.current) return
 
     const controller = new AbortController()
     abortRef.current = controller
@@ -355,9 +401,15 @@ export const CoscientistPanel: React.FC = () => {
     const reader = response.body?.getReader()
     const decoder = new TextDecoder()
     let buffer = ""
+    let seen = false
 
-    while (reader) {
+    read: while (reader) {
       const { done, value } = await reader.read()
+      // Another run (or none) is in view now: this stream may not write anything.
+      if (token !== runTokenRef.current) {
+        controller.abort()
+        return
+      }
       if (done) break
       buffer += decoder.decode(value, { stream: true })
       const lines = buffer.split("\n")
@@ -367,13 +419,22 @@ export const CoscientistPanel: React.FC = () => {
         if (!line.startsWith("data: ")) continue
         try {
           const event = JSON.parse(line.substring(6))
+          // the run is gone (finished and forgotten): stay on the loaded snapshot
+          if (reattach && !seen && event.type === "error" && event.message === "Run not found") {
+            controller.abort()
+            break read
+          }
+          seen = true
           handleEvent(event)
         } catch {}
       }
     }
+    if (token !== runTokenRef.current) return
     setActiveRunId(null)
+    setCurrentRound(stopRunningRows)
+    setScout(stopRunningScout)
     setPhase("complete")
-    fetchWorkspaceRuns()
+    void fetchRunsRef.current()
   }
 
   const handleEvent = (event: any) => {
@@ -466,7 +527,6 @@ export const CoscientistPanel: React.FC = () => {
             ),
           }
         })
-        setRoundPhase("evaluating")
         break
 
       case "worker_failed":
@@ -479,7 +539,6 @@ export const CoscientistPanel: React.FC = () => {
             ),
           }
         })
-        setRoundPhase("evaluating")
         break
 
       case "worker_tool_call":
@@ -520,6 +579,7 @@ export const CoscientistPanel: React.FC = () => {
       case "round_summary":
         roundSummaryRef.current = event.summary || ""
         setRoundPhase("done")
+        setCurrentRound(failPendingProposer)
         break
 
       case "round_completed":
@@ -528,14 +588,11 @@ export const CoscientistPanel: React.FC = () => {
           const savedSummary = roundSummaryRef.current
           roundSummaryRef.current = ""
           setCurrentRound(prev => {
-            setJournal(jPrev => [
-              ...jPrev,
-              {
-                roundId: prev?.roundId || event.round_id,
-                focus: prev?.focus || "",
-                summary: savedSummary,
-              },
-            ])
+            setJournal(jPrev => appendJournalEntry(jPrev, {
+              roundId: prev?.roundId || event.round_id,
+              focus: prev?.focus || "",
+              summary: savedSummary,
+            }))
             return prev
           })
         }
@@ -560,22 +617,28 @@ export const CoscientistPanel: React.FC = () => {
   const stopResearch = () => {
     if (phase === "cancelling") return
     const runId = activeRunId
+    const token = runTokenRef.current
     setPhase(transitionResearchPhase(phase, "STOP"))
-    stoppingRef.current = true
+    stoppedTokenRef.current = token
     abortRef.current?.abort()
+    setCurrentRound(stopRunningRows)
+    setScout(stopRunningScout)
     if (runId) {
       void authedFetch(
         `${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/runs/${runId}/cancel`,
-        { method: "POST" },
+        // a hung request must not hold the panel in "cancelling"
+        { method: "POST", signal: AbortSignal.timeout(CANCEL_TIMEOUT_MS) },
       )
         .catch(() => { /* best effort */ })
         .finally(() => {
+          void fetchRunsRef.current()   // the stopped run is now resumable from the history
+          if (token !== runTokenRef.current) return   // the view moved on meanwhile
           setActiveRunId(null)
           setPhase(transitionResearchPhase("cancelling", "CANCEL_ACK"))
-          void fetchWorkspaceRuns()   // the stopped run is now resumable from the history
         })
       return
     }
+    // No run id yet: the start / resume request cancels the run when it returns.
     setActiveRunId(null)
     setPhase(transitionResearchPhase("cancelling", "CANCEL_ACK"))
   }
@@ -639,6 +702,11 @@ export const CoscientistPanel: React.FC = () => {
 
   const isRunning = isResearchRunning(phase)
   const isCancelling = isResearchCancelling(phase)
+  // A run is live: switching the view away is disabled until it ends or is stopped.
+  const busy = isRunning || isCancelling
+  // Each worker's own end does not end the stage: the judge starts once none is left running.
+  const stage = (roundPhase === "workers" || roundPhase === "materializing") && currentRound && !currentRound.workers.some(w => w.status === "running")
+    ? "evaluating" : roundPhase
 
   // ─── Render ──────────────────────────────────────────────────────────────
 
@@ -677,7 +745,7 @@ export const CoscientistPanel: React.FC = () => {
             <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="Run history" onClick={() => { if (!showHistory) void fetchWorkspaceRuns(); setShowHistory(!showHistory) }}>
               <History className="h-4 w-4" />
             </Button>
-            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="New research task" onClick={() => { setPhase("input"); setFormResetKey(k => k + 1); setCurrentRound(null); setJournal([]); setError(null); setResumeInfo(null); setActiveRunId(null); setScout(SCOUT_IDLE); setFinalSummary(null); }}>
+            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="New research task" disabled={busy} title={busy ? BUSY_TITLE : undefined} onClick={() => { beginRun(); setPhase("input"); setFormResetKey(k => k + 1); setCurrentRound(null); setJournal([]); setError(null); setResumeInfo(null); setActiveRunId(null); setScout(SCOUT_IDLE); setFinalSummary(null); }}>
               <Plus className="h-4 w-4" />
             </Button>
           </div>
@@ -709,10 +777,13 @@ export const CoscientistPanel: React.FC = () => {
                 <button
                   key={run.run_root_path}
                   className={cn(
-                    "w-full text-left px-2 py-1 rounded text-xs hover:bg-muted transition-colors",
+                    "w-full text-left px-2 py-1 rounded text-xs hover:bg-muted transition-colors disabled:opacity-50 disabled:hover:bg-transparent",
                     run.run_id === activeRunId ? "bg-primary/10 text-primary" : "text-muted-foreground"
                   )}
+                  disabled={busy}
+                  title={busy ? BUSY_TITLE : undefined}
                   onClick={() => {
+                    const token = beginRun()
                     setShowHistory(false)
                     setCurrentRound(null)
                     setJournal([])
@@ -720,7 +791,7 @@ export const CoscientistPanel: React.FC = () => {
                     setError(null)
                     setScout(SCOUT_IDLE)
                     setResumeInfo(null)
-                    void loadWorkspaceRun(run.run_root_path)
+                    void loadWorkspaceRun(run.run_root_path, token)
                   }}
                 >
                   <div className="flex items-center justify-between gap-2">
@@ -877,7 +948,7 @@ export const CoscientistPanel: React.FC = () => {
         )}
 
         {/* ─── PHASE 2: Live Dashboard ────────────────────────────────── */}
-        {(phase === "running" || phase === "complete") && (
+        {(phase === "running" || phase === "cancelling" || phase === "complete") && (
           <div className="p-4 space-y-3">
             {/* Error */}
             {error && (
@@ -977,6 +1048,8 @@ export const CoscientistPanel: React.FC = () => {
                                             <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
                                           </svg>
                                         </div>
+                                      ) : tc.status === "stopped" ? (
+                                        <div className="h-3 w-3 rounded-full border-2 border-border" />
                                       ) : (
                                         <div className="h-3 w-3 rounded-full bg-red-500/80 flex items-center justify-center">
                                           <svg className="h-1.5 w-1.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
@@ -1005,16 +1078,16 @@ export const CoscientistPanel: React.FC = () => {
             )}
 
             {/* Phase status indicator */}
-            {isRunning && roundPhase && roundPhase !== "done" && (
+            {isRunning && stage && stage !== "done" && (
               <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-muted/30 border border-border/40">
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-primary shrink-0" />
                 <span className="text-xs text-muted-foreground">
-                  {roundPhase === "proposing" && "Proposer is choosing a hypothesis..."}
-                  {roundPhase === "workers" && ((currentRound?.workers.length ?? 0) > 2
+                  {stage === "proposing" && "Proposer is choosing a hypothesis..."}
+                  {stage === "workers" && ((currentRound?.workers.length ?? 0) > 2
                     ? "Workers are implementing their plans side by side..."
                     : "Worker is implementing the plan as result.py...")}
-                  {roundPhase === "materializing" && "Running result.py on every donor and checking it..."}
-                  {roundPhase === "evaluating" && "Judge is scoring the variations with nested cross-validation..."}
+                  {stage === "materializing" && "Running result.py on every donor and checking it..."}
+                  {stage === "evaluating" && "Judge is scoring the variations with nested cross-validation..."}
                 </span>
               </div>
             )}
@@ -1082,7 +1155,7 @@ export const CoscientistPanel: React.FC = () => {
               <Button
                 variant="outline"
                 className="w-full h-9 text-xs border-primary/30 text-primary hover:bg-primary/5"
-                onClick={() => { setPhase("input"); setCurrentRound(null); setActiveRunId(null); setScout(SCOUT_IDLE); setFinalSummary(null); }}
+                onClick={() => { beginRun(); setPhase("input"); setCurrentRound(null); setActiveRunId(null); setScout(SCOUT_IDLE); setFinalSummary(null); }}
               >
                 <Plus className="h-3.5 w-3.5 mr-1.5" />
                 New Research Task
@@ -1103,7 +1176,7 @@ export const CoscientistPanel: React.FC = () => {
                     {scout.status === "done" && (scout.reusedFrom
                       ? `Reusing the dataset guide from ${scout.reusedFrom}.`
                       : `Dataset guide written (${scout.calls.length} commands).`)}
-                    {scout.status === "failed" && `Dataset scout: no guide (${scout.note}). Continuing without it.`}
+                    {scout.status === "failed" && `Dataset scout: no guide (${scout.note}).${isRunning ? " Continuing without it." : ""}`}
                   </span>
                 </div>
                 {scout.calls.length > 0 && (

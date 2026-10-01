@@ -31,7 +31,7 @@ def is_openai_cloud() -> bool:
     if not url:
         return True
     host = (urlparse(url).hostname or "").lower()
-    return host.endswith("openai.com")
+    return host == "openai.com" or host.endswith(".openai.com")
 
 
 def api_mode() -> str:

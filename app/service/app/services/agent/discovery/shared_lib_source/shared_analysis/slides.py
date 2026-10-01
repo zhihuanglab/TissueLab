@@ -60,10 +60,15 @@ def _cohort_row(data_root: str | Path, donor_id: str, lay: dict[str, Any]) -> pd
     return rows.iloc[0]
 
 
+def _slide_relpath(value: Any) -> str:
+    # Cohorts written on Windows separate folders with backslashes.
+    return str(value).replace("\\", "/")
+
+
 def slide_path(data_root: str | Path, donor_id: str, layout: dict[str, Any] | None = None) -> Path:
     """The .zarr store of one donor's slide."""
     lay = dataset_layout(layout)
-    return Path(data_root) / str(_cohort_row(data_root, donor_id, lay)[lay["slide_column"]])
+    return Path(data_root) / _slide_relpath(_cohort_row(data_root, donor_id, lay)[lay["slide_column"]])
 
 
 def load_slide_metadata(data_root: str | Path, donor_id: str, layout: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -84,7 +89,7 @@ def load_slide_metadata(data_root: str | Path, donor_id: str, layout: dict[str, 
         meta["mpp_x"] = meta["mpp_y"] = float(row[mpp_col])
     if meta.get("mpp_x") is None:
         try:
-            attrs = dict(open_slide_zarr(Path(data_root) / str(row[lay["slide_column"]])).attrs)
+            attrs = dict(open_slide_zarr(Path(data_root) / _slide_relpath(row[lay["slide_column"]])).attrs)
         except Exception:
             attrs = {}
         for key in ("mpp_x", "mpp", "microns_per_pixel"):

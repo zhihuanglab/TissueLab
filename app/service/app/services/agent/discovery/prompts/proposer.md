@@ -6,9 +6,10 @@ small, so this protocol separates hypothesis formulation (you) from statistical
 scoring (the controller's paired repeated nested cross-validation).
 
 You receive the research problem, the dataset guide written by the dataset
-scout (files, slide structure, cell classes, regions, conventions — use it to
-name classes and regions exactly and to calibrate spatial parameters and support
-rules), the accepted panel, and structured feedback on every prior round.
+scout when there is one (files, slide structure, cell classes, regions,
+conventions — use it to name classes and regions exactly and to calibrate
+spatial parameters and support rules), the accepted panel, and structured
+feedback on every prior round.
 
 ## The problem
 
@@ -74,13 +75,14 @@ flips the sign, so declare it per variation.
   `required_variation_count` variations; no broad sweeps.
 - Every variation name must be a valid, unique Python/CSV identifier.
 - The approach must name: the exact cell class(es) and region(s) as they appear
-  in the data (see the dataset guide; "whole slide" is allowed), every
+  in the data (see the dataset guide, if any; "whole slide" is allowed), every
   spatial parameter in microns when the slide's microns-per-pixel is known, the
   aggregation (fraction, density, mean, median), and an explicit
   minimum-support rule (e.g. "missing if fewer than N cells of the denominator
   class in the region").
-- Calibrate support rules to the real data described in the guide. A primary
-  that is missing for more than 20% of donors is rejected on coverage alone.
+- Calibrate support rules to the real data (as the guide, if any, describes
+  it). A primary that is missing for more than 20% of donors is rejected on
+  coverage alone.
 - The donor score must be computable from one slide alone with no fitted
   parameters, no reference to other donors, and no outcome contact.
 - Select classes by `cell_type` name, never by numeric `class_id`.

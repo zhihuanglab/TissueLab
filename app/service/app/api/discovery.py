@@ -4,6 +4,7 @@ A run is its folder, <workspace>/autoresearch_runs/<run_id>; the loop lives in
 :mod:`app.services.agent.discovery`.
 """
 import asyncio
+import contextlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,7 @@ from app.services.agent.discovery.client import unavailable_reason
 from app.services.agent.discovery.loop import (
     FINDINGS_NAME,
     feedback_path,
+    guide_recorded,
     load_results_rows,
     read_run_state,
 )
@@ -40,6 +42,7 @@ from app.services.agent.discovery.scout import GUIDE_NAME
 from app.services.agent.discovery.sandbox import RUNS_DIRNAME, docker_unavailable_reason
 from app.services.file_manager.common import (
     assert_can_access_path,
+    assert_can_access_path_async,
     assert_can_write_path_async,
 )
 
@@ -90,7 +93,7 @@ def _run_summary(run_root: Path) -> Dict[str, Any]:
         "rounds": rounds,
         "next_round_id": next_round_id,
         # its scout's guide, which a new run here may reuse
-        "has_guide": (run_root / "shared" / GUIDE_NAME).is_file(),
+        "has_guide": guide_recorded(state, run_root) and (run_root / "shared" / GUIDE_NAME).is_file(),
     }
 
 
@@ -173,11 +176,14 @@ def list_runs(workspace_path: str, auth_user: AuthUser = Depends(get_auth_user))
     try:
         assert_can_access_path(auth_user, workspace_path, "list research runs")
         runs_dir = workspace_data_dir(workspace_path) / RUNS_DIRNAME
-        runs = [
-            _run_summary(run_root)
-            for run_root in (runs_dir.iterdir() if runs_dir.is_dir() else [])
-            if (run_root / "run_state.json").exists()
-        ]
+        runs = []
+        for run_root in runs_dir.iterdir() if runs_dir.is_dir() else []:
+            if not (run_root / "run_state.json").exists():
+                continue
+            try:
+                runs.append(_run_summary(run_root))
+            except Exception:
+                continue   # one unreadable run_state.json must not hide the others
         return success_response({"runs": sorted(runs, key=lambda r: r["updated_at"], reverse=True)})
     except AppError:
         raise
@@ -233,16 +239,19 @@ async def resume_run(request: ResumeRunRequest, auth_user: AuthUser = Depends(ge
 
 @discovery_router.get("/v1/discovery/runs/{run_id}/stream")
 async def stream_run(run_id: str, auth_user: AuthUser = Depends(get_auth_user)):
+    manager = get_discovery_run_manager()
+    run_root = manager.run_root(run_id)
+    if run_root is not None:
+        await assert_can_access_path_async(auth_user, str(run_root), "stream research run")
+
     async def event_generator():
-        queue = get_discovery_run_manager().get_event_queue(run_id)
-        if queue is None:
-            yield f"data: {json.dumps({'type': 'error', 'message': 'Run not found'})}\n\n"
-            return
-        while True:
-            event = await queue.get()
-            if event is None:
-                break
-            yield f"data: {json.dumps(event)}\n\n"
+        async with contextlib.aclosing(manager.read_stream(run_id)) as events:
+            try:
+                async for event in events:
+                    # an SSE comment: the panel ignores it, a dropped connection fails on it
+                    yield ": ping\n\n" if event is None else f"data: {json.dumps(event)}\n\n"
+            except ProblemError as exc:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -253,6 +262,10 @@ async def stream_run(run_id: str, auth_user: AuthUser = Depends(get_auth_user)):
 
 @discovery_router.post("/v1/discovery/runs/{run_id}/cancel")
 async def cancel_run(run_id: str, auth_user: AuthUser = Depends(get_auth_user)):
-    if not await get_discovery_run_manager().cancel_run(run_id):
+    manager = get_discovery_run_manager()
+    run_root = manager.run_root(run_id)
+    if run_root is not None:
+        await assert_can_write_path_async(auth_user, str(run_root), "cancel research")
+    if not await manager.cancel_run(run_id):
         return error_response("Run is not active or already completed")
     return success_response({"cancelled": True})

@@ -4,13 +4,13 @@ Ported from the TissueLab control plane. The open edition runs the agent in
 the same process as the viewer; every blocking LLM call is pushed off the
 event loop inside :mod:`app.services.agent.workflow_agent`.
 """
-import ast
 import asyncio
 import json
 import os
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -31,7 +31,7 @@ from app.services.feedback import get_feedback_service
 from app.utils.workflow.model_store import model_store
 
 agent_router = APIRouter()
-# Research panel (discovery / autoresearch): /v1/coscientist/*
+# Research panel (discovery / autoresearch): /v1/discovery/*
 agent_router.include_router(discovery_router)
 
 
@@ -276,9 +276,6 @@ async def get_steps(
         {"step": 3, "model": "CodingAgent", "input": "Calculate overlap..."}
     ]
     """
-    # Bound before the try: the fallback handler below parses it, but it is
-    # only assigned once the agent call returns.
-    steps_str = None
     try:
         user_id = auth_user.uid
         merged_dc = _merged_data_context(request, user_id)
@@ -300,24 +297,9 @@ async def get_steps(
 
         steps_list.sort(key=lambda x: x["step"])
         return success_response(steps_list)
-    except Exception:
-        # Backward-compatibility fallback to legacy dict-like output
-        if steps_str is None:
-            raise                      # nothing came back; report the real failure
-        try:
-            steps_dict = ast.literal_eval(steps_str)
-            steps_list = []
-            for step_key, step_value in steps_dict.items():
-                step_num = int(step_key.split()[1])
-                steps_list.append({
-                    "step": step_num,
-                    "model": step_value["model"],
-                    "input": step_value["input"]
-                })
-            steps_list.sort(key=lambda x: x["step"])
-            return success_response(steps_list)
-        except Exception as e2:
-            return error_response(str(e2))
+    except Exception as e:
+        logger.error(f"Error in v1/get_steps: {e}", exc_info=True)
+        return error_response(f"Error in v1/get_steps: {e}")
 
 
 @agent_router.post("/v2/get_steps")
@@ -477,11 +459,8 @@ async def process_script_stream(
 ):
     """
     Stream Coding Agent assistant output as SSE (`data: {"delta"|"done"|"error"}` JSON lines).
-    Final event includes extracted Python code. Requires Chat Completions streaming (CODE_PROVIDER=openai).
+    Final event includes extracted Python code.
     """
-    if workflow_agent.code_provider_name != "openai":
-        raise AppErrors.NOT_IMPLEMENTED("Script streaming requires CODE_PROVIDER=openai")
-
     try:
         system_prompt, user_prompt, _ = await workflow_agent.prepare_script_prompts(
             script_task=request.prompt,
@@ -496,15 +475,18 @@ async def process_script_stream(
     def sync_sse():
         # Runs in Starlette's threadpool (sync generator), so the blocking
         # stream never touches the event loop.
+        deltas = workflow_agent.iter_script_chat_stream(system_prompt, user_prompt)
         try:
             full_parts: List[str] = []
-            for delta in workflow_agent.iter_script_chat_stream(system_prompt, user_prompt):
+            for delta in deltas:
                 full_parts.append(delta)
                 yield f"data: {json.dumps({'delta': delta}, ensure_ascii=False)}\n\n"
             code = _extract_code_from_markdown("".join(full_parts))
             yield f"data: {json.dumps({'done': True, 'code': code}, ensure_ascii=False)}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+        finally:
+            deltas.close()  # client gone or done: close the upstream stream now
 
     return StreamingResponse(
         sync_sse(),
@@ -565,7 +547,26 @@ def get_model_settings(auth_user: AuthUser = Depends(get_auth_user)):
     return success_response(llm_settings.public_settings())
 
 
-@agent_router.put("/v1/model_settings")
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _require_local_origin(origin: Optional[str] = Header(None)) -> None:
+    """CORS is open and every caller is the local user, so without this any web
+    page the user opens could point the agent at its own server and receive the
+    key. Browsers always send Origin on a cross-origin PUT; the app's renderer
+    is served from http://localhost:<port>, and non-browser clients send none.
+    "null" (sandboxed iframes, opaque origins) is rejected on purpose."""
+    if origin is None or origin.startswith("file://"):
+        return
+    try:
+        host = urlparse(origin).hostname
+    except ValueError:
+        host = None
+    if host not in _LOCAL_HOSTS:
+        raise AppErrors.USER_FORBIDDEN("Model settings can only be changed from the TissueLab app.")
+
+
+@agent_router.put("/v1/model_settings", dependencies=[Depends(_require_local_origin)])
 def put_model_settings(request: ModelSettingsRequest, auth_user: AuthUser = Depends(get_auth_user)):
     """Save and apply at once: the next agent / research request uses them."""
     try:

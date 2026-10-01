@@ -14,7 +14,9 @@ dataset guide. Each round:
 
 State lives in the run folder: run_state.json, accepted_panel.json, results.tsv,
 round_NNNN/ (plans, proposer and worker traces, judge CSVs, feedback), and
-research_findings.md at the end.
+research_findings.md at the end. run_state.json's "guide" records that the scout
+wrote shared/dataset_guide.md (or it was copied from an earlier run): workers
+can write /shared too, so the file alone is not trusted.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Awaitable, Callable, Optional
 
-from .client import discovery_model
+from .client import discovery_model, pin_run_client
 from .scout import GUIDE_NAME, run_scout
 from .judge import review_candidate
 from .panel_cv import PredictivePanelConfig
@@ -105,8 +107,9 @@ def _load_or_init_state(*, run_root: Path, config: dict[str, Any]) -> dict[str, 
     path = run_root / "run_state.json"
     if path.exists():
         raw = _read_json(path)
-        return {"next_round_id": int(raw.get("next_round_id", 1) or 1), "config": dict(raw.get("config") or config)}
-    state = {"next_round_id": 1, "config": config}
+        return {"next_round_id": int(raw.get("next_round_id", 1) or 1), "config": dict(raw.get("config") or config),
+                "guide": guide_recorded(raw, run_root)}
+    state = {"next_round_id": 1, "config": config, "guide": False}
     _write_json(path, state)
     return state
 
@@ -124,8 +127,16 @@ def _load_or_init_accepted_panel(run_root: Path) -> dict[str, Any]:
     return payload
 
 
+def guide_recorded(state: dict[str, Any], run_root: Path) -> bool:
+    """Whether shared/dataset_guide.md came from the run's scout (or a reused guide).
+    Runs from before the "guide" flag only ever had their scout write it."""
+    if "guide" in state:
+        return bool(state["guide"])
+    return (run_root / "shared" / GUIDE_NAME).is_file()
+
+
 def read_run_state(run_root: Path) -> dict[str, Any]:
-    """run_state.json: {"next_round_id", "config"}; {} when the run never started."""
+    """run_state.json: {"next_round_id", "config", "guide"}; {} when the run never started."""
     path = run_root / "run_state.json"
     return _read_json(path) if path.exists() else {}
 
@@ -421,7 +432,8 @@ def _record_candidate(
 
 def _finish_round(*, run_root: Path, accepted_panel: dict[str, Any], state: dict[str, Any], next_round_id: int) -> dict[str, Any]:
     _write_json(run_root / ACCEPTED_PANEL_NAME, accepted_panel)
-    persisted = {"next_round_id": next_round_id, "config": dict(state.get("config") or {})}
+    persisted = {"next_round_id": next_round_id, "config": dict(state.get("config") or {}),
+                 "guide": bool(state.get("guide"))}
     _write_json(run_root / "run_state.json", persisted)
     return persisted
 
@@ -454,10 +466,12 @@ def run_folder_busy(run_root: Path) -> bool:
 
 async def _in_thread(run_root: Path, fn: Callable[..., Any], /, **kwargs: Any) -> Any:
     key = str(run_root.resolve())
-    with _BUSY_LOCK:
-        _BUSY[key] = _BUSY.get(key, 0) + 1
 
+    # Counted from inside the thread: a call cancelled while still queued never
+    # runs, so it must never have been counted.
     def call() -> Any:
+        with _BUSY_LOCK:
+            _BUSY[key] = _BUSY.get(key, 0) + 1
         try:
             return fn(**kwargs)
         finally:
@@ -497,6 +511,7 @@ async def run_discovery(
     awaiting coroutine can be cancelled, but the threads it waits on cannot.
     """
     model = model or discovery_model()
+    pin_run_client()
     panel_config = PredictivePanelConfig()
     data_dir = Path(data_dir)
     run_root = Path(run_root)
@@ -509,6 +524,11 @@ async def run_discovery(
                 "worker_wall_clock_sec": worker_wall_clock_sec, "dataset_scout": dataset_scout,
                 "guide_from": guide_from, "workers_per_round": workers_per_round},
     )
+    # A resume may add rounds: the run's total is what status and listing go by.
+    total_rounds = int(state.get("next_round_id", 1) or 1) + rounds - 1
+    if state["config"].get("rounds") != total_rounds:
+        state["config"]["rounds"] = total_rounds
+        _write_json(run_root / "run_state.json", state)
     workers = max(1, min(MAX_WORKERS_PER_ROUND, int(workers_per_round)))
     accepted_panel = _load_or_init_accepted_panel(run_root)
     await asyncio.to_thread(copy_tree, SHARED_LIB_SOURCE, shared_dir / "lib" / "shared_analysis")
@@ -523,21 +543,26 @@ async def run_discovery(
 
     # A failed scout costs the guide, not the run.
     guide_path = shared_dir / GUIDE_NAME
-    if guide_from and guide_path.exists() and int(state.get("next_round_id", 1) or 1) == 1:
+    if guide_from and guide_path.exists() and not state["guide"]:
+        state["guide"] = True
+        _write_json(run_root / "run_state.json", state)
         await emit({"type": "scout_done", "status": "reused", "from": guide_from})
-    elif dataset_scout and not guide_path.exists():
+    elif dataset_scout and not state["guide"]:
         await emit({"type": "scout_started"})
         try:
             scouted = await _in_thread(
                 run_root, run_scout, spec=spec, data_dir=data_dir, shared_dir=shared_dir, run_root=run_root,
                 model=model, on_event=forward, cancel_event=cancel_event,
             )
+            if scouted.get("status") == "completed":
+                state["guide"] = True
+                _write_json(run_root / "run_state.json", state)
             await emit({"type": "scout_done", **scouted})
         except Exception as exc:
             if cancel_event is not None and cancel_event.is_set():
                 raise
             await emit({"type": "scout_done", "status": "error", "error": f"{type(exc).__name__}: {exc}"})
-    dataset_guide_text = guide_path.read_text(encoding="utf-8") if guide_path.exists() else ""
+    dataset_guide_text = guide_path.read_text(encoding="utf-8") if state["guide"] and guide_path.exists() else ""
 
     next_round_id = int(state.get("next_round_id", 1) or 1)
     rounds_done = 0

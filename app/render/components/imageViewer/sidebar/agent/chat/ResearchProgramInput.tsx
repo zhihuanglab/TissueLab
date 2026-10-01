@@ -102,15 +102,22 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
   const [result, setResult] = useState<{ key: string; value: Resolved | null } | null>(null)
   const [showDetails, setShowDetails] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
+  // Bumped per load: only the newest one (this folder) may write state.
+  const loadSeqRef = useRef(0)
 
   const load = useCallback(async () => {
+    const seq = ++loadSeqRef.current
     if (!workspaceDir) {
       setSetup(null)
+      setSaved({})
+      setNotice(null)
+      setLoading(false)
       return
     }
     setLoading(true)
     try {
       const res = await authedFetch(`${API()}/setup?data_dir=${encodeURIComponent(workspaceDir)}`, { method: "GET" })
+      if (seq !== loadSeqRef.current) return
       if (!res.ok || res.data?.code !== 0) throw new Error(res.data?.message || "Could not read the workspace")
       const next = res.data.data as Setup
       setSetup(next)
@@ -127,9 +134,14 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
         setSaved({})
       }
     } catch (e: any) {
+      if (seq !== loadSeqRef.current) return
+      // Nothing of another folder (or of the last good scan) stays behind.
+      setSetup(null)
+      setSaved({})
+      if (!typedRef.current) setText("")
       setNotice(e?.message ?? String(e))
     } finally {
-      setLoading(false)
+      if (seq === loadSeqRef.current) setLoading(false)
     }
   }, [authedFetch, workspaceDir])
 
@@ -198,8 +210,9 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
   // The text stays (typed, or problem.md's again); so do the picks.
   const rescan = async () => {
     const keep = picked
+    const seq = loadSeqRef.current + 1
     await load()
-    setPicked(keep)
+    if (seq === loadSeqRef.current) setPicked(keep)
   }
 
   const outcomeLabel = (name: string) => {
@@ -334,6 +347,9 @@ export const ResearchProgramInput: React.FC<ResearchProgramInputProps> = ({ work
       </div>
       )}
 
+      {setup && !loading && setup.cohorts.length === 0 && !text.trimStart().startsWith("---") && (
+        <Hint tone="warn">No patient table (CSV) found in this folder. Add one, then Rescan.</Hint>
+      )}
       {notice && <Hint tone="warn">{notice}</Hint>}
       <Hint>
         Saved as <span className="font-mono">problem.md</span> in your workspace. The agents get this text and the

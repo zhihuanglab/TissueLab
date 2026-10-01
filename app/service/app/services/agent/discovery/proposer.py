@@ -34,15 +34,19 @@ def parse_json(text: str) -> dict[str, Any]:
     if match:
         text = match.group(1)
     try:
-        return json.loads(text.strip())
+        value = json.loads(text.strip())
     except json.JSONDecodeError:
+        value = None
         start, end = text.find("{"), text.rfind("}")
         if start != -1 and end != -1:
             try:
-                return json.loads(text[start: end + 1])
+                value = json.loads(text[start: end + 1])
             except json.JSONDecodeError:
                 pass
-    return {}
+    # a plan wrapped in a one-element list is still the plan; anything else is not one
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    return value if isinstance(value, dict) else {}
 
 
 def parse_expected_sign(value: Any) -> int | None:
@@ -141,7 +145,9 @@ def _reasoning_summary(response: dict[str, Any]) -> list[str]:
     ]
 
 
-def _create_with_retry(payload: dict[str, Any], timeout: int) -> dict[str, Any]:
+def _create_with_retry(
+    payload: dict[str, Any], timeout: int, cancel_event: Optional[threading.Event] = None,
+) -> dict[str, Any]:
     attempt = 0
     while True:
         attempt += 1
@@ -150,7 +156,12 @@ def _create_with_retry(payload: dict[str, Any], timeout: int) -> dict[str, Any]:
         except Exception:
             if attempt >= PROPOSER_MAX_ATTEMPTS:
                 raise
-            time.sleep(PROPOSER_RETRY_BACKOFF_SEC * attempt)
+            delay = PROPOSER_RETRY_BACKOFF_SEC * attempt
+            # a cancel ends the backoff at once (an in-flight request still runs out)
+            if cancel_event is None:
+                time.sleep(delay)
+            elif cancel_event.wait(delay):
+                raise RuntimeError("proposer cancelled") from None
 
 
 def run_proposer(
@@ -178,7 +189,9 @@ def run_proposer(
         prompt
         + "\n\n# Research question\n" + spec.question
         + ("\n\n# Dataset guide (written by the dataset scout, outcome-blind)\n" + dataset_guide_text[:12000]
-           if dataset_guide_text else "")
+           if dataset_guide_text else
+           "\n\n# Dataset guide\nNone for this run: name cell classes and regions as plainly as you can; "
+           "the worker looks up their exact names in the data.")
     )
     payload: dict[str, Any] = {
         "accepted_panel": accepted_panel_summary,
@@ -214,7 +227,7 @@ def run_proposer(
         }
         if previous:
             request["previous_response_id"] = previous
-        response = _create_with_retry(request, timeout=PROPOSER_TIMEOUT_SEC)
+        response = _create_with_retry(request, timeout=PROPOSER_TIMEOUT_SEC, cancel_event=cancel_event)
         (prop_dir / f"turn_{attempt:02d}.response.json").write_text(json.dumps(response, indent=2, default=str), encoding="utf-8")
         previous = response_id(response)
         _sum_usage(usage_total, response.get("usage"))
@@ -232,6 +245,9 @@ def run_proposer(
             )
             continue
         pending = "Reply with exactly one JSON object following the schema (no prose, no code fences)."
+    if not (plan_json.get("variations") or plan_json.get("candidate_id")):
+        # A placeholder plan would spend a whole worker on nothing.
+        raise RuntimeError(f"no parseable JSON plan after {MAX_JSON_NUDGES + 1} replies")
 
     plan = normalize_plan(plan_json, round_id=round_id)
     plan["proposer_usage"] = usage_total

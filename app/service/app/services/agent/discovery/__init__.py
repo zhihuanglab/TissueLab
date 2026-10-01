@@ -2,8 +2,8 @@
 Discovery: an iterative, outcome-blind biomarker discovery loop (protocol v2.3).
 
 The user points it at a data folder (slides + a cohort file) and writes
-problem.md: a YAML header naming the outcome, covariates and class rules, and
-the research question in prose. Each round a proposer inspects the slides and
+problem.md: a YAML header naming the outcome and covariates, and the research
+question in prose. Each round a proposer inspects the slides and
 proposes one hypothesis with pre-specified variations, a worker implements it
 as result.py, the controller materializes and checks the donor table in a
 Docker sandbox, and a judge admits the best variation that improves the panel

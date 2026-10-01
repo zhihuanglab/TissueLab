@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import hashlib
 import os
+import posixpath
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -34,12 +36,29 @@ import psutil
 
 _DOCKER_IMAGE_LOCK = threading.Lock()
 
+# A Finder-launched macOS app inherits launchd's bare PATH, which lacks the
+# docker CLI (and the credential helpers it calls); append where Docker
+# Desktop and Homebrew install them.
+_MAC_DOCKER_DIRS = ("/usr/local/bin", "/opt/homebrew/bin", "/Applications/Docker.app/Contents/Resources/bin")
+
+
+def _add_docker_to_path() -> None:
+    if sys.platform != "darwin" or shutil.which("docker"):
+        return
+    current = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    os.environ["PATH"] = os.pathsep.join([*current, *(d for d in _MAC_DOCKER_DIRS if d not in current)])
+
+
+_add_docker_to_path()
+
 # Caps on the two docker calls made while _DOCKER_IMAGE_LOCK is held. An inspect
 # is instant when the daemon is healthy; a first build pulls a base image.
 DOCKER_INSPECT_TIMEOUT = 30
 DOCKER_BUILD_TIMEOUT = 1800
 DOCKER_RUN_TIMEOUT = 120
 DOCKER_CLI_TIMEOUT = 15
+# Bytes of each output stream a command returns (the tail); the rest is dropped as it streams.
+OUTPUT_TAIL_BYTES = 20_000
 
 # Resource caps for the container. The code inside is model-generated and
 # unreviewed, so an unbounded container could take the host down with it.
@@ -125,6 +144,7 @@ def _execute(req):
                 path = req["path"]
                 args = list(req.get("args") or [])
                 sys.argv = [path, *args]
+                sys.path.insert(0, os.path.dirname(path))   # as `python script.py` does
                 try:
                     runpy.run_path(path, run_name="__main__")
                 except SystemExit as exc:
@@ -140,6 +160,7 @@ def _execute(req):
                 code = req["code"]
                 args = list(req.get("args") or [])
                 sys.argv = ["-c", *args]
+                sys.path.insert(0, cwd)   # as `python -c` does
                 try:
                     exec(compile(code, "<tl_runtime>", "exec"), {"__name__": "__main__"})
                 except SystemExit as exc:
@@ -218,6 +239,9 @@ def main():
             if pid == 0:
                 code = 0
                 try:
+                    # SIG_IGN is inherited: left in place, the request's own
+                    # subprocesses are auto-reaped and always report exit 0.
+                    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
                     server.close()
                     _handle(conn)
                 except Exception:
@@ -328,7 +352,11 @@ exec "{real_python}" "{client_path}" "$@"
 
 
 def _symlinks_under(data_dir: Path) -> list[Path]:
-    """Every symlink below data_dir, skipping the (masked) run-output folder."""
+    """Every symlink below data_dir, skipping the (masked) run-output folder.
+
+    Linked directories are not followed, and a .zarr store is checked itself
+    but not walked: its (often millions of) chunk files are never links out.
+    """
     found: list[Path] = []
     for root, dirs, files in os.walk(data_dir):
         root_path = Path(root)
@@ -338,7 +366,17 @@ def _symlinks_under(data_dir: Path) -> list[Path]:
             entry = root_path / name
             if entry.is_symlink():
                 found.append(entry)
+        dirs[:] = [name for name in dirs if not name.lower().endswith(".zarr")]
     return sorted(found, key=lambda p: p.relative_to(data_dir).as_posix())
+
+
+def _read_tail(stream, name: str, tails: dict[str, bytes]) -> None:
+    """Read a pipe to EOF, keeping its last OUTPUT_TAIL_BYTES in tails[name]."""
+    tail = b""
+    with stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            tail = (tail + chunk)[-OUTPUT_TAIL_BYTES:]
+    tails[name] = tail
 
 
 class SandboxSession:
@@ -361,7 +399,12 @@ class SandboxSession:
             self.shared_dir.mkdir(parents=True, exist_ok=True)
         # container path -> host file, bind-mounted read-only over /data (the
         # outcome-free cohort file shadowing the real one).
-        self.file_overlays = {str(k): str(Path(v).resolve()) for k, v in (file_overlays or {}).items()}
+        # Keys are normalized (a Windows-style or ./-prefixed cohort_file) so the
+        # overlay sits exactly on the real file's path.
+        self.file_overlays = {
+            posixpath.normpath(str(k).replace("\\", "/")): str(Path(v).resolve())
+            for k, v in (file_overlays or {}).items()
+        }
         self.image = DEFAULT_IMAGE
         self.command_timeout_sec = int(command_timeout_sec)
         self.container_name: Optional[str] = None
@@ -417,25 +460,39 @@ class SandboxSession:
             raise RuntimeError("Sandbox session has not been started")
         timeout = int(timeout_sec or self.command_timeout_sec)
         assert self.container_name is not None
+        # stdin is closed (an inherited one can hang a command that reads it), and
+        # each stream is drained as it arrives keeping only its tail, so a chatty
+        # command cannot fill the service's memory.
+        proc = subprocess.Popen(
+            ["docker", "exec", "-w", "/",
+             self.container_name, "/bin/sh", "-lc", self._wrap_command(command)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        tails: dict[str, bytes] = {}
+        readers = [
+            threading.Thread(target=_read_tail, args=(stream, name, tails), daemon=True)
+            for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr))
+        ]
+        for reader in readers:
+            reader.start()
         try:
-            proc = subprocess.run(
-                ["docker", "exec", "-i", "-w", "/",
-                 self.container_name, "/bin/sh", "-lc", self._wrap_command(command)],
-                capture_output=True, text=True,
-                timeout=timeout, check=False,
-            )
-            return {
-                "exit_code": proc.returncode,
-                "stdout": proc.stdout[-20_000:],
-                "stderr": proc.stderr[-20_000:],
-            }
+            proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
             self._kill_inflight()
             return {
                 "exit_code": -1,
                 "stdout": "",
                 "stderr": f"Command timed out after {timeout}s (process killed)",
             }
+        for reader in readers:
+            reader.join(timeout=5)   # docker exited; its pipes close with it
+        return {
+            "exit_code": proc.returncode,
+            "stdout": tails.get("stdout", b"").decode("utf-8", errors="replace"),
+            "stderr": tails.get("stderr", b"").decode("utf-8", errors="replace"),
+        }
 
     # -- warm Python runtime ----------------------------------------------------
 
@@ -571,6 +628,12 @@ class SandboxSession:
                 target = entry.resolve(strict=True)
                 relative = entry.relative_to(self.data_dir)
             except (OSError, ValueError):
+                continue
+            # A link back into the data folder would expose, through a second
+            # mount, what the overlays and the runs mask hide (and one to an
+            # ancestor, e.g. `root -> /`, the whole host): never mount those.
+            # Relative ones still resolve inside the container's /data.
+            if target.is_relative_to(self.data_dir) or self.data_dir.is_relative_to(target):
                 continue
             container_path = (Path("/data") / relative).as_posix()
             if container_path in self.file_overlays:

@@ -12,8 +12,8 @@ import os
 from typing import Tuple
 
 from app.core.logger import logger
+from app.services import llm_config
 
-_REVIEW_MODEL = os.getenv("CODEEXEC_REVIEW_MODEL", "gpt-4o-mini")
 # OFF by default. The Docker sandbox's read-only mounts are the hard boundary that
 # physically prevents touching other users' files, and the AST guard blocks
 # shell/network/escape. The LLM review is an unreliable soft layer that false-blocks
@@ -51,14 +51,19 @@ def review_code(code: str) -> Tuple[bool, str]:
         from openai import OpenAI
 
         client = OpenAI(api_key=api_key)
+        # The agent's endpoint: CODEEXEC_REVIEW_MODEL, else the shared LLM_MODEL.
+        model = llm_config.model_for("CODEEXEC_REVIEW_MODEL")
+        kwargs = {}
+        if not llm_config.is_gpt5(model):  # gpt-5 only takes the default temperature
+            kwargs["temperature"] = 0
         resp = client.chat.completions.create(
-            model=_REVIEW_MODEL,
-            temperature=0,
+            model=model,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": _SYSTEM},
                 {"role": "user", "content": f"```python\n{code}\n```"},
             ],
+            **kwargs,
         )
         data = json.loads(resp.choices[0].message.content or "{}")
         safe = bool(data.get("safe", True))

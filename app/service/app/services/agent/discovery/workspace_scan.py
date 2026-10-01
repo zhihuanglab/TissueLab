@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 import pandas as pd
 
+from .panel_cv import covariate_matrix
 from .problem import ProblemError, ProblemSpec, _relative_inside, parse_problem
 
 MAX_COHORT_FILES = 20
@@ -42,6 +43,15 @@ def _column_info(values: pd.Series) -> dict[str, Any]:
         info["min"] = float(numbers.min())
         info["max"] = float(numbers.max())
     return info
+
+
+def _judge_accepts_covariate(frame: pd.DataFrame, name: str) -> bool:
+    """Whether the judge can adjust for this column (numeric and complete, or a sex column)."""
+    try:
+        covariate_matrix(frame, [name])
+    except ValueError:
+        return False
+    return True
 
 
 def _slides_found(data_dir: Path, values: pd.Series) -> int:
@@ -93,7 +103,10 @@ def inspect_cohort(data_dir: Path, path: Path) -> Optional[dict[str, Any]]:
         info["name"] for info in columns
         if info["name"] not in reserved and info["numeric"] and info["missing"] == 0 and info["unique"] > 1
     ]
-    covariates = [info["name"] for info in columns if info["name"] not in reserved and info["unique"] > 1]
+    covariates = [
+        info["name"] for info in columns
+        if info["name"] not in reserved and info["unique"] > 1 and _judge_accepts_covariate(frame, info["name"])
+    ]
     return {
         "file": path.relative_to(data_dir).as_posix(),
         "rows": int(len(frame)),
@@ -187,15 +200,15 @@ Research program:
 {question}
 
 Columns that can be the outcome (numeric, complete): {outcomes}
-Columns that can be covariates: {covariates}
+Columns that can be covariates (numeric, complete, or sex): {covariates}
 
 Choose:
 - "outcome": the column the program wants to predict or explain. If the program names or describes it,
   use that column. If it does not, choose the most plausible primary target among the outcome columns
   (not an identifier, a demographic, or a technical/batch variable).
 - "covariates": the columns the program says to adjust or control for. If it says none, choose the
-  plain confounders among the covariate columns (demographics such as age or sex, site / batch), never
-  another candidate outcome. May be empty.
+  plain confounders among the covariate columns (demographics such as age or sex), never another
+  candidate outcome. May be empty.
 
 Return JSON only: {{"outcome": "<column>", "covariates": ["<column>", ...]}}. Use exact column names
 from the lists; map plain words to them (e.g. "age" -> "age_years") when the match is clear."""

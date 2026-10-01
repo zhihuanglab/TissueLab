@@ -8,8 +8,7 @@ Contract (prompts/worker.md):
     and calls it for every cohort donor -> /scratch/donor_feature_table.csv, and
     checks: import works, planned columns present, no duplicate donors, primary
     coverage >= 80%, no mention of the outcome or covariates in the code or the
-    shell commands, and the problem's class rules. results.json is written from
-    the plan.
+    shell commands. results.json is written from the plan.
 
 Guards: per-command timeout floor, a rewrite cap with a nudge, a hard turn cap,
 and materialization even when the conversation died (a usable result.py still

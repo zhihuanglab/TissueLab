@@ -38,6 +38,8 @@ class PredictivePanelConfig:
         2154.4346900318824,
         10000.0,
     )
+    # The RMSE thresholds below are in units of the outcome's standard deviation,
+    # so the gates mean the same whatever scale the outcome is recorded in.
     min_mean_rmse_improvement: float = 5e-4
     min_fraction_repeats_better_rmse: float = 0.65
     min_consensus_rmse_improvement: float = 0.0
@@ -230,7 +232,8 @@ def prediction_metrics(outcome: np.ndarray, prediction: np.ndarray) -> dict[str,
     return {
         "pearson_r": pearson,
         "spearman_r": spearman,
-        "r2": 1.0 - float(np.sum(residual**2)) / denominator,
+        # undefined for a constant outcome (e.g. a leave-one-donor subset without its one positive)
+        "r2": 1.0 - float(np.sum(residual**2)) / denominator if denominator > 0 else float("nan"),
         "rmse": float(np.sqrt(np.mean(residual**2))),
         "mae": float(np.mean(np.abs(residual))),
     }
@@ -246,9 +249,13 @@ def _panel_predictions(
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
     predictions = np.full((config.outer_repeats, len(outcome)), np.nan, dtype=float)
     tuning: list[dict[str, Any]] = []
+    # A cohort smaller than outer_folds is cross-validated leave-one-out.
+    outer_folds = min(config.outer_folds, len(outcome))
+    if outer_folds < 2:
+        raise ValueError(f"Cross-validation needs at least 2 donors, got {len(outcome)}")
     for repeat in range(config.outer_repeats):
         outer = KFold(
-            n_splits=config.outer_folds,
+            n_splits=outer_folds,
             shuffle=True,
             random_state=config.seed + repeat,
         )
@@ -398,23 +405,26 @@ def compare_predictive_panels(
     mean_rmse_improvement = float(rmse_improvements.mean())
     fraction_better = float((rmse_improvements > 0).mean())
     worst_leave_one_donor = float(leave_one_donor_improvements.min())
+    outcome_sd = float(outcome.std())
 
+    # NaN metrics (a constant outcome) compare False: such a panel is not admitted.
     gates = {
         "mean_rmse_improvement": (
-            mean_rmse_improvement >= config.min_mean_rmse_improvement
+            mean_rmse_improvement >= config.min_mean_rmse_improvement * outcome_sd
         ),
         "fraction_repeats_better_rmse": (
             fraction_better >= config.min_fraction_repeats_better_rmse
         ),
         "consensus_rmse_improvement": (
-            consensus_rmse_improvement >= config.min_consensus_rmse_improvement
+            consensus_rmse_improvement
+            >= config.min_consensus_rmse_improvement * outcome_sd
         ),
         "consensus_pearson_delta": (
             consensus_pearson_delta >= config.min_consensus_pearson_delta
         ),
         "leave_one_donor_sensitivity": (
             worst_leave_one_donor
-            >= config.min_worst_leave_one_donor_rmse_improvement
+            >= config.min_worst_leave_one_donor_rmse_improvement * outcome_sd
         ),
     }
     accepted = all(gates.values())
@@ -440,6 +450,7 @@ def compare_predictive_panels(
     return {
         "config": asdict(config),
         "n_donors": len(frame),
+        "outcome_sd": outcome_sd,
         "baseline_feature_columns": list(baseline_feature_columns),
         "candidate_feature_columns": list(candidate_feature_columns),
         "baseline_mean_metrics": {

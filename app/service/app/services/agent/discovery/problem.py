@@ -87,6 +87,9 @@ class ProblemSpec:
 HEADER_KEYS = frozenset({
     "outcome", "covariates", "cohort_file", "id_column", "slide_column", "mpp_column",
 })
+# Class rules from before they were dropped: an older run's problem.md still
+# names them, so they are accepted and ignored.
+LEGACY_HEADER_KEYS = frozenset({"excluded_classes", "exclude_only_classes"})
 
 
 def _relative_inside(path: str, what: str) -> PurePosixPath:
@@ -150,7 +153,7 @@ def parse_problem(text: str) -> ProblemSpec:
     if not question:
         raise ProblemError("problem.md: describe the research question below the header")
 
-    unknown = sorted(set(header) - HEADER_KEYS)
+    unknown = sorted(set(header) - HEADER_KEYS - LEGACY_HEADER_KEYS)
     if unknown:
         raise ProblemError(f"problem.md: unknown setting(s) {unknown}; allowed: {sorted(HEADER_KEYS)}")
     defaults = ProblemSpec(outcome=outcome, question=question)

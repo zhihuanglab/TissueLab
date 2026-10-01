@@ -396,14 +396,22 @@ def _isolated_child_env() -> Dict[str, str]:
     show what went wrong.
 
     Nothing here undoes leaks of the service's own files: the service does not
-    modify its environment for its own configuration (see
-    ``app.core.libvips.configure``), and the desktop shell passes it nothing
-    that names the bundle, so there is nothing to undo.
+    modify its environment to locate them (see ``app.core.libvips.configure``),
+    and the desktop shell passes it nothing that names the bundle, so there is
+    nothing to undo. (On macOS the discovery sandbox appends Docker's install
+    dirs to PATH; appended, they only resolve commands a node would not find
+    otherwise.) It does write the LLM settings from Preferences into its
+    environment (``app.services.llm_settings``); the API keys among them are
+    dropped here, since a node has no use for them.
     """
+    from app.services.llm_settings import SECRETS
+
     env_vars = os.environ.copy()
     env_vars["PYTHONNOUSERSITE"] = "1"
     env_vars.pop("PYTHONPATH", None)
     env_vars.pop("PYTHONHOME", None)
+    for name in SECRETS:
+        env_vars.pop(name, None)
     return env_vars
 
 

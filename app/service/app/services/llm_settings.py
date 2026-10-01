@@ -85,8 +85,9 @@ def _reset_clients() -> None:
     from app.services.agent import verification_agent, workflow_agent
     from app.services.agent.discovery import client as discovery_client
 
-    workflow_agent._workflow_agent = None
-    verification_agent._verification_agent = None
+    # Also keeps one being built from the old settings from being cached after this.
+    workflow_agent.reset_workflow_agent()
+    verification_agent.reset_verification_agent()
     discovery_client._client = None
 
 
@@ -110,8 +111,10 @@ def apply_saved_settings() -> None:
 
 
 def _validate(name: str, value: str) -> str:
-    if name in URL_FIELDS and not value.lower().startswith(("http://", "https://")):
-        raise SettingsError(f"{name} must be an http(s) URL, got {value!r}.")
+    if name in URL_FIELDS:
+        if not value.lower().startswith(("http://", "https://")):
+            raise SettingsError(f"{name} must be an http(s) URL, got {value!r}.")
+        value = value.rstrip("/")  # the SDK appends "/chat/completions" itself
     if name == "LLM_API":
         value = value.lower()
         if value not in LLM_API_VALUES:

@@ -12,15 +12,24 @@ import shutil
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional, Tuple
 
-from app.services.agent.discovery.loop import DEFAULT_WORKER_WALL_CLOCK, read_run_state, run_discovery, run_folder_busy
+from app.services.agent.discovery.loop import (
+    DEFAULT_WORKER_WALL_CLOCK, guide_recorded, read_run_state, run_discovery, run_folder_busy,
+)
 from app.services.agent.discovery.problem import ProblemError, parse_problem, validate_against_data
 from app.services.agent.discovery.sandbox import RUNS_DIRNAME
 from app.services.agent.discovery.scout import GUIDE_NAME
 from app.utils import resolve_path
 
 PROBLEM_FILENAME = "problem.md"
+# Events kept for a stream that is not reading; past this the oldest are dropped.
+EVENT_BACKLOG = 1000
+# How long a finished run's events wait for a stream to collect them.
+FINISHED_RUN_GRACE_SEC = 60
+# A silent stream yields a heartbeat this often: the server only notices a
+# dropped connection when it sends, and a worker can be silent for minutes.
+STREAM_HEARTBEAT_SEC = 15
 
 
 def workspace_data_dir(workspace_path: str) -> Path:
@@ -51,9 +60,17 @@ def _earlier_guide(data_dir: Path, run_id: str) -> Path:
     if not run_id or run_id != Path(run_id).name or run_id.startswith("."):
         raise ProblemError(f"Not a run id: {run_id!r}")
     guide = data_dir / RUNS_DIRNAME / run_id / "shared" / GUIDE_NAME
-    if not guide.is_file():
+    # only a guide its scout recorded: a worker could have written that file too
+    if not guide.is_file() or not guide_recorded(read_run_state(guide.parent.parent), guide.parent.parent):
         raise ProblemError(f"Run {run_id} in this folder has no dataset guide to reuse")
     return guide
+
+
+def _put(queue: asyncio.Queue, event: Optional[dict]) -> None:
+    """Never blocks the run: with no one reading, the oldest event goes."""
+    if queue.full():
+        queue.get_nowait()
+    queue.put_nowait(event)
 
 
 class DiscoveryRunManager:
@@ -63,10 +80,71 @@ class DiscoveryRunManager:
         # Set on cancel/shutdown. task.cancel() only stops the awaiting
         # coroutine; the proposer/worker threads and their containers watch this.
         self._cancel_events: Dict[str, threading.Event] = {}
+        self._run_roots: Dict[str, Path] = {}
+        # The queue a stream is reading and its stop flag, per run: one reader, or
+        # they would split the events.
+        self._streaming: Dict[str, Tuple[asyncio.Queue, asyncio.Event]] = {}
         self._lock = asyncio.Lock()
 
-    def get_event_queue(self, run_id: str) -> Optional[asyncio.Queue]:
-        return self._queues.get(run_id)
+    def run_root(self, run_id: str) -> Optional[Path]:
+        """The folder of a run this process is running or still holds events for."""
+        return self._run_roots.get(run_id)
+
+    async def read_stream(self, run_id: str) -> AsyncIterator[Optional[dict]]:
+        """The run's events for its one reader, and None after each
+        STREAM_HEARTBEAT_SEC of silence. A newer reader takes over (a reattach
+        whose old connection dropped unnoticed); this one then stops, handing
+        back an event it had already taken."""
+        queue = self._queues.get(run_id)
+        if queue is None:
+            raise ProblemError("Run not found")
+        previous = self._streaming.get(run_id)
+        if previous is not None:
+            previous[1].set()
+        entry = (queue, asyncio.Event())
+        self._streaming[run_id] = entry
+        stop = entry[1]
+        try:
+            while True:
+                get = asyncio.ensure_future(queue.get())
+                halt = asyncio.ensure_future(stop.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {get, halt}, timeout=STREAM_HEARTBEAT_SEC, return_when=asyncio.FIRST_COMPLETED)
+                except BaseException:
+                    if get.done() and not get.cancelled():
+                        _put(queue, get.result())
+                    get.cancel()
+                    raise
+                finally:
+                    halt.cancel()
+                if get not in done:
+                    get.cancel()   # it has taken nothing: Queue.get leaves the item on cancel
+                    if stop.is_set():
+                        return
+                    yield None
+                    continue
+                event = get.result()
+                if stop.is_set():
+                    _put(queue, event)
+                    return
+                if event is None:
+                    return
+                yield event
+        finally:
+            if self._streaming.get(run_id) is entry:
+                del self._streaming[run_id]
+            task = self._tasks.get(run_id)
+            if task is not None and task.done():
+                self._drop(run_id, task)
+
+    def _drop(self, run_id: str, task: asyncio.Task) -> None:
+        """Forget a finished run, unless it was relaunched or a stream is reading it."""
+        reading = self._streaming.get(run_id)
+        if self._tasks.get(run_id) is not task or (reading is not None and reading[0] is self._queues.get(run_id)):
+            return
+        for table in (self._tasks, self._queues, self._cancel_events, self._run_roots):
+            table.pop(run_id, None)
 
     def is_active(self, run_id: str) -> bool:
         task = self._tasks.get(run_id)
@@ -135,31 +213,41 @@ class DiscoveryRunManager:
             if run_folder_busy(run_root):
                 raise ProblemError(f"Run {run_id} is still stopping; try again in a moment")
             self._cancel_events[run_id] = threading.Event()
-            self._queues[run_id] = asyncio.Queue()
-            self._tasks[run_id] = asyncio.create_task(self._execute(run_id, run_root, **params))
+            queue = self._queues[run_id] = asyncio.Queue(maxsize=EVENT_BACKLOG)
+            self._run_roots[run_id] = run_root
+            task = self._tasks[run_id] = asyncio.create_task(self._execute(run_id, run_root, **params))
+            task.add_done_callback(lambda done: self._finished(run_id, queue, done))
+
+    def _finished(self, run_id: str, queue: asyncio.Queue, task: asyncio.Task) -> None:
+        """Close the stream however the task ended (even cancelled before it ever ran)."""
+        _put(queue, None)
+        # A stream that comes later still gets the ending; then the run is forgotten.
+        task.get_loop().call_later(FINISHED_RUN_GRACE_SEC, self._drop, run_id, task)
 
     async def _execute(self, run_id: str, run_root: Path, **params: Any) -> None:
         queue = self._queues[run_id]
+
+        async def emit(event: dict) -> None:
+            _put(queue, event)
+
         try:
             result = await run_discovery(
                 run_root=run_root,
-                emit=queue.put,
+                emit=emit,
                 cancel_event=self._cancel_events[run_id],
                 **params,
             )
-            await queue.put({"type": "complete", "result": result})
+            await emit({"type": "complete", "result": result})
         except asyncio.CancelledError:
-            await queue.put({"type": "error", "message": "Run cancelled"})
+            await emit({"type": "error", "message": "Run cancelled"})
         except Exception as exc:
-            await queue.put({"type": "error", "message": str(exc)})
-        finally:
-            await queue.put(None)
+            await emit({"type": "error", "message": str(exc)})
 
     async def cancel_run(self, run_id: str) -> bool:
         if not self.is_active(run_id):
             return False
         self._cancel_events[run_id].set()
-        # The task's CancelledError handler reports "Run cancelled" and closes the stream — once.
+        # The task's CancelledError handler reports "Run cancelled" once; _finished closes the stream.
         self._tasks[run_id].cancel()
         return True
 
