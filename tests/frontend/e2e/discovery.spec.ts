@@ -163,10 +163,10 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     // Stopping is not an error: no red box (e.g. the aborted stream's message).
     await expect(page.locator('.bg-red-50')).toHaveCount(0);
 
-    // History lists the stopped run as incomplete; opening it offers to resume.
+    // History lists the run as stopped; opening it offers to resume.
     await page.getByRole('button', { name: 'Run history' }).click();
     const entry = page.locator(`[data-run-id="${runId}"]`);
-    await expect(entry).toContainText(/incomplete/i);
+    await expect(entry).toContainText(/stopped/i);
     await entry.click();
     await expect(page.getByText("A previous run in this folder didn't finish. Resume it?")).toBeVisible();
 

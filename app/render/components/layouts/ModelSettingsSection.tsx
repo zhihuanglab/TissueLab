@@ -35,6 +35,7 @@ const PLAIN: PlainName[] = ['OPENAI_BASE_URL', 'LLM_MODEL', 'LLM_API', 'DISCOVER
 const SECRETS: SecretName[] = ['OPENAI_API_KEY', 'DISCOVERY_API_KEY']
 const AUTO = 'auto'
 const OPENAI_URL = 'https://api.openai.com/v1'
+const URL_OF: Record<SecretName, PlainName> = { OPENAI_API_KEY: 'OPENAI_BASE_URL', DISCOVERY_API_KEY: 'DISCOVERY_BASE_URL' }
 const PROTOCOL_LABEL: Record<string, string> = { chat: 'Chat Completions', responses: 'Responses' }
 
 // Where a key goes: an endpoint's host and port (empty means OpenAI).
@@ -125,17 +126,32 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
     const effective = (value: string) => value.trim() || settings.fields[url].env_value
     return hostOf(effective(plain[url])) !== hostOf(effective(settings.fields[url].value))
   }
-  const keyNote = (url: PlainName, key: SecretName) => keyWillBeCleared(url, key) && (
-    <p className="text-xs text-amber-600">
-      The saved key will be cleared — enter the key for the new endpoint.
-    </p>
-  )
+  // .env.local's key only goes to .env.local's endpoint (the service withholds it elsewhere).
+  const envKeyApplies = (key: SecretName) => {
+    if (!settings) return true
+    const url = URL_OF[key]
+    const env = settings.fields[url].env_value
+    return hostOf(plain[url].trim() || env) === hostOf(env)
+  }
+  const keyNote = (url: PlainName, key: SecretName) => {
+    const field = settings?.fields[key]
+    const needsKey = !keyWillBeCleared(url, key) && field?.env_set && !envKeyApplies(key)
+      && !keys[key].trim() && (!field.set || clearKeys[key])
+    if (!keyWillBeCleared(url, key) && !needsKey) return null
+    return (
+      <p className="text-xs text-amber-600">
+        {needsKey
+          ? 'The key from .env.local is only sent to its own endpoint — enter the key for this one.'
+          : 'The saved key will be cleared — enter the key for the new endpoint.'}
+      </p>
+    )
+  }
 
   // Research's own key with no endpoint of its own goes to OpenAI.
   const researchHasKey = Boolean(
     keys.DISCOVERY_API_KEY.trim()
     || (settings?.fields.DISCOVERY_API_KEY.set && !clearKeys.DISCOVERY_API_KEY)
-    || settings?.fields.DISCOVERY_API_KEY.env_set,
+    || (settings?.fields.DISCOVERY_API_KEY.env_set && envKeyApplies('DISCOVERY_API_KEY')),
   )
   const protocolDefault = settings?.fields.LLM_API.env_value
 
@@ -144,7 +160,7 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
     const cleared = clearKeys[name]
     const placeholder = field?.set && !cleared
       ? `Saved ${field.hint} — type to replace`
-      : field?.env_set
+      : field?.env_set && envKeyApplies(name)
         ? `default: ${field.env_hint} (from .env.local)`
         : fallback
     const shown = showKeys[name]

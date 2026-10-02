@@ -59,8 +59,16 @@ MAX_REPORT_BYTES = 50 << 20
 MAX_TABLE_BYTES = 500 << 20
 
 
-class ControllerChecksFailed(RuntimeError):
-    """The worker's result.py ran but failed the controller's checks — a verdict, not a crash."""
+class HypothesisFailed(RuntimeError):
+    """The worker ran but its hypothesis came to nothing — a verdict, not an infrastructure crash."""
+
+
+class ControllerChecksFailed(HypothesisFailed):
+    """The worker's result.py ran but failed the controller's checks."""
+
+
+class NoResultProduced(HypothesisFailed):
+    """The worker's conversation ended without writing result.py."""
 
 
 def _kickoff_message(plan: dict[str, Any]) -> str:
@@ -381,7 +389,7 @@ def run_worker(
             )
 
         if stat_contained(scratch_dir, RESULT_NAME) is None:
-            raise RuntimeError(f"{worker_name}: no result.py produced ({state.get('error') or 'worker ended without writing it'})")
+            raise NoResultProduced(f"{worker_name}: no result.py produced ({state.get('error') or 'worker ended without writing it'})")
         # ---- controller materialization (whether the conversation ended in DONE or not)
         write_contained(scratch_dir, MATERIALIZE_SCRIPT, _materialize_script(plan))
         emit({"type": "worker_materialize", "worker_name": worker_name})

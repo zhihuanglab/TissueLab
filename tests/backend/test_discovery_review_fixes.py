@@ -446,7 +446,8 @@ def test_two_rounds_of_infrastructure_failures_stop_the_run(tmp_path, monkeypatc
 
     # a worker that wrote no result.py is the hypothesis's failure, not the infrastructure's
     def no_result(**kwargs):
-        raise RuntimeError(f"{kwargs['worker_brief']['worker_name']}: no result.py produced (turn cap)")
+        from app.services.agent.discovery.worker import NoResultProduced
+        raise NoResultProduced(f"{kwargs['worker_brief']['worker_name']}: no result.py produced (turn cap)")
 
     monkeypatch.setattr(loop, "run_worker", no_result)
     out = asyncio.run(loop.run_discovery(spec=_spec(), data_dir=data, run_root=tmp_path / "run2", emit=_quiet,

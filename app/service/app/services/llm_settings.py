@@ -17,6 +17,10 @@ the old one.
 Saved "true": discovery runs on the agent's endpoint and key, whatever
 DISCOVERY_BASE_URL / DISCOVERY_API_KEY say (in Preferences or .env.local).
 Saved "false" or never saved: those variables decide (see the discovery client).
+
+A key goes only to the endpoint it came with: a saved key is cleared when its
+endpoint moves (:func:`update_settings`), and a key from .env.local is not used
+once Preferences point that connection at another host.
 """
 from __future__ import annotations
 
@@ -31,6 +35,9 @@ from app.config.path_config import SERVICE_STORAGE_DIR
 from app.services.llm_config import OPENAI_URL, ROLE_MODEL_VARS
 
 SETTINGS_FILENAME = "llm_settings.json"
+# Written into the file. Files without it come from the first Preferences build, which
+# saved RESEARCH_USES_AGENT=true on every save whether or not the user touched it.
+FORMAT_KEY, FORMAT = "_format", 2
 
 FIELDS = (
     "OPENAI_BASE_URL",
@@ -75,6 +82,8 @@ def load_saved() -> Dict[str, str]:
         return {}
     if not isinstance(raw, dict):
         return {}
+    if raw.get(FORMAT_KEY) != FORMAT and raw.get(USES_AGENT) == "true":
+        raw.pop(USES_AGENT)  # not the user's choice: follow .env.local again
     return {
         k: v.strip() for k, v in raw.items()
         if (k in FIELDS or k == USES_AGENT) and isinstance(v, str) and v.strip()
@@ -88,7 +97,7 @@ def _write(saved: Mapping[str, str]) -> None:
     # Holds API keys: owner-only from the moment it exists.
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(dict(saved), fh, indent=2, sort_keys=True)
+        json.dump({**saved, FORMAT_KEY: FORMAT}, fh, indent=2, sort_keys=True)
     os.replace(tmp, path)
 
 
@@ -145,10 +154,32 @@ def _reset_clients() -> None:
         cache.clear()
 
 
+def _target(url: Optional[str]) -> Tuple[str, int]:
+    """(host, port) a key sent to ``url`` reaches; empty means OpenAI."""
+    parsed = urlparse(url or OPENAI_URL)
+    return (parsed.hostname or "").lower(), parsed.port or (443 if parsed.scheme == "https" else 80)
+
+
+def _endpoint(saved: Mapping[str, str], url_name: str) -> Tuple[str, int]:
+    """Where a connection's key goes with ``saved`` applied."""
+    return _target(saved.get(url_name) or _baseline.get(url_name))
+
+
+def _env_key_applies(saved: Mapping[str, str], url_name: str) -> bool:
+    """Whether .env.local's key for this connection still goes to its own endpoint."""
+    return _endpoint(saved, url_name) == _target(_baseline.get(url_name))
+
+
+_ENV_KEY_URL = {key: url for url, key in CONNECTIONS}
+
+
 def _apply(saved: Mapping[str, str]) -> None:
     research_on_agent = saved.get(USES_AGENT) == "true"
     for name in WATCHED:
         if name in RESEARCH_CONNECTION and research_on_agent:
+            value = None
+        elif name in _ENV_KEY_URL and name not in saved and not _env_key_applies(saved, _ENV_KEY_URL[name]):
+            # .env.local's key belongs to .env.local's endpoint, not the one set in Preferences.
             value = None
         elif name in ROLE_MODEL_VARS and saved.get("LLM_MODEL"):
             # The model chosen in Preferences is the later, explicit choice.
@@ -163,9 +194,16 @@ def _apply(saved: Mapping[str, str]) -> None:
 
 
 def apply_saved_settings() -> None:
-    """Apply the saved overrides (service startup)."""
+    """Apply the saved overrides (service startup); rewrites a first-build file in the current format."""
     with _lock:
-        _apply(load_saved())
+        saved = load_saved()
+        try:
+            raw = json.loads(settings_path().read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and raw.get(FORMAT_KEY) != FORMAT:
+                _write(saved)
+        except (OSError, ValueError):
+            pass
+        _apply(saved)
 
 
 def _validate(name: str, value: str) -> str:
@@ -188,12 +226,6 @@ def _validate(name: str, value: str) -> str:
         if value not in ("true", "false"):
             raise SettingsError(f"{USES_AGENT} must be true or false.")
     return value
-
-
-def _endpoint(saved: Mapping[str, str], url_name: str) -> Tuple[str, Optional[int]]:
-    """(host, port) a connection's key goes to; empty means OpenAI."""
-    parsed = urlparse(saved.get(url_name) or _baseline.get(url_name) or OPENAI_URL)
-    return (parsed.hostname or "").lower(), parsed.port
 
 
 def update_settings(changes: Mapping[str, Optional[str]]) -> List[str]:

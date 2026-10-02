@@ -807,16 +807,17 @@ export const CoscientistPanel: React.FC = () => {
     <div className="flex flex-col h-full bg-background">
       {/* Header */}
       {/* Same height and layout as the Agent chat's toolbar: switching between them must not jump */}
-      <div className="sticky top-0 z-10 bg-background border-b border-border px-3 py-2">
-        <div className="min-h-8 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="w-6 h-6 rounded-full bg-primary/15 flex items-center justify-center">
+      <div className="@container sticky top-0 z-10 bg-background border-b border-border px-3 py-2">
+        <div className="min-h-8 flex items-center justify-between gap-1.5">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="w-6 h-6 shrink-0 rounded-full bg-primary/15 flex items-center justify-center">
               <FlaskConical className="h-3.5 w-3.5 text-primary" />
             </div>
             {/* Locked while a run is live: leaving would unmount this panel mid-run. */}
-            <span title={busy ? BUSY_TITLE : undefined}>
+            {/* gives way before the buttons do in a narrow sidebar */}
+            <span className="flex w-[170px] min-w-[96px] shrink" title={busy ? BUSY_TITLE : undefined}>
               <Select disabled={busy} value={selectedAgent} onValueChange={(value: AgentName) => { if (value !== selectedAgent) dispatch(setSelectedAgent(value)) }}>
-                <SelectTrigger className="h-7 w-[170px] border border-border/50 shadow-sm bg-background text-sm font-medium text-foreground hover:bg-muted/50 focus:ring-1 focus:ring-primary/30">
+                <SelectTrigger className="h-7 w-full border border-border/50 shadow-sm bg-background text-sm font-medium text-foreground hover:bg-muted/50 focus:ring-1 focus:ring-primary/30">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -826,7 +827,7 @@ export const CoscientistPanel: React.FC = () => {
               </Select>
             </span>
           </div>
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5 shrink-0">
             {busy && (
               <Button
                 variant="ghost"
@@ -840,8 +841,9 @@ export const CoscientistPanel: React.FC = () => {
               </Button>
             )}
             <Button variant="ghost" size="sm" className="h-7 px-2" aria-label="Run history" title="History" onClick={() => { if (!showHistory) void fetchWorkspaceRuns(); setShowHistory(!showHistory) }}>
-              <History className="h-4 w-4 mr-1" />
-              <span className="text-xs">History</span>
+              {/* labelled when there is room; icon only next to Stop */}
+              <History className={cn("h-4 w-4", !busy && "@[22rem]:mr-1")} />
+              {!busy && <span className="hidden @[22rem]:inline text-xs">History</span>}
             </Button>
             <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="New research task" disabled={busy} title={busy ? BUSY_TITLE : "New research task"} onClick={requestNewTask}>
               <Plus className="h-4 w-4" />

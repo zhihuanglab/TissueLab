@@ -37,7 +37,7 @@ from .judge import TABLE_NAME, review_candidate
 from .panel_cv import PredictivePanelConfig
 from .problem import ProblemSpec, write_dataset_layout
 from .proposer import run_proposer
-from .worker import ControllerChecksFailed, run_worker
+from .worker import ControllerChecksFailed, HypothesisFailed, run_worker
 
 DEFAULT_WORKER_WALL_CLOCK = 1800
 WORKER_COMMAND_TIMEOUT = 900
@@ -731,7 +731,7 @@ async def run_discovery(
                 status = "failed"
                 # The worker's own failures (no result.py, failed checks) are the
                 # hypothesis's; anything else (Docker, the sandbox) is the infrastructure's.
-                infra = not isinstance(exc, ControllerChecksFailed) and "no result.py produced" not in str(exc)
+                infra = not isinstance(exc, HypothesisFailed)
             await emit({"type": f"worker_{status}", "worker_name": result.get("worker_name", ""),
                         "summary": result.get("summary", "")})
             return {**result, "status": status, "infra_failure": infra}

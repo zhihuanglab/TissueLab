@@ -244,3 +244,36 @@ def test_saved_settings_survive_a_restart(client, settings_module):
     os.environ.pop("LLM_MODEL")
     settings_module.apply_saved_settings()
     assert os.environ["OPENAI_API_KEY"] == KEY and os.environ["LLM_MODEL"] == "persisted"
+
+
+def test_first_build_files_lose_their_automatic_research_switch(client, settings_module, monkeypatch):
+    import json
+    # The first Preferences build wrote RESEARCH_USES_AGENT=true on every save, with no format mark.
+    settings_module.settings_path().write_text(json.dumps({"LLM_MODEL": "m1", "RESEARCH_USES_AGENT": "true"}))
+    monkeypatch.setitem(settings_module._baseline, "DISCOVERY_BASE_URL", "https://env.example/v1")
+    monkeypatch.setitem(settings_module._baseline, "DISCOVERY_API_KEY", "sk-env-research-0000")
+    settings_module.apply_saved_settings()
+    assert os.environ["DISCOVERY_BASE_URL"] == "https://env.example/v1"
+    assert json.loads(settings_module.settings_path().read_text()) == {"LLM_MODEL": "m1", "_format": 2}
+    # Chosen in the current build: kept.
+    _put(client, RESEARCH_USES_AGENT="true")
+    settings_module.apply_saved_settings()
+    assert settings_module.load_saved()["RESEARCH_USES_AGENT"] == "true"
+    assert "DISCOVERY_BASE_URL" not in os.environ
+
+
+@pytest.mark.parametrize("url, key", [("OPENAI_BASE_URL", "OPENAI_API_KEY"), ("DISCOVERY_BASE_URL", "DISCOVERY_API_KEY")])
+def test_env_file_key_stays_with_its_endpoint(client, settings_module, monkeypatch, url, key):
+    monkeypatch.setitem(settings_module._baseline, url, "https://env.example/v1")
+    monkeypatch.setitem(settings_module._baseline, key, "sk-env-file-key-9999")
+    settings_module.apply_saved_settings()
+    assert os.environ[key] == "sk-env-file-key-9999"
+
+    _put(client, **{url: "https://env.example:443/v2"})   # same host: still its key
+    assert os.environ[key] == "sk-env-file-key-9999"
+    _put(client, **{url: "https://third-party.example/v1"})
+    assert key not in os.environ
+    _put(client, **{key: KEY})                             # a key typed for the new endpoint
+    assert os.environ[key] == KEY
+    _put(client, **{url: "", key: ""})                     # back to .env.local's pair
+    assert os.environ[url] == "https://env.example/v1" and os.environ[key] == "sk-env-file-key-9999"
