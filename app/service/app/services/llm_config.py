@@ -13,12 +13,25 @@ The agent speaks the OpenAI API. Two wire protocols exist:
 
 Models: every role (router / chat / workflow / code / ranking / vision) can be
 set individually; ``LLM_MODEL`` is the shared default so a self-hosted server
-with a single model needs one variable.
+with a single model needs one variable. A LLM_MODEL saved in Preferences beats
+the per-role variables of .env.local (see :mod:`app.services.llm_settings`).
 """
 import os
 from urllib.parse import urlparse
 
 DEFAULT_CLOUD_MODEL = "gpt-5.2"
+OPENAI_URL = "https://api.openai.com/v1"
+# The per-role overrides of LLM_MODEL read through model_for().
+ROLE_MODEL_VARS = (
+    "OPENAI_MODEL_ROUTER",
+    "CHAT_MODEL",
+    "WORKFLOW_MODEL",
+    "CODE_MODEL",
+    "RANKING_MODEL",
+    "OPENAI_MODEL_SEARCH",
+    "OPENAI_VISION_MODEL",
+    "CODEEXEC_REVIEW_MODEL",
+)
 
 
 def base_url() -> str:
@@ -64,6 +77,8 @@ def is_gpt5(model: str) -> bool:
 
 __all__ = [
     "DEFAULT_CLOUD_MODEL",
+    "OPENAI_URL",
+    "ROLE_MODEL_VARS",
     "api_mode",
     "base_url",
     "default_model",

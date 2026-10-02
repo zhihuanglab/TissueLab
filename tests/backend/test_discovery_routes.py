@@ -322,8 +322,10 @@ def test_cancel_stops_the_worker_thread_and_reports_once(client, workspace, llm_
 
     assert client.post(f"{API}/runs/{run_id}/cancel").json()["data"] == {"cancelled": True}
     assert thread_saw_cancel.wait(5)
-    errors = [e for e in _events(client, run_id) if e["type"] == "error"]
-    assert errors == [{"type": "error", "message": "Run cancelled"}]
+    endings = [e for e in _events(client, run_id) if e["type"] in ("error", "run_cancelled", "complete")]
+    assert endings == [{"type": "run_cancelled", "run_id": run_id}]
+    # stopping it again is not an error
+    assert client.post(f"{API}/runs/{run_id}/cancel").json()["data"] == {"cancelled": False, "reason": "not active"}
 
 
 def test_resume_rereads_the_problem_and_refuses_a_running_folder(client, workspace, llm_ready, fake_loop):

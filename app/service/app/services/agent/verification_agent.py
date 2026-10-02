@@ -7,11 +7,10 @@ Determines whether problems are in workflow planning, model output, or coding st
 
 import os
 import json
-import threading
 from typing import Dict, Any, List, Optional
 from openai import OpenAI
 
-from app.services import llm_config
+from app.services import llm_config, llm_settings
 
 # PROMPTS_DIR is in parent directory (app/services/prompts)
 PROMPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts")
@@ -35,14 +34,14 @@ class VerificationAgent:
     This agent diagnoses which stage has issues when results are incorrect or unsatisfactory.
     """
     
-    def __init__(self, model: Optional[str] = None):
+    def __init__(self, model: Optional[str] = None, client: Optional[OpenAI] = None):
         """
         Initialize the verification agent.
         
         Args:
             model: OpenAI model to use for vision tasks (default: "gpt-5.2")
         """
-        self.client = OpenAI()
+        self.client = client or OpenAI()
         self.model = model or llm_config.model_for("OPENAI_VISION_MODEL")
         
         # Load prompt template
@@ -191,34 +190,13 @@ def _parse_json_object(text: Optional[str]) -> Optional[Dict[str, Any]]:
     return None
 
 
-# Singleton instance
-_verification_agent: Optional[VerificationAgent] = None
-# Bumped by reset_verification_agent(): an agent built from settings that
-# Preferences replaced meanwhile is never cached. The lock only guards these
-# two names (never held while building).
-_agent_generation = 0
-_agent_lock = threading.Lock()
-
-
-def reset_verification_agent() -> None:
-    global _verification_agent, _agent_generation
-    with _agent_lock:
-        _agent_generation += 1
-        _verification_agent = None
+# Singleton, rebuilt once Preferences change the LLM settings.
+_agent_cache = llm_settings.SettingsCached(
+    lambda settings: VerificationAgent(client=OpenAI(**llm_settings.openai_kwargs(settings)))
+)
 
 
 def get_verification_agent() -> VerificationAgent:
     """Get or create the verification agent instance"""
-    global _verification_agent
-    agent = _verification_agent
-    if agent is not None:
-        return agent
-    generation = _agent_generation
-    agent = VerificationAgent()
-    with _agent_lock:
-        if generation != _agent_generation:
-            return agent
-        if _verification_agent is None:
-            _verification_agent = agent
-        return _verification_agent
+    return _agent_cache.get()
 

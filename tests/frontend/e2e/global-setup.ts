@@ -211,6 +211,8 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     // ---- 2. Python service -------------------------------------------------
     const slideName = copySlide(serviceRoot);
     const backendPort = await freePort();
+    // Picked now: the service only accepts model-settings calls from the renderer's port.
+    const rendererPort = await freePort();
     const backendOrigin = `http://127.0.0.1:${backendPort}`;
     const apiUrl = `${backendOrigin}/api`;
     const wsUrl = `ws://127.0.0.1:${backendPort}/ws`;
@@ -227,6 +229,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
       LLM_MODEL: 'mock-llm',
       DISCOVERY_BASE_URL: discoveryBase,
       DISCOVERY_API_KEY: 'dummy',
+      TL_RENDERER_PORTS: String(rendererPort),
     };
     delete backendEnv.LLM_API;
     const backend = spawnLogged('backend', python, ['main.py', '--port', String(backendPort), '--service-root', serviceRoot], {
@@ -242,7 +245,6 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     log(`mock community ready (${community.url})`);
 
     // ---- 4. renderer ---------------------------------------------------------
-    const rendererPort = await freePort();
     const baseURL = `http://127.0.0.1:${rendererPort}`;
     const rendererEnv: NodeJS.ProcessEnv = {
       ...process.env,

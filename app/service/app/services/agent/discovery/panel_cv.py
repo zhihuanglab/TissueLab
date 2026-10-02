@@ -6,6 +6,7 @@ nested cross-validated ridge predictions on the discovery cohort.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -40,13 +41,21 @@ class PredictivePanelConfig:
     )
     # The RMSE thresholds below are in units of the outcome's standard deviation,
     # so the gates mean the same whatever scale the outcome is recorded in.
-    min_mean_rmse_improvement: float = 5e-4
-    min_fraction_repeats_better_rmse: float = 0.65
+    # A meaningful gain: mean RMSE lower by at least 1% of the outcome's SD.
+    min_mean_rmse_improvement: float = 0.01
+    # Better in at least this share of the repeats, as a whole count (rounded up):
+    # with 5 repeats, 0.8 = at least 4 of 5.
+    min_fraction_repeats_better_rmse: float = 0.8
     min_consensus_rmse_improvement: float = 0.0
     min_consensus_pearson_delta: float = -0.02
     min_worst_leave_one_donor_rmse_improvement: float = -1e-3
     min_candidate_coverage: float = 0.80
     max_panel_size: int = 5
+
+
+def min_repeats_better(config: PredictivePanelConfig) -> int:
+    """How many of the outer repeats the candidate must beat the baseline in."""
+    return math.ceil(round(config.min_fraction_repeats_better_rmse * config.outer_repeats, 9))
 
 
 def _sex_values(series: pd.Series) -> np.ndarray:
@@ -245,7 +254,6 @@ def _panel_predictions(
     outcome: np.ndarray,
     *,
     config: PredictivePanelConfig,
-    split_seed_offset: int,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
     predictions = np.full((config.outer_repeats, len(outcome)), np.nan, dtype=float)
     tuning: list[dict[str, Any]] = []
@@ -265,12 +273,7 @@ def _panel_predictions(
                 covariates[train_index],
                 outcome[train_index],
                 alphas=config.ridge_alphas,
-                seed=(
-                    config.seed
-                    + split_seed_offset
-                    + repeat * 1000
-                    + outer_fold * 50
-                ),
+                seed=config.seed + repeat * 1000 + outer_fold * 50,
                 inner_folds=config.inner_folds,
             )
             prediction, retained = _predict_with_alpha(
@@ -324,6 +327,24 @@ def _leave_one_donor_improvements(
     return np.asarray(improvements, dtype=float)
 
 
+def panel_cv_predictions(
+    frame: pd.DataFrame,
+    *,
+    outcome_column: str,
+    covariates: list[str],
+    feature_columns: list[str],
+    config: PredictivePanelConfig,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """One panel's repeated nested-CV predictions (repeats x donors) and alpha tuning,
+    for compare_predictive_panels(baseline=...) on frames with the same donor order."""
+    return _panel_predictions(
+        _feature_array(frame, feature_columns),
+        covariate_matrix(frame, covariates),
+        pd.to_numeric(frame[outcome_column], errors="raise").to_numpy(dtype=float),
+        config=config,
+    )
+
+
 def compare_predictive_panels(
     frame: pd.DataFrame,
     *,
@@ -332,8 +353,10 @@ def compare_predictive_panels(
     baseline_feature_columns: list[str],
     candidate_feature_columns: list[str],
     config: PredictivePanelConfig,
+    baseline: tuple[np.ndarray, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    """Compare two fixed panels with identical repeated outer folds."""
+    """Compare two fixed panels with identical repeated outer folds. `baseline`: the
+    baseline panel's panel_cv_predictions, when already computed on this donor order."""
     if len(candidate_feature_columns) > config.max_panel_size:
         raise ValueError(
             f"Candidate panel has {len(candidate_feature_columns)} features; "
@@ -348,22 +371,19 @@ def compare_predictive_panels(
 
     outcome = pd.to_numeric(frame[outcome_column], errors="raise").to_numpy(dtype=float)
     covariate_values = covariate_matrix(frame, covariates)
-    baseline_features = _feature_array(frame, baseline_feature_columns)
     candidate_features = _feature_array(frame, candidate_feature_columns)
 
-    baseline_predictions, baseline_tuning = _panel_predictions(
-        baseline_features,
+    baseline_predictions, baseline_tuning = baseline or _panel_predictions(
+        _feature_array(frame, baseline_feature_columns),
         covariate_values,
         outcome,
         config=config,
-        split_seed_offset=0,
     )
     candidate_predictions, candidate_tuning = _panel_predictions(
         candidate_features,
         covariate_values,
         outcome,
         config=config,
-        split_seed_offset=0,
     )
     baseline_repeat = _repeat_metrics(outcome, baseline_predictions)
     candidate_repeat = _repeat_metrics(outcome, candidate_predictions)
@@ -403,7 +423,8 @@ def compare_predictive_panels(
         candidate_consensus["pearson_r"] - baseline_consensus["pearson_r"]
     )
     mean_rmse_improvement = float(rmse_improvements.mean())
-    fraction_better = float((rmse_improvements > 0).mean())
+    repeats_better = int((rmse_improvements > 0).sum())
+    fraction_better = repeats_better / len(rmse_improvements)
     worst_leave_one_donor = float(leave_one_donor_improvements.min())
     outcome_sd = float(outcome.std())
 
@@ -412,9 +433,7 @@ def compare_predictive_panels(
         "mean_rmse_improvement": (
             mean_rmse_improvement >= config.min_mean_rmse_improvement * outcome_sd
         ),
-        "fraction_repeats_better_rmse": (
-            fraction_better >= config.min_fraction_repeats_better_rmse
-        ),
+        "fraction_repeats_better_rmse": repeats_better >= min_repeats_better(config),
         "consensus_rmse_improvement": (
             consensus_rmse_improvement
             >= config.min_consensus_rmse_improvement * outcome_sd
@@ -466,6 +485,8 @@ def compare_predictive_panels(
         "mean_rmse_improvement": mean_rmse_improvement,
         "median_rmse_improvement": float(np.median(rmse_improvements)),
         "fraction_repeats_better_rmse": fraction_better,
+        "repeats_better_rmse": repeats_better,
+        "min_repeats_better_rmse": min_repeats_better(config),
         "mean_pearson_delta": float(pearson_deltas.mean()),
         "consensus_rmse_improvement": float(consensus_rmse_improvement),
         "consensus_pearson_delta": float(consensus_pearson_delta),

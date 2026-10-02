@@ -29,7 +29,7 @@ test.describe('Preferences: AI models', () => {
       ['OPENAI_BASE_URL', 'OPENAI_API_KEY', 'LLM_MODEL', 'LLM_API', 'DISCOVERY_BASE_URL', 'DISCOVERY_API_KEY', 'DISCOVERY_MODEL']
         .map((name) => [name, '']),
     );
-    fields.RESEARCH_USES_AGENT = 'false';
+    fields.RESEARCH_USES_AGENT = '';
     await request.put(`${e2eEnv().backendOrigin}/api/agent/v1/model_settings`, { data: { fields } });
   });
 
@@ -42,7 +42,7 @@ test.describe('Preferences: AI models', () => {
     await expect(status).toContainText('Chat Completions');
     await expect(status).toContainText('Research: ready (gpt-5.4)');
     await expect(dialog.getByLabel('Agent endpoint')).toHaveAttribute('placeholder', /\(from \.env\.local\)$/);
-    await expect(dialog.getByLabel('Agent API key')).toHaveAttribute('placeholder', /^•••• \(from \.env\.local\)$/);
+    await expect(dialog.getByLabel('Agent API key')).toHaveAttribute('placeholder', /^default: •••• \(from \.env\.local\)$/);
 
     await dialog.getByLabel('Agent model').fill('e2e-model');
     // The eye appears only while a key is being typed; it reveals it and hides it again.

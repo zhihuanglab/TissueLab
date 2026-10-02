@@ -3,8 +3,9 @@ Docker sandbox for model-written code (proposer exploration, worker scripts,
 the controller's donor-table materialization).
 
 Each session is one container with:
-- the data folder read-only at /data, with the run-output folder masked so a
-  run never sees earlier runs' results, plus optional read-only single-file
+- the data folder read-only at /data, with every run-output folder masked so a
+  run never sees earlier runs' results, every other table (csv / tsv / xlsx /
+  xls / parquet) shadowed by an empty file, plus optional read-only single-file
   overlays (the outcome-free cohort file)
 - a writable /scratch (the session's own folder) and a shared /shared
 - no network, a read-only root filesystem, and memory / CPU / pid / tmpfs caps
@@ -24,6 +25,7 @@ import hashlib
 import os
 import posixpath
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -68,8 +70,9 @@ SANDBOX_PIDS_LIMIT = os.environ.get("TL_SANDBOX_PIDS_LIMIT", "512")
 SANDBOX_TMPFS_SIZE = os.environ.get("TL_SANDBOX_TMPFS_SIZE", "512m")
 
 OWNER_LABEL = "tissuelab.discovery.pid"
+OWNER_STARTED_LABEL = "tissuelab.discovery.pid_started"
 SHARED_READ_ONLY = ("lib", "dataset.json", "dataset_guide.md")
-# Runs live under <data folder>/autoresearch_runs; the sandbox masks it.
+# Runs live under <data folder>/autoresearch_runs; the sandbox masks it (at any depth).
 RUNS_DIRNAME = "autoresearch_runs"
 SANDBOX_PYTHON = "/usr/local/bin/python3"
 
@@ -350,24 +353,184 @@ RUNTIME_WRAPPER_TEMPLATE = """#!/bin/sh
 exec "{real_python}" "{client_path}" "$@"
 """
 
+# Tabular files other than the (overlaid) cohort may carry outcomes: each is
+# shadowed by an empty file. Capped so a huge tree cannot explode the mount list.
+TABULAR_SUFFIXES = (".csv", ".tsv", ".xlsx", ".xls", ".parquet")
+MAX_MASKS = 2000
+MAX_WALK_ENTRIES = 200_000
+
+
+# -- host access to sandbox-writable folders -------------------------------------
+# /scratch and /shared are writable from the container, so model-written code can
+# plant symlinks (or FIFOs) there. Every host-side read / write in them goes
+# through these helpers: no symlink below the root is followed, only regular
+# files are touched. POSIX walks with dir_fd + O_NOFOLLOW (race-free); Windows
+# falls back to an lstat check per component.
+
+class UnsafePathError(OSError):
+    """A path below a sandbox-writable root crosses a symlink or is not a regular file."""
+
+
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)   # a planted FIFO must not block the open
+_O_BINARY = getattr(os, "O_BINARY", 0)
+_DIR_FD_OK = bool(_O_NOFOLLOW) and os.open in os.supports_dir_fd
+
+
+def _relative_parts(relative: str | Path) -> tuple[str, ...]:
+    parts = posixpath.normpath(str(relative).replace("\\", "/")).split("/")
+    if not parts or parts[0] in ("", ".", "..") or ".." in parts:
+        raise UnsafePathError(f"not a plain relative path: {relative}")
+    return tuple(parts)
+
+
+def _open_contained(root: str | Path, relative: str | Path, flags: int, mode: int = 0o644,
+                    *, make_dirs: bool = False) -> int:
+    parts = _relative_parts(relative)
+    flags |= _O_NONBLOCK | _O_BINARY
+    if not _DIR_FD_OK:
+        path = Path(root)
+        for i, part in enumerate(parts):
+            path = path / part
+            if i < len(parts) - 1 and make_dirs and not os.path.lexists(path):
+                path.mkdir(exist_ok=True)
+            if os.path.islink(path):
+                if i == len(parts) - 1 and flags & os.O_CREAT:
+                    os.unlink(path)
+                    continue
+                raise UnsafePathError(f"symlink in sandbox path: {path}")
+        fd = os.open(path, flags, mode)
+    else:
+        dir_fd = os.open(root, os.O_RDONLY | _O_DIRECTORY)
+        try:
+            for part in parts[:-1]:
+                if make_dirs:
+                    try:
+                        os.mkdir(part, dir_fd=dir_fd)
+                    except FileExistsError:
+                        pass
+                try:
+                    nxt = os.open(part, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=dir_fd)
+                except OSError as e:   # ELOOP / ENOTDIR: a link where a folder should be
+                    if isinstance(e, FileNotFoundError):
+                        raise
+                    raise UnsafePathError(f"symlink in sandbox path: {relative}") from e
+                os.close(dir_fd)
+                dir_fd = nxt
+            try:
+                fd = os.open(parts[-1], flags | _O_NOFOLLOW, mode, dir_fd=dir_fd)
+            except OSError as e:
+                if not _is_link_at(dir_fd, parts[-1]):
+                    raise
+                if not flags & os.O_CREAT:
+                    raise UnsafePathError(f"symlink in sandbox path: {relative}") from e
+                os.unlink(parts[-1], dir_fd=dir_fd)   # writing: replace the planted link
+                fd = os.open(parts[-1], flags | _O_NOFOLLOW | os.O_EXCL, mode, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise UnsafePathError(f"not a regular file: {relative}")
+    return fd
+
+
+def _is_link_at(dir_fd: int, name: str) -> bool:
+    try:
+        return stat.S_ISLNK(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
+def write_contained(root: str | Path, relative: str | Path, data: str | bytes, *,
+                    mode: Optional[int] = None, make_dirs: bool = True) -> None:
+    """Write root/relative without following links (str is written UTF-8 with LF newlines)."""
+    payload = data.encode("utf-8") if isinstance(data, str) else data
+    fd = _open_contained(root, relative, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                         0o644 if mode is None else mode, make_dirs=make_dirs)
+    try:
+        if mode is not None and hasattr(os, "fchmod"):
+            os.fchmod(fd, mode)
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(fd, view):]
+    finally:
+        os.close(fd)
+
+
+def read_contained(root: str | Path, relative: str | Path, max_bytes: Optional[int] = None) -> Optional[bytes]:
+    """Bytes of root/relative, or None when missing, linked or not a regular file."""
+    try:
+        fd = _open_contained(root, relative, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        chunks, total = [], 0
+        while max_bytes is None or total < max_bytes:
+            chunk = os.read(fd, 1 << 20 if max_bytes is None else min(1 << 20, max_bytes - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def stat_contained(root: str | Path, relative: str | Path) -> Optional[os.stat_result]:
+    """stat of root/relative as a regular file reached without links, else None."""
+    try:
+        fd = _open_contained(root, relative, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        return os.fstat(fd)
+    finally:
+        os.close(fd)
+
+
+# -- data folder scan ------------------------------------------------------------
+
+def _scan_data(base: Path) -> dict[str, list[Path]]:
+    """One bounded walk below base, not following links and not entering .zarr stores
+    (their chunk files are never links out) or run-output folders (masked).
+
+    Returns {"symlinks", "runs", "tabular"}: every symlink, every RUNS_DIRNAME
+    folder at any depth, every tabular file (a linked one counts as tabular too,
+    so it is masked, not mounted).
+    """
+    found: dict[str, list[Path]] = {"symlinks": [], "runs": [], "tabular": []}
+    seen = 0
+    for root, dirs, files in os.walk(base):
+        root_path = Path(root)
+        for name in [*dirs, *files]:
+            seen += 1
+            entry = root_path / name
+            linked = entry.is_symlink()
+            if name == RUNS_DIRNAME and name in dirs:
+                found["runs"].append(entry)
+            elif name.lower().endswith(TABULAR_SUFFIXES) and (name in files or linked):
+                found["tabular"].append(entry)
+            elif linked:
+                found["symlinks"].append(entry)
+        dirs[:] = [n for n in dirs if n != RUNS_DIRNAME and not n.lower().endswith(".zarr")]
+        if seen > MAX_WALK_ENTRIES:
+            print(f"[discovery] data folder scan stopped after {MAX_WALK_ENTRIES} entries: {base}")
+            break
+    for key in found:
+        found[key].sort(key=lambda p: p.relative_to(base).as_posix())
+    return found
+
 
 def _symlinks_under(data_dir: Path) -> list[Path]:
-    """Every symlink below data_dir, skipping the (masked) run-output folder.
+    """Every symlink below data_dir, skipping run-output folders at any depth.
 
     Linked directories are not followed, and a .zarr store is checked itself
     but not walked: its (often millions of) chunk files are never links out.
     """
-    found: list[Path] = []
-    for root, dirs, files in os.walk(data_dir):
-        root_path = Path(root)
-        if root_path == data_dir and RUNS_DIRNAME in dirs:
-            dirs.remove(RUNS_DIRNAME)
-        for name in [*dirs, *files]:
-            entry = root_path / name
-            if entry.is_symlink():
-                found.append(entry)
-        dirs[:] = [name for name in dirs if not name.lower().endswith(".zarr")]
-    return sorted(found, key=lambda p: p.relative_to(data_dir).as_posix())
+    return _scan_data(data_dir)["symlinks"]
 
 
 def _read_tail(stream, name: str, tails: dict[str, bytes]) -> None:
@@ -503,25 +666,20 @@ class SandboxSession:
         return f"/scratch/{RUNTIME_DIRNAME}"
 
     def _install_runtime_files(self) -> None:
-        runtime_root = self._runtime_root()
-        bin_dir = runtime_root / "bin"
-        bin_dir.mkdir(parents=True, exist_ok=True)
-        server_path = runtime_root / RUNTIME_SERVER_SCRIPT
-        client_path = runtime_root / RUNTIME_CLIENT_SCRIPT
-        server_path.write_text(RUNTIME_SERVER_CODE, encoding="utf-8")
-        client_path.write_text(RUNTIME_CLIENT_CODE, encoding="utf-8")
-        os.chmod(server_path, 0o755)
-        os.chmod(client_path, 0o755)
+        # Written as bytes (LF on Windows too: the container runs them) and
+        # without following links (/scratch may be a reused, container-written folder).
+        root = self.scratch_dir
+        write_contained(root, f"{RUNTIME_DIRNAME}/{RUNTIME_SERVER_SCRIPT}", RUNTIME_SERVER_CODE, mode=0o755)
+        write_contained(root, f"{RUNTIME_DIRNAME}/{RUNTIME_CLIENT_SCRIPT}", RUNTIME_CLIENT_CODE, mode=0o755)
         for name in ("python", "python3", "tlpy"):
-            wrapper_path = bin_dir / name
-            wrapper_path.write_text(
+            write_contained(
+                root, f"{RUNTIME_DIRNAME}/bin/{name}",
                 RUNTIME_WRAPPER_TEMPLATE.format(
                     real_python=SANDBOX_PYTHON,
                     client_path=f"{self._runtime_exec_root()}/{RUNTIME_CLIENT_SCRIPT}",
                 ),
-                encoding="utf-8",
+                mode=0o755,
             )
-            os.chmod(wrapper_path, 0o755)
 
     def _runtime_env(self) -> dict[str, str]:
         return {
@@ -615,22 +773,32 @@ class SandboxSession:
 
     # -- container ---------------------------------------------------------------
 
+    def _empty_mask_file(self) -> Path:
+        # Beside /scratch, not in it: the container cannot write it.
+        path = self.scratch_dir.parent / ".tl_empty_mask"
+        if not path.is_file() or path.is_symlink() or path.stat().st_size:
+            path.unlink(missing_ok=True)
+            path.write_bytes(b"")
+        return path
+
     def _data_mounts(self) -> list[str]:
         mounts = ["-v", f"{self.data_dir}:/data:ro"]
+        try:
+            scan = _scan_data(self.data_dir)
+        except OSError:
+            scan = {"symlinks": [], "runs": [], "tabular": []}
+        runs = [(self.data_dir, p) for p in scan["runs"]]
+        tabular = [(self.data_dir, p) for p in scan["tabular"]]
         # Symlink targets outside the mounted folder are otherwise invisible:
         # overlay each resolved link at its original relative path.
-        try:
-            entries = _symlinks_under(self.data_dir)
-        except OSError:
-            entries = []
-        for entry in entries:
+        for entry in scan["symlinks"]:
             try:
                 target = entry.resolve(strict=True)
                 relative = entry.relative_to(self.data_dir)
             except (OSError, ValueError):
                 continue
             # A link back into the data folder would expose, through a second
-            # mount, what the overlays and the runs mask hide (and one to an
+            # mount, what the overlays and the masks hide (and one to an
             # ancestor, e.g. `root -> /`, the whole host): never mount those.
             # Relative ones still resolve inside the container's /data.
             if target.is_relative_to(self.data_dir) or self.data_dir.is_relative_to(target):
@@ -638,12 +806,52 @@ class SandboxSession:
             container_path = (Path("/data") / relative).as_posix()
             if container_path in self.file_overlays:
                 continue   # shadowed by an overlay (e.g. a symlinked cohort file)
+            if target.is_file() and target.name.lower().endswith(TABULAR_SUFFIXES):
+                tabular.append((self.data_dir, entry))   # masked, not mounted
+                continue
             mounts.extend(["-v", f"{target}:{container_path}:ro"])
+            if target.is_dir():   # a linked folder brings its own tables / run folders
+                try:
+                    sub = _scan_data(target)
+                except OSError:
+                    continue
+                rebase = lambda p, t=target, e=entry: e / p.relative_to(t)
+                runs += [(self.data_dir, rebase(p)) for p in sub["runs"]]
+                tabular += [(self.data_dir, rebase(p)) for p in sub["tabular"]]
         # Earlier runs' outputs (results, panels, reports) sit inside the data
-        # folder; an empty tmpfs over it keeps them out of this run's view.
-        if (self.data_dir / RUNS_DIRNAME).is_dir():
-            mounts.extend(["--tmpfs", f"/data/{RUNS_DIRNAME}:ro,size=64k"])
-        return mounts
+        # folder, at any depth; an empty tmpfs over each keeps them out of view.
+        masks: list[str] = []
+        for base, path in runs:
+            masks.extend(["--tmpfs", f"{(Path('/data') / path.relative_to(base)).as_posix()}:ro,size=64k"])
+        # Other tables may carry the outcome: an empty file shadows each. The
+        # loaders read only the (overlaid) cohort file and metadata/<id>.json
+        # (shared_analysis/slides.py), which is JSON and stays visible.
+        # A link to a file inside the folder is masked at its target: a second
+        # mount through the link would stack on (and could blank) an overlay.
+        table_paths = set()
+        for base, path in tabular:
+            if path.is_symlink():
+                try:
+                    target = path.resolve(strict=True)
+                except OSError:
+                    continue
+                if not target.is_file():
+                    continue
+                if target.is_relative_to(self.data_dir):
+                    base, path = self.data_dir, target
+            table_paths.add((Path("/data") / path.relative_to(base)).as_posix())
+        container_tables = sorted(table_paths - set(self.file_overlays))
+        if container_tables:
+            if len(container_tables) + len(runs) > MAX_MASKS:
+                # Refuse rather than start with outcome tables visible.
+                raise RuntimeError(
+                    f"The data folder holds {len(container_tables)} tables outside the cohort file; "
+                    f"the sandbox masks at most {MAX_MASKS}. Move unrelated tables out of the data folder."
+                )
+            empty = self._empty_mask_file()
+            for container_path in container_tables:
+                masks.extend(["-v", f"{empty}:{container_path}:ro"])
+        return mounts + masks
 
     def _start_docker(self) -> None:
         self._ensure_docker_image()
@@ -655,6 +863,7 @@ class SandboxSession:
             # Owner pid: lets service shutdown and the next startup find
             # containers this process left behind (see remove_owned_containers).
             "--label", f"{OWNER_LABEL}={os.getpid()}",
+            "--label", f"{OWNER_STARTED_LABEL}={_own_create_time()}",   # tells a reused pid apart
             "--network", "none",
             "--read-only",
             "--memory", SANDBOX_MEMORY,
@@ -675,7 +884,8 @@ class SandboxSession:
             # What the controller trusts stays read-only: the loaders, the cohort
             # layout and the dataset guide. The rest of /shared is writable.
             for name in SHARED_READ_ONLY:
-                if (self.shared_dir / name).exists():
+                # A link planted by an earlier session would bind a host file into this one.
+                if (self.shared_dir / name).exists() and not (self.shared_dir / name).is_symlink():
                     cmd.extend(["-v", f"{self.shared_dir / name}:/shared/{name}:ro"])
         cmd.extend([self.image, "sleep", "infinity"])
         try:
@@ -683,8 +893,11 @@ class SandboxSession:
                 cmd, capture_output=True, text=True, check=False, timeout=DOCKER_RUN_TIMEOUT,
             )
         except subprocess.TimeoutExpired as e:
+            # The container may still come up after the CLI gave up: remove it by name.
+            _remove_containers([self.container_name])
             raise RuntimeError(f"Docker did not start the sandbox within {DOCKER_RUN_TIMEOUT}s") from e
         if proc.returncode != 0:
+            _remove_containers([self.container_name])   # a created-but-not-started one is left otherwise
             raise RuntimeError(
                 f"Failed to start Docker sandbox: {proc.stderr.strip() or proc.stdout.strip()}"
             )
@@ -752,6 +965,27 @@ def docker_unavailable_reason() -> Optional[str]:
     return None
 
 
+def _own_create_time() -> str:
+    try:
+        return f"{psutil.Process().create_time():.3f}"
+    except (psutil.Error, OSError):
+        return ""
+
+
+def _owner_alive(pid: int, started: str) -> bool:
+    """The owner pid is running and is the same process (not a reused pid)."""
+    if not psutil.pid_exists(pid):
+        return False
+    try:
+        expected = float(started)
+    except ValueError:
+        return True   # an unlabeled (older) container: the pid is all there is
+    try:
+        return abs(psutil.Process(pid).create_time() - expected) < 1.0
+    except (psutil.Error, OSError):
+        return False
+
+
 def remove_owned_containers(*, current_process: bool) -> int:
     """Remove discovery sandboxes by owner.
 
@@ -764,25 +998,30 @@ def remove_owned_containers(*, current_process: bool) -> int:
     try:
         proc = subprocess.run(
             ["docker", "ps", "-a", "--filter", f"label={OWNER_LABEL}",
-             "--format", f'{{{{.Names}}}}\t{{{{.Label "{OWNER_LABEL}"}}}}'],
+             "--format", f'{{{{.Names}}}}\t{{{{.Label "{OWNER_LABEL}"}}}}\t{{{{.Label "{OWNER_STARTED_LABEL}"}}}}'],
             capture_output=True, text=True, check=False, timeout=DOCKER_CLI_TIMEOUT,
         )
     except (OSError, subprocess.TimeoutExpired):
         return 0
     if proc.returncode != 0:
         return 0
-    own_pid = os.getpid()
+    own_pid, own_started = os.getpid(), _own_create_time()
     doomed: list[str] = []
     for line in proc.stdout.splitlines():
-        name, _, pid_text = line.partition("\t")
+        name, _, rest = line.partition("\t")
+        pid_text, _, started = rest.partition("\t")
         try:
             pid = int(pid_text.strip())
         except ValueError:
             continue
+        started = started.strip()
         if current_process:
             if pid == own_pid:
                 doomed.append(name.strip())
-        elif pid != own_pid and not psutil.pid_exists(pid):
+        elif pid == own_pid:
+            if started and started != own_started:   # an earlier process that had our pid
+                doomed.append(name.strip())
+        elif not _owner_alive(pid, started):
             doomed.append(name.strip())
     _remove_containers(doomed)
     return len(doomed)

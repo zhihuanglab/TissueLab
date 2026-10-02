@@ -22,6 +22,7 @@ from .panel_cv import (
     PredictivePanelConfig,
     compare_predictive_panels,
     covariate_matrix,
+    panel_cv_predictions,
     predictive_result_fields,
 )
 from .problem import ProblemSpec, load_cohort
@@ -42,35 +43,42 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
 
 
-def _resolve_artifact(worker_dir: Path, value: Any) -> Path | None:
+TABLE_NAME = "donor_feature_table.csv"   # the worker's controller writes /scratch/<this>
+_ROUND_DIR = re.compile(r"round_\d{4}")
+
+
+def run_path(run_root: Path | None, value: Any) -> Path | None:
+    """A path recorded in the run folder (accepted_panel.json): relative to the run
+    folder, or absolute from runs before that. An absolute path that no longer
+    exists (the folder was moved or renamed) is re-rooted at its round_NNNN part."""
     if not value:
         return None
     path = Path(str(value))
-    if path.is_absolute() and str(path).startswith("/scratch/"):
-        return worker_dir / "sandbox" / path.relative_to("/scratch")
-    if path.is_absolute():
+    if run_root is None:
         return path
-    direct = worker_dir / path
-    if direct.exists():
-        return direct
-    sandbox = worker_dir / "sandbox" / path
-    return sandbox if sandbox.exists() else direct
+    if not path.is_absolute():
+        return run_root / path
+    if not path.exists():
+        parts = path.parts
+        for index, part in enumerate(parts):
+            if _ROUND_DIR.fullmatch(part):
+                return run_root.joinpath(*parts[index:])
+    return path
 
 
-def _member_table_and_column(member: dict[str, Any]) -> tuple[Path, str]:
-    worker_dir = Path(str(member.get("worker_dir") or ""))
+def _member_table_and_column(member: dict[str, Any], run_root: Path | None) -> tuple[Path, str]:
+    worker_dir = run_path(run_root, member.get("worker_dir")) or Path()
     feature_column = str(member.get("feature_column") or "").strip()
-    table_path = _resolve_artifact(worker_dir, member.get("donor_feature_table"))
-
-    results_path = Path(str(member.get("results_path") or ""))
-    results = _read_json(results_path) if results_path.exists() else {}
-    if not feature_column:
-        feature_column = str(results.get("feature_column") or "").strip()
-    if table_path is None:
-        table_path = _resolve_artifact(
-            worker_dir, (results.get("artifacts") or {}).get("donor_feature_table")
-        )
+    recorded = str(member.get("donor_feature_table") or "")
+    # Older members recorded the sandbox path; the table is in the worker's sandbox folder.
+    table_path = None if not recorded or recorded.startswith("/scratch/") else run_path(run_root, recorded)
     if table_path is None or not table_path.exists():
+        table_path = worker_dir / "sandbox" / TABLE_NAME
+    if not feature_column:
+        results_path = run_path(run_root, member.get("results_path"))
+        results = _read_json(results_path) if results_path and results_path.exists() else {}
+        feature_column = str(results.get("feature_column") or "").strip()
+    if not table_path.exists():
         raise FileNotFoundError(
             f"Could not locate donor table for accepted panel member {member.get('feature_name')}"
         )
@@ -81,26 +89,12 @@ def _member_table_and_column(member: dict[str, Any]) -> tuple[Path, str]:
     return table_path, feature_column
 
 
-def _candidate_table_and_column(
-    worker_brief: dict[str, Any], worker_roundup: dict[str, Any]
-) -> tuple[Path, str]:
-    results = worker_roundup.get("results") or {}
-    worker_dir = Path(str(worker_roundup.get("worker_dir") or ""))
-    table_path = _resolve_artifact(
-        worker_dir, (results.get("artifacts") or {}).get("donor_feature_table")
-    )
-    if table_path is None or not table_path.exists():
-        conventional = worker_dir / "sandbox" / "donor_feature_table.csv"
-        table_path = conventional if conventional.exists() else None
-    if table_path is None:
-        raise FileNotFoundError("Candidate worker did not produce donor_feature_table.csv")
-
+def _candidate_table_and_column(worker_brief: dict[str, Any], worker_roundup: dict[str, Any]) -> tuple[Path, str]:
+    table_path = Path(str(worker_roundup.get("worker_dir") or "")) / "sandbox" / TABLE_NAME
+    if not table_path.exists():
+        raise FileNotFoundError(f"Candidate worker did not produce {TABLE_NAME}")
     canonical = str(worker_brief.get("baseline_variation") or "").strip()
     table = pd.read_csv(table_path, nrows=2, dtype={"donor_id": str})
-    if canonical not in table.columns:
-        fallback = str(results.get("feature_column") or "").strip()
-        if fallback in table.columns:
-            canonical = fallback
     if canonical not in table.columns:
         raise ValueError(
             f"Pre-specified primary variation {canonical!r} is not a donor-table column"
@@ -128,11 +122,12 @@ def _load_feature_frame(
 def _merge_panel(
     cohort: pd.DataFrame,
     members: list[dict[str, Any]],
+    run_root: Path | None,
 ) -> tuple[pd.DataFrame, list[str]]:
     merged = cohort.copy()
     feature_columns: list[str] = []
     for index, member in enumerate(members, start=1):
-        table_path, source_column = _member_table_and_column(member)
+        table_path, source_column = _member_table_and_column(member, run_root)
         output_column = f"panel_{index:02d}__{_slug(source_column)}"
         frame = _load_feature_frame(table_path, source_column, output_column)
         merged = merged.merge(frame, on="donor_id", how="left", validate="one_to_one")
@@ -189,7 +184,8 @@ def _variation_redundancy(
     table_path: Path, columns: list[str]
 ) -> tuple[dict[str, float], list[list[str]], int]:
     """Pairwise Pearson r between the screened variations, the near-duplicate pairs (|r| > 0.95),
-    and the number of distinct (non-near-duplicate) variations — reported for multiplicity accounting."""
+    and the number of distinct (non-near-duplicate) variations. Reported only: no gate or
+    threshold is adjusted for the number of variations screened."""
     if len(columns) < 2:
         return {}, [], len(columns)
     table = pd.read_csv(table_path, usecols=["donor_id", *columns], dtype={"donor_id": str}).replace([np.inf, -np.inf], np.nan)
@@ -285,8 +281,10 @@ def review_candidate(
     spec: ProblemSpec,
     round_dir: str | Path,
     config: PredictivePanelConfig,
+    run_root: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Evaluate add/replace actions against the frozen current panel."""
+    """Evaluate add/replace actions against the frozen current panel. run_root is the
+    run folder the accepted members' paths are recorded relative to."""
     primary_outcome = spec.outcome
     covariates = list(spec.covariates)
     round_dir = Path(round_dir)
@@ -302,7 +300,9 @@ def review_candidate(
     if not cohort[primary_outcome].notna().all():
         raise ValueError("Discovery cohort contains missing outcomes")
     current_members = [dict(member) for member in accepted_panel.get("members", [])]
-    current_frame, current_columns = _merge_panel(cohort, current_members)
+    current_frame, current_columns = _merge_panel(
+        cohort, current_members, Path(run_root) if run_root is not None else None
+    )
 
     candidate_path, primary_column = _candidate_table_and_column(
         worker_brief, worker_roundup
@@ -326,6 +326,11 @@ def review_candidate(
     variation_summaries: list[dict[str, Any]] = []
     base_results = dict(worker_roundup.get("results") or {})
     comparison: dict[str, Any] | None = None
+    # The current panel's CV predictions are the same for every variation and action.
+    baseline = panel_cv_predictions(
+        panel_frame, outcome_column=primary_outcome, covariates=covariates,
+        feature_columns=current_columns, config=config,
+    )
 
     # Every pre-specified variation is judged (and counted as a screened candidate); the
     # best eligible one across variations x actions is admitted. Primary is listed first.
@@ -379,6 +384,7 @@ def review_candidate(
                 baseline_feature_columns=current_columns,
                 candidate_feature_columns=action["proposed_columns"],
                 config=config,
+                baseline=baseline,
             )
             fields = predictive_result_fields(comparison)
             coverage_passed = coverage >= config.min_candidate_coverage
@@ -391,7 +397,8 @@ def review_candidate(
                     "predictive_validation_passed": eligible,
                     "artifacts": {
                         **(base_results.get("artifacts") or {}),
-                        "donor_feature_table": str(candidate_path),
+                        # the sandbox path: valid wherever the run folder is moved
+                        "donor_feature_table": f"/scratch/{TABLE_NAME}",
                     },
                 }
             )
@@ -575,14 +582,4 @@ def review_candidate(
             if keep
             else 0.0
         ),
-        "action_reviews": [
-            {key: value for key, value in review.items() if key != "evaluation"}
-            for review in action_reviews
-        ],
-        "artifacts": {
-            "review": str(review_artifact),
-            "repeat_metrics": str(round_dir / "predictive_cv_repeat_metrics.csv"),
-            "predictions": str(round_dir / "predictive_cv_predictions.csv"),
-            "tuning": str(round_dir / "predictive_cv_tuning.csv"),
-        },
     }

@@ -10,6 +10,10 @@ import { Textarea } from "@/components/ui/textarea"
 import { Progress } from "@/components/ui/progress"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription,
+  AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { cn } from "@/utils/common/twMerge"
 import { useDispatch, useSelector } from "react-redux"
 import { useActiveSlidePath } from "@/utils/viewer/slidePath";
@@ -19,26 +23,36 @@ import { formatPath } from "@/utils/common/path.utils"
 import { CTRL_SERVICE_API_ENDPOINT } from "@/config/api.config"
 import { getAuthToken } from "@/utils/common/authToken"
 import {
-  isResearchCancelling,
-  isResearchRunning,
-  transitionResearchPhase,
-  type ResearchPhase,
-} from "@/utils/agent/research/phaseStateMachine"
-import {
   appendJournalEntry,
+  detachedEndState,
+  ensureRound,
   failPendingProposer,
+  requestErrorMessage,
+  roundIdOf,
   stopRunningRows,
   stopRunningScout,
+  withWorker,
+  type EndState,
   type JournalEntry,
   type RoundState,
   type ScoutState,
 } from "./researchRunState"
+import { ErrorBox, StatusDot, formatClock, renderMarkdown, workerLabel } from "./researchView"
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 const SCOUT_IDLE: ScoutState = { status: "idle", calls: [] }
+// A cancel request that hangs is given up on (the stream still tells when the run stops).
 const CANCEL_TIMEOUT_MS = 15_000
+// Stopping waits for the step in progress; after this long the panel says so.
+const STOP_SLOW_MS = 15_000
+// Auto-scroll only when the view is already this close to the bottom.
+const NEAR_BOTTOM_PX = 80
+const DEFAULT_TIME_LIMIT_MIN = 30
 const BUSY_TITLE = "Stop the running research first"
+
+// input → running → (cancelling →) complete
+type Phase = "input" | "running" | "cancelling" | "complete"
 
 type WorkspaceRun = {
   run_id: string
@@ -47,6 +61,10 @@ type WorkspaceRun = {
   updated_at?: string
   rounds: number
   next_round_id: number
+  // the user stopped it (status stays "incomplete": it can be resumed)
+  stopped?: boolean
+  // the run's research question, when the service lists it
+  question?: string
 }
 
 type ResumeInfo = {
@@ -55,63 +73,13 @@ type ResumeInfo = {
   nextRoundId: number
 }
 
-// ─── Lightweight markdown renderer ───────────────────────────────────────────
-
-function renderMarkdown(text: string): React.ReactNode[] {
-  const elements: React.ReactNode[] = []
-  const lines = text.split("\n")
-  let bullets: string[] = []
-  let key = 0
-
-  const flush = () => {
-    if (bullets.length === 0) return
-    elements.push(
-      <ul key={key++} className="list-disc list-outside pl-4 space-y-0.5 my-1">
-        {bullets.map((b, i) => <li key={i}>{inlineFormat(b)}</li>)}
-      </ul>
-    )
-    bullets = []
-  }
-
-  for (const line of lines) {
-    const t = line.trim()
-    if (t.startsWith("## ")) {
-      flush()
-      elements.push(<h2 key={key++} className="text-sm font-bold text-foreground mt-3 mb-1 first:mt-0">{inlineFormat(t.slice(3))}</h2>)
-    } else if (t.startsWith("# ")) {
-      flush()
-      elements.push(<h1 key={key++} className="text-base font-bold text-foreground mt-3 mb-1 first:mt-0">{inlineFormat(t.slice(2))}</h1>)
-    } else if (t.startsWith("### ")) {
-      flush()
-      elements.push(<h3 key={key++} className="text-xs font-semibold text-foreground mt-2 mb-0.5">{inlineFormat(t.slice(4))}</h3>)
-    } else if (t.startsWith("- ") || t.startsWith("* ")) {
-      bullets.push(t.slice(2))
-    } else if (t === "---") {
-      flush()
-      elements.push(<hr key={key++} className="my-2 border-border" />)
-    } else if (t.length > 0) {
-      flush()
-      elements.push(<p key={key++} className="my-0.5">{inlineFormat(line)}</p>)
-    } else {
-      flush()
-    }
-  }
-  flush()
-  return elements
+const END_LABEL: Record<EndState, { text: string; className: string }> = {
+  finished: { text: "Finished", className: "bg-primary/10 text-primary border-primary/30" },
+  stopped: { text: "Stopped", className: "bg-muted text-muted-foreground border-border" },
+  incomplete: { text: "Incomplete", className: "bg-amber-50 text-amber-700 border-amber-200" },
 }
-
-function inlineFormat(text: string): React.ReactNode {
-  // Split on inline patterns: **bold**, *italic*, `code`
-  const parts = text.split(/(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/g)
-  return parts.map((seg, i) => {
-    if (seg.startsWith("**") && seg.endsWith("**"))
-      return <strong key={i} className="font-semibold">{seg.slice(2, -2)}</strong>
-    if (seg.startsWith("*") && seg.endsWith("*") && seg.length >= 3)
-      return <em key={i}>{seg.slice(1, -1)}</em>
-    if (seg.startsWith("`") && seg.endsWith("`"))
-      return <code key={i} className="px-1 py-0.5 rounded bg-muted text-foreground font-mono text-[10px]">{seg.slice(1, -1)}</code>
-    return seg
-  })
+const RUN_STATUS_LABEL: Record<WorkspaceRun["status"], string> = {
+  running: "Running", completed: "Finished", incomplete: "Incomplete",
 }
 
 // ─── Component ───────────────────────────────────────────────────────────────
@@ -122,18 +90,20 @@ export const CoscientistPanel: React.FC = () => {
   const { allowed: pathWritable, tooltip: writeBlockTitle } = usePathWriteAccess(currentPath);
   const selectedAgent = useSelector((state: RootState) => state.agent.selectedAgent)
 
-  // Phase state machine: input → running → cancelling → complete
-  const [phase, setPhase] = useState<ResearchPhase>("input")
+  const [phase, setPhase] = useState<Phase>("input")
+  // For the auto-reattach, which decides after its request returns.
+  const phaseRef = useRef(phase)
+  useEffect(() => { phaseRef.current = phase }, [phase])
 
   // Input state
   // The research program in plain words (or problem.md with its header); the service works out the rest.
   const [program, setProgram] = useState("")
   const [formResetKey, setFormResetKey] = useState(0)
   const [rounds, setRounds] = useState(3)
-  // Hypotheses (and parallel workers, one sandbox each) per round; at most one is admitted.
+  // Hypotheses (and parallel workers) per round; at most one is admitted.
   const [workersPerRound, setWorkersPerRound] = useState(1)
   const [reasoningEffort, setReasoningEffort] = useState<"low" | "medium" | "high">("high")
-  const [workerTimeLimitMin, setWorkerTimeLimitMin] = useState(30)
+  const [workerTimeLimitMin, setWorkerTimeLimitMin] = useState(DEFAULT_TIME_LIMIT_MIN)
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [datasetScout, setDatasetScout] = useState(true)
 
@@ -146,6 +116,8 @@ export const CoscientistPanel: React.FC = () => {
 
   // Run state
   const [currentRound, setCurrentRound] = useState<RoundState | null>(null)
+  // The round as of the last event (events update it in order; the journal reads it).
+  const roundRef = useRef<RoundState | null>(null)
   const [journal, setJournal] = useState<JournalEntry[]>([])
   const [error, setError] = useState<string | null>(null)
   const [selectedWorker, setSelectedWorker] = useState<string | null>(null)
@@ -154,41 +126,76 @@ export const CoscientistPanel: React.FC = () => {
   const [finalSummary, setFinalSummary] = useState<string | null>(null)
   const [expandedJournalIdx, setExpandedJournalIdx] = useState<number | null>(null)
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
+  const [endState, setEndState] = useState<EndState | null>(null)
+  // Stop pressed a while ago and the run has not confirmed yet.
+  const [stopSlow, setStopSlow] = useState(false)
+  const [confirmKind, setConfirmKind] = useState<"stop" | "discard" | null>(null)
+  // The column the run in view predicts (the service picks it at start).
+  const [outcome, setOutcome] = useState<string | null>(null)
+  // The run's planned rounds and per-worker time limit (seconds; unknown for a reopened run).
+  const plannedRoundsRef = useRef(rounds)
+  const [runLimitSec, setRunLimitSec] = useState<number | null>(null)
+  const [now, setNow] = useState(() => Date.now())
 
   const scrollRef = useRef<HTMLDivElement>(null)
+  const scrollPendingRef = useRef(false)
   const abortRef = useRef<AbortController | null>(null)
   // Bumped whenever the view changes run (start, resume, history, new task, unmount):
   // a stream or request begun under an older token must not write state.
   const runTokenRef = useRef(0)
-  // The token Stop was pressed under: the aborted stream then rejects, and that is not an error.
+  // The token Stop was pressed under, and the last token whose run ended in view.
   const stoppedTokenRef = useRef(-1)
-  const roundSummaryRef = useRef<string>("")
+  const endedTokenRef = useRef(-1)
+  const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const runsSeqRef = useRef(0)
-  // The program box: typed into since the last reset (a slow pre-fill must not overwrite
-  // it), and the newest pre-fill request (only it may write).
+  // The program box: typed into since the last reset or save (a slow pre-fill must not
+  // overwrite it, and "+" asks first), and the newest pre-fill request (only it may write).
   const programTypedRef = useRef(false)
   const programSeqRef = useRef(0)
-  // The cohort column the run in view predicts (the service picks it at start).
-  const [outcome, setOutcome] = useState<string | null>(null)
 
   const workspacePath = formatPath(currentPath ?? "")
   // The open slide's folder; formatPath yields "\\" separators on Windows.
   const workspaceDir = workspacePath ? workspacePath.replace(/[\\/][^\\/]+$/, "") || workspacePath : ""
 
-  // A new run in view: drop the old stream (if any) and hand out a fresh token.
-  const beginRun = () => {
+  const updateRound = (next: RoundState | null | ((prev: RoundState | null) => RoundState | null)) => {
+    roundRef.current = typeof next === "function" ? next(roundRef.current) : next
+    setCurrentRound(roundRef.current)
+  }
+
+  const clearStopTimer = () => {
+    if (stopTimerRef.current) clearTimeout(stopTimerRef.current)
+    stopTimerRef.current = null
+  }
+
+  // A new run in view (or none): drop the old stream, clear what it showed, and hand
+  // out a fresh token. The one reset for "+", the history, "New Research Task", start and resume.
+  const resetView = () => {
     abortRef.current?.abort()
     abortRef.current = null
-    roundSummaryRef.current = ""
+    clearStopTimer()
+    updateRound(null)
+    setJournal([])
+    setError(null)
+    setSelectedWorker(null)
+    setExpandedJournalIdx(null)
+    setRoundPhase(null)
+    setScout(SCOUT_IDLE)
+    setFinalSummary(null)
+    setActiveRunId(null)
+    setResumeInfo(null)
+    setOutcome(null)
+    setEndState(null)
+    setStopSlow(false)
+    setConfirmKind(null)
     return ++runTokenRef.current
   }
-  const isStale = (token: number) => token !== runTokenRef.current || stoppedTokenRef.current === token
 
   // Unmounted (e.g. the header switched to Agent): stop listening; the run itself
-  // goes on and can be reopened from the history.
+  // goes on and is reopened when the panel comes back.
   useEffect(() => () => {
     runTokenRef.current++
     abortRef.current?.abort()
+    clearStopTimer()
   }, [])
 
   // ─── API helpers ─────────────────────────────────────────────────────────
@@ -206,13 +213,14 @@ export const CoscientistPanel: React.FC = () => {
 
   // ─── Runs ────────────────────────────────────────────────────────────────
 
-  const fetchWorkspaceRuns = useCallback(async () => {
+  /** This folder's runs; null when a newer request (or another folder) took over. */
+  const fetchWorkspaceRuns = useCallback(async (): Promise<WorkspaceRun[] | null> => {
     // Only the newest request (this folder) may write the list.
     const seq = ++runsSeqRef.current
     if (!workspaceDir) {
       setWorkspaceRuns([])
       setRunsLoading(false)
-      return
+      return []
     }
     setRunsLoading(true)
     let runs: WorkspaceRun[] = []
@@ -223,13 +231,28 @@ export const CoscientistPanel: React.FC = () => {
       )
       if (res.ok && res.data?.code === 0) runs = (res.data.data?.runs || []) as WorkspaceRun[]
     } catch {}
-    if (seq !== runsSeqRef.current) return
+    if (seq !== runsSeqRef.current) return null
     setWorkspaceRuns(runs)
     setRunsLoading(false)
+    return runs
   }, [authedFetch, workspaceDir])
   // For callbacks that outlive a render (a run's stream, Stop): always this folder's.
   const fetchRunsRef = useRef(fetchWorkspaceRuns)
   fetchRunsRef.current = fetchWorkspaceRuns
+
+  // The run in view ended (once per token): settle what still spins and say how it ended.
+  const endRun = (token: number, end: EndState | null) => {
+    if (token !== runTokenRef.current || endedTokenRef.current === token) return
+    endedTokenRef.current = token
+    clearStopTimer()
+    setStopSlow(false)
+    setActiveRunId(null)
+    updateRound(stopRunningRows)
+    setScout(stopRunningScout)
+    setPhase("complete")
+    setEndState(end)
+    void fetchRunsRef.current()
+  }
 
   const loadWorkspaceRun = async (runRootPath: string, token: number) => {
     let payload: any
@@ -243,19 +266,19 @@ export const CoscientistPanel: React.FC = () => {
     } catch {
       return
     }
-    if (isStale(token)) return
+    if (token !== runTokenRef.current) return
     setJournal((payload.journal || []) as JournalEntry[])
     setFinalSummary(payload.final_summary || null)
     setOutcome(payload.outcome || null)
-    setCurrentRound(null)
-    setActiveRunId(null)
-    setRoundPhase(null)
+    plannedRoundsRef.current = payload.rounds || 1
+    setRunLimitSec(null)
     setResumeInfo(payload.status === "incomplete"
       ? { runId: payload.run_id, runRootPath: payload.run_root_path, nextRoundId: payload.next_round_id }
       : null)
     // offer the rounds the run still had planned
     setResumeRounds(Math.max(1, (payload.rounds || 1) - (payload.next_round_id || 1) + 1))
     if (payload.status !== "running" || !payload.run_id) {
+      setEndState(payload.status === "completed" ? "finished" : payload.stopped ? "stopped" : "incomplete")
       setPhase("complete")
       return
     }
@@ -263,14 +286,17 @@ export const CoscientistPanel: React.FC = () => {
     setActiveRunId(payload.run_id)
     setPhase("running")
     try {
-      await consumeStream(payload.run_id, token, true)
+      await consumeStream(payload.run_id, token, true, payload.run_root_path)
     } catch {
-      if (isStale(token)) return
       // Gone after all: what was loaded stays.
-      setActiveRunId(null)
-      setCurrentRound(stopRunningRows)
-      setPhase("complete")
+      endRun(token, stoppedTokenRef.current === token ? "stopped" : null)
     }
+  }
+
+  const openRun = (runRootPath: string) => {
+    const token = resetView()
+    setShowHistory(false)
+    void loadWorkspaceRun(runRootPath, token)
   }
 
   const resumeResearch = async () => {
@@ -279,40 +305,51 @@ export const CoscientistPanel: React.FC = () => {
       setError(writeBlockTitle || 'Not allowed here.')
       return
     }
-    const token = beginRun()
-    const { runRootPath, nextRoundId } = resumeInfo
-    setError(null)
+    const info = resumeInfo
+    const keptJournal = journal.filter(j => j.roundId < info.nextRoundId)
+    const keptOutcome = outcome
+    const token = resetView()
     setPhase("running")
     // The rounds done so far stay in the journal; the resumed run adds to them.
-    setJournal(prev => prev.filter(j => j.roundId < nextRoundId))
-    setCurrentRound(null)
-    setScout(SCOUT_IDLE)
-    setFinalSummary(null)
-    setActiveRunId(null)
+    setJournal(keptJournal)
+    setOutcome(keptOutcome)
+    plannedRoundsRef.current = info.nextRoundId - 1 + resumeRounds
+    setRunLimitSec(null)
 
     try {
       const res = await authedFetch(`${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/runs/resume`, {
         method: "POST",
-        body: JSON.stringify({ run_root_path: runRootPath, additional_rounds: resumeRounds }),
+        body: JSON.stringify({ run_root_path: info.runRootPath, additional_rounds: resumeRounds }),
       })
-      if (!res.ok || res.data?.code !== 0) throw new Error(res.data?.message || "Failed to resume run")
+      if (!res.ok || res.data?.code !== 0) throw new Error(requestErrorMessage(res.data, "Couldn't resume the run"))
       const runId = res.data.data?.run_id
       if (!runId) throw new Error("Run ID missing")
       if (cancelIfStopped(runId, token)) return
-      setOutcome(res.data.data?.outcome || null)
-      setResumeInfo(null)
+      setOutcome(res.data.data?.outcome || keptOutcome)
       setActiveRunId(runId)
       await consumeStream(runId, token)
     } catch (err: any) {
-      if (isStale(token)) return
+      if (token !== runTokenRef.current || endedTokenRef.current === token) return
+      if (stoppedTokenRef.current === token) return endRun(token, "stopped")
       setError(err.message)
-      setCurrentRound(stopRunningRows)
-      setScout(stopRunningScout)
-      setPhase("complete")
+      // still resumable
+      setResumeInfo(info)
+      endRun(token, null)
     }
   }
 
-  useEffect(() => { fetchWorkspaceRuns() }, [fetchWorkspaceRuns])
+  // On a new workspace (and when the panel comes back): list its runs, and watch the
+  // one still running there, as if it were picked from the history.
+  useEffect(() => {
+    let live = true
+    void fetchWorkspaceRuns().then(runs => {
+      const running = runs?.find(r => r.status === "running")
+      if (!live || !running || phaseRef.current !== "input" || programTypedRef.current) return
+      openRun(running.run_root_path)
+    })
+    return () => { live = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fetchWorkspaceRuns])
 
   // Pre-fill the program from the workspace's problem.md (the last run's), on a new
   // workspace and on "+".
@@ -344,15 +381,11 @@ export const CoscientistPanel: React.FC = () => {
       setError(writeBlockTitle || 'Not allowed here.')
       return
     }
-    const token = beginRun()
-    setError(null)
+    const savedResume = resumeInfo
+    const token = resetView()
     setPhase("running")
-    setJournal([])
-    setCurrentRound(null)
-    setScout(SCOUT_IDLE)
-    setFinalSummary(null)
-    setActiveRunId(null)
-    setOutcome(null)
+    plannedRoundsRef.current = rounds
+    setRunLimitSec(workerTimeLimitMin * 60)
     let started = false
 
     try {
@@ -368,22 +401,25 @@ export const CoscientistPanel: React.FC = () => {
           dataset_scout: datasetScout,
         }),
       })
-      if (!res.ok || res.data?.code !== 0) throw new Error(res.data?.message || "Failed to start run")
+      if (!res.ok || res.data?.code !== 0) throw new Error(requestErrorMessage(res.data, "Failed to start run"))
 
       const runId = res.data.data?.run_id
       if (!runId) throw new Error("Run ID missing")
       if (cancelIfStopped(runId, token)) return
       started = true
+      // saved as problem.md now: nothing unsaved in the box
+      programTypedRef.current = false
       setOutcome(res.data.data?.outcome || null)
       setActiveRunId(runId)
       await consumeStream(runId, token)
     } catch (err: any) {
-      if (isStale(token)) return
+      if (token !== runTokenRef.current || endedTokenRef.current === token) return
+      if (stoppedTokenRef.current === token) return endRun(token, "stopped")
       setError(err.message)
-      setCurrentRound(stopRunningRows)
-      setScout(stopRunningScout)
+      if (started) return endRun(token, null)
       // Not started (e.g. no column to predict): back to the form, the program as typed.
-      setPhase(started ? "complete" : "input")
+      setResumeInfo(savedResume)
+      setPhase("input")
     }
   }
 
@@ -400,10 +436,29 @@ export const CoscientistPanel: React.FC = () => {
     return token !== runTokenRef.current
   }
 
+  // ─── Auto-scroll ─────────────────────────────────────────────────────────
+
+  // Follow new events only when the view is already at the bottom (reading further up
+  // is not interrupted); at most one scroll per frame.
+  const scheduleScroll = (behavior: ScrollBehavior) => {
+    const el = scrollRef.current
+    if (!el || scrollPendingRef.current) return
+    if (el.scrollHeight - el.scrollTop - el.clientHeight > NEAR_BOTTOM_PX) return
+    scrollPendingRef.current = true
+    const raf = typeof window.requestAnimationFrame === "function"
+      ? window.requestAnimationFrame.bind(window)
+      : (cb: () => void) => setTimeout(cb, 16)
+    raf(() => {
+      scrollPendingRef.current = false
+      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior })
+    })
+  }
+
   // ─── SSE stream consumer ─────────────────────────────────────────────────
 
   // reattach: a run listed as running may have just ended; then its "not found" is no error.
-  const consumeStream = async (runId: string, token: number, reattach = false) => {
+  // runRootPath lets the service report a run it no longer holds (e.g. after a restart).
+  const consumeStream = async (runId: string, token: number, reattach = false, runRootPath?: string) => {
     const authToken = await getAuthToken().catch(() => null)
     const headers: Record<string, string> = { "Content-Type": "application/json" }
     if (authToken) headers["Authorization"] = `Bearer ${authToken}`
@@ -413,7 +468,7 @@ export const CoscientistPanel: React.FC = () => {
     abortRef.current = controller
 
     const response = await fetch(
-      `${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/runs/${runId}/stream`,
+      `${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/runs/${runId}/stream${runRootPath ? `?run_root_path=${encodeURIComponent(runRootPath)}` : ""}`,
       { method: "GET", headers, signal: controller.signal },
     )
     if (!response.ok) throw new Error(`Stream failed: ${response.status}`)
@@ -422,6 +477,8 @@ export const CoscientistPanel: React.FC = () => {
     const decoder = new TextDecoder()
     let buffer = ""
     let seen = false
+    // How the run ended, as its events tell (none: the stream just closed).
+    let ending: EndState | null | undefined
 
     read: while (reader) {
       const { done, value } = await reader.read()
@@ -435,29 +492,51 @@ export const CoscientistPanel: React.FC = () => {
       const lines = buffer.split("\n")
       buffer = lines.pop() || ""
 
+      const events: any[] = []
       for (const line of lines) {
         if (!line.startsWith("data: ")) continue
-        try {
-          const event = JSON.parse(line.substring(6))
-          // the run is gone (finished and forgotten): stay on the loaded snapshot
-          if (reattach && !seen && event.type === "error" && event.message === "Run not found") {
-            controller.abort()
-            break read
-          }
-          seen = true
-          handleEvent(event)
-        } catch {}
+        try { events.push(JSON.parse(line.substring(6))) } catch {}
       }
+      for (const event of events) {
+        // the run is gone (finished and forgotten): stay on the loaded snapshot
+        if (reattach && !seen && event.type === "error" && event.message === "Run not found") {
+          ending = null
+          controller.abort()
+          break read
+        }
+        seen = true
+        if (event.type === "run_cancelled" || event.type === "run_detached") {
+          // The run is over here: stopped, or (reattaching) only on disk now.
+          ending = event.type === "run_cancelled" ? "stopped" : detachedEndState(event.status)
+          controller.abort()
+          break read
+        }
+        if (event.type === "complete") ending = "finished"
+        if (event.type === "error") {
+          // the old service's word for a stop, or any error after Stop: not an error to show
+          if (event.message === "Run cancelled" || stoppedTokenRef.current === token) {
+            ending = "stopped"
+            continue
+          }
+          ending = "incomplete"
+        }
+        handleEvent(event)
+      }
+      // A burst (e.g. a reattach replaying the backlog) jumps; single events glide.
+      if (events.length) scheduleScroll(events.length > 1 ? "auto" : "smooth")
     }
     if (token !== runTokenRef.current) return
-    setActiveRunId(null)
-    setCurrentRound(stopRunningRows)
-    setScout(stopRunningScout)
-    setPhase("complete")
-    void fetchRunsRef.current()
+    endRun(token, ending !== undefined ? ending : stoppedTokenRef.current === token ? "stopped" : "incomplete")
   }
 
   const handleEvent = (event: any) => {
+    // A round's event: make a stub round when its round_started was missed (reattached mid-round).
+    const inRound = (update: (round: RoundState) => RoundState) =>
+      updateRound(prev => {
+        const round = ensureRound(prev, roundIdOf(event), plannedRoundsRef.current)
+        return round ? update(round) : round
+      })
+
     switch (event.type) {
       case "scout_started":
         setScout({ status: "running", calls: [] })
@@ -482,35 +561,42 @@ export const CoscientistPanel: React.FC = () => {
         }
         setScout(prev => event.status === "completed"
           ? { ...prev, status: "done" }
-          : { ...prev, status: "failed", note: event.error || "it finished without writing a guide" })
+          : { ...prev, status: "failed", note: event.error || "it finished without writing them" })
         break
 
       case "round_started":
         setRoundPhase("proposing")
-        setCurrentRound({
+        updateRound({
           roundId: event.round_id,
-          totalRounds: event.total_rounds || rounds,
+          totalRounds: event.total_rounds || plannedRoundsRef.current,
           focus: "",
+          startedAt: Date.now(),
           // The proposer inspects the data first; it is listed with the worker.
-          workers: [{ name: "proposer", question: event.workers > 1 ? `Proposing ${event.workers} different hypotheses` : "Proposing a hypothesis", status: "running", toolCalls: [] }],
+          workers: [{
+            name: "proposer",
+            question: event.workers > 1 ? `Choosing ${event.workers} different ideas to test` : "Choosing an idea to test",
+            status: "running",
+            toolCalls: [],
+            startedAt: Date.now(),
+          }],
         })
         break
 
       case "candidate_proposed":
         // One per worker; the proposer is done once the workers start.
-        setCurrentRound(prev => prev ? {
-          ...prev,
-          focus: prev.focus || event.scientific_question || event.candidate_id || "",
-          workers: prev.workers.map(w => w.name === "proposer"
+        inRound(r => ({
+          ...r,
+          focus: r.focus || event.scientific_question || event.candidate_id || "",
+          workers: r.workers.map(w => w.name === "proposer"
             ? { ...w, summary: [w.summary, event.candidate_id].filter(Boolean).join(", ") } : w),
-        } : prev)
+        }))
         break
 
       case "proposer_failed":
-        setCurrentRound(prev => prev ? {
-          ...prev,
-          workers: prev.workers.map(w => w.name === "proposer" ? { ...w, summary: [w.summary, event.error].filter(Boolean).join("; ") } : w),
-        } : prev)
+        inRound(r => ({
+          ...r,
+          workers: r.workers.map(w => w.name === "proposer" ? { ...w, summary: [w.summary, event.error].filter(Boolean).join("; ") } : w),
+        }))
         break
 
       case "worker_materialize":
@@ -523,100 +609,53 @@ export const CoscientistPanel: React.FC = () => {
 
       case "worker_started":
         setRoundPhase("workers")
-        setCurrentRound(prev => {
-          if (!prev) return prev
-          return {
-            ...prev,
-            workers: [...prev.workers.map(w => w.name === "proposer" && w.status === "running" ? { ...w, status: "completed" as const } : w), {
-              name: event.worker_name,
-              question: event.scientific_question || "",
-              status: "running",
-              toolCalls: [],
-            }],
-          }
-        })
+        inRound(r => withWorker(
+          { ...r, workers: r.workers.map(w => w.name === "proposer" && w.status === "running" ? { ...w, status: "completed" as const } : w) },
+          event.worker_name,
+          w => ({ ...w, question: event.scientific_question || w.question, startedAt: w.startedAt ?? Date.now() }),
+        ))
         break
 
       case "worker_completed":
-        setCurrentRound(prev => {
-          if (!prev) return prev
-          return {
-            ...prev,
-            workers: prev.workers.map(w =>
-              w.name === event.worker_name ? { ...w, status: "completed", summary: event.summary } : w
-            ),
-          }
-        })
-        break
-
       case "worker_failed":
-        setCurrentRound(prev => {
-          if (!prev) return prev
-          return {
-            ...prev,
-            workers: prev.workers.map(w =>
-              w.name === event.worker_name ? { ...w, status: "failed", summary: event.summary } : w
-            ),
-          }
-        })
+        inRound(r => withWorker(r, event.worker_name, w => ({
+          ...w, status: event.type === "worker_completed" ? "completed" : "failed", summary: event.summary,
+        })))
         break
 
       case "worker_tool_call":
-        setCurrentRound(prev => {
-          if (!prev) return prev
-          return {
-            ...prev,
-            workers: prev.workers.map(w =>
-              w.name === event.worker_name
-                ? { ...w, toolCalls: [...w.toolCalls, { turnId: event.turn_id, thought: event.thought || "", command: event.command_preview || "", status: "running" as "running" }] }
-                : w
-            ),
-          }
-        })
+        inRound(r => withWorker(r, event.worker_name, w => ({
+          ...w,
+          toolCalls: [...w.toolCalls, { turnId: event.turn_id, thought: event.thought || "", command: event.command_preview || "", status: "running" }],
+        })))
         break
 
       case "worker_tool_result":
-        setCurrentRound(prev => {
-          if (!prev) return prev
-          return {
-            ...prev,
-            workers: prev.workers.map(w =>
-              w.name === event.worker_name
-                ? {
-                    ...w,
-                    toolCalls: w.toolCalls.map((tc, i) =>
-                      i === w.toolCalls.length - 1
-                        ? { ...tc, exitCode: event.exit_code, status: (event.exit_code === 0 ? "done" : "error") as "done" | "error" }
-                        : tc
-                    ),
-                  }
-                : w
-            ),
-          }
-        })
+        inRound(r => withWorker(r, event.worker_name, w => ({
+          ...w,
+          toolCalls: w.toolCalls.map((tc, i) =>
+            i === w.toolCalls.length - 1
+              ? { ...tc, exitCode: event.exit_code, status: event.exit_code === 0 ? "done" : "error" }
+              : tc
+          ),
+        })))
         break
 
       case "round_summary":
-        roundSummaryRef.current = event.summary || ""
         setRoundPhase("done")
-        setCurrentRound(failPendingProposer)
+        inRound(r => ({ ...failPendingProposer(r)!, summary: event.summary || "" }))
         break
 
-      case "round_completed":
+      case "round_completed": {
         setRoundPhase(null)
-        {
-          const savedSummary = roundSummaryRef.current
-          roundSummaryRef.current = ""
-          setCurrentRound(prev => {
-            setJournal(jPrev => appendJournalEntry(jPrev, {
-              roundId: prev?.roundId || event.round_id,
-              focus: prev?.focus || "",
-              summary: savedSummary,
-            }))
-            return prev
-          })
-        }
+        const round = roundRef.current
+        setJournal(prev => appendJournalEntry(prev, {
+          roundId: round?.roundId || event.round_id,
+          focus: round?.focus || "",
+          summary: round?.summary || "",
+        }))
         break
+      }
 
       case "complete":
         setActiveRunId(null)
@@ -626,42 +665,67 @@ export const CoscientistPanel: React.FC = () => {
       case "error":
         setActiveRunId(null)
         setError(event.message)
-        setPhase("complete")
         break
     }
-
-    // Auto-scroll
-    setTimeout(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }), 50)
   }
 
+  // ─── Stop ────────────────────────────────────────────────────────────────
+
+  // Stop waits for the run to say it stopped (run_cancelled, or its stream closing):
+  // until then the panel shows "Stopping" and keeps listening.
   const stopResearch = () => {
-    if (phase === "cancelling") return
+    if (phase !== "running") return
     const runId = activeRunId
     const token = runTokenRef.current
-    setPhase(transitionResearchPhase(phase, "STOP"))
     stoppedTokenRef.current = token
-    abortRef.current?.abort()
-    setCurrentRound(stopRunningRows)
-    setScout(stopRunningScout)
-    if (runId) {
-      void authedFetch(
-        `${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/runs/${runId}/cancel`,
-        // a hung request must not hold the panel in "cancelling"
-        { method: "POST", signal: AbortSignal.timeout(CANCEL_TIMEOUT_MS) },
-      )
-        .catch(() => { /* best effort */ })
-        .finally(() => {
-          void fetchRunsRef.current()   // the stopped run is now resumable from the history
-          if (token !== runTokenRef.current) return   // the view moved on meanwhile
-          setActiveRunId(null)
-          setPhase(transitionResearchPhase("cancelling", "CANCEL_ACK"))
-        })
-      return
-    }
+    setPhase("cancelling")
     // No run id yet: the start / resume request cancels the run when it returns.
-    setActiveRunId(null)
-    setPhase(transitionResearchPhase("cancelling", "CANCEL_ACK"))
+    if (!runId) return endRun(token, "stopped")
+    clearStopTimer()
+    stopTimerRef.current = setTimeout(() => {
+      if (token === runTokenRef.current) setStopSlow(true)
+    }, STOP_SLOW_MS)
+    void authedFetch(
+      `${CTRL_SERVICE_API_ENDPOINT}/agent/v1/discovery/runs/${runId}/cancel`,
+      { method: "POST", signal: AbortSignal.timeout(CANCEL_TIMEOUT_MS) },
+    )
+      .then(res => {
+        // Not active any more: it had already stopped (or finished); nothing more will come.
+        const notActive = res.ok && res.data?.code === 0
+          ? res.data.data?.cancelled === false
+          : /not active/i.test(String(res.data?.message ?? ""))
+        if (!notActive || token !== runTokenRef.current) return
+        abortRef.current?.abort()
+        endRun(token, "stopped")
+      })
+      .catch(() => { /* best effort: the stream still tells when it stops */ })
   }
+
+  // ─── New task ────────────────────────────────────────────────────────────
+
+  // "+": a fresh form, pre-filled again from the workspace's problem.md.
+  const startOver = () => {
+    resetView()
+    setPhase("input")
+    setFormResetKey(k => k + 1)
+  }
+  const requestNewTask = () => {
+    if (phase === "input" && programTypedRef.current && program.trim()) setConfirmKind("discard")
+    else startOver()
+  }
+
+  // ─── Elapsed time ────────────────────────────────────────────────────────
+
+  const isRunning = phase === "running"
+  const isCancelling = phase === "cancelling"
+  // A run is live: switching the view away is disabled until it ends or is stopped.
+  const busy = isRunning || isCancelling
+
+  useEffect(() => {
+    if (!isRunning) return
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [isRunning])
 
   // ─── Helpers ─────────────────────────────────────────────────────────────
 
@@ -676,6 +740,16 @@ export const CoscientistPanel: React.FC = () => {
     return `${Math.floor(hrs / 24)}d ago`
   }
 
+  // A history entry's title: its question's first line, else when it last ran.
+  const runTitle = (run: WorkspaceRun) => {
+    const question = run.question?.trim().split("\n")[0]
+    if (question) return question
+    const t = run.updated_at ? Date.parse(run.updated_at) : NaN
+    return Number.isNaN(t)
+      ? "Research run"
+      : `Run of ${new Date(t).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`
+  }
+
   const progressPercent = currentRound
     ? ((currentRound.roundId - 1 + currentRound.workers.filter(w => w.status !== "running").length / Math.max(currentRound.workers.length, 1)) / currentRound.totalRounds) * 100
     : 0
@@ -686,13 +760,15 @@ export const CoscientistPanel: React.FC = () => {
                 <div className="flex items-start gap-2">
                   <RotateCcw className="h-3.5 w-3.5 text-primary mt-0.5 shrink-0" />
                   <div className="flex-1 min-w-0">
-                    <div className="text-xs font-semibold text-primary">Incomplete run detected</div>
+                    <div className="text-xs font-semibold text-primary">A previous run in this folder didn&apos;t finish. Resume it?</div>
                     <div className="text-[11px] text-muted-foreground mt-0.5">
-                      Run <span className="font-mono">{resumeInfo.runId.slice(-8)}</span> stopped at round {resumeInfo.nextRoundId - 1}.
-                      Resume from round {resumeInfo.nextRoundId}.
+                      It continues from round {resumeInfo.nextRoundId}.
                     </div>
                   </div>
                   <button
+                    type="button"
+                    aria-label="Dismiss"
+                    title="Hide this for now"
                     className="text-[10px] text-muted-foreground hover:text-foreground"
                     onClick={() => setResumeInfo(null)}
                   >✕</button>
@@ -720,13 +796,10 @@ export const CoscientistPanel: React.FC = () => {
               </div>
   )
 
-  const isRunning = isResearchRunning(phase)
-  const isCancelling = isResearchCancelling(phase)
-  // A run is live: switching the view away is disabled until it ends or is stopped.
-  const busy = isRunning || isCancelling
   // Each worker's own end does not end the stage: the judge starts once none is left running.
   const stage = (roundPhase === "workers" || roundPhase === "materializing") && currentRound && !currentRound.workers.some(w => w.status === "running")
     ? "evaluating" : roundPhase
+  const analyses = currentRound?.workers.filter(w => w.name !== "proposer").length ?? 0
 
   // ─── Render ──────────────────────────────────────────────────────────────
 
@@ -740,33 +813,37 @@ export const CoscientistPanel: React.FC = () => {
             <div className="w-6 h-6 rounded-full bg-primary/15 flex items-center justify-center">
               <FlaskConical className="h-3.5 w-3.5 text-primary" />
             </div>
-            <Select value={selectedAgent} onValueChange={(value: AgentName) => { if (value !== selectedAgent) dispatch(setSelectedAgent(value)) }}>
-              <SelectTrigger className="h-7 w-[170px] border border-border/50 shadow-sm bg-background text-sm font-medium text-foreground hover:bg-muted/50 focus:ring-1 focus:ring-primary/30">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="TLAgent">Agent</SelectItem>
-                <SelectItem value="TL Coscientist">Research</SelectItem>
-              </SelectContent>
-            </Select>
+            {/* Locked while a run is live: leaving would unmount this panel mid-run. */}
+            <span title={busy ? BUSY_TITLE : undefined}>
+              <Select disabled={busy} value={selectedAgent} onValueChange={(value: AgentName) => { if (value !== selectedAgent) dispatch(setSelectedAgent(value)) }}>
+                <SelectTrigger className="h-7 w-[170px] border border-border/50 shadow-sm bg-background text-sm font-medium text-foreground hover:bg-muted/50 focus:ring-1 focus:ring-primary/30">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="TLAgent">Agent</SelectItem>
+                  <SelectItem value="TL Coscientist">Research</SelectItem>
+                </SelectContent>
+              </Select>
+            </span>
           </div>
           <div className="flex items-center gap-1.5">
-            {(isRunning || isCancelling) && (
+            {busy && (
               <Button
                 variant="ghost"
                 size="sm"
                 className="h-7 px-2 text-red-500 hover:text-red-600 hover:bg-red-50"
-                onClick={stopResearch}
+                onClick={() => setConfirmKind("stop")}
                 disabled={isCancelling}
               >
                 <Square className="h-3.5 w-3.5 mr-1" />
-                <span className="text-xs">{isCancelling ? "Stopping..." : "Stop"}</span>
+                <span className="text-xs">{isCancelling ? "Stopping…" : "Stop"}</span>
               </Button>
             )}
-            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="Run history" onClick={() => { if (!showHistory) void fetchWorkspaceRuns(); setShowHistory(!showHistory) }}>
-              <History className="h-4 w-4" />
+            <Button variant="ghost" size="sm" className="h-7 px-2" aria-label="Run history" title="History" onClick={() => { if (!showHistory) void fetchWorkspaceRuns(); setShowHistory(!showHistory) }}>
+              <History className="h-4 w-4 mr-1" />
+              <span className="text-xs">History</span>
             </Button>
-            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="New research task" disabled={busy} title={busy ? BUSY_TITLE : undefined} onClick={() => { beginRun(); setPhase("input"); setFormResetKey(k => k + 1); setCurrentRound(null); setJournal([]); setError(null); setResumeInfo(null); setActiveRunId(null); setScout(SCOUT_IDLE); setFinalSummary(null); }}>
+            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="New research task" disabled={busy} title={busy ? BUSY_TITLE : "New research task"} onClick={requestNewTask}>
               <Plus className="h-4 w-4" />
             </Button>
           </div>
@@ -777,6 +854,9 @@ export const CoscientistPanel: React.FC = () => {
           <div className="mt-2 space-y-1">
             <div className="flex justify-between text-[10px] text-muted-foreground">
               <span>Round {currentRound.roundId}/{currentRound.totalRounds}</span>
+              {currentRound.startedAt !== undefined && (
+                <span title="Time spent on this round">{formatClock(now - currentRound.startedAt)}</span>
+              )}
             </div>
             <Progress value={progressPercent} className="h-1.5 bg-primary/10 [&>div]:bg-primary" />
           </div>
@@ -788,36 +868,28 @@ export const CoscientistPanel: React.FC = () => {
         {/* Workspace runs dropdown */}
         {showHistory && (
           <div className="border-b border-border bg-muted/30 px-4 py-2">
-            <div className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5">Workspace Runs</div>
+            <div className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5">Runs in this folder</div>
             {runsLoading && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
             {!runsLoading && workspaceRuns.length === 0 && (
-              <div className="text-xs text-muted-foreground py-1">No autoresearch runs found in this workspace</div>
+              <div className="text-xs text-muted-foreground py-1">No research runs in this folder yet</div>
             )}
             <div className="space-y-0.5 max-h-40 overflow-y-auto">
               {workspaceRuns.map(run => (
                 <button
                   key={run.run_root_path}
+                  type="button"
+                  data-run-id={run.run_id}
                   className={cn(
                     "w-full text-left px-2 py-1 rounded text-xs hover:bg-muted transition-colors disabled:opacity-50 disabled:hover:bg-transparent",
                     run.run_id === activeRunId ? "bg-primary/10 text-primary" : "text-muted-foreground"
                   )}
                   disabled={busy}
                   title={busy ? BUSY_TITLE : undefined}
-                  onClick={() => {
-                    const token = beginRun()
-                    setShowHistory(false)
-                    setCurrentRound(null)
-                    setJournal([])
-                    setFinalSummary(null)
-                    setError(null)
-                    setScout(SCOUT_IDLE)
-                    setResumeInfo(null)
-                    void loadWorkspaceRun(run.run_root_path, token)
-                  }}
+                  onClick={() => openRun(run.run_root_path)}
                 >
                   <div className="flex items-center justify-between gap-2">
-                    <span className="truncate">{run.run_id}</span>
-                    <span className="text-[10px] uppercase tracking-wider">{run.status}</span>
+                    <span className="truncate">{runTitle(run)}</span>
+                    <span className="text-[10px] uppercase tracking-wider shrink-0">{run.stopped ? "Stopped" : RUN_STATUS_LABEL[run.status] ?? run.status}</span>
                   </div>
                   <div className="text-[10px] text-muted-foreground mt-0.5">
                     {formatRelativeTime(run.updated_at)}
@@ -838,7 +910,7 @@ export const CoscientistPanel: React.FC = () => {
                 <div className="min-w-0">
                   <div className="text-xs font-medium text-foreground">Workspace</div>
                   <div className="text-[11px] text-muted-foreground font-mono truncate" title={workspaceDir}>{workspaceDir}</div>
-                  <div className="text-[10px] text-muted-foreground mt-0.5">Workers will have read-only access to all files in this folder.</div>
+                  <div className="text-[10px] text-muted-foreground mt-0.5">The research can read every file in this folder; it does not change them.</div>
                 </div>
               </div>
             )}
@@ -878,7 +950,7 @@ export const CoscientistPanel: React.FC = () => {
                   type="number"
                   min={1}
                   max={5}
-                  title="Hypotheses tested side by side each round, each in its own sandbox; the best one is kept"
+                  title="Ideas tested side by side each round; the best one is kept"
                   value={workersPerRound}
                   onChange={e => setWorkersPerRound(Math.max(1, Math.min(5, parseInt(e.target.value) || 1)))}
                   className="w-full h-8 rounded-md border border-border bg-background px-2.5 text-xs font-medium text-foreground focus:border-primary/50 focus:ring-1 focus:ring-primary/20 focus:outline-none"
@@ -901,6 +973,7 @@ export const CoscientistPanel: React.FC = () => {
                       {([["low", "Low", "Fastest"], ["medium", "Medium", "Balanced"], ["high", "High", "Deepest"]] as const).map(([id, label, desc]) => (
                         <button
                           key={id}
+                          type="button"
                           onClick={() => setReasoningEffort(id)}
                           className={cn(
                             "flex-1 py-1.5 rounded-md text-center border transition-colors",
@@ -916,16 +989,17 @@ export const CoscientistPanel: React.FC = () => {
                     </div>
                   </div>
 
-                  {/* Worker time limit */}
+                  {/* Worker time limit: the service needs at least 2 minutes */}
                   <div>
-                    <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1 block">Worker Time Limit</label>
+                    <label htmlFor="worker-time-limit" className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1 block">Worker Time Limit</label>
                     <div className="flex items-center gap-2">
                       <input
+                        id="worker-time-limit"
                         type="number"
-                        min={1}
+                        min={2}
                         max={60}
                         value={workerTimeLimitMin}
-                        onChange={e => setWorkerTimeLimitMin(Math.max(1, Math.min(60, parseInt(e.target.value) || 10)))}
+                        onChange={e => setWorkerTimeLimitMin(Math.max(2, Math.min(60, parseInt(e.target.value) || DEFAULT_TIME_LIMIT_MIN)))}
                         className="w-20 h-8 rounded-md border border-border bg-background px-2.5 text-xs font-medium text-foreground focus:border-primary/50 focus:ring-1 focus:ring-primary/20 focus:outline-none"
                       />
                       <span className="text-xs text-muted-foreground">minutes per worker</span>
@@ -946,11 +1020,7 @@ export const CoscientistPanel: React.FC = () => {
 
             {resumeCard}
 
-            {error && (
-              <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700">
-                {error}
-              </div>
-            )}
+            {error && <ErrorBox>{error}</ErrorBox>}
 
             {/* Start button */}
             <Button
@@ -966,18 +1036,31 @@ export const CoscientistPanel: React.FC = () => {
         )}
 
         {/* ─── PHASE 2: Live Dashboard ────────────────────────────────── */}
-        {(phase === "running" || phase === "cancelling" || phase === "complete") && (
+        {phase !== "input" && (
           <div className="p-4 space-y-3">
-            {outcome && (
-              <div className="text-xs text-muted-foreground">
-                Predicting <b className="font-mono text-foreground">{outcome}</b>
+            {(outcome || (phase === "complete" && endState)) && (
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                {outcome && <span>Predicting <b className="font-mono text-foreground">{outcome}</b></span>}
+                {phase === "complete" && endState && (
+                  <span
+                    data-testid="run-end-state"
+                    className={cn("ml-auto px-2 py-0.5 rounded-full border text-[10px] font-semibold", END_LABEL[endState].className)}
+                  >
+                    {END_LABEL[endState].text}
+                  </span>
+                )}
               </div>
             )}
 
-            {/* Error */}
-            {error && (
-              <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700">
-                {error}
+            {error && <ErrorBox>{error}</ErrorBox>}
+
+            {/* Stopping: the run finishes its current step first */}
+            {isCancelling && (
+              <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-muted/30 border border-border/40">
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-red-500 shrink-0" />
+                <span className="text-xs text-muted-foreground">
+                  {stopSlow ? "Still stopping — the current step is finishing" : "Stopping…"}
+                </span>
               </div>
             )}
 
@@ -1000,7 +1083,7 @@ export const CoscientistPanel: React.FC = () => {
                 <div className="px-3 py-2 bg-muted/30 border-b border-border/40 flex items-center gap-2">
                   <Users className="h-3.5 w-3.5 text-muted-foreground" />
                   <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
-                    Proposer &amp; {currentRound.workers.length > 2 ? "Workers" : "Worker"}
+                    Planning &amp; {analyses > 1 ? "analyses" : "analysis"}
                   </span>
                   <span className="text-[10px] text-muted-foreground ml-auto">
                     {currentRound.workers.filter(w => w.status === "completed").length}/{currentRound.workers.length}
@@ -1009,9 +1092,11 @@ export const CoscientistPanel: React.FC = () => {
                 <div className="divide-y divide-border/30">
                   {currentRound.workers.map(w => {
                     const isSelected = selectedWorker === w.name
+                    const showClock = isRunning && w.status === "running" && w.startedAt !== undefined
                     return (
                       <div key={w.name}>
                         <button
+                          type="button"
                           className={cn(
                             "w-full text-left px-3 py-2 flex items-start gap-2.5 transition-colors",
                             isSelected ? "bg-primary/5" : "hover:bg-muted/30",
@@ -1019,30 +1104,20 @@ export const CoscientistPanel: React.FC = () => {
                           onClick={() => setSelectedWorker(isSelected ? null : w.name)}
                         >
                           <div className="mt-0.5 shrink-0">
-                            {w.status === "running" ? (
-                              <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
-                            ) : w.status === "completed" ? (
-                              <div className="h-3.5 w-3.5 rounded-full bg-primary flex items-center justify-center">
-                                <svg className="h-2 w-2 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                                </svg>
-                              </div>
-                            ) : w.status === "failed" ? (
-                              <div className="h-3.5 w-3.5 rounded-full bg-red-500 flex items-center justify-center">
-                                <svg className="h-2 w-2 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                                </svg>
-                              </div>
-                            ) : (
-                              <div className="h-3.5 w-3.5 rounded-full border-2 border-border" />
-                            )}
+                            <StatusDot status={w.status === "running" ? "running" : w.status === "completed" ? "ok" : w.status === "failed" ? "failed" : "none"} />
                           </div>
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-1.5">
-                              <span className="text-xs font-medium text-foreground">{w.name}</span>
-                              {!isSelected && w.toolCalls.length > 0 && (
-                                <span className="text-[10px] text-muted-foreground/60 ml-auto">{w.toolCalls.length} tool calls</span>
-                              )}
+                              <span className="text-xs font-medium text-foreground">{workerLabel(w.name)}</span>
+                              <span className="ml-auto flex items-center gap-1.5 text-[10px] text-muted-foreground/60">
+                                {showClock && (
+                                  <span title={runLimitSec && w.name !== "proposer" ? "Time spent / time limit" : "Time spent"}>
+                                    {formatClock(now - w.startedAt!)}
+                                    {runLimitSec && w.name !== "proposer" ? ` / ${formatClock(runLimitSec * 1000)}` : ""}
+                                  </span>
+                                )}
+                                {!isSelected && !showClock && w.toolCalls.length > 0 && <span>{w.toolCalls.length} steps</span>}
+                              </span>
                               {isSelected ? <ChevronDown className="h-3 w-3 text-muted-foreground shrink-0" /> : <ChevronRight className="h-3 w-3 text-muted-foreground shrink-0" />}
                             </div>
                             {w.question && (
@@ -1057,35 +1132,19 @@ export const CoscientistPanel: React.FC = () => {
                           <div className="border-t border-border/20 bg-muted/10 px-3 py-2">
                             {w.toolCalls.length === 0 ? (
                               <div className="text-[11px] text-muted-foreground italic">
-                                {w.status === "running" ? "Waiting for first tool call..." : "No tool calls recorded."}
+                                {w.status === "running" ? "Getting started…" : "No steps recorded."}
                               </div>
                             ) : (
                               <div className="space-y-1">
                                 {w.toolCalls.map((tc, i) => (
                                   <div key={i} className="flex items-start gap-2 text-[11px]">
                                     <div className="mt-0.5 shrink-0">
-                                      {tc.status === "running" ? (
-                                        <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
-                                      ) : tc.status === "done" ? (
-                                        <div className="h-3 w-3 rounded-full bg-green-500/80 flex items-center justify-center">
-                                          <svg className="h-1.5 w-1.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                                            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                                          </svg>
-                                        </div>
-                                      ) : tc.status === "stopped" ? (
-                                        <div className="h-3 w-3 rounded-full border-2 border-border" />
-                                      ) : (
-                                        <div className="h-3 w-3 rounded-full bg-red-500/80 flex items-center justify-center">
-                                          <svg className="h-1.5 w-1.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                                            <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                                          </svg>
-                                        </div>
-                                      )}
+                                      <StatusDot size="sm" status={tc.status === "running" ? "running" : tc.status === "done" ? "ok" : tc.status === "stopped" ? "none" : "failed"} />
                                     </div>
                                     <div className="flex-1 min-w-0">
-                                      <span className="text-foreground block">{tc.thought || tc.command || `Turn ${tc.turnId}`}</span>
+                                      <span className="text-foreground block">{tc.thought || tc.command || `Step ${tc.turnId}`}</span>
                                       {tc.exitCode !== undefined && tc.status !== "running" && tc.exitCode !== 0 && (
-                                        <span className="text-[10px] text-red-500">exit {tc.exitCode}</span>
+                                        <span className="text-[10px] text-red-500">this step failed</span>
                                       )}
                                     </div>
                                   </div>
@@ -1106,12 +1165,12 @@ export const CoscientistPanel: React.FC = () => {
               <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-muted/30 border border-border/40">
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-primary shrink-0" />
                 <span className="text-xs text-muted-foreground">
-                  {stage === "proposing" && "Proposer is choosing a hypothesis..."}
-                  {stage === "workers" && ((currentRound?.workers.length ?? 0) > 2
-                    ? "Workers are implementing their plans side by side..."
-                    : "Worker is implementing the plan as result.py...")}
-                  {stage === "materializing" && "Running result.py on every donor and checking it..."}
-                  {stage === "evaluating" && "Judge is scoring the variations with nested cross-validation..."}
+                  {stage === "proposing" && "Planning which idea to test next..."}
+                  {stage === "workers" && (analyses > 1
+                    ? "Carrying out the analyses side by side..."
+                    : "Carrying out the analysis...")}
+                  {stage === "materializing" && "Computing the new feature for every case..."}
+                  {stage === "evaluating" && "Checking whether the new feature improves prediction..."}
                 </span>
               </div>
             )}
@@ -1128,6 +1187,7 @@ export const CoscientistPanel: React.FC = () => {
                     return (
                       <div key={idx}>
                         <button
+                          type="button"
                           className={cn(
                             "w-full text-left px-3 py-2 transition-colors",
                             isExpanded ? "bg-primary/5" : "hover:bg-muted/30"
@@ -1179,7 +1239,7 @@ export const CoscientistPanel: React.FC = () => {
               <Button
                 variant="outline"
                 className="w-full h-9 text-xs border-primary/30 text-primary hover:bg-primary/5"
-                onClick={() => { beginRun(); setPhase("input"); setCurrentRound(null); setActiveRunId(null); setScout(SCOUT_IDLE); setFinalSummary(null); }}
+                onClick={() => { resetView(); setPhase("input") }}
               >
                 <Plus className="h-3.5 w-3.5 mr-1.5" />
                 New Research Task
@@ -1196,11 +1256,11 @@ export const CoscientistPanel: React.FC = () => {
                     <FileText className={cn("h-3.5 w-3.5 shrink-0", scout.status === "failed" ? "text-amber-600" : "text-primary")} />
                   )}
                   <span className="text-xs text-muted-foreground">
-                    {scout.status === "running" && "Dataset scout: exploring the data folder..."}
+                    {scout.status === "running" && "Looking through the data folder first..."}
                     {scout.status === "done" && (scout.reusedFrom
-                      ? `Reusing the dataset guide from ${scout.reusedFrom}.`
-                      : `Dataset guide written (${scout.calls.length} commands).`)}
-                    {scout.status === "failed" && `Dataset scout: no guide (${scout.note}).${isRunning ? " Continuing without it." : ""}`}
+                      ? `Reusing the notes on the data from ${scout.reusedFrom}.`
+                      : "Notes on the data are ready.")}
+                    {scout.status === "failed" && `No notes on the data (${scout.note}).${isRunning ? " Continuing without them." : ""}`}
                   </span>
                 </div>
                 {scout.calls.length > 0 && (
@@ -1219,12 +1279,38 @@ export const CoscientistPanel: React.FC = () => {
             {isRunning && !currentRound && scout.status === "idle" && (
               <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-muted/30 border border-border/40">
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-primary shrink-0" />
-                <span className="text-xs text-muted-foreground">Initializing research...</span>
+                <span className="text-xs text-muted-foreground">Getting ready...</span>
               </div>
             )}
           </div>
         )}
       </div>
+
+      <AlertDialog open={confirmKind !== null} onOpenChange={open => { if (!open) setConfirmKind(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{confirmKind === "stop" ? "Stop this research run?" : "Discard your research program?"}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {confirmKind === "stop"
+                ? "Work in the current round will be lost."
+                : "The text you typed has not been saved. A new task starts from the program saved in this folder."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{confirmKind === "stop" ? "Keep running" : "Keep editing"}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                const kind = confirmKind
+                setConfirmKind(null)
+                if (kind === "stop") stopResearch()
+                else if (kind === "discard") startOver()
+              }}
+            >
+              {confirmKind === "stop" ? "Stop run" : "Discard"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

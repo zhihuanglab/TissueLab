@@ -42,6 +42,8 @@ def _column_info(values: pd.Series) -> dict[str, Any]:
     info: dict[str, Any] = {
         "name": str(values.name),
         "numeric": numeric,
+        # whole numbers (an id like 1001 can be one; a measurement like 0.37 cannot)
+        "integer": numeric and bool((numbers % 1 == 0).all()),
         "missing": int(len(values) - len(present)),
         "unique": int(present.nunique()),
         "examples": [str(v)[:40] for v in present.unique()[:3]],
@@ -94,12 +96,19 @@ def inspect_cohort(data_dir: Path, path: Path) -> Optional[dict[str, Any]]:
     if slide_scores[slide_column] == 0:
         slide_column = None
 
-    # Id column: complete and unique, preferring a name that says so.
+    # Id column: complete, unique, never fractional; a name that says so, else a text
+    # column. Whole-number columns could be the outcome: they are only offered
+    # (id_candidates) for program_problem to choose once the outcome is known.
     unique = [
-        info["name"] for info in columns
+        info for info in columns
         if info["name"] != slide_column and info["missing"] == 0 and info["unique"] == len(frame)
+        and (not info["numeric"] or info["integer"])
     ]
-    id_column = next((c for c in unique if _ID_NAME.search(c)), unique[0] if unique else None)
+    id_column = next(
+        (i["name"] for i in unique if _ID_NAME.search(i["name"])),
+        next((i["name"] for i in unique if not i["numeric"]), None),
+    )
+    id_candidates = [i["name"] for i in unique if i["integer"]] if id_column is None else []
 
     mpp_column = next(
         (info["name"] for info in columns if "mpp" in info["name"].lower() and info["numeric"]),
@@ -119,6 +128,7 @@ def inspect_cohort(data_dir: Path, path: Path) -> Optional[dict[str, Any]]:
         "rows": int(len(frame)),
         "columns": columns,
         "id_column": id_column,
+        "id_candidates": id_candidates,
         "slide_column": slide_column,
         "mpp_column": mpp_column,
         "slides_found": slide_scores[slide_column] if slide_column else 0,
@@ -146,9 +156,25 @@ def scan_workspace(data_dir: Path) -> dict[str, Any]:
 # open, the model chooses from the column names alone (never a value). Starting a
 # run turns the result into problem.md's header.
 
+# Phrases that put the columns after them (to the end of the sentence, or to an
+# outcome phrase) among the covariates.
 _ADJUST = re.compile(
-    r"adjust|control(?:ling|led)?\s+for|account(?:ing)?\s+for|covariat|confound|correct(?:ing)?\s+for"
-    r"|校正|调整|控制|协变量|混杂",
+    r"adjust|control(?:s|ling|led)?\s+for|account(?:s|ing|ed)?\s+for|covariat|confound|correct(?:s|ing|ed)?\s+for"
+    r"|independent(?:ly)?\s+of|conditional\s+on|net\s+of|校正|调整|控制|协变量|混杂",
+    re.IGNORECASE,
+)
+# Phrases that name what to predict: the first column after one is the outcome.
+_OUTCOME_CUE = re.compile(
+    r"predict|explain|outcome|target|track|associat\w*\s+with|correlat\w*\s+with|relat\w*\s+to"
+    r"|预测|解释|结局|目标",
+    re.IGNORECASE,
+)
+# The program says not to adjust at all.
+_NO_ADJUST = re.compile(
+    r"\bno\s+(?:covariates?|adjustments?|confounders?)\b|\bunadjusted\b"
+    r"|\bwithout\s+(?:any\s+)?(?:covariates?|adjust\w*|controlling|confounders?)"
+    r"|\b(?:do\s+not|don'?t|not|no\s+need\s+to)\s+(?:be\s+)?(?:adjust\w*|(?:control|correct)\w*\s+for)"
+    r"|不(?:做|进行|需要|用)?(?:校正|调整)|无需(?:校正|调整)|无协变量|没有协变量",
     re.IGNORECASE,
 )
 _SENTENCE_END = re.compile(r"[.;!?\n。；！？]")
@@ -164,28 +190,52 @@ def _mention(text: str, column: str) -> Optional[int]:
     return min(positions) if positions else None
 
 
+def says_no_adjustment(text: str) -> bool:
+    """Whether the program asks for no covariates ("unadjusted", "without adjustment", ...)."""
+    return bool(_NO_ADJUST.search(text))
+
+
+def _spans(text: str, starts: re.Pattern, stops: re.Pattern) -> list[tuple[int, int]]:
+    """From each match of `starts` to the end of its sentence or the next match of `stops`."""
+    spans = []
+    for kw in starts.finditer(text):
+        ends = [m.start() for m in (_SENTENCE_END.search(text, kw.end()), stops.search(text, kw.end())) if m]
+        spans.append((kw.start(), min(ends, default=len(text))))
+    return spans
+
+
 def match_columns(text: str, cohort: dict[str, Any]) -> dict[str, Any]:
-    """Outcome and covariates named in the text; columns after "adjust for" etc.
-    (in the same sentence) are covariates, the first other outcome-capable column
-    is the outcome."""
+    """Outcome and covariates named in the text. Columns after "adjust for",
+    "independent of" etc. are covariates; the outcome is the column named after
+    "predict", "explain", "associated with" etc., else the only other outcome-capable
+    column named. Two different outcomes so named leave the outcome open (""), for
+    the model to choose. "no_adjustment": the text asks for no covariates."""
     mentioned = {}
-    for name in cohort["covariate_candidates"]:
+    for name in dict.fromkeys([*cohort["covariate_candidates"], *cohort["outcome_candidates"]]):
         at = _mention(text, name)
         if at is not None:
             mentioned[name] = at
-    adjust_spans = []
-    for kw in _ADJUST.finditer(text):
-        end = _SENTENCE_END.search(text, kw.end())
-        adjust_spans.append((kw.start(), end.start() if end else len(text)))
-    covariates = [
-        name for name, at in sorted(mentioned.items(), key=lambda kv: kv[1])
-        if any(start <= at < stop for start, stop in adjust_spans)
+    ordered = sorted(mentioned.items(), key=lambda kv: kv[1])
+    no_adjustment = says_no_adjustment(text)
+    adjust_spans = _spans(text, _ADJUST, _OUTCOME_CUE)
+    covariates = [] if no_adjustment else [
+        name for name, at in ordered
+        if name in cohort["covariate_candidates"] and any(start <= at < stop for start, stop in adjust_spans)
     ]
-    outcomes = [
-        name for name, at in sorted(mentioned.items(), key=lambda kv: kv[1])
-        if name in cohort["outcome_candidates"] and name not in covariates
+    free = [
+        (name, at) for name, at in ordered
+        if name in cohort["outcome_candidates"] and not any(start <= at < stop for start, stop in adjust_spans)
     ]
-    return {"outcome": outcomes[0] if outcomes else "", "covariates": covariates}
+    cued = []
+    for start, stop in _spans(text, _OUTCOME_CUE, _ADJUST):
+        first = next((name for name, at in free if start <= at < stop), None)
+        if first and first not in cued:
+            cued.append(first)
+    if cued:
+        outcome = cued[0] if len(cued) == 1 else ""
+    else:
+        outcome = free[0][0] if len(free) == 1 else ""
+    return {"outcome": outcome, "covariates": covariates, "no_adjustment": no_adjustment}
 
 
 _ASK_MODEL = """You set up a predictive analysis from a research program and a cohort table's column names.
@@ -200,9 +250,9 @@ Choose:
 - "outcome": the column the program wants to predict or explain. If the program names or describes it,
   use that column. If it does not, choose the most plausible primary target among the outcome columns
   (not an identifier, a demographic, or a technical/batch variable).
-- "covariates": the columns the program says to adjust or control for. If it says none, choose the
-  plain confounders among the covariate columns (demographics such as age or sex), never another
-  candidate outcome. May be empty.
+- "covariates": the columns the program says to adjust or control for. If the program does not
+  mention adjustment at all, choose the plain confounders among the covariate columns (demographics
+  such as age or sex), never another candidate outcome. If it says not to adjust, return []. May be empty.
 
 Return JSON only: {{"outcome": "<column>", "covariates": ["<column>", ...]}}. Use exact column names
 from the lists; map plain words to them (e.g. "age" -> "age_years") when the match is clear."""
@@ -258,14 +308,15 @@ def resolve_program(text: str, data_dir: Path, cohort_file: Optional[str] = None
     cohorts = scan_workspace(data_dir)["cohorts"]
     cohort = next((c for c in cohorts if c["file"] == cohort_file), cohorts[0] if cohorts else None)
     if cohort is None:
-        return {"cohort": None, "outcome": "", "covariates": []}
+        return {"cohort": None, "outcome": "", "covariates": [], "no_adjustment": False}
     found = match_columns(text, cohort)
-    if use_model and text.strip() and (not found["outcome"] or not found["covariates"]):
+    open_covariates = not found["covariates"] and not found["no_adjustment"]
+    if use_model and text.strip() and (not found["outcome"] or open_covariates):
         asked = _ask_model_cached(text.strip(), tuple(cohort["outcome_candidates"]), tuple(cohort["covariate_candidates"]))
         if asked:
             if not found["outcome"]:
                 found["outcome"] = asked["outcome"]
-            if not found["covariates"]:
+            if open_covariates:
                 found["covariates"] = [c for c in asked["covariates"] if c != found["outcome"]]
     return {"cohort": cohort, **found}
 
@@ -281,8 +332,11 @@ def _saved_problem(data_dir: Path) -> Optional[ProblemSpec]:
 def program_problem(text: str, data_dir: Path) -> str:
     """problem.md for a plain-text program: its header worked out from the cohort
     table. What the text (or the model) leaves open comes from the saved
-    problem.md when it used the same table, or is the table's only candidate.
-    Raises ProblemError with what to do when no outcome can be chosen."""
+    problem.md when it used the same table, or is the table's only candidate; the
+    saved id / slide / mpp columns are kept while the table still has them and they
+    are not the outcome or a covariate. A program that asks for no adjustment gets
+    no covariates. Raises ProblemError with what to do when no outcome (or no id
+    column) can be chosen."""
     question = text.strip()
     if not question:
         raise ProblemError("Describe the research program first")
@@ -307,15 +361,37 @@ def program_problem(text: str, data_dir: Path) -> str:
             f'Couldn\'t tell which column to predict. Name it in the program, e.g. "predict {candidates[0]}". '
             f"Columns: {', '.join(candidates)}"
         )
-    covariates = found["covariates"] or (
-        [c for c in same_table.covariates if c in cohort["covariate_candidates"]] if same_table else []
+    if found["no_adjustment"]:
+        covariates: list[str] = []
+    else:
+        covariates = found["covariates"] or (
+            [c for c in same_table.covariates if c in cohort["covariate_candidates"]] if same_table else []
+        )
+    covariates = [c for c in dict.fromkeys(covariates) if c != outcome]
+
+    columns = {info["name"] for info in cohort["columns"]}
+    taken = {outcome, *covariates}
+
+    def layout(key: str, scanned: Optional[str]) -> Optional[str]:
+        kept = getattr(same_table, key) if same_table else None
+        return kept if kept in columns and kept not in taken else scanned
+
+    id_column = layout("id_column", cohort["id_column"]) or next(
+        (c for c in cohort.get("id_candidates") or [] if c not in taken), None
     )
+    if not id_column:
+        raise ProblemError(
+            f"Couldn't tell which column identifies each donor in {cohort['file']}: "
+            "it needs a column with a different text or whole-number value in every row, "
+            "named like donor_id, patient_id or case"
+        )
+    covariates = [c for c in covariates if c != id_column]
     return compose_problem({
         "outcome": outcome,
         "question": question,
-        "covariates": [c for c in dict.fromkeys(covariates) if c != outcome],
+        "covariates": covariates,
         "cohort_file": cohort["file"],
-        "id_column": cohort["id_column"] or _DEFAULT_SPEC.id_column,
-        "slide_column": cohort["slide_column"] or _DEFAULT_SPEC.slide_column,
-        "mpp_column": cohort["mpp_column"] or _DEFAULT_SPEC.mpp_column,
+        "id_column": id_column,
+        "slide_column": layout("slide_column", cohort["slide_column"]) or _DEFAULT_SPEC.slide_column,
+        "mpp_column": layout("mpp_column", cohort["mpp_column"]) or _DEFAULT_SPEC.mpp_column,
     })

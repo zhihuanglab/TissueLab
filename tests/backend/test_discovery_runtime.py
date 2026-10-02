@@ -447,8 +447,6 @@ def test_a_dedicated_discovery_endpoint_frees_the_agent_model(monkeypatch):
 
     monkeypatch.setenv("DISCOVERY_BASE_URL", "https://api.openai.com/v1")
     monkeypatch.setenv("DISCOVERY_API_KEY", "sk-discovery")
-    monkeypatch.setattr(discovery_client, "_client", None)
     assert discovery_client.unavailable_reason() is None
     client = discovery_client.get_client()
     assert str(client.base_url).rstrip("/") == "https://api.openai.com/v1" and client.api_key == "sk-discovery"
-    monkeypatch.setattr(discovery_client, "_client", None)

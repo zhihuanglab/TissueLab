@@ -118,6 +118,8 @@ def held_loop(monkeypatch):
         (kwargs["run_root"] / "run_state.json").write_text(json.dumps({"next_round_id": 1, "config": {"rounds": 1}}))
         await kwargs["emit"]({"type": "round_started", "round_id": 1})
         await asyncio.to_thread(release.wait, 10)
+        # as the real loop does after its last round
+        (kwargs["run_root"] / "run_state.json").write_text(json.dumps({"next_round_id": 2, "config": {"rounds": 1}}))
         return {"answer": "done", "status": "completed", "iterations": 1}
 
     monkeypatch.setattr(run_manager_mod, "run_discovery", loop)
@@ -159,7 +161,9 @@ def test_a_newer_stream_takes_over_and_a_finished_run_is_forgotten(client, works
     assert [e["type"] for e in second["events"]] == ["complete"]
     # the end reached its reader: nothing is kept, and a late stream returns at once
     assert run_id not in manager._queues and run_id not in manager._tasks
-    assert _in_time(lambda: _events(client, run_id)) == [{"type": "error", "message": "Run not found"}]
+    # the run is no longer streamed here: its state on disk, not an error
+    assert _in_time(lambda: _events(client, run_id)) == [{"type": "run_detached", "run_id": run_id, "status": "completed"}]
+    assert _in_time(lambda: _events(client, "run_unknown")) == [{"type": "error", "message": "Run not found"}]
 
 
 async def _drain(stream):
@@ -227,7 +231,7 @@ def test_a_stream_opened_after_the_run_ended_gets_the_ending_then_not_found(clie
     while manager.is_active(run_id) and time.monotonic() < deadline:
         time.sleep(0.01)
     assert [e["type"] for e in _in_time(lambda: _events(client, run_id))] == ["round_started", "complete"]
-    assert _in_time(lambda: _events(client, run_id)) == [{"type": "error", "message": "Run not found"}]
+    assert _in_time(lambda: _events(client, run_id)) == [{"type": "run_detached", "run_id": run_id, "status": "completed"}]
 
 
 def test_a_run_cancelled_before_it_starts_still_ends_its_stream(monkeypatch, tmp_path):
@@ -246,7 +250,7 @@ def test_a_run_cancelled_before_it_starts_still_ends_its_stream(monkeypatch, tmp
         return events, manager
 
     events, manager = asyncio.run(scenario())
-    assert events == []   # the task never ran; the sentinel still came
+    assert events == [{"type": "run_cancelled", "run_id": "run_x"}]   # the task never ran; the ending still came
     assert "run_x" not in manager._queues
 
 
@@ -406,7 +410,6 @@ def clean_llm_env(monkeypatch):
 
     for name in ("OPENAI_BASE_URL", "OPENAI_API_KEY", "DISCOVERY_BASE_URL", "DISCOVERY_API_KEY", "LLM_API"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(discovery_client, "_client", None)
     return discovery_client
 
 
@@ -454,20 +457,18 @@ def test_endpoint_and_key_are_taken_as_a_pair(clean_llm_env, monkeypatch):
     monkeypatch.setenv("LLM_API", "responses")
     assert discovery_client.unavailable_reason() is None
     assert discovery_client.get_client().api_key == "sk-agent"
-    monkeypatch.setattr(discovery_client, "_client", None)
 
-    # a research key without its endpoint never goes to the agent's endpoint
+    # a research key without its endpoint never goes to the agent's endpoint: it goes to OpenAI
     monkeypatch.delenv("DISCOVERY_BASE_URL")
     monkeypatch.setenv("DISCOVERY_API_KEY", "sk-research")
     client = discovery_client.get_client()
-    assert client.api_key == "sk-agent" and str(client.base_url).startswith("https://third-party.example/v1")
-    monkeypatch.setattr(discovery_client, "_client", None)
+    assert client.api_key == "sk-research" and str(client.base_url).startswith("https://api.openai.com/v1")
+    assert discovery_client.unavailable_reason() is None
 
     # the full research pair is used as is
     monkeypatch.setenv("DISCOVERY_BASE_URL", "https://research.example/v1")
     client = discovery_client.get_client()
     assert client.api_key == "sk-research" and str(client.base_url).startswith("https://research.example/v1")
-    monkeypatch.setattr(discovery_client, "_client", None)
 
 
 # ── 8. stream / cancel check access to the run's folder ──────────────────────

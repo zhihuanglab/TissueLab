@@ -8,7 +8,7 @@ import contextlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -30,6 +30,7 @@ from app.services.agent.discovery.loop import (
     guide_recorded,
     load_results_rows,
     read_run_state,
+    run_status_on_disk,
 )
 from app.services.agent.discovery.problem import PROBLEM_FILENAME, parse_problem
 from app.services.agent.discovery.scout import GUIDE_NAME
@@ -47,7 +48,7 @@ class StartRunRequest(BaseModel):
     task: str                       # the program in plain words, or problem.md with its header
     workspace_path: str
     rounds: int = Field(3, ge=1, le=50)
-    reasoning_effort: str = "high"
+    reasoning_effort: Literal["low", "medium", "high"] = "high"   # the panel's choices
     worker_wall_clock_sec: int = Field(1800, ge=120, le=7200)
     dataset_scout: bool = True      # explore the folder first, write a dataset guide
     # instead of exploring: the guide of an earlier run in this workspace (its run id)
@@ -84,11 +85,29 @@ def _run_summary(run_root: Path) -> Dict[str, Any]:
         "run_root_path": str(run_root),
         "updated_at": datetime.fromtimestamp(run_root.stat().st_mtime, tz=timezone.utc).isoformat(),
         "status": status,
+        # the user pressed Stop (still resumable, so status stays "incomplete")
+        "stopped": status == "incomplete" and state.get("stopped") == "cancelled",
         "rounds": rounds,
         "next_round_id": next_round_id,
         # its scout's guide, which a new run here may reuse
         "has_guide": guide_recorded(state, run_root) and (run_root / "shared" / GUIDE_NAME).is_file(),
+        "question": _run_question(run_root),
     }
+
+
+QUESTION_PREVIEW_CHARS = 120
+
+
+def _run_question(run_root: Path) -> Optional[str]:
+    """The first line of the run's research program (its problem.md question), for the list."""
+    try:
+        question = parse_problem((run_root / PROBLEM_FILENAME).read_text(encoding="utf-8")).question
+    except (OSError, UnicodeDecodeError, ProblemError):
+        return None
+    line = next((line.strip() for line in question.splitlines() if line.strip()), "")
+    if len(line) > QUESTION_PREVIEW_CHARS:
+        line = line[:QUESTION_PREVIEW_CHARS - 1].rstrip() + "\u2026"
+    return line or None
 
 
 def _run_outcome(run_root: Optional[Path]) -> Optional[str]:
@@ -211,14 +230,36 @@ async def resume_run(request: ResumeRunRequest, auth_user: AuthUser = Depends(ge
     return success_response({"run_id": run_id, "outcome": _run_outcome(get_discovery_run_manager().run_root(run_id))})
 
 
+def _detached_run_root(run_id: str, run_root_path: Optional[str]) -> Optional[Path]:
+    """The folder of a run this process no longer streams: one it ran earlier, or the
+    run_root_path the panel passes (it lists runs by folder), when it names this run."""
+    run_root = get_discovery_run_manager().past_run_root(run_id)
+    if run_root is None and run_root_path:
+        try:
+            run_root = run_folder(run_root_path)
+        except ProblemError:
+            return None
+    if run_root is None or run_root.name != run_id or not (run_root / "run_state.json").is_file():
+        return None
+    return run_root
+
+
 @discovery_router.get("/v1/discovery/runs/{run_id}/stream")
-async def stream_run(run_id: str, auth_user: AuthUser = Depends(get_auth_user)):
+async def stream_run(run_id: str, run_root_path: Optional[str] = None, auth_user: AuthUser = Depends(get_auth_user)):
     manager = get_discovery_run_manager()
     run_root = manager.run_root(run_id)
     if run_root is not None:
         await assert_can_access_path_async(auth_user, str(run_root), "stream research run")
+    detached = None if run_root is not None else _detached_run_root(run_id, run_root_path)
+    if detached is not None:
+        await assert_can_access_path_async(auth_user, str(detached), "stream research run")
 
     async def event_generator():
+        if detached is not None:
+            # Not running here (finished, stopped, or from before a restart): its state on disk.
+            status = await asyncio.to_thread(run_status_on_disk, detached)
+            yield f"data: {json.dumps({'type': 'run_detached', 'run_id': run_id, 'status': status})}\n\n"
+            return
         async with contextlib.aclosing(manager.read_stream(run_id)) as events:
             try:
                 async for event in events:
@@ -241,5 +282,6 @@ async def cancel_run(run_id: str, auth_user: AuthUser = Depends(get_auth_user)):
     if run_root is not None:
         await assert_can_write_path_async(auth_user, str(run_root), "cancel research")
     if not await manager.cancel_run(run_id):
-        return error_response("Run is not active or already completed")
+        # nothing to stop: already finished or stopped (a repeated Stop is not an error)
+        return success_response({"cancelled": False, "reason": "not active"})
     return success_response({"cancelled": True})

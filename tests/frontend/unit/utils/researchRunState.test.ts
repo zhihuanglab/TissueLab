@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   appendJournalEntry,
+  detachedEndState,
+  ensureRound,
   failPendingProposer,
+  requestErrorMessage,
+  roundIdOf,
+  withWorker,
   stopRunningRows,
   stopRunningScout,
   type RoundState,
@@ -53,5 +58,43 @@ describe('research run state', () => {
     const j = [{ roundId: 1, focus: 'a', summary: 's' }];
     expect(appendJournalEntry(j, { roundId: 1, focus: 'b', summary: 't' })).toBe(j);
     expect(appendJournalEntry(j, { roundId: 2, focus: 'b', summary: 't' })).toHaveLength(2);
+  });
+
+  it('finds an event\'s round from round_id, else from its worker\'s name', () => {
+    expect(roundIdOf({ round_id: 3 })).toBe(3);
+    expect(roundIdOf({ worker_name: 'round_0002_worker_1' })).toBe(2);
+    expect(roundIdOf({ worker_name: 'proposer' })).toBeNull();
+    expect(roundIdOf({})).toBeNull();
+  });
+
+  it('makes a stub round for an event of a round it never saw start (reattached mid-round)', () => {
+    expect(ensureRound(null, 2, 3)).toEqual({ roundId: 2, totalRounds: 3, focus: '', workers: [] });
+    // more rounds than planned (a resumed run): the total is at least this round
+    expect(ensureRound(null, 5, 3)!.totalRounds).toBe(5);
+    expect(ensureRound(null, null, 3)).toBeNull();
+    const r = round();
+    expect(ensureRound(r, 2, 3)).toBe(r);
+  });
+
+  it('updates a worker, adding a row for one first seen mid-way', () => {
+    const r = withWorker(round(), 'w1', (w) => ({ ...w, status: 'completed' }));
+    expect(r.workers.map((w) => w.status)).toEqual(['completed', 'completed', 'failed']);
+    const added = withWorker(round(), 'w3', (w) => ({ ...w, question: 'q' }));
+    expect(added.workers).toHaveLength(4);
+    expect(added.workers[3]).toMatchObject({ name: 'w3', question: 'q', status: 'running', toolCalls: [] });
+  });
+
+  it('reads a refused request\'s reason: the service message, or FastAPI\'s validation detail', () => {
+    expect(requestErrorMessage({ code: 400, message: 'A research run is already in progress in this folder.' }, 'x'))
+      .toBe('A research run is already in progress in this folder.');
+    expect(requestErrorMessage({ detail: [{ loc: ['body', 'rounds'], msg: 'too big' }, { msg: 'bad' }] }, 'x')).toBe('rounds: too big; bad');
+    expect(requestErrorMessage({ detail: 'Not Found' }, 'x')).toBe('Not Found');
+    expect(requestErrorMessage(null, 'Failed to start run')).toBe('Failed to start run');
+  });
+
+  it('maps run_detached\'s status to how the run ended', () => {
+    expect(detachedEndState('completed')).toBe('finished');
+    expect(detachedEndState('cancelled')).toBe('stopped');
+    expect(detachedEndState('incomplete')).toBe('incomplete');
   });
 });

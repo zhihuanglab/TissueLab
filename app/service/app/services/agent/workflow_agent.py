@@ -16,7 +16,7 @@ import threading
 from datetime import datetime, timezone
 from app.utils.workflow.model_store import model_store
 from app.services.providers import LLMProvider, OpenAIProvider
-from app.services import llm_config
+from app.services import llm_config, llm_settings
 from app.services.agent.knowledge_store import get_knowledge_store
 from app.repos.schema.knowledge import KnowledgeItem
 import aiohttp
@@ -75,9 +75,9 @@ class WorkflowAgent:
     # Only the OpenAI-compatible provider ships; services.tasks still checks this.
     code_provider_name = "openai"
 
-    def __init__(self):
+    def __init__(self, client: Optional[OpenAI] = None):
         # Legacy OpenAI client (for web search)
-        self.client = OpenAI()
+        self.client = client or OpenAI()
 
         # Initialize providers
         self._init_providers()
@@ -1324,45 +1324,26 @@ Return only JSON, no other text. If is_correction is false, other fields can be 
             raise
 
 
-# Singleton instance
-_workflow_agent = None
-# Bumped by reset_workflow_agent(): an agent built from settings that Preferences
-# replaced meanwhile serves its own request but is never cached. The lock only
-# guards these two names (never held while building).
-_agent_generation = 0
-_agent_lock = threading.Lock()
-
-
-def reset_workflow_agent() -> None:
-    global _workflow_agent, _agent_generation
-    with _agent_lock:
-        _agent_generation += 1
-        _workflow_agent = None
-
-
 def agent_configured() -> bool:
     return bool(os.getenv("OPENAI_API_KEY"))
+
+
+def _build_workflow_agent(settings) -> WorkflowAgent:
+    if not settings.get("OPENAI_API_KEY"):
+        raise AgentNotConfigured(
+            "The LLM agent is not configured: add an API key in Preferences > AI Models "
+            "(or set OPENAI_API_KEY in .env.local)."
+        )
+    return WorkflowAgent(client=OpenAI(**llm_settings.openai_kwargs(settings)))
+
+
+# Singleton, rebuilt once Preferences change the LLM settings.
+_agent_cache = llm_settings.SettingsCached(_build_workflow_agent)
 
 
 def get_workflow_agent() -> WorkflowAgent:
     """
     Get singleton instance of WorkflowAgent
     """
-    global _workflow_agent
-    agent = _workflow_agent
-    if agent is not None:
-        return agent
-    generation = _agent_generation
-    if not agent_configured():
-        raise AgentNotConfigured(
-            "The LLM agent is not configured: add an API key in Preferences > AI Models "
-            "(or set OPENAI_API_KEY in .env.local)."
-        )
-    agent = WorkflowAgent()
-    with _agent_lock:
-        if generation != _agent_generation:
-            return agent
-        if _workflow_agent is None:
-            _workflow_agent = agent
-        return _workflow_agent
+    return _agent_cache.get()
 

@@ -108,14 +108,15 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     expect(body.code, JSON.stringify(body)).toBe(0);
     const runId: string = body.data.run_id;
 
-    // Live progress: the hypothesis the proposer committed to, both agents, the journal.
+    // Live progress: the hypothesis the proposer committed to, both analyses, the journal.
     await expect(page.getByText(QUESTION).first()).toBeVisible({ timeout: 120_000 });
-    await expect(page.getByText('Proposer & Workers')).toBeVisible();
+    await expect(page.getByText('Planning & analyses')).toBeVisible();
     await expect(findings(page)).toBeVisible({ timeout: 360_000 });
     await expect(page.getByText('Research Journal')).toBeVisible();
     await expect(page.getByText(/Outcome: score/)).toBeVisible();
     await expect(page.getByText(/Accepted panel members: [1-5]/)).toBeVisible();
     await expect(page.getByText('Round 1', { exact: true })).toBeVisible();
+    await expect(page.getByTestId('run-end-state')).toHaveText('Finished');
 
     // The run folder: both judged candidates (one admitted), the findings, the problem it ran.
     const rows = resultsRows(runId);
@@ -152,18 +153,22 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     await expect(page.getByText(QUESTION).first()).toBeVisible({ timeout: 120_000 });
 
     const cancel = page.waitForResponse((r) => r.url().endsWith(`/runs/${runId}/cancel`));
-    await page.getByRole('button', { name: 'Stop' }).click();
+    await page.getByRole('button', { name: 'Stop', exact: true }).click();
+    // Stop asks first.
+    await page.getByRole('alertdialog').getByRole('button', { name: 'Stop run' }).click();
     expect((await (await cancel).json()).code).toBe(0);
-    await expect(page.getByRole('button', { name: 'New Research Task', exact: true })).toBeVisible();
+    // Stopping waits for the step in progress, then the run says it stopped.
+    await expect(page.getByRole('button', { name: 'New Research Task', exact: true })).toBeVisible({ timeout: 120_000 });
+    await expect(page.getByTestId('run-end-state')).toHaveText('Stopped');
     // Stopping is not an error: no red box (e.g. the aborted stream's message).
     await expect(page.locator('.bg-red-50')).toHaveCount(0);
 
     // History lists the stopped run as incomplete; opening it offers to resume.
     await page.getByRole('button', { name: 'Run history' }).click();
-    const entry = page.getByRole('button').filter({ hasText: runId });
+    const entry = page.locator(`[data-run-id="${runId}"]`);
     await expect(entry).toContainText(/incomplete/i);
     await entry.click();
-    await expect(page.getByText('Incomplete run detected')).toBeVisible();
+    await expect(page.getByText("A previous run in this folder didn't finish. Resume it?")).toBeVisible();
 
     // The stopped run's threads may still be winding down: the service refuses
     // to resume until the folder is quiet, so retry for a while.
@@ -173,7 +178,7 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
       const reply = await (await resumed).json();
       if (reply.code !== 0) {
         await page.getByRole('button', { name: 'Run history' }).click();
-        await page.getByRole('button').filter({ hasText: runId }).click();
+        await page.locator(`[data-run-id="${runId}"]`).click();
       }
       expect(reply.code, JSON.stringify(reply)).toBe(0);
     }).toPass({ timeout: 90_000, intervals: [3_000] });
@@ -182,7 +187,7 @@ test.describe('Research panel (discovery, scripted model, real sandbox)', () => 
     expect(resultsRows(runId)).toHaveLength(1);
 
     await page.getByRole('button', { name: 'Run history' }).click();
-    await expect(page.getByRole('button').filter({ hasText: runId })).toContainText(/completed/i);
+    await expect(page.locator(`[data-run-id="${runId}"]`)).toContainText(/finished/i);
     expect(guards.pageErrors).toEqual([]);
   });
 

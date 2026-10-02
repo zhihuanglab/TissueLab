@@ -42,9 +42,9 @@ def test_save_applies_at_once_and_hides_the_key(client, settings_module):
     from app.services.agent import verification_agent, workflow_agent
     from app.services.agent.discovery import client as discovery_client
 
-    workflow_agent._workflow_agent = object()
-    verification_agent._verification_agent = object()
-    discovery_client._client = object()
+    caches = (workflow_agent._agent_cache, verification_agent._agent_cache, discovery_client._client_cache)
+    for cache in caches:
+        cache._entry = ((), object())
 
     reply = client.put(API, json={"fields": {
         "OPENAI_API_KEY": KEY, "OPENAI_BASE_URL": " http://127.0.0.1:11434/v1 ", "LLM_MODEL": "qwen3", "LLM_API": "Chat",
@@ -68,9 +68,7 @@ def test_save_applies_at_once_and_hides_the_key(client, settings_module):
     assert os.environ["OPENAI_API_KEY"] == KEY
     assert os.environ["OPENAI_BASE_URL"] == "http://127.0.0.1:11434/v1"
     assert os.environ["LLM_API"] == "chat"
-    assert workflow_agent._workflow_agent is None
-    assert verification_agent._verification_agent is None
-    assert discovery_client._client is None
+    assert all(cache._entry is None for cache in caches)
 
     path = settings_module.settings_path()
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -94,11 +92,109 @@ def test_research_same_as_agent_switch(client, settings_module, monkeypatch):
     settings_module.apply_saved_settings()
     assert "DISCOVERY_BASE_URL" not in os.environ
 
-    # Off again: back to .env.local's pair.
+    # Off again: back to .env.local's pair, and saved as off.
     data = _put(client, RESEARCH_USES_AGENT="false")["data"]
     assert data["fields"]["RESEARCH_USES_AGENT"] == {"value": False}
     assert os.environ["DISCOVERY_BASE_URL"] == "https://env.example/v1"
+    assert settings_module.load_saved()["RESEARCH_USES_AGENT"] == "false"
+
+
+def test_research_switch_untouched_follows_env_and_off_round_trips(client, settings_module, monkeypatch):
+    # Saves that leave the switch alone (the UI sends it only when changed) never pin it:
+    # research's own pair added to .env.local later still takes effect.
+    _put(client, LLM_MODEL="m1")
     assert "RESEARCH_USES_AGENT" not in settings_module.load_saved()
+    assert client.get(API).json()["data"]["fields"]["RESEARCH_USES_AGENT"] == {"value": True}
+    monkeypatch.setitem(settings_module._baseline, "DISCOVERY_BASE_URL", "https://env.example/v1")
+    monkeypatch.setitem(settings_module._baseline, "DISCOVERY_API_KEY", "sk-env-research-0000")
+    settings_module.apply_saved_settings()
+    assert os.environ["DISCOVERY_BASE_URL"] == "https://env.example/v1"
+    assert client.get(API).json()["data"]["fields"]["RESEARCH_USES_AGENT"] == {"value": False}
+
+    # Turned off with no research connection anywhere: still off on reopen.
+    monkeypatch.setitem(settings_module._baseline, "DISCOVERY_BASE_URL", None)
+    monkeypatch.setitem(settings_module._baseline, "DISCOVERY_API_KEY", None)
+    data = _put(client, RESEARCH_USES_AGENT="false")["data"]
+    assert data["fields"]["RESEARCH_USES_AGENT"] == {"value": False}
+    assert client.get(API).json()["data"]["fields"]["RESEARCH_USES_AGENT"] == {"value": False}
+    # "" goes back to following .env.local.
+    data = _put(client, RESEARCH_USES_AGENT="")["data"]
+    assert data["fields"]["RESEARCH_USES_AGENT"] == {"value": True}
+    assert "RESEARCH_USES_AGENT" not in settings_module.load_saved()
+
+
+def test_preferences_model_beats_per_role_models_from_env(client, settings_module, monkeypatch):
+    monkeypatch.setitem(settings_module._baseline, "CHAT_MODEL", "env-chat")
+    monkeypatch.setitem(settings_module._baseline, "WORKFLOW_MODEL", "env-workflow")
+    settings_module.apply_saved_settings()
+    from app.services import llm_config
+
+    assert llm_config.model_for("WORKFLOW_MODEL") == "env-workflow"
+    assert client.get(API).json()["data"]["status"]["agent_model"] == "env-chat"
+
+    data = _put(client, LLM_MODEL="prefs-model")["data"]
+    assert data["status"]["agent_model"] == "prefs-model"
+    assert llm_config.model_for("WORKFLOW_MODEL") == "prefs-model"
+    assert "CHAT_MODEL" not in os.environ
+
+    # Cleared: the per-role models of .env.local are back.
+    data = _put(client, LLM_MODEL="")["data"]
+    assert data["status"]["agent_model"] == "env-chat"
+    assert os.environ["WORKFLOW_MODEL"] == "env-workflow"
+
+
+@pytest.mark.parametrize("url, key", [("OPENAI_BASE_URL", "OPENAI_API_KEY"), ("DISCOVERY_BASE_URL", "DISCOVERY_API_KEY")])
+def test_moving_the_endpoint_clears_its_saved_key(client, settings_module, url, key):
+    _put(client, **{url: "https://api.openai.com/v1", key: KEY})
+    # Same host (path / trailing slash): the key stays.
+    body = _put(client, **{url: "https://api.openai.com/v1/"})
+    assert body["data"]["cleared_keys"] == [] and settings_module.load_saved()[key] == KEY
+
+    # Another host without a new key: the saved key never goes there.
+    body = _put(client, **{url: "https://third-party.example/v1"})
+    assert body["data"]["cleared_keys"] == [key]
+    assert key not in settings_module.load_saved()
+    assert body["data"]["fields"][key]["set"] is False
+
+    # Another host with its key: kept.
+    body = _put(client, **{url: "http://127.0.0.1:8000/v1", key: "sk-local-key-00005678"})
+    assert body["data"]["cleared_keys"] == []
+    assert settings_module.load_saved()[key] == "sk-local-key-00005678"
+    # Another port on the same host is another server.
+    body = _put(client, **{url: "http://127.0.0.1:9000/v1"})
+    assert body["data"]["cleared_keys"] == [key]
+
+
+def test_research_key_alone_goes_to_openai(client, settings_module):
+    from app.services.agent.discovery import client as discovery_client
+
+    data = _put(client, OPENAI_API_KEY=KEY, OPENAI_BASE_URL="http://127.0.0.1:11434/v1",
+                RESEARCH_USES_AGENT="false", DISCOVERY_API_KEY="sk-research-key-4321")["data"]
+    assert data["status"]["research_unavailable_reason"] is None
+    research = discovery_client.get_client()
+    assert research.api_key == "sk-research-key-4321"
+    assert str(research.base_url).startswith("https://api.openai.com/v1")
+
+
+def test_cached_clients_follow_every_save(client, settings_module):
+    from app.services.agent import verification_agent, workflow_agent
+    from app.services.agent.discovery import client as discovery_client
+
+    _put(client, OPENAI_API_KEY=KEY, OPENAI_BASE_URL="https://api.openai.com/v1")
+    agent = workflow_agent.get_workflow_agent()
+    assert workflow_agent.get_workflow_agent() is agent
+    research = discovery_client.get_client()
+    assert discovery_client.get_client() is research
+
+    _put(client, OPENAI_API_KEY="sk-second-key-00009999")
+    for current in (workflow_agent.get_workflow_agent(), verification_agent.get_verification_agent()):
+        assert current.client.api_key == "sk-second-key-00009999"
+    assert workflow_agent.get_workflow_agent() is not agent
+    assert discovery_client.get_client().api_key == "sk-second-key-00009999"
+
+    # An environment changed some other way is noticed too.
+    os.environ["OPENAI_API_KEY"] = "sk-third-key-000077777"
+    assert discovery_client.get_client().api_key == "sk-third-key-000077777"
 
 
 def test_null_keeps_empty_clears(client, settings_module):
@@ -129,6 +225,9 @@ def test_cleared_field_falls_back_to_env_file(client, settings_module, monkeypat
 
 @pytest.mark.parametrize("fields, message", [
     ({"OPENAI_BASE_URL": "localhost:11434"}, "http(s) URL"),
+    ({"OPENAI_BASE_URL": "http://"}, "http(s) URL"),
+    ({"DISCOVERY_BASE_URL": "https:///v1"}, "http(s) URL"),
+    ({"OPENAI_BASE_URL": "http://host:abc/v1"}, "http(s) URL"),
     ({"LLM_API": "grpc"}, "LLM_API must be one of"),
     ({"PATH": "/tmp"}, "Unknown setting"),
     ({"RESEARCH_USES_AGENT": "yes"}, "must be true or false"),

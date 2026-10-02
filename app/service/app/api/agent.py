@@ -541,36 +541,58 @@ class ModelSettingsRequest(BaseModel):
     fields: Dict[str, Optional[str]]
 
 
-@agent_router.get("/v1/model_settings")
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+# Ports the renderer is served from: Electron starts Next.js on the first free
+# port from 3000 (100 tries), `next dev` defaults to 3000. TL_RENDERER_PORTS
+# ("3000-3099", "3000,4000", …) changes them for another setup.
+_DEFAULT_RENDERER_PORTS = "3000-3099"
+
+
+def _renderer_ports() -> set:
+    ports = set()
+    for part in (os.getenv("TL_RENDERER_PORTS") or _DEFAULT_RENDERER_PORTS).split(","):
+        low, _, high = part.strip().partition("-")
+        try:
+            ports.update(range(int(low), int(high or low) + 1))
+        except ValueError:
+            continue
+    return ports
+
+
+def _require_local_origin(origin: Optional[str] = Header(None)) -> None:
+    """CORS is open and every caller is the local user, so without this any web
+    page the user opens - a dev server or Jupyter on localhost included - could
+    point the agent at its own server and receive the key, or read the endpoints.
+    Browsers always send Origin on a cross-origin request; allowed are the app's
+    renderer (localhost on a renderer port, see TL_RENDERER_PORTS) and clients
+    that send none (Electron's file://, non-browser). "null" (sandboxed iframes,
+    opaque origins) is rejected on purpose, and so is any other host name, which
+    also keeps DNS rebinding out."""
+    if origin is None or origin.startswith("file://"):
+        return
+    try:
+        parsed = urlparse(origin)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        host = port = None
+    if host not in _LOCAL_HOSTS or port not in _renderer_ports():
+        raise AppErrors.USER_FORBIDDEN("Model settings can only be read or changed from the TissueLab app.")
+
+
+@agent_router.get("/v1/model_settings", dependencies=[Depends(_require_local_origin)])
 def get_model_settings(auth_user: AuthUser = Depends(get_auth_user)):
     """The LLM endpoints / keys / models set in Preferences (keys only as a hint)."""
     return success_response(llm_settings.public_settings())
 
 
-_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
-
-
-def _require_local_origin(origin: Optional[str] = Header(None)) -> None:
-    """CORS is open and every caller is the local user, so without this any web
-    page the user opens could point the agent at its own server and receive the
-    key. Browsers always send Origin on a cross-origin PUT; the app's renderer
-    is served from http://localhost:<port>, and non-browser clients send none.
-    "null" (sandboxed iframes, opaque origins) is rejected on purpose."""
-    if origin is None or origin.startswith("file://"):
-        return
-    try:
-        host = urlparse(origin).hostname
-    except ValueError:
-        host = None
-    if host not in _LOCAL_HOSTS:
-        raise AppErrors.USER_FORBIDDEN("Model settings can only be changed from the TissueLab app.")
-
-
 @agent_router.put("/v1/model_settings", dependencies=[Depends(_require_local_origin)])
 def put_model_settings(request: ModelSettingsRequest, auth_user: AuthUser = Depends(get_auth_user)):
-    """Save and apply at once: the next agent / research request uses them."""
+    """Save and apply at once: the next agent / research request uses them.
+
+    ``cleared_keys``: saved keys dropped because their endpoint moved to another host.
+    """
     try:
-        llm_settings.update_settings(request.fields)
+        cleared = llm_settings.update_settings(request.fields)
     except llm_settings.SettingsError as e:
         raise AppErrors.PARAMS_ERROR(str(e))
-    return success_response(llm_settings.public_settings())
+    return success_response({**llm_settings.public_settings(), "cleared_keys": cleared})

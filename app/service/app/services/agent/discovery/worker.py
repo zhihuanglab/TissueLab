@@ -18,12 +18,17 @@ by an identifier-only copy.
 
 from __future__ import annotations
 
+import contextvars
+import io
 import json
+import os
 import re
 import shutil
 import threading
 import time
+import tokenize
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -32,7 +37,7 @@ import pandas as pd
 from .client import custom_tool_call_output, custom_tool_calls, output_text, response_id, responses_create
 from .panel_cv import PredictivePanelConfig
 from .problem import ProblemSpec, write_public_cohort
-from .sandbox import SandboxSession
+from .sandbox import SandboxSession, read_contained, stat_contained, write_contained
 from .tools import SHELL_TOOL_NAME, SHELL_TOOL_SPEC, bounded_tool_text, is_done, load_prompt
 
 RESULT_NAME = "result.py"
@@ -46,6 +51,12 @@ MAX_REWRITES = 4
 MAX_TURNS = 40
 MIN_COMMAND_TIMEOUT = 120
 MATERIALIZE_TIMEOUT = 1800
+MATERIALIZE_GRACE = 300   # on top of what is left of the wall clock
+CANCEL_POLL_SEC = 1.0
+# Host-side read caps for sandbox-written files (the container could write huge ones).
+MAX_SCRIPT_BYTES = 10 << 20
+MAX_REPORT_BYTES = 50 << 20
+MAX_TABLE_BYTES = 500 << 20
 
 
 class ControllerChecksFailed(RuntimeError):
@@ -123,23 +134,109 @@ print("MATERIALIZED", report["rows"], report["coverage"])
 '''
 
 
+def call_cancellable(fn: Callable[[], Any], cancel_event: Optional[threading.Event], label: str) -> Any:
+    """fn() on a helper thread (same context: the run's pinned client), abandoned on cancel.
+
+    An LLM call can block for many minutes; a cancel must not wait for it. The
+    abandoned call finishes (or times out) in the background and is dropped.
+    """
+    if cancel_event is None:
+        return fn()
+    box: dict[str, Any] = {}
+    finished = threading.Event()
+    ctx = contextvars.copy_context()
+
+    def _run() -> None:
+        try:
+            box["value"] = ctx.run(fn)
+        except BaseException as exc:  # handed back to the caller
+            box["error"] = exc
+        finally:
+            finished.set()
+
+    threading.Thread(target=_run, name="discovery-llm-call", daemon=True).start()
+    while not finished.wait(CANCEL_POLL_SEC):
+        if cancel_event.is_set():
+            raise RuntimeError(f"{label} cancelled")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
 def _worker_scripts(scratch_dir: Path) -> list[Path]:
     """Python files the worker wrote in /scratch (result.py and any helper it imports)."""
     return sorted(p for p in scratch_dir.glob("*.py") if not p.name.startswith("."))
 
 
+def _python_reference_lines(text: str, names: list[str]) -> Optional[set[int]]:
+    """Lines where Python code names a protected column: an identifier equal to it, or
+    a string literal equal to it (case-insensitive), e.g. df["slope"]. Comments and
+    docstrings (a string that is a statement of its own) are prose and skipped.
+    None when the text does not tokenize."""
+    exact = set(names)
+    lowered = {n.lower() for n in names}
+    skip = {tokenize.NL, tokenize.COMMENT}
+    try:
+        tokens = [t for t in tokenize.generate_tokens(io.StringIO(text).readline) if t.type not in skip]
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return None
+    starts = {tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT}
+    lines: set[int] = set()
+    for i, tok in enumerate(tokens):
+        if tok.type == tokenize.NAME and tok.string in exact:
+            lines.add(tok.start[0])
+        elif tok.type == tokenize.STRING:
+            prev = tokens[i - 1].type if i else tokenize.NEWLINE
+            nxt = tokens[i + 1].type if i + 1 < len(tokens) else tokenize.ENDMARKER
+            if prev in starts and nxt in (tokenize.NEWLINE, tokenize.ENDMARKER):
+                continue   # a docstring / bare string statement
+            body = re.sub(r"^[A-Za-z]*", "", tok.string)
+            body = body[3:-3] if body[:3] in ('"""', "'''") else body[1:-1]
+            if body.strip().lower() in lowered:
+                lines.add(tok.start[0])
+    return lines
+
+
 def outcome_references(worker_dir: Path, scripts: list[Path], names: list[str]) -> list[str]:
-    """Lines in the worker's scripts or shell commands naming the outcome or a covariate."""
+    """Lines in the worker's scripts or shell commands naming the outcome or a covariate.
+
+    Scripts are read without following links (a linked or unreadable one is a hit:
+    its code cannot be audited); shell comments are ignored.
+    """
     names = [n for n in names if n]
     if not names:
         return []
     pattern = re.compile(r"\b(" + "|".join(re.escape(n) for n in names) + r")\b")
     hits: list[str] = []
-    for path in [*scripts, *sorted(worker_dir.glob("turn_*.command.sh"))]:
+    for path in scripts:
+        raw = read_contained(path.parent, path.name, MAX_SCRIPT_BYTES + 1)
+        if raw is None or len(raw) > MAX_SCRIPT_BYTES:
+            hits.append(f"{path.name}: not auditable (link, not a regular file, or too large)")
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        found = _python_reference_lines(text, names)
+        src = text.splitlines()
+        if found is None:   # not valid Python: fall back to plain line matching
+            found = {n for n, line in enumerate(src, 1) if pattern.search(line)}
+        hits.extend(f"{path.name}:{n}: {src[n - 1].strip()[:160]}" for n in sorted(found) if n <= len(src))
+    for path in sorted(worker_dir.glob("turn_*.command.sh")):
         for lineno, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-            if pattern.search(line):
+            if pattern.search(re.sub(r"(^|\s)#.*", "", line)):
                 hits.append(f"{path.name}:{lineno}: {line.strip()[:160]}")
     return hits
+
+
+def _fresh_scratch(worker_dir: Path) -> Path:
+    """An empty worker_dir/sandbox. A container's root-owned leftovers (Linux) survive
+    rmtree; the folder is renamed aside then, so they are never read back."""
+    scratch_dir = worker_dir / "sandbox"
+    if os.path.lexists(scratch_dir):
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+    if os.path.lexists(scratch_dir):
+        # Renaming within worker_dir needs only worker_dir's permissions.
+        os.rename(scratch_dir, worker_dir / f".sandbox.stale-{uuid.uuid4().hex[:8]}")
+    scratch_dir.mkdir(parents=True)
+    return scratch_dir
 
 
 def run_worker(
@@ -161,16 +258,14 @@ def run_worker(
     worker_name = worker_brief["worker_name"]
     worker_dir = round_dir / worker_name
     worker_dir.mkdir(parents=True, exist_ok=True)
-    scratch_dir = worker_dir / "sandbox"
-    if scratch_dir.exists():
-        shutil.rmtree(scratch_dir, ignore_errors=True)
-    (scratch_dir / "logs").mkdir(parents=True, exist_ok=True)
+    scratch_dir = _fresh_scratch(worker_dir)
+    (scratch_dir / "logs").mkdir()
 
     plan = {
         k: worker_brief.get(k)
         for k in ("candidate_id", "scientific_question", "approach", "variations", "baseline_variation", "notes", "rationale")
     }
-    (scratch_dir / "plan.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
+    write_contained(scratch_dir, "plan.json", json.dumps(plan, indent=2))
 
     def emit(event: dict[str, Any]) -> None:
         if on_event:
@@ -186,7 +281,6 @@ def run_worker(
         file_overlays={f"/data/{spec.cohort_file}": public_cohort},
     )
     state: dict[str, Any] = {"turns": 0, "rewrites": 0, "error": None}
-    result_path_sb = scratch_dir / RESULT_NAME
     deadline = time.monotonic() + max(120, int(worker_wall_clock_sec))
     previous_response: Optional[str] = None
     pending_input: Any = _kickoff_message(plan)
@@ -217,7 +311,9 @@ def run_worker(
                 if previous_response:
                     payload["previous_response_id"] = previous_response
                 prefix = worker_dir / f"turn_{turn_id:02d}"
-                response = responses_create(payload, timeout=int(min(1800, max(120, remaining))))
+                request_timeout = int(min(1800, max(120, remaining)))
+                response = call_cancellable(lambda: responses_create(payload, timeout=request_timeout),
+                                            cancel_event, worker_name)
                 prefix.with_suffix(".response.json").write_text(json.dumps(response, indent=2, default=str), encoding="utf-8")
                 previous_response = response_id(response)
                 state["turns"] = turn_id
@@ -241,13 +337,17 @@ def run_worker(
                     emit({"type": "worker_tool_call", "worker_name": worker_name, "turn_id": turn_id,
                           "tool_name": SHELL_TOOL_NAME, "command_preview": command[:120]})
                     result = session.exec(command, timeout_sec=timeout)
-                    (scratch_dir / "logs" / f"turn_{turn_id:02d}.stdout.txt").write_text(str(result.get("stdout") or ""), encoding="utf-8")
-                    (scratch_dir / "logs" / f"turn_{turn_id:02d}.stderr.txt").write_text(str(result.get("stderr") or ""), encoding="utf-8")
+                    for stream in ("stdout", "stderr"):   # /scratch is writable from the container
+                        try:
+                            write_contained(scratch_dir, f"logs/turn_{turn_id:02d}.{stream}.txt", str(result.get(stream) or ""))
+                        except OSError:
+                            pass
                     emit({"type": "worker_tool_result", "worker_name": worker_name, "turn_id": turn_id,
                           "tool_name": SHELL_TOOL_NAME, "exit_code": result.get("exit_code")})
                     note = ""
-                    if result_path_sb.exists():
-                        mt = result_path_sb.stat().st_mtime
+                    result_stat = stat_contained(scratch_dir, RESULT_NAME)
+                    if result_stat is not None:
+                        mt = result_stat.st_mtime
                         if mt != last_mtime:
                             if last_mtime:
                                 state["rewrites"] += 1
@@ -280,38 +380,52 @@ def run_worker(
                 json.dumps({"error": str(exc), "traceback": traceback.format_exc()}, indent=2), encoding="utf-8"
             )
 
-        if not result_path_sb.exists():
+        if stat_contained(scratch_dir, RESULT_NAME) is None:
             raise RuntimeError(f"{worker_name}: no result.py produced ({state.get('error') or 'worker ended without writing it'})")
         # ---- controller materialization (whether the conversation ended in DONE or not)
-        (scratch_dir / MATERIALIZE_SCRIPT).write_text(_materialize_script(plan), encoding="utf-8")
+        write_contained(scratch_dir, MATERIALIZE_SCRIPT, _materialize_script(plan))
         emit({"type": "worker_materialize", "worker_name": worker_name})
-        mat = session.exec(f"cd /scratch && python {MATERIALIZE_SCRIPT}", timeout_sec=max(command_timeout_sec, MATERIALIZE_TIMEOUT))
+        # Bounded by what is left of the wall clock, plus a grace for a worker that used it all.
+        mat_timeout = int(min(MATERIALIZE_TIMEOUT, max(0.0, deadline - time.monotonic()) + MATERIALIZE_GRACE))
+        mat = session.exec(f"cd /scratch && python {MATERIALIZE_SCRIPT}", timeout_sec=mat_timeout)
         (worker_dir / "materialize.exec.json").write_text(json.dumps(mat, indent=2, default=str), encoding="utf-8")
     finally:
         stop_cancel_watch()
         session.stop()
 
-    report_path_sb = scratch_dir / MATERIALIZE_REPORT
-    mreport = (
-        json.loads(report_path_sb.read_text(encoding="utf-8"))
-        if report_path_sb.exists()
-        else {"status": "no_report", "coverage": {}, "errors": {}}
-    )
+    # Everything below reads what the container wrote: never through a planted link.
+    mreport: dict[str, Any] = {"status": "no_report", "coverage": {}, "errors": {}}
+    report_raw = read_contained(scratch_dir, MATERIALIZE_REPORT, MAX_REPORT_BYTES)
+    if report_raw is not None:
+        try:
+            loaded = json.loads(report_raw.decode("utf-8", errors="replace"))
+            if isinstance(loaded, dict):
+                mreport = loaded
+        except ValueError:
+            mreport = {"status": "bad_report", "coverage": {}, "errors": {}}
     primary = str(plan.get("baseline_variation") or (plan.get("variations") or [{}])[0].get("name") or "")
     names = [v.get("name", "") for v in plan.get("variations", [])]
-    table_sb = scratch_dir / TABLE_NAME
+    table_raw = read_contained(scratch_dir, TABLE_NAME, MAX_TABLE_BYTES + 1)
+    if table_raw is not None and len(table_raw) > MAX_TABLE_BYTES:
+        table_raw = None
+    if table_raw is None and os.path.islink(scratch_dir / TABLE_NAME):
+        os.unlink(scratch_dir / TABLE_NAME)   # the judge reads it from here: drop a planted link
     checks: dict[str, Any] = {
         "result_py_exists": True,
         "import_ok": mreport.get("status") == "ok",
-        "table_written": table_sb.exists(),
+        "table_written": table_raw is not None,
         "planned_columns_present": False,
         "no_duplicate_donors": False,
         "primary_coverage": float((mreport.get("coverage") or {}).get(primary, 0.0) or 0.0),
         "primary_coverage_ok": False,
         "donor_errors": int(mreport.get("n_errors", len(mreport.get("errors", {})))),
     }
-    if table_sb.exists():
-        table = pd.read_csv(table_sb, dtype={"donor_id": str})
+    if table_raw is not None:
+        try:
+            table = pd.read_csv(io.BytesIO(table_raw), dtype={"donor_id": str})
+        except ValueError:   # unparsable / empty / not text
+            table = pd.DataFrame()
+            checks["table_written"] = False
         checks["planned_columns_present"] = all(n in table.columns for n in names) and "donor_id" in table.columns
         checks["no_duplicate_donors"] = bool("donor_id" in table.columns and not table["donor_id"].duplicated().any())
         checks["primary_coverage_ok"] = checks["primary_coverage"] >= MIN_COVERAGE
@@ -327,7 +441,10 @@ def run_worker(
     )
 
     result_path = worker_dir / RESULT_NAME
-    shutil.copy2(result_path_sb, result_path)
+    result_raw = read_contained(scratch_dir, RESULT_NAME, MAX_SCRIPT_BYTES)
+    if result_raw is None:
+        raise RuntimeError(f"{worker_name}: result.py is not a regular file in the sandbox")
+    result_path.write_bytes(result_raw)
     results_path = worker_dir / RESULTS_NAME
     results_payload = {
         "status": "ok" if passed else "failed",

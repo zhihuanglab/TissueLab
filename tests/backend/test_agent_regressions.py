@@ -195,20 +195,33 @@ def test_base_url_trailing_slash_is_dropped():
 
 # --- 8. only the app may change the model settings ----------------------------------
 
-@pytest.mark.parametrize("origin", ["https://evil.example", "null", "http://localhost.evil.example"])
-def test_put_model_settings_rejects_foreign_origins(client, settings_module, origin):
+@pytest.mark.parametrize("origin", [
+    "https://evil.example", "null", "http://localhost.evil.example",
+    # other local web pages: Jupyter, a Vite dev server, the service's own port, no port
+    "http://localhost:8888", "http://127.0.0.1:5173", "http://127.0.0.1:5001", "http://localhost",
+])
+def test_model_settings_reject_foreign_origins(client, settings_module, origin):
     r = client.put(API, json={"fields": {"OPENAI_BASE_URL": "https://evil.example/v1"}},
                    headers={"Origin": origin})
     assert r.json()["code"] == 403
     assert "OPENAI_BASE_URL" not in settings_module.load_saved()
+    assert client.get(API, headers={"Origin": origin}).json()["code"] == 403
 
 
-@pytest.mark.parametrize("origin", [None, "http://localhost:3000", "http://127.0.0.1:5001", "http://[::1]:3000"])
-def test_put_model_settings_allows_the_app(client, settings_module, origin):
+@pytest.mark.parametrize("origin", [None, "http://localhost:3000", "http://127.0.0.1:3005", "http://[::1]:3099"])
+def test_model_settings_allow_the_app(client, settings_module, origin):
     headers = {"Origin": origin} if origin else {}
     r = client.put(API, json={"fields": {"LLM_MODEL": "qwen3"}}, headers=headers)
     assert r.json()["code"] == 0
     assert settings_module.load_saved()["LLM_MODEL"] == "qwen3"
+    assert client.get(API, headers=headers).json()["code"] == 0
+
+
+def test_renderer_ports_are_configurable(client, settings_module, monkeypatch):
+    monkeypatch.setenv("TL_RENDERER_PORTS", "4000, 4100-4101")
+    put = lambda origin: client.put(API, json={"fields": {"LLM_MODEL": "m"}}, headers={"Origin": origin}).json()["code"]
+    assert put("http://localhost:3000") == 403
+    assert put("http://localhost:4000") == 0 and put("http://127.0.0.1:4101") == 0
 
 
 # --- 9. settings saves racing agent construction ----------------------------------
@@ -248,20 +261,38 @@ def test_saves_and_getters_race_without_deadlock_or_stale_agent(settings_module,
     assert va.get_verification_agent().client.api_key == last_key
 
 
-def test_agent_built_across_a_reset_is_not_cached(monkeypatch):
+def test_agent_built_across_a_save_is_not_served_again(settings_module, monkeypatch):
     from app.services.agent import workflow_agent as wa
 
-    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
-    wa.reset_workflow_agent()
+    settings_module.update_settings({"OPENAI_API_KEY": "sk-before-000000000000"})
     real_init = wa.WorkflowAgent.__init__
+    saved_once = []
 
-    def init_then_reset(self):
-        real_init(self)
-        wa.reset_workflow_agent()  # Preferences saved while this one was being built
+    def init_then_save(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        if not saved_once:  # Preferences saved while this one was being built
+            saved_once.append(True)
+            settings_module.update_settings({"OPENAI_API_KEY": "sk-after-0000000000000"})
 
-    monkeypatch.setattr(wa.WorkflowAgent, "__init__", init_then_reset)
+    monkeypatch.setattr(wa.WorkflowAgent, "__init__", init_then_save)
+    wa._agent_cache.clear()
     built = wa.get_workflow_agent()
-    assert built is not None and wa._workflow_agent is None
+    assert built.client.api_key == "sk-before-000000000000"  # serves its own request
+    current = wa.get_workflow_agent()
+    assert current is not built and current.client.api_key == "sk-after-0000000000000"
+
+
+def test_agent_client_takes_endpoint_and_key_from_one_snapshot(monkeypatch):
+    from app.services import llm_settings
+    from app.services.agent import workflow_agent as wa
+
+    seen = {}
+    monkeypatch.setattr(wa, "OpenAI", lambda **kw: seen.update(kw) or SimpleNamespace(api_key=kw["api_key"]))
+    monkeypatch.setattr(wa, "WorkflowAgent", lambda client=None: SimpleNamespace(client=client))
+    wa._build_workflow_agent({"OPENAI_API_KEY": "sk-snap", "OPENAI_BASE_URL": None})
+    # explicit, never left for the SDK to read from os.environ on its own
+    assert seen == {"api_key": "sk-snap", "base_url": "https://api.openai.com/v1"}
+    assert llm_settings.openai_kwargs({"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "http://h:1/v1"})["base_url"] == "http://h:1/v1"
 
 
 # --- 13. concurrent corrections make one knowledge item -----------------------------

@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Optional, Tuple
 
 from app.services.agent.discovery.loop import (
-    DEFAULT_WORKER_WALL_CLOCK, guide_recorded, read_run_state, run_discovery, run_folder_busy,
+    DEFAULT_WORKER_WALL_CLOCK, guide_recorded, mark_run_cancelled, read_run_state, run_discovery,
+    run_folder_busy,
 )
 from app.services.agent.discovery.problem import (
     PROBLEM_FILENAME, ProblemError, parse_problem, validate_against_data,
@@ -32,6 +33,9 @@ FINISHED_RUN_GRACE_SEC = 60
 # A silent stream yields a heartbeat this often: the server only notices a
 # dropped connection when it sends, and a worker can be silent for minutes.
 STREAM_HEARTBEAT_SEC = 15
+# Finished runs whose folder the process still remembers (for a late stream).
+REMEMBERED_RUNS = 256
+FOLDER_BUSY_MESSAGE = "A research run is already in progress in this folder."
 
 
 def workspace_data_dir(workspace_path: str) -> Path:
@@ -87,10 +91,26 @@ class DiscoveryRunManager:
         # they would split the events.
         self._streaming: Dict[str, Tuple[asyncio.Queue, asyncio.Event]] = {}
         self._lock = asyncio.Lock()
+        # Runs the user stopped (vs. a shutdown), data folders a start is setting up,
+        # and the folders of finished runs this process has forgotten.
+        self._user_cancelled: set[str] = set()
+        self._starting: set[Path] = set()
+        self._past_roots: Dict[str, Path] = {}
 
     def run_root(self, run_id: str) -> Optional[Path]:
         """The folder of a run this process is running or still holds events for."""
         return self._run_roots.get(run_id)
+
+    def past_run_root(self, run_id: str) -> Optional[Path]:
+        """The folder of a run this process ran and has since forgotten."""
+        return self._past_roots.get(run_id)
+
+    def _folder_in_use(self, data_dir: Path) -> bool:
+        key = data_dir.resolve()
+        return key in self._starting or any(
+            self.is_active(run_id) and root.parent.parent.resolve() == key
+            for run_id, root in self._run_roots.items()
+        )
 
     async def read_stream(self, run_id: str) -> AsyncIterator[Optional[dict]]:
         """The run's events for its one reader, and None after each
@@ -145,8 +165,15 @@ class DiscoveryRunManager:
         reading = self._streaming.get(run_id)
         if self._tasks.get(run_id) is not task or (reading is not None and reading[0] is self._queues.get(run_id)):
             return
+        root = self._run_roots.get(run_id)
+        if root is not None:
+            self._past_roots.pop(run_id, None)
+            self._past_roots[run_id] = root
+            while len(self._past_roots) > REMEMBERED_RUNS:
+                self._past_roots.pop(next(iter(self._past_roots)))
         for table in (self._tasks, self._queues, self._cancel_events, self._run_roots):
             table.pop(run_id, None)
+        self._user_cancelled.discard(run_id)
 
     def is_active(self, run_id: str) -> bool:
         task = self._tasks.get(run_id)
@@ -160,8 +187,27 @@ class DiscoveryRunManager:
     ) -> str:
         """Start a run. `task` is problem.md itself when it starts with a `---` header,
         else the program in plain words, whose header is worked out from the cohort
-        table. Raises ProblemError when it does not parse or does not match the data folder."""
+        table. Raises ProblemError when it does not parse or does not match the data folder,
+        or when another run is in progress in the folder (both would rewrite its problem.md)."""
         data_dir = workspace_data_dir(workspace_path)
+        # Claimed before the first await: two Starts at once cannot both pass.
+        if self._folder_in_use(data_dir):
+            raise ProblemError(FOLDER_BUSY_MESSAGE)
+        key = data_dir.resolve()
+        self._starting.add(key)
+        try:
+            return await self._start(
+                task=task, data_dir=data_dir, rounds=rounds, reasoning_effort=reasoning_effort,
+                worker_wall_clock_sec=worker_wall_clock_sec, dataset_scout=dataset_scout,
+                reuse_guide_from=reuse_guide_from, workers_per_round=workers_per_round,
+            )
+        finally:
+            self._starting.discard(key)
+
+    async def _start(
+        self, *, task: str, data_dir: Path, rounds: int, reasoning_effort: str, worker_wall_clock_sec: int,
+        dataset_scout: bool, reuse_guide_from: Optional[str], workers_per_round: int,
+    ) -> str:
         if not task.lstrip("\ufeff").startswith("---"):
             task = await asyncio.to_thread(program_problem, task, data_dir)
         spec = parse_problem(task)
@@ -198,7 +244,9 @@ class DiscoveryRunManager:
         await asyncio.to_thread(validate_against_data, spec, data_dir)
         config = state.get("config") or {}
         next_round_id = int(state.get("next_round_id", 1) or 1)
-        remaining = max(1, int(config.get("rounds", 1)) - next_round_id + 1)
+        remaining = int(config.get("rounds", 1) or 1) - next_round_id + 1
+        if remaining < 1 and not additional_rounds:
+            raise ProblemError("This run has finished all its rounds; choose how many more rounds to run")
         await self._launch(
             run_root.name, run_root, spec=spec, data_dir=data_dir,
             rounds=int(additional_rounds) if additional_rounds else remaining,
@@ -218,13 +266,25 @@ class DiscoveryRunManager:
             if run_folder_busy(run_root):
                 raise ProblemError(f"Run {run_id} is still stopping; try again in a moment")
             self._cancel_events[run_id] = threading.Event()
+            self._user_cancelled.discard(run_id)
             queue = self._queues[run_id] = asyncio.Queue(maxsize=EVENT_BACKLOG)
             self._run_roots[run_id] = run_root
             task = self._tasks[run_id] = asyncio.create_task(self._execute(run_id, run_root, **params))
             task.add_done_callback(lambda done: self._finished(run_id, queue, done))
 
+    def _report_cancelled(self, run_id: str, run_root: Path, queue: asyncio.Queue) -> None:
+        """The user stopped the run: say so on disk and to the stream, once."""
+        self._user_cancelled.discard(run_id)
+        try:
+            mark_run_cancelled(run_root)
+        except OSError:
+            pass
+        _put(queue, {"type": "run_cancelled", "run_id": run_id})
+
     def _finished(self, run_id: str, queue: asyncio.Queue, task: asyncio.Task) -> None:
         """Close the stream however the task ended (even cancelled before it ever ran)."""
+        if run_id in self._user_cancelled and self._tasks.get(run_id) is task:
+            self._report_cancelled(run_id, self._run_roots[run_id], queue)
         _put(queue, None)
         # A stream that comes later still gets the ending; then the run is forgotten.
         task.get_loop().call_later(FINISHED_RUN_GRACE_SEC, self._drop, run_id, task)
@@ -244,13 +304,18 @@ class DiscoveryRunManager:
             )
             await emit({"type": "complete", "result": result})
         except asyncio.CancelledError:
-            await emit({"type": "error", "message": "Run cancelled"})
+            if run_id in self._user_cancelled:
+                # no await before the event: a second cancel() must not interrupt this handler
+                self._report_cancelled(run_id, run_root, queue)
+            else:
+                await emit({"type": "error", "message": "Run stopped: the backend is shutting down"})
         except Exception as exc:
             await emit({"type": "error", "message": str(exc)})
 
     async def cancel_run(self, run_id: str) -> bool:
         if not self.is_active(run_id):
             return False
+        self._user_cancelled.add(run_id)
         self._cancel_events[run_id].set()
         # The task's CancelledError handler reports "Run cancelled" once; _finished closes the stream.
         self._tasks[run_id].cancel()

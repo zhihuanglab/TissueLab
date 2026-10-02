@@ -34,6 +34,8 @@ from app.core.libvips import configure as _configure_libvips
 _configure_libvips()
 
 from fastapi import FastAPI
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import argparse
@@ -55,6 +57,7 @@ from app.websocket.device_connection_manager import start_websocket_health_check
 from app.services.thumbnail import thumbnail_worker  # Import thumbnail_worker for shutdown
 from app.core import settings
 from app.middlewares import error_handler
+from app.core.response import error_response
 from app.middlewares.logging_middleware import logging_middleware
 from app.middlewares.auth_middleware import auth_middleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -259,6 +262,44 @@ app.add_middleware(
 app.middleware("http")(logging_middleware)
 app.middleware("http")(auth_middleware)
 app.add_exception_handler(StarletteHTTPException, error_handler)
+
+
+_VALIDATION_MESSAGES = {
+    "greater_than_equal": "must be \u2265 {ge}",
+    "less_than_equal": "must be \u2264 {le}",
+    "greater_than": "must be > {gt}",
+    "less_than": "must be < {lt}",
+    "missing": "is required",
+}
+
+
+def _validation_message(errors) -> str:
+    """Pydantic's errors as one line the panel can show, e.g. "worker_wall_clock_sec: must be ≥ 120"."""
+    parts = []
+    for err in errors:
+        loc = [str(p) for p in err.get("loc", ()) if p not in ("body", "query", "path", "header")]
+        template = _VALIDATION_MESSAGES.get(err.get("type", ""))
+        try:
+            text = template.format(**(err.get("ctx") or {})) if template else err.get("msg", "invalid")
+        except (KeyError, IndexError):
+            text = err.get("msg", "invalid")
+        parts.append(f"{'.'.join(loc)}: {text}" if loc else text)
+    return "; ".join(parts) or "Invalid request"
+
+
+async def _request_validation_handler(request, exc: RequestValidationError):
+    """A rejected request body / query on /api gets the usual envelope, with a readable message."""
+    if not request.url.path.startswith("/api"):
+        return await request_validation_exception_handler(request, exc)
+    return error_response(
+        message=_validation_message(exc.errors()),
+        code=422,
+        request_id=request.headers.get("X-Request-ID") or "",
+        error_code="VALIDATION_ERROR",
+    )
+
+
+app.add_exception_handler(RequestValidationError, _request_validation_handler)
 # Route generic uncaught exceptions through error_handler too, so they get the
 # consistent AppResponse envelope on /api.
 app.add_exception_handler(Exception, error_handler)

@@ -43,10 +43,17 @@ flips the sign, so declare it per variation.
 ## How scoring works (read this before proposing)
 
 - ALL variations are judged and all count as screened candidates. Each is
-  compared against the current panel with paired repeated nested CV on the
-  covariates listed above. Gates: mean out-of-fold RMSE improvement >= 5e-4,
-  better in >= 65% of repeats, consensus RMSE and Pearson not worse, no
-  single-donor reversal, and coverage >= 80% of donors. A variation is eligible ONLY if its observed partial r has
+  compared against the current panel with paired repeated nested CV (5 repeats
+  of 5-fold) on the covariates listed above. Gates, all required:
+  - mean out-of-fold RMSE lower by at least 1% of the outcome's SD;
+  - lower RMSE in at least 4 of the 5 repeats;
+  - consensus (repeat-averaged) predictions: RMSE not worse, Pearson r not
+    lower by more than 0.02;
+  - leave-one-donor check: removing any single donor from the consensus RMSE
+    comparison (the models are not refitted) never leaves the candidate worse
+    by more than 0.1% of the outcome's SD;
+  - coverage >= 80% of donors.
+  A variation is eligible ONLY if its observed partial r has
   the declared `expected_sign`; the opposite direction is a refuted hypothesis
   and is reported back as UNEXPECTED_DIRECTION (you may re-propose the reversed
   hypothesis explicitly in a later round). The best eligible variation is

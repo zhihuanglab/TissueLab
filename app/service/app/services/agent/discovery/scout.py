@@ -1,16 +1,17 @@
 """The dataset scout: an optional agent that explores the data folder once,
 before round 1, and writes shared/dataset_guide.md for the proposer and workers.
 
-It runs in the same outcome-blind sandbox as the proposer (the cohort file is
-overlaid with its id / slide / mpp columns only), writes only to its own
-/scratch, and the controller copies the guide into /shared, where the later
-sessions see it read-only.
+It runs in the same outcome-blind sandbox as the workers (the cohort file is
+overlaid with its id / slide / mpp columns only, other tables are masked),
+writes only to its own /scratch, and the controller copies the guide into
+/shared, where the workers see it read-only. The proposer itself never runs
+code: it plans from the guide and the earlier rounds.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
+import os
 import threading
 import time
 from pathlib import Path
@@ -18,7 +19,8 @@ from typing import Any, Callable, Optional
 
 from .client import custom_tool_call_output, custom_tool_calls, output_text, response_id, responses_create
 from .problem import ProblemSpec, write_public_cohort
-from .sandbox import SandboxSession
+from .sandbox import SandboxSession, read_contained, stat_contained, write_contained
+from .worker import call_cancellable
 from .tools import SHELL_TOOL_NAME, SHELL_TOOL_SPEC, bounded_tool_text, is_done, load_prompt
 
 GUIDE_NAME = "dataset_guide.md"
@@ -45,7 +47,7 @@ def run_scout(
     """Explore, write the guide; returns {"status": "completed"|"no_guide", "turns"}."""
     scout_dir = Path(run_root) / "scout"
     scratch_dir = scout_dir / "sandbox"
-    (scratch_dir / "logs").mkdir(parents=True, exist_ok=True)
+    scratch_dir.mkdir(parents=True, exist_ok=True)
 
     def emit(event: dict[str, Any]) -> None:
         if on_event:
@@ -73,7 +75,7 @@ def run_scout(
             remaining = deadline - time.monotonic()
             tools_open = turns < max_tool_turns and remaining > 60
             if not tools_open:
-                if (scratch_dir / GUIDE_NAME).exists():
+                if stat_contained(scratch_dir, GUIDE_NAME) is not None:
                     break
                 pending = (pending if isinstance(pending, list) else []) + [{
                     "type": "message", "role": "user", "content": [{"type": "input_text", "text":
@@ -92,13 +94,15 @@ def run_scout(
             }
             if previous:
                 request["previous_response_id"] = previous
-            response = responses_create(request, timeout=int(min(SCOUT_REQUEST_TIMEOUT, max(60, remaining))))
+            request_timeout = int(min(SCOUT_REQUEST_TIMEOUT, max(60, remaining)))
+            response = call_cancellable(lambda: responses_create(request, timeout=request_timeout),
+                                        cancel_event, "scout")
             (scout_dir / f"turn_{turn_id:02d}.response.json").write_text(
                 json.dumps(response, indent=2, default=str), encoding="utf-8")
             previous = response_id(response)
             calls = custom_tool_calls(response, SHELL_TOOL_NAME)
             if not calls:
-                if is_done(output_text(response)) or (scratch_dir / GUIDE_NAME).exists():
+                if is_done(output_text(response)) or stat_contained(scratch_dir, GUIDE_NAME) is not None:
                     break
                 pending = f"Write /scratch/{GUIDE_NAME}, then reply with exactly DONE."
                 continue
@@ -108,8 +112,11 @@ def run_scout(
                 command = str(call.get("input") or "")
                 emit({"type": "scout_tool_call", "turn_id": turn_id, "command_preview": command[:120]})
                 result = session.exec(command, timeout_sec=int(min(command_timeout_sec, max(30, deadline - time.monotonic()))))
-                (scratch_dir / "logs" / f"turn_{turn_id:02d}.stdout.txt").write_text(str(result.get("stdout") or ""), encoding="utf-8")
-                (scratch_dir / "logs" / f"turn_{turn_id:02d}.stderr.txt").write_text(str(result.get("stderr") or ""), encoding="utf-8")
+                for stream in ("stdout", "stderr"):   # /scratch is writable from the container
+                    try:
+                        write_contained(scratch_dir, f"logs/turn_{turn_id:02d}.{stream}.txt", str(result.get(stream) or ""))
+                    except OSError:
+                        pass
                 outputs.append(custom_tool_call_output(str(call.get("call_id", "")), {
                     "exit_code": result.get("exit_code"),
                     "stdout": bounded_tool_text(result.get("stdout"), 6000),
@@ -122,12 +129,12 @@ def run_scout(
         stop_cancel_watch()
         session.stop()
 
-    guide = scratch_dir / GUIDE_NAME
-    if not guide.is_file():
+    # Read without following links: a linked guide is no guide. /shared is
+    # container-writable too, so the temp file is written the same way.
+    raw = read_contained(scratch_dir, GUIDE_NAME, GUIDE_MAX_CHARS * 4)
+    if raw is None:
         return {"status": "no_guide", "turns": turns}
-    text = guide.read_text(encoding="utf-8", errors="replace")[:GUIDE_MAX_CHARS]
-    target = Path(shared_dir) / GUIDE_NAME
-    tmp = target.with_name(GUIDE_NAME + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    shutil.move(str(tmp), str(target))
+    text = raw.decode("utf-8", errors="replace")[:GUIDE_MAX_CHARS]
+    write_contained(shared_dir, GUIDE_NAME + ".tmp", text)
+    os.replace(Path(shared_dir) / (GUIDE_NAME + ".tmp"), Path(shared_dir) / GUIDE_NAME)
     return {"status": "completed", "turns": turns}
