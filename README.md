@@ -63,7 +63,7 @@ Released as a publicly available ecosystem, TissueLab can accelerate computation
 - **Node.js** v24+ ([Download](https://nodejs.org/en/download/))
 - **Python** 3.11 with conda (or any virtualenv)
 - **NVIDIA GPU** recommended for the task nodes (the service itself runs on CPU)
-- **Docker** required for the **Research / Discovery** panel; optional for ordinary chat code execution (`CODEEXEC_DOCKER=auto` or `1`). See [Research setup](#4-research--discovery-setup).
+- **Docker Engine** required for the **Research / Discovery** panel; optional for ordinary chat code execution. See [Docker setup](#4-docker-setup).
 
 ### 1. Clone and Setup
 
@@ -130,7 +130,7 @@ run. Both sides read one `.env` file each; anything can be overridden in `.env.l
 | `TL_HOST` | Bind address, default `127.0.0.1`. |
 | `PUBLIC_DATA_PATH` | Extra read-only data folder shown as `samples/Data`. |
 | `TL_BUNDLE_BASE_URL` | HTTPS host for task node bundles (catalog + archives). |
-| `CODEEXEC_DOCKER` | Ordinary chat code execution: `auto` (default), `1` require Docker, `0` in-process subprocess. Research always requires Docker, regardless of this setting. |
+| `CODEEXEC_DOCKER` | Optional setting for ordinary chat code execution. Leave it as `auto` (the default) unless you need to change the Docker behavior. Research always requires Docker. |
 
 **Frontend** — `app/render/.env` (overridable in `.env.local`):
 
@@ -140,64 +140,68 @@ run. Both sides read one `.env` file each; anything can be overridden in `.env.l
 | `PUBLIC_COMMUNITY_API_ENDPOINT` | The hosted TissueLab community (Ctrl Service) that the Community page browses and publishes to. Default `https://ctrl.vlm.ai/api`. Requires signing in with a TissueLab account. |
 | `NEXT_PUBLIC_FIREBASE_*`, `NEXT_PUBLIC_GOOGLE_CLIENT_ID` | Public web-client identifiers of the hosted TissueLab project, used only for the community sign-in (Firebase Auth; Google PKCE flow on the desktop). |
 
-### 4. Research / Discovery setup
+### 4. Docker setup
 
-Research needs a running **Docker Engine** and the Docker CLI.
+Docker is required only when using the **Research / Discovery** panel. Ordinary chat and the
+main viewer can run without Docker.
 
-**Windows**
+#### Install and verify Docker
 
-**1. Install — paste into PowerShell:**
+Docker Desktop is recommended on Windows and macOS. Linux users can install Docker Engine.
+
+**Windows (PowerShell)**
 
 ```powershell
 winget install --id Docker.DockerDesktop --exact --source winget
 ```
 
-Open **Docker Desktop** from the Start menu, finish setup, and wait for the
-**Linux container engine** to start. If WSL is missing, run `wsl --install` in an
-administrator PowerShell and restart Windows if prompted.
+Open Docker Desktop and wait until it is ready. If WSL is not installed, run `wsl --install` in
+an administrator PowerShell and restart Windows if prompted.
 
-**2. Verify — paste into a new PowerShell:**
-
-```powershell
-docker info --format '{{.ServerVersion}}'
-docker run --rm hello-world
-```
-
-**macOS (Apple Silicon)**
-
-**1. Install and open — paste into Terminal (requires [Homebrew](https://brew.sh/)):**
+**macOS**
 
 ```bash
 brew install --cask docker-desktop
 open -a Docker
 ```
 
-Without Homebrew, [download Docker Desktop for Apple Silicon](https://docs.docker.com/desktop/setup/install/mac-install/),
-drag it into Applications, and open it.
-Finish the first-run setup and wait for the engine to start.
+Alternatively, install the appropriate [Docker Desktop for Mac](https://docs.docker.com/desktop/setup/install/mac-install/)
+version manually and open it.
 
-**2. Verify — paste into a new Terminal:**
+**Linux**
 
-```bash
-docker info --format '{{.ServerVersion}}'
-docker run --rm hello-world
+Follow the official [Docker Engine installation guide](https://docs.docker.com/engine/install/).
+
+**Verify on any platform**
+
+```text
+docker version
 ```
 
-When you see **Hello from Docker!**, restart TissueLab and the Python service.
-If Docker cannot connect, open Docker Desktop and wait for its engine to start.
+The command must show both a **Client** and a **Server** section. If the **Server** section is
+missing, start Docker Desktop (or the Docker service on Linux) and retry. Restart TissueLab after
+installing Docker while the app was already open.
 
-**3. Start Research:** set a Responses API connection in **Preferences → AI Models**,
-choose a workspace with slides and a patient CSV, and click **Start Research**.
-The research instructions are loaded from `program.md` and automatically saved after a
-3-second pause or every 15 seconds of continuous editing, without starting Research.
-If multiple cohort CSVs exist, the agent selects one from their summaries and shows its reason.
-To choose explicitly, name the CSV in the program or set `cohort_file` in its YAML header.
-Each run saves its own `program.md` and resolved `run_config.json` in
-`autoresearch_runs/<run_id>/`, so changing the workspace program does not change past runs.
-The first run downloads and builds the sandbox image automatically; allow extra time.
+#### Research / Discovery
 
-For Linux: [install Docker Engine](https://docs.docker.com/engine/install/), then run
-the same verification commands above.
+After Docker is ready:
+
+1. Set a **Responses API** connection in **Preferences → AI Models**.
+2. Open a workspace containing slides and a patient/cohort CSV.
+3. Click **Start Research**.
+
+The first run downloads and prepares the required environment automatically, so it may take
+several minutes.
+
+Research instructions are loaded from `program.md`. If multiple cohort CSVs exist, specify
+`cohort_file` in the program YAML header to choose one explicitly.
+
+#### Troubleshooting
+
+- **`docker` is not recognized**: open a new terminal after installing Docker.
+- **Docker is not running**: open Docker Desktop, wait until it is ready, and run `docker version`
+  again.
+- **Research still cannot start**: restart TissueLab after Docker is ready.
 
 ## 🏗️ Architecture Overview
 
