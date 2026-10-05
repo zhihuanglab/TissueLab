@@ -63,7 +63,7 @@ Released as a publicly available ecosystem, TissueLab can accelerate computation
 - **Node.js** v24+ ([Download](https://nodejs.org/en/download/))
 - **Python** 3.11 with conda (or any virtualenv)
 - **NVIDIA GPU** recommended for the task nodes (the service itself runs on CPU)
-- **Docker** optional — only for sandboxed code execution (`CODEEXEC_DOCKER=1`)
+- **Docker** required for the **Research / Discovery** panel; optional for ordinary chat code execution (`CODEEXEC_DOCKER=auto` or `1`). See [Research setup](#4-research--discovery-setup).
 
 ### 1. Clone and Setup
 
@@ -117,7 +117,7 @@ trust (see [docs/local-mode.md](docs/local-mode.md)).
 **By default**, TissueLab ships with a working configuration — no additional setup is needed to
 run. Both sides read one `.env` file each; anything can be overridden in `.env.local`.
 
-**Backend** — `app/service/.env.local` (copy of `.env.example`, gitignored):
+**Backend** — `app/service/.env.local` (copy of `.env.example`, gitignored). The LLM connection (endpoint, API key, model, protocol, and a separate one for the Research panel) can also be set in the app under **Preferences → AI Models** (the gear next to Login): saved to `<service root>/storage/llm_settings.json`, applied immediately, and taking precedence over `.env.local`; a cleared field falls back to it.
 
 | Variable | Purpose |
 |----------|---------|
@@ -130,7 +130,7 @@ run. Both sides read one `.env` file each; anything can be overridden in `.env.l
 | `TL_HOST` | Bind address, default `127.0.0.1`. |
 | `PUBLIC_DATA_PATH` | Extra read-only data folder shown as `samples/Data`. |
 | `TL_BUNDLE_BASE_URL` | HTTPS host for task node bundles (catalog + archives). |
-| `CODEEXEC_DOCKER` | `auto` (default), `1` require Docker, `0` in-process subprocess. |
+| `CODEEXEC_DOCKER` | Ordinary chat code execution: `auto` (default), `1` require Docker, `0` in-process subprocess. Research always requires Docker, regardless of this setting. |
 
 **Frontend** — `app/render/.env` (overridable in `.env.local`):
 
@@ -139,6 +139,65 @@ run. Both sides read one `.env` file each; anything can be overridden in `.env.l
 | `PUBLIC_AI_SERVICE_API_ENDPOINT`, `PUBLIC_AI_SERVICE_SOCKET_ENDPOINT` | The local service. Defaults `http://127.0.0.1:5001/api` and `ws://127.0.0.1:5001/ws`. |
 | `PUBLIC_COMMUNITY_API_ENDPOINT` | The hosted TissueLab community (Ctrl Service) that the Community page browses and publishes to. Default `https://ctrl.vlm.ai/api`. Requires signing in with a TissueLab account. |
 | `NEXT_PUBLIC_FIREBASE_*`, `NEXT_PUBLIC_GOOGLE_CLIENT_ID` | Public web-client identifiers of the hosted TissueLab project, used only for the community sign-in (Firebase Auth; Google PKCE flow on the desktop). |
+
+### 4. Research / Discovery setup
+
+Research needs a running **Docker Engine** and the Docker CLI.
+
+**Windows**
+
+**1. Install — paste into PowerShell:**
+
+```powershell
+winget install --id Docker.DockerDesktop --exact --source winget
+```
+
+Open **Docker Desktop** from the Start menu, finish setup, and wait for the
+**Linux container engine** to start. If WSL is missing, run `wsl --install` in an
+administrator PowerShell and restart Windows if prompted.
+
+**2. Verify — paste into a new PowerShell:**
+
+```powershell
+docker info --format '{{.ServerVersion}}'
+docker run --rm hello-world
+```
+
+**macOS (Apple Silicon)**
+
+**1. Install and open — paste into Terminal (requires [Homebrew](https://brew.sh/)):**
+
+```bash
+brew install --cask docker-desktop
+open -a Docker
+```
+
+Without Homebrew, [download Docker Desktop for Apple Silicon](https://docs.docker.com/desktop/setup/install/mac-install/),
+drag it into Applications, and open it.
+Finish the first-run setup and wait for the engine to start.
+
+**2. Verify — paste into a new Terminal:**
+
+```bash
+docker info --format '{{.ServerVersion}}'
+docker run --rm hello-world
+```
+
+When you see **Hello from Docker!**, restart TissueLab and the Python service.
+If Docker cannot connect, open Docker Desktop and wait for its engine to start.
+
+**3. Start Research:** set a Responses API connection in **Preferences → AI Models**,
+choose a workspace with slides and a patient CSV, and click **Start Research**.
+The research instructions are loaded from `program.md` and automatically saved after a
+3-second pause or every 15 seconds of continuous editing, without starting Research.
+If multiple cohort CSVs exist, the agent selects one from their summaries and shows its reason.
+To choose explicitly, name the CSV in the program or set `cohort_file` in its YAML header.
+Each run saves its own `program.md` and resolved `run_config.json` in
+`autoresearch_runs/<run_id>/`, so changing the workspace program does not change past runs.
+The first run downloads and builds the sandbox image automatically; allow extra time.
+
+For Linux: [install Docker Engine](https://docs.docker.com/engine/install/), then run
+the same verification commands above.
 
 ## 🏗️ Architecture Overview
 
@@ -367,7 +426,7 @@ npm run dist:win       # dist/TissueLab-Setup-<version>.exe + dist/win-unpacked/
 npm run dist:mac       # DMG
 ```
 
-An installed app reads `OPENAI_API_KEY` and the other settings from `<service root>/.env.local`
+An installed app takes the LLM settings from **Preferences → AI Models**, or reads `OPENAI_API_KEY` and the other settings from `<service root>/.env.local`
 (`%APPDATA%\TissueLab\.env.local` on Windows,
 `~/Library/Application Support/TissueLab/.env.local` on macOS); see `app/service/.env.example`.
 
