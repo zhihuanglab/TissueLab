@@ -1,4 +1,6 @@
+import json
 import os
+import re
 import time
 import uuid
 
@@ -12,6 +14,19 @@ from app.core.request_context import req_var
 _LOG_BODIES = os.getenv("LOG_BODIES", "1") != "0"
 _BODY_MAX = int(os.getenv("LOG_BODY_MAX", "2048"))       # max chars written per body
 _READ_MAX = int(os.getenv("LOG_BODY_READ_MAX", "100000"))  # don't even read bodies bigger than this
+# JSON fields whose values never reach the log (API keys in Preferences, tokens...).
+_SECRET_NAME = re.compile(r"key|token|secret|password", re.IGNORECASE)
+
+
+def _redact(obj):
+    if isinstance(obj, dict):
+        return {
+            k: "***" if isinstance(v, str) and v and _SECRET_NAME.search(str(k)) else _redact(v)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_redact(v) for v in obj]
+    return obj
 
 
 def _truncate(s: str) -> str:
@@ -39,7 +54,13 @@ async def _req_body_for_log(request: Request) -> str:
         return ""
     if not raw:
         return ""
-    return _truncate(raw.decode("utf-8", "replace"))
+    text = raw.decode("utf-8", "replace")
+    if _SECRET_NAME.search(text):  # cheap pre-check: parse only bodies that may hold a secret
+        try:
+            text = json.dumps(_redact(json.loads(text)), ensure_ascii=False)
+        except (ValueError, RecursionError):
+            return "<unparsable JSON body omitted>"
+    return _truncate(text)
 
 
 async def logging_middleware(request: Request, call_next):
