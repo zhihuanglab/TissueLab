@@ -6,7 +6,7 @@ interface WorkflowStep {
     input: string
 }
 
-export type AgentName = "TLAgent"
+export type AgentName = "TLAgent" | "TL Coscientist"
 
 interface AgentState {
     workflow: WorkflowStep[]
@@ -17,7 +17,7 @@ interface AgentState {
 const getInitialSelectedAgent = (): AgentName => {
     if (typeof window !== 'undefined') {
         const saved = localStorage.getItem('tl_selected_agent');
-        if (saved === 'TLAgent') {
+        if (saved === 'TLAgent' || saved === 'TL Coscientist') {
             return saved as AgentName;
         }
     }
