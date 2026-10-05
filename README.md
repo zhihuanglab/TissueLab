@@ -63,7 +63,7 @@ Released as a publicly available ecosystem, TissueLab can accelerate computation
 - **Node.js** v24+ ([Download](https://nodejs.org/en/download/))
 - **Python** 3.11 with conda (or any virtualenv)
 - **NVIDIA GPU** recommended for the task nodes (the service itself runs on CPU)
-- **Docker** optional — only for sandboxed code execution (`CODEEXEC_DOCKER=1`)
+- **Docker Engine** required for the **Research / Discovery** panel; optional for ordinary chat code execution. See [Docker setup](#4-docker-setup).
 
 ### 1. Clone and Setup
 
@@ -117,7 +117,7 @@ trust (see [docs/local-mode.md](docs/local-mode.md)).
 **By default**, TissueLab ships with a working configuration — no additional setup is needed to
 run. Both sides read one `.env` file each; anything can be overridden in `.env.local`.
 
-**Backend** — `app/service/.env.local` (copy of `.env.example`, gitignored):
+**Backend** — `app/service/.env.local` (copy of `.env.example`, gitignored). The LLM connection (endpoint, API key, model, protocol, and a separate one for the Research panel) can also be set in the app under **Preferences → AI Models** (the gear next to Login): saved to `<service root>/storage/llm_settings.json`, applied immediately, and taking precedence over `.env.local`; a cleared field falls back to it.
 
 | Variable | Purpose |
 |----------|---------|
@@ -130,7 +130,7 @@ run. Both sides read one `.env` file each; anything can be overridden in `.env.l
 | `TL_HOST` | Bind address, default `127.0.0.1`. |
 | `PUBLIC_DATA_PATH` | Extra read-only data folder shown as `samples/Data`. |
 | `TL_BUNDLE_BASE_URL` | HTTPS host for task node bundles (catalog + archives). |
-| `CODEEXEC_DOCKER` | `auto` (default), `1` require Docker, `0` in-process subprocess. |
+| `CODEEXEC_DOCKER` | Optional setting for ordinary chat code execution. Leave it as `auto` (the default) unless you need to change the Docker behavior. Research always requires Docker. |
 
 **Frontend** — `app/render/.env` (overridable in `.env.local`):
 
@@ -139,6 +139,69 @@ run. Both sides read one `.env` file each; anything can be overridden in `.env.l
 | `PUBLIC_AI_SERVICE_API_ENDPOINT`, `PUBLIC_AI_SERVICE_SOCKET_ENDPOINT` | The local service. Defaults `http://127.0.0.1:5001/api` and `ws://127.0.0.1:5001/ws`. |
 | `PUBLIC_COMMUNITY_API_ENDPOINT` | The hosted TissueLab community (Ctrl Service) that the Community page browses and publishes to. Default `https://ctrl.vlm.ai/api`. Requires signing in with a TissueLab account. |
 | `NEXT_PUBLIC_FIREBASE_*`, `NEXT_PUBLIC_GOOGLE_CLIENT_ID` | Public web-client identifiers of the hosted TissueLab project, used only for the community sign-in (Firebase Auth; Google PKCE flow on the desktop). |
+
+### 4. Docker setup
+
+Docker is required only when using the **Research / Discovery** panel. Ordinary chat and the
+main viewer can run without Docker.
+
+#### Install and verify Docker
+
+Docker Desktop is recommended on Windows and macOS. Linux users can install Docker Engine.
+
+**Windows (PowerShell)**
+
+```powershell
+winget install --id Docker.DockerDesktop --exact --source winget
+```
+
+Open Docker Desktop and wait until it is ready. If WSL is not installed, run `wsl --install` in
+an administrator PowerShell and restart Windows if prompted.
+
+**macOS**
+
+```bash
+brew install --cask docker-desktop
+open -a Docker
+```
+
+Alternatively, install the appropriate [Docker Desktop for Mac](https://docs.docker.com/desktop/setup/install/mac-install/)
+version manually and open it.
+
+**Linux**
+
+Follow the official [Docker Engine installation guide](https://docs.docker.com/engine/install/).
+
+**Verify on any platform**
+
+```text
+docker version
+```
+
+The command must show both a **Client** and a **Server** section. If the **Server** section is
+missing, start Docker Desktop (or the Docker service on Linux) and retry. Restart TissueLab after
+installing Docker while the app was already open.
+
+#### Research / Discovery
+
+After Docker is ready:
+
+1. Set a **Responses API** connection in **Preferences → AI Models**.
+2. Open a workspace containing slides and a patient/cohort CSV.
+3. Click **Start Research**.
+
+The first run downloads and prepares the required environment automatically, so it may take
+several minutes.
+
+Research instructions are loaded from `program.md`. If multiple cohort CSVs exist, specify
+`cohort_file` in the program YAML header to choose one explicitly.
+
+#### Troubleshooting
+
+- **`docker` is not recognized**: open a new terminal after installing Docker.
+- **Docker is not running**: open Docker Desktop, wait until it is ready, and run `docker version`
+  again.
+- **Research still cannot start**: restart TissueLab after Docker is ready.
 
 ## 🏗️ Architecture Overview
 
@@ -367,7 +430,7 @@ npm run dist:win       # dist/TissueLab-Setup-<version>.exe + dist/win-unpacked/
 npm run dist:mac       # DMG
 ```
 
-An installed app reads `OPENAI_API_KEY` and the other settings from `<service root>/.env.local`
+An installed app takes the LLM settings from **Preferences → AI Models**, or reads `OPENAI_API_KEY` and the other settings from `<service root>/.env.local`
 (`%APPDATA%\TissueLab\.env.local` on Windows,
 `~/Library/Application Support/TissueLab/.env.local` on macOS); see `app/service/.env.example`.
 

@@ -34,6 +34,8 @@ from app.core.libvips import configure as _configure_libvips
 _configure_libvips()
 
 from fastapi import FastAPI
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import argparse
@@ -55,6 +57,7 @@ from app.websocket.device_connection_manager import start_websocket_health_check
 from app.services.thumbnail import thumbnail_worker  # Import thumbnail_worker for shutdown
 from app.core import settings
 from app.middlewares import error_handler
+from app.core.response import error_response
 from app.middlewares.logging_middleware import logging_middleware
 from app.middlewares.auth_middleware import auth_middleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -143,6 +146,14 @@ async def lifespan(app: FastAPI):
         anyio.to_thread.current_default_thread_limiter().total_tokens = SYNC_ROUTE_THREADS
         print(f"[INFO] Sync route threads: {SYNC_ROUTE_THREADS}")
 
+        # LLM endpoints / keys saved in Preferences override .env.local.
+        try:
+            from app.services.llm_settings import apply_saved_settings
+            apply_saved_settings()
+            print(f"[INFO] LLM agent: {'configured' if os.getenv('OPENAI_API_KEY') else 'not configured (Preferences > AI Models, or OPENAI_API_KEY)'}")
+        except Exception as llm_err:
+            print(f"[WARN] Could not apply saved model settings: {llm_err}")
+
         # Start WebSocket health checker
         await start_websocket_health_checker()
         print("[INFO] WebSocket health checker started")
@@ -155,6 +166,19 @@ async def lifespan(app: FastAPI):
             await asyncio.to_thread(reconcile_interrupted_tasks)
         except Exception as fm_err:
             print(f"[WARN] File manager task reconciliation failed: {fm_err}")
+
+        # Discovery sandboxes left running by a crashed or force-killed service
+        # (their owning pid is gone). Background: docker may be slow or absent.
+        async def _sweep_discovery_containers() -> None:
+            try:
+                from app.services.agent.discovery.sandbox import remove_owned_containers
+                removed = await asyncio.to_thread(remove_owned_containers, current_process=False)
+                if removed:
+                    print(f"[INFO] Removed {removed} orphaned discovery sandbox container(s)")
+            except Exception as sweep_err:
+                print(f"[WARN] Discovery container sweep failed: {sweep_err}")
+
+        asyncio.get_running_loop().create_task(_sweep_discovery_containers())
 
         # Non-blocking auto-activation on startup if enabled
         from app.services.activation import is_auto_activation_enabled, auto_activate_all_tasknodes
@@ -171,6 +195,21 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     try:
+        # First: the desktop shell force-kills the service ~2.5s after asking it
+        # to stop, and a killed service would leave its discovery containers
+        # running (they `sleep infinity`). Stop the runs, then remove them.
+        try:
+            from app.services.agent.discovery import run_manager as discovery_runs
+            from app.services.agent.discovery.sandbox import remove_owned_containers
+            manager = discovery_runs._run_manager_instance
+            stopping = manager.request_shutdown() if manager is not None else []
+            await asyncio.to_thread(remove_owned_containers, current_process=True)
+            if stopping:
+                # let the cancelled tasks record "cancelled" on their sessions
+                await asyncio.wait(stopping, timeout=2)
+        except Exception as de:
+            print(f"[WARN] Error stopping discovery runs: {de}")
+
         # Drop all in-memory segmentation handlers before pool shutdown.
         try:
             from app.services.seg_registry import clear_all_instance_handlers
@@ -224,6 +263,44 @@ app.add_middleware(
 app.middleware("http")(logging_middleware)
 app.middleware("http")(auth_middleware)
 app.add_exception_handler(StarletteHTTPException, error_handler)
+
+
+_VALIDATION_MESSAGES = {
+    "greater_than_equal": "must be \u2265 {ge}",
+    "less_than_equal": "must be \u2264 {le}",
+    "greater_than": "must be > {gt}",
+    "less_than": "must be < {lt}",
+    "missing": "is required",
+}
+
+
+def _validation_message(errors) -> str:
+    """Pydantic's errors as one line the panel can show, e.g. "worker_wall_clock_sec: must be ≥ 120"."""
+    parts = []
+    for err in errors:
+        loc = [str(p) for p in err.get("loc", ()) if p not in ("body", "query", "path", "header")]
+        template = _VALIDATION_MESSAGES.get(err.get("type", ""))
+        try:
+            text = template.format(**(err.get("ctx") or {})) if template else err.get("msg", "invalid")
+        except (KeyError, IndexError):
+            text = err.get("msg", "invalid")
+        parts.append(f"{'.'.join(loc)}: {text}" if loc else text)
+    return "; ".join(parts) or "Invalid request"
+
+
+async def _request_validation_handler(request, exc: RequestValidationError):
+    """A rejected request body / query on /api gets the usual envelope, with a readable message."""
+    if not request.url.path.startswith("/api"):
+        return await request_validation_exception_handler(request, exc)
+    return error_response(
+        message=_validation_message(exc.errors()),
+        code=422,
+        request_id=request.headers.get("X-Request-ID") or "",
+        error_code="VALIDATION_ERROR",
+    )
+
+
+app.add_exception_handler(RequestValidationError, _request_validation_handler)
 # Route generic uncaught exceptions through error_handler too, so they get the
 # consistent AppResponse envelope on /api.
 app.add_exception_handler(Exception, error_handler)
@@ -297,7 +374,6 @@ if __name__ == "__main__":
     print(f" service root: {_settings.TL_SERVICE_ROOT}")
     print(f" storage root: {STORAGE_ROOT}")
     print(f" local user: {_settings.LOCAL_USER_ID}")
-    print(f" LLM agent: {'configured' if os.getenv('OPENAI_API_KEY') else 'not configured (set OPENAI_API_KEY)'}")
     print(f" {libvips_summary()}")
     print("=======================================================")
     print(get_activation_status_message())

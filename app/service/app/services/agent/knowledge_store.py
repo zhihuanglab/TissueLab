@@ -27,6 +27,12 @@ class KnowledgeStore:
     def __init__(self, base_dir: Optional[str] = None):
         self._base = base_dir or os.path.join(SERVICE_ROOT_DIR, "storage", "users")
 
+    @property
+    def lock(self):
+        """Hold across a find-then-upsert so it is atomic (reentrant: the
+        store's own methods take it too)."""
+        return _lock
+
     def _path(self, user_id: str) -> str:
         safe = "".join(ch for ch in (user_id or "") if ch.isalnum() or ch in "-_.")
         if not safe:

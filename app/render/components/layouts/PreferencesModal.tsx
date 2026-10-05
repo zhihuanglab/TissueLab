@@ -9,6 +9,7 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Separator } from '@/components/ui/separator'
 import { useUserInfo } from '@/contexts/UserInfoProvider'
+import ModelSettingsSection from './ModelSettingsSection'
 import { RootState } from '@/store'
 import { setHighlightGtAnnotations } from '@/store/slices/viewer/viewerSettingsSlice'
 
@@ -150,6 +151,11 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
               </div>
             </div>
           </div>
+
+          <Separator className="bg-border" />
+
+          {/* LLM endpoints / keys: saved by the service, separately from the rest */}
+          <ModelSettingsSection isOpen={isOpen} />
 
           <Separator className="bg-border" />
 

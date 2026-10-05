@@ -16,7 +16,7 @@ import threading
 from datetime import datetime, timezone
 from app.utils.workflow.model_store import model_store
 from app.services.providers import LLMProvider, OpenAIProvider
-from app.services import llm_config
+from app.services import llm_config, llm_settings
 from app.services.agent.knowledge_store import get_knowledge_store
 from app.repos.schema.knowledge import KnowledgeItem
 
@@ -66,10 +66,12 @@ def _extract_code_from_markdown(raw_text: str) -> str:
     return raw_text.strip()
 
 class WorkflowAgent:
+    # Only the OpenAI-compatible provider ships; services.tasks still checks this.
+    code_provider_name = "openai"
 
-    def __init__(self):
+    def __init__(self, client: Optional[OpenAI] = None):
         # Legacy OpenAI client (for web search)
-        self.client = OpenAI()
+        self.client = client or OpenAI()
 
         # Initialize providers
         self._init_providers()
@@ -105,15 +107,8 @@ class WorkflowAgent:
         # OpenAI-compatible provider (OPENAI_BASE_URL for self-hosted servers)
         self.openai_provider = OpenAIProvider(self.client)
 
-        # Provider routing configuration
-        self.router_provider_name = os.getenv("ROUTER_PROVIDER", "openai")
-        self.chat_provider_name = os.getenv("CHAT_PROVIDER", "openai")
-        self.workflow_provider_name = os.getenv("WORKFLOW_PROVIDER", "openai")
-        self.code_provider_name = os.getenv("CODE_PROVIDER", "openai")
-        self.ranking_provider_name = os.getenv("RANKING_PROVIDER", "openai")
-
-    def _get_provider(self, provider_name: str) -> LLMProvider:
-        """Get provider by name (only the OpenAI-compatible provider ships)."""
+    def _get_provider(self) -> LLMProvider:
+        """The LLM provider (only the OpenAI-compatible provider ships)."""
         return self.openai_provider
 
     def _fetch_guidelines(self, query_text: str, always_search: bool = False) -> str:
@@ -198,7 +193,7 @@ class WorkflowAgent:
             messages.append({"role": "user", "content": query or ""})
 
             # Use provider abstraction
-            provider = self._get_provider(self.router_provider_name)
+            provider = self._get_provider()
             json_schema = {
                 "name": "route_label",
                 "schema": {
@@ -362,7 +357,7 @@ class WorkflowAgent:
                     messages[0]["content"] += f"\n\nMEDICAL GUIDELINES REFERENCE:\n{guidelines}"
 
             # Use provider abstraction
-            provider = self._get_provider(self.chat_provider_name)
+            provider = self._get_provider()
             response = await asyncio.to_thread(provider.infer, 
                 messages=messages,
                 model=self.model_chat,
@@ -685,7 +680,7 @@ Rules:
             }
 
             # Use provider abstraction
-            provider = self._get_provider(self.workflow_provider_name)
+            provider = self._get_provider()
             response = await asyncio.to_thread(provider.infer, 
                 messages=messages,
                 model=self.model_workflow,
@@ -706,8 +701,9 @@ Rules:
 
             return out
         except Exception as e:
+            # Surface it: an empty plan would hide a bad key / URL / model.
             print("Error in get_processing_steps():", e)
-            return "{}"
+            raise
 
     def _load_user_knowledge(self, user_id: str) -> List[KnowledgeItem]:
         """Load all knowledge items for a user (with caching)"""
@@ -769,52 +765,54 @@ Rules:
     ) -> str:
         """Save knowledge item (update if similar item exists, otherwise create new)"""
         store = get_knowledge_store()
-        existing_knowledge = (
-            store.find_by_query(user_id, original_query, context_key) if original_query else None
-        )
+        # Find and write under the store's lock, or two saves both create the item.
+        with store.lock:
+            existing_knowledge = (
+                store.find_by_query(user_id, original_query, context_key) if original_query else None
+            )
 
-        if existing_knowledge:
-            # Merge content (append new correction info)
-            updated_content = existing_knowledge.content
-            if content and content not in updated_content:
-                updated_content = f"{updated_content}\n\n[Follow-up Correction] {content}"
+            if existing_knowledge:
+                # Merge content (append new correction info)
+                updated_content = existing_knowledge.content
+                if content and content not in updated_content:
+                    updated_content = f"{updated_content}\n\n[Follow-up Correction] {content}"
 
-            merged_tags = list(set((existing_knowledge.tags or []) + (tags or [])))
+                merged_tags = list(set((existing_knowledge.tags or []) + (tags or [])))
 
-            updated_correction_context = existing_knowledge.correction_context or ""
-            if correction_context:
-                updated_correction_context = f"{updated_correction_context}\n\n---\n{correction_context}"
+                updated_correction_context = existing_knowledge.correction_context or ""
+                if correction_context:
+                    updated_correction_context = f"{updated_correction_context}\n\n---\n{correction_context}"
 
-            existing_knowledge.content = updated_content
-            existing_knowledge.tags = merged_tags
-            existing_knowledge.correction_context = updated_correction_context
-            existing_knowledge.updated_at = datetime.now(timezone.utc)
-            existing_knowledge.version = existing_knowledge.version + 1
-            if importance_score > existing_knowledge.importance_score:
-                existing_knowledge.importance_score = importance_score
-            if title and title != existing_knowledge.title:
-                existing_knowledge.title = title
+                existing_knowledge.content = updated_content
+                existing_knowledge.tags = merged_tags
+                existing_knowledge.correction_context = updated_correction_context
+                existing_knowledge.updated_at = datetime.now(timezone.utc)
+                existing_knowledge.version = existing_knowledge.version + 1
+                if importance_score > existing_knowledge.importance_score:
+                    existing_knowledge.importance_score = importance_score
+                if title and title != existing_knowledge.title:
+                    existing_knowledge.title = title
 
-            knowledge_id = store.upsert(user_id, existing_knowledge)
+                knowledge_id = store.upsert(user_id, existing_knowledge)
+                self._invalidate_knowledge_cache(user_id)
+                return knowledge_id
+
+            knowledge_item = KnowledgeItem(
+                user_id=user_id,
+                title=title,
+                content=content,
+                category=category,
+                tags=tags or [],
+                context_key=context_key,
+                source_type=source_type,
+                importance_score=importance_score,
+                original_query=original_query,
+                original_response=original_response,
+                correction_context=correction_context,
+            )
+            knowledge_id = store.upsert(user_id, knowledge_item)
             self._invalidate_knowledge_cache(user_id)
             return knowledge_id
-
-        knowledge_item = KnowledgeItem(
-            user_id=user_id,
-            title=title,
-            content=content,
-            category=category,
-            tags=tags or [],
-            context_key=context_key,
-            source_type=source_type,
-            importance_score=importance_score,
-            original_query=original_query,
-            original_response=original_response,
-            correction_context=correction_context,
-        )
-        knowledge_id = store.upsert(user_id, knowledge_item)
-        self._invalidate_knowledge_cache(user_id)
-        return knowledge_id
 
     def _extract_knowledge_from_correction(
         self,
@@ -928,7 +926,7 @@ Return only JSON, no other text. If is_correction is false, other fields can be 
                 {"role": "user", "content": detection_prompt}
             ]
 
-            provider = self._get_provider(self.chat_provider_name)
+            provider = self._get_provider()
             response = provider.infer(messages=messages, model=self.model_chat)
 
             try:
@@ -1038,7 +1036,7 @@ Return only JSON, no other text. If is_correction is false, other fields can be 
             }
 
             # Use provider abstraction
-            provider = self._get_provider(self.ranking_provider_name)
+            provider = self._get_provider()
             response = await asyncio.to_thread(provider.infer, 
                 messages=messages,
                 model=self.model_ranking,
@@ -1110,23 +1108,29 @@ Return only JSON, no other text. If is_correction is false, other fields can be 
                 {"role": "user", "content": user_prompt},
             ],
             "stream": True,
+            # Per read: a server that stops sending chunks fails instead of hanging.
+            "timeout": 300,
         }
         # gpt-5 models only accept the default temperature.
         if not llm_config.is_gpt5(self.model_code or ""):
             kwargs["temperature"] = 1.0
 
         stream = self.client.chat.completions.create(**kwargs)
-        for chunk in stream:
-            try:
-                choices = getattr(chunk, "choices", None) or []
-                if not choices:
+        try:
+            for chunk in stream:
+                try:
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    delta = getattr(choices[0], "delta", None)
+                    piece = getattr(delta, "content", None) if delta is not None else None
+                    if piece:
+                        yield piece
+                except Exception:
                     continue
-                delta = getattr(choices[0], "delta", None)
-                piece = getattr(delta, "content", None) if delta is not None else None
-                if piece:
-                    yield piece
-            except Exception:
-                continue
+        finally:
+            # Also runs when the consumer stops early (client gone): drop the upstream connection.
+            stream.close()
 
     async def get_script(self, script_task: str, zarr_structure: str = None, original_question: str = None, web_search_enabled: bool = False) -> str:
         """
@@ -1150,7 +1154,7 @@ Return only JSON, no other text. If is_correction is false, other fields can be 
 
         try:
             # Use provider abstraction
-            provider = self._get_provider(self.code_provider_name)
+            provider = self._get_provider()
             response = await asyncio.to_thread(provider.infer,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -1167,25 +1171,26 @@ Return only JSON, no other text. If is_correction is false, other fields can be 
             raise
 
 
-# Singleton instance
-_workflow_agent = None
-
-
 def agent_configured() -> bool:
     return bool(os.getenv("OPENAI_API_KEY"))
+
+
+def _build_workflow_agent(settings) -> WorkflowAgent:
+    if not settings.get("OPENAI_API_KEY"):
+        raise AgentNotConfigured(
+            "The LLM agent is not configured: add an API key in Preferences > AI Models "
+            "(or set OPENAI_API_KEY in .env.local)."
+        )
+    return WorkflowAgent(client=OpenAI(**llm_settings.openai_kwargs(settings)))
+
+
+# Singleton, rebuilt once Preferences change the LLM settings.
+_agent_cache = llm_settings.SettingsCached(_build_workflow_agent)
 
 
 def get_workflow_agent() -> WorkflowAgent:
     """
     Get singleton instance of WorkflowAgent
     """
-    global _workflow_agent
-    if _workflow_agent is None:
-        if not agent_configured():
-            raise AgentNotConfigured(
-                "The LLM agent is not configured: set OPENAI_API_KEY in app/service/.env.local "
-                "(an OpenAI-compatible endpoint can be set with OPENAI_BASE_URL)."
-            )
-        _workflow_agent = WorkflowAgent()
-    return _workflow_agent
+    return _agent_cache.get()
 

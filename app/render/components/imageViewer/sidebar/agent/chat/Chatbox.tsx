@@ -353,12 +353,15 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
         // Only poll when code is being generated, not when workflow is running
         if (isWorkflowRunning) return;
         const response = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/tasks/v1/get_answer`, { method: 'GET', returnAxiosFormat: true });
+        // apiFetch({ returnAxiosFormat: true }) already unwraps the envelope:
+        // response.data is { message: "wait" | "done" | ..., answer }.
         const data = response.data;
         console.log("Polling get_answer:", data);
 
-        if (!answerReceivedRef.current && (data.data.answer || data.message === "done")) {
+        // "wait" carries the partial stream so far, not the answer.
+        if (!answerReceivedRef.current && data?.message !== "wait" && (data?.answer || data?.message === "done")) {
           let botMessage: MessageType | undefined;
-          const ans = data?.data?.answer;
+          const ans = data?.answer;
           if (typeof ans === "string") {
             const looksLikeGeneratedScript = ans.includes('def analyze_medical_image');
             // If the answer is generated code, do not post guidance here; rely on the one-time hint effect
@@ -370,7 +373,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
                 type: "text" as const,
               };
             }
-          } else if (typeof ans === "object") {
+          } else if (ans && typeof ans === "object") {
             botMessage = {
               id: Date.now() + 1,
               content: createTextPayload(`Here is the response:\n\n${JSON.stringify(ans.execution_result, null, 2)}\n\nPlease review the information above.`),
@@ -700,6 +703,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
         type: "text" as const,
       }
       dispatch(addMessage(errorMessage))
+      setIsLoading(false)
       setShowThinking(false)
     }
   }
@@ -730,6 +734,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="TLAgent">Agent</SelectItem>
+                <SelectItem value="TL Coscientist">Research</SelectItem>
               </SelectContent>
             </Select>
           </div>

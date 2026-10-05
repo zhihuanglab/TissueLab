@@ -20,6 +20,9 @@ numpy==2.4.6
 opencv-python-headless==5.0.0.93
 Pillow==12.3.0
 scipy==1.17.1
+# Discovery judge (app/services/agent/discovery): donor tables, nested-CV ridge panels
+pandas==3.0.6
+scikit-learn==1.9.1
 h5py==3.16.0
 matplotlib==3.11.1
 
