@@ -1185,7 +1185,7 @@ export const CoscientistPanel: React.FC = () => {
             </div>}
             {(outcome || (phase === "complete" && endState)) && (
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                {outcome && <span>Predicting <b className="font-mono text-foreground">{outcome}</b></span>}
+                {outcome && <span>Outcome: <b className="font-mono text-foreground">{outcome}</b></span>}
                 {phase === "complete" && endState && (
                   <span
                     data-testid="run-end-state"
