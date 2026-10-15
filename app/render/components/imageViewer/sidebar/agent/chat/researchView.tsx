@@ -3,68 +3,67 @@
  * dots, the error box, and the plain-language names it shows for internal ones.
  */
 import React, { useState } from "react"
+import { marked, type Token, type Tokens } from "marked"
 import type { ToolCallEntry } from "./researchRunState"
 import { Check, Loader2, X, ChevronDown, ChevronRight } from "lucide-react"
 import { cn } from "@/utils/common/twMerge"
 
-// ─── Lightweight markdown renderer ───────────────────────────────────────────
-
+// Parse Markdown with the existing library, then render React elements so raw
+// HTML in generated findings cannot execute in the application.
 export function renderMarkdown(text: string): React.ReactNode[] {
-  const elements: React.ReactNode[] = []
-  const lines = text.split("\n")
-  let bullets: string[] = []
-  let key = 0
-
-  const flush = () => {
-    if (bullets.length === 0) return
-    elements.push(
-      <ul key={key++} className="list-disc list-outside pl-4 space-y-0.5 my-1">
-        {bullets.map((b, i) => <li key={i}>{inlineFormat(b)}</li>)}
-      </ul>
-    )
-    bullets = []
-  }
-
-  for (const line of lines) {
-    const t = line.trim()
-    if (t.startsWith("## ")) {
-      flush()
-      elements.push(<h2 key={key++} className="text-sm font-bold text-foreground mt-3 mb-1 first:mt-0">{inlineFormat(t.slice(3))}</h2>)
-    } else if (t.startsWith("# ")) {
-      flush()
-      elements.push(<h1 key={key++} className="text-base font-bold text-foreground mt-3 mb-1 first:mt-0">{inlineFormat(t.slice(2))}</h1>)
-    } else if (t.startsWith("### ")) {
-      flush()
-      elements.push(<h3 key={key++} className="text-xs font-semibold text-foreground mt-2 mb-0.5">{inlineFormat(t.slice(4))}</h3>)
-    } else if (t.startsWith("- ") || t.startsWith("* ")) {
-      bullets.push(t.slice(2))
-    } else if (t === "---") {
-      flush()
-      elements.push(<hr key={key++} className="my-2 border-border" />)
-    } else if (t.length > 0) {
-      flush()
-      elements.push(<p key={key++} className="my-0.5">{inlineFormat(line)}</p>)
-    } else {
-      flush()
-    }
-  }
-  flush()
-  return elements
+  return markdownNodes(marked.lexer(text, { gfm: true, breaks: false }))
 }
 
-function inlineFormat(text: string): React.ReactNode {
-  // Split on inline patterns: **bold**, *italic*, `code`
-  const parts = text.split(/(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/g)
-  return parts.map((seg, i) => {
-    if (seg.startsWith("**") && seg.endsWith("**"))
-      return <strong key={i} className="font-semibold">{seg.slice(2, -2)}</strong>
-    if (seg.startsWith("*") && seg.endsWith("*") && seg.length >= 3)
-      return <em key={i}>{seg.slice(1, -1)}</em>
-    if (seg.startsWith("`") && seg.endsWith("`"))
-      return <code key={i} className="px-1 py-0.5 rounded bg-muted text-foreground font-mono text-[10px]">{seg.slice(1, -1)}</code>
-    return seg
+function markdownNodes(tokens: Token[]): React.ReactNode[] {
+  return tokens.map((token, key) => {
+    const children = () => markdownNodes("tokens" in token ? token.tokens || [] : [])
+    switch (token.type) {
+      case "space":
+      case "def": return null
+      case "heading": {
+        const Tag = `h${token.depth}` as "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+        return <Tag key={key} className={cn("font-semibold text-foreground mt-3 mb-1 first:mt-0", token.depth === 1 ? "text-base" : token.depth === 2 ? "text-sm" : "text-xs")}>{children()}</Tag>
+      }
+      case "paragraph": return <p key={key} className="my-1.5 break-words">{children()}</p>
+      case "text": return <React.Fragment key={key}>{token.tokens ? children() : token.text}</React.Fragment>
+      case "strong": return <strong key={key} className="font-semibold">{children()}</strong>
+      case "em": return <em key={key}>{children()}</em>
+      case "del": return <del key={key}>{children()}</del>
+      case "codespan": return <code key={key} className="px-1 py-0.5 rounded bg-muted text-foreground font-mono text-[11px] break-all">{token.text}</code>
+      case "code": return <pre key={key} className="my-2 rounded-md bg-muted/50 p-2 overflow-x-auto text-[11px]"><code>{token.text}</code></pre>
+      case "br": return <br key={key} />
+      case "hr": return <hr key={key} className="my-3 border-border" />
+      case "blockquote": return <blockquote key={key} className="my-2 border-l-2 border-border pl-3 text-muted-foreground">{children()}</blockquote>
+      case "list": {
+        const Tag = token.ordered ? "ol" : "ul"
+        return <Tag key={key} start={token.ordered ? Number(token.start) : undefined} className={cn("list-outside pl-4 space-y-0.5 my-1.5", token.ordered ? "list-decimal" : "list-disc")}>
+          {token.items.map((item: Tokens.ListItem, i: number) => <li key={i}>
+            {item.task && <input type="checkbox" checked={!!item.checked} disabled aria-label={item.checked ? "Completed" : "Incomplete"} className="mr-1" />}
+            {markdownNodes(item.tokens)}
+          </li>)}
+        </Tag>
+      }
+      case "table": return <div key={key} role="region" aria-label="Findings table" tabIndex={0} className="my-3 max-w-full overflow-x-auto rounded-md border border-border/60">
+        <table className="w-full border-collapse text-[11px] leading-relaxed">
+          <thead className="bg-muted/50 text-muted-foreground">
+            <tr>{token.header.map((cell: Tokens.TableCell, i: number) => <th key={i} scope="col" style={{ textAlign: token.align[i] || "left" }} className="px-2.5 py-2 font-medium whitespace-nowrap border-b border-border/60">{markdownNodes(cell.tokens)}</th>)}</tr>
+          </thead>
+          <tbody>{token.rows.map((row: Tokens.TableCell[], i: number) => <tr key={i} className="even:bg-muted/20">
+            {row.map((cell, j) => <td key={j} style={{ textAlign: token.align[j] || "left" }} className="px-2.5 py-2 align-top border-b border-border/40 break-words [overflow-wrap:anywhere] min-w-[5rem] max-w-[16rem] tabular-nums">{markdownNodes(cell.tokens)}</td>)}
+          </tr>)}</tbody>
+        </table>
+      </div>
+      case "link": {
+        let safe = false
+        try { safe = ["https:", "http:", "mailto:"].includes(new URL(token.href, "https://localhost/").protocol) } catch { /* Show invalid links as text. */ }
+        return safe ? <a key={key} href={token.href} target="_blank" rel="noopener noreferrer" className="text-primary underline underline-offset-2 break-words">{children()}</a> : <React.Fragment key={key}>{children()}</React.Fragment>
+      }
+      case "image": return <React.Fragment key={key}>{token.text}</React.Fragment>
+      default: return <React.Fragment key={key}>{("text" in token ? token.text : undefined) || token.raw}</React.Fragment>
+    }
   })
 }
+
 
 // ─── Status pieces ───────────────────────────────────────────────────────────
 

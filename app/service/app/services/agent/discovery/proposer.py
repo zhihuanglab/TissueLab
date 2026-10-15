@@ -29,6 +29,11 @@ MAX_JSON_NUDGES = 2
 REQUIRED_VARIATION_COUNT = 3
 
 
+def requested_variation_count(question: str) -> int:
+    match = re.search(r"\b(\d+)\s+(?:(?:nearby|meaningful|local)\s+)*variations\b", question, re.IGNORECASE)
+    return max(1, min(100, int(match.group(1)))) if match else REQUIRED_VARIATION_COUNT
+
+
 def parse_json(text: str) -> dict[str, Any]:
     match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
     if match:
@@ -70,7 +75,30 @@ def parse_expected_sign(value: Any) -> int | None:
     return 1 if f > 0 else -1 if f < 0 else None
 
 
-def normalize_plan(raw: dict[str, Any], *, round_id: int) -> dict[str, Any]:
+def _declared_metadata(entry: dict[str, Any]) -> dict[str, Any]:
+    """Read structured fields or explicitly labeled declarations; never infer from values."""
+    description = str(entry.get('description') or '')
+    patterns = {
+        'units': r'\bunits\s*:\s*([^.;\n]+)',
+        'measurement_scale': r'\bmeasurement_scale\s*:\s*(ratio|interval)\b',
+        'reference_scale': r'\breference_scale\s*:\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)',
+    }
+    metadata = {}
+    for name, pattern in patterns.items():
+        value = entry.get(name)
+        if value is None or str(value).strip().lower() in {'', 'unspecified'}:
+            match = re.search(pattern, description, re.IGNORECASE)
+            value = match.group(1).strip() if match else None
+        if name == 'reference_scale' and value is not None:
+            try:
+                value = float(value)
+            except (ValueError, TypeError):
+                value = None
+        metadata[name] = value if value is not None else (None if name == 'reference_scale' else 'unspecified')
+    return metadata
+
+
+def normalize_plan(raw: dict[str, Any], *, round_id: int, variation_limit: int = REQUIRED_VARIATION_COUNT) -> dict[str, Any]:
     candidate_id = str(raw.get("candidate_id") or "").strip() or f"candidate_round_{round_id:04d}"
     scientific_question = str(raw.get("scientific_question") or candidate_id).strip()
     approach = str(raw.get("approach") or "").strip()
@@ -93,9 +121,10 @@ def normalize_plan(raw: dict[str, Any], *, round_id: int) -> dict[str, Any]:
                 # pre-registered direction of the covariate-adjusted correlation with the
                 # outcome; None = undeclared (the variation cannot be admitted)
                 "expected_sign": sign if sign is not None else plan_sign,
+                **_declared_metadata(entry),
             }
         )
-        if len(variations) >= REQUIRED_VARIATION_COUNT:
+        if len(variations) >= variation_limit:
             break
     if not variations:
         name = candidate_id if candidate_id.isidentifier() and candidate_id != "donor_id" else "primary"
@@ -112,6 +141,7 @@ def normalize_plan(raw: dict[str, Any], *, round_id: int) -> dict[str, Any]:
         "variations": variations,
         "baseline_variation": baseline_variation,
         "notes": str(raw.get("notes") or "").strip(),
+        "biological_anchor": str(raw.get("biological_anchor") or approach).strip(),
     }
 
 
@@ -197,7 +227,7 @@ def run_proposer(
         "accepted_panel": accepted_panel_summary,
         "recent_results": results_log_text or "(no prior rounds)",
         "round_id": round_id,
-        "required_variation_count": REQUIRED_VARIATION_COUNT,
+        "required_variation_count": requested_variation_count(spec.question),
     }
     if proposed_this_round:
         # Parallel workers: each tests a different hypothesis.
@@ -235,7 +265,7 @@ def run_proposer(
         raw_text = output_text(response)
         plan_json = parse_json(raw_text) if raw_text else {}
         if plan_json.get("variations") or plan_json.get("candidate_id"):
-            missing_sign = _variations_missing_sign(plan_json)
+            missing_sign = [] if spec.evaluation_mode == "descriptive" else _variations_missing_sign(plan_json)
             if not missing_sign:
                 break
             pending = (
@@ -249,7 +279,7 @@ def run_proposer(
         # A placeholder plan would spend a whole worker on nothing.
         raise RuntimeError(f"no parseable JSON plan after {MAX_JSON_NUDGES + 1} replies")
 
-    plan = normalize_plan(plan_json, round_id=round_id)
+    plan = normalize_plan(plan_json, round_id=round_id, variation_limit=requested_variation_count(spec.question))
     plan["proposer_usage"] = usage_total
     plan["proposer_model"] = response.get("model") or model
     plan["proposer_reasoning_summary"] = reasoning

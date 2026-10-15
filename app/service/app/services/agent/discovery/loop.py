@@ -78,6 +78,8 @@ RESULTS_HEADERS = [
     "description",
     "artifact_dir",
     "error",
+    "evaluation_mode",
+    "candidate_score",
 ]
 
 
@@ -218,6 +220,10 @@ def build_round_feedback(
                 "name": v.get("variation"),
                 "is_primary": bool(v.get("is_primary")),
                 "coverage": v.get("coverage"),
+                "candidate_score": v.get("candidate_score"),
+                "iqr": v.get("iqr"),
+                "normalization": v.get("normalization"),
+                "tissue_stability": v.get("tissue_stability"),
                 "tested_as": v.get("best_action"),
                 "replaced_feature": v.get("best_action_replaced_feature"),
                 "expected_sign": v.get("expected_sign"),
@@ -248,6 +254,8 @@ def build_round_feedback(
         "worker_summary": worker_summary,
         "decision": decision,
         "reason": reason,
+        "evaluation_mode": review.get("evaluation_mode", "predictive"),
+        "evaluation_reason": review.get("evaluation_reason"),
         "evaluation_note": review.get("evaluation_note"),
         "n_donors": review.get("n_donors"),
         "chosen_variation": review.get("chosen_variation"),
@@ -264,6 +272,16 @@ def build_round_feedback(
 
 
 def render_feedback_text(fb: dict[str, Any]) -> str:
+    if fb.get("evaluation_mode") == "descriptive":
+        lines = [f"round={fb.get('round_id')} candidate={fb.get('candidate_id')} "
+                 f"decision={fb.get('decision')} reason={fb.get('reason')}",
+                 "Exploratory descriptive search; no predictive or inferential statistics."]
+        for v in fb.get("variations") or []:
+            failed = [name for name, passed in (v.get('gates') or {}).items() if not passed]
+            lines.append(f"  {v.get('name')}: coverage={_fmt(v.get('coverage'))} "
+                         f"cohort_IQR={_fmt(v.get('iqr'))} score={_fmt(v.get('candidate_score'))} "
+                         f"scale={v.get('normalization')} stability={v.get('tissue_stability')} failed={failed}")
+        return "\n".join(lines)
     if fb.get("evaluation_note"):
         lines = [f"round={fb.get('round_id')} candidate={fb.get('candidate_id')} "
                  f"decision={fb.get('decision')}", str(fb["evaluation_note"]),
@@ -318,6 +336,9 @@ def compact_feedback_text(fb: dict[str, Any]) -> str:
         f"round={fb.get('round_id')} candidate={fb.get('candidate_id')} decision={fb.get('decision')} "
         f"reason={fb.get('reason')} question={str(fb.get('scientific_question') or '')[:100]!r}"
     )
+    if fb.get("evaluation_mode") == "descriptive":
+        return head + " | " + "; ".join(f"{v.get('name')} descriptive_score={_fmt(v.get('candidate_score'))} "
+                                       f"eligible={v.get('eligible')}" for v in fb.get('variations') or [])
     variations = [
         f"{v.get('name')} partial_r={_fmt(v.get('partial_r'))} dRMSE={_fmt(v.get('mean_rmse_improvement'), 5)} "
         f"repeats_better={_fmt(v.get('fraction_repeats_better_rmse'), 2)} eligible={v.get('eligible')}"
@@ -377,6 +398,8 @@ def accepted_panel_summary(accepted_panel: dict[str, Any]) -> dict[str, Any]:
             "round_id": member.get("round_id"),
             "panel_candidate_score": member.get("panel_candidate_score"),
             "panel_candidate_rmse": member.get("panel_candidate_rmse"),
+            "candidate_score": member.get("candidate_score"),
+            "biological_anchor": member.get("biological_anchor"),
         }
         for idx, member in enumerate(accepted_panel.get("members") or [], start=1)
         if isinstance(member, dict)
@@ -385,6 +408,7 @@ def accepted_panel_summary(accepted_panel: dict[str, Any]) -> dict[str, Any]:
         "best_panel_score": accepted_panel.get("best_panel_score"),
         "best_panel_rmse": accepted_panel.get("best_panel_rmse"),
         "member_count": len(members),
+        "evaluation_mode": accepted_panel.get("evaluation_mode", "predictive"),
         "members": members,
     }
 
@@ -406,6 +430,7 @@ def _build_worker_brief(
         "baseline_variation": plan.get("baseline_variation", ""),
         "notes": plan.get("notes", ""),
         "rationale": plan.get("rationale", ""),
+        "biological_anchor": plan.get("biological_anchor", ""),
     }
 
 
@@ -437,6 +462,12 @@ def _panel_member_record(
         "worker_dir": _run_relative(worker_dir, run_root),
         "results_path": _run_relative(worker_roundup.get("results_path"), run_root),
         "result_path": _run_relative(worker_roundup.get("result_path"), run_root),
+        "evaluation_mode": results.get("evaluation_mode", "predictive"),
+        "candidate_score": results.get("candidate_score"),
+        "descriptive_summary": results.get("descriptive_summary"),
+        "biological_anchor": results.get("biological_anchor") or plan.get("biological_anchor") or plan.get("approach"),
+        "description": next((v.get('description') for v in plan.get('variations', [])
+                             if v.get('name') == results.get('feature_column')), plan.get('approach')),
     }
 
 
@@ -454,14 +485,27 @@ def _apply_panel_review(
     else:
         members.append(_panel_member_record(round_id=round_id, plan=plan, worker_roundup=worker_roundup,
                                             slot=len(members) + 1, run_root=run_root))
+    # Write a scalar replay adapter beside the worker's original implementation
+    # and any fitted state. Model-written code is never executed host-side.
+    if results.get('evaluation_mode') == 'descriptive':
+        from .worker import score_adapter_source
+        target = slot - 1 if chosen.get('action') == 'replace' and isinstance(slot, int) else len(members) - 1
+        adapter = Path(worker_roundup['worker_dir']) / 'sandbox' / 'donor_score.py'
+        adapter.write_text(score_adapter_source(str(results['feature_column'])), encoding='utf-8')
+        members[target]['score_path'] = _run_relative(adapter, run_root)
     return {
         "best_panel_score": _safe_float(results.get("panel_candidate_score")),
         "best_panel_rmse": _safe_float(results.get("panel_candidate_rmse")),
+        "evaluation_mode": results.get("evaluation_mode", "predictive"),
         "members": members,
     }
 
 
 def _round_summary_text(plan: dict[str, Any], results: dict[str, Any], decision: str, reason: str, review: dict[str, Any]) -> str:
+    if review.get('evaluation_mode') == 'descriptive':
+        return (f"{plan.get('candidate_id', '')}: {decision} ({reason}), "
+                f"variation={review.get('chosen_variation') or 'NA'}, "
+                f"descriptive panel score={_fmt(review.get('accepted_panel_score'))}; not predictive validation")
     if review.get("evaluation_note"):
         return f"{plan.get('candidate_id', '')}: {decision}. {review['evaluation_note']}"
     chosen = review.get("chosen_review") or {}
@@ -477,6 +521,9 @@ def _round_summary_text(plan: dict[str, Any], results: dict[str, Any], decision:
 
 
 def findings_markdown(accepted_panel: dict[str, Any], spec: ProblemSpec, run_root: Path | None = None) -> str:
+    if spec.evaluation_mode == "descriptive":
+        from .descriptive import findings_descriptive
+        return findings_descriptive(accepted_panel, spec, run_root)
     members = [m for m in (accepted_panel.get("members") or []) if isinstance(m, dict)]
     lines = [
         f"Outcome: {spec.outcome}",
@@ -618,6 +665,11 @@ async def run_discovery(
     panel_config = PredictivePanelConfig()
     data_dir = Path(data_dir)
     run_root = Path(run_root)
+    if spec.evaluation_mode == 'auto':
+        from .problem import resolve_evaluation
+        from .problem import write_run_config
+        spec = resolve_evaluation(spec, data_dir)
+        write_run_config(spec, run_root)
     shared_dir = run_root / "shared"
     shared_dir.mkdir(parents=True, exist_ok=True)
     # State first: a run cancelled before round 1 is still listed and resumable.
@@ -634,6 +686,8 @@ async def run_discovery(
         _write_json(run_root / "run_state.json", state)
     workers = max(1, min(MAX_WORKERS_PER_ROUND, int(workers_per_round)))
     accepted_panel = _load_or_init_accepted_panel(run_root)
+    if accepted_panel.get('members') and accepted_panel.get('evaluation_mode', 'predictive') != spec.evaluation_mode:
+        raise ValueError('Cannot mix evaluation protocols in an accepted panel; start a new run')
     await asyncio.to_thread(copy_tree, SHARED_LIB_SOURCE, shared_dir / "lib" / "shared_analysis")
     write_dataset_layout(spec, shared_dir)
     loop = asyncio.get_running_loop()
@@ -814,6 +868,9 @@ async def run_discovery(
         eligible = [c for c in candidates if c["review"].get("keep")]
 
         def panel_rmse(c: dict[str, Any]) -> float:
+            if spec.evaluation_mode == "descriptive":
+                score = _safe_float(c["review"].get("accepted_panel_score"))
+                return -score if score is not None else float("inf")
             rmse = _safe_float(c["review"].get("accepted_panel_rmse"))
             return float("inf") if rmse is None else rmse
 
@@ -884,6 +941,8 @@ async def run_discovery(
                         None,
                     ),
                     "accepted_panel_rmse": review.get("accepted_panel_rmse"),
+                    "evaluation_mode": spec.evaluation_mode,
+                    "candidate_score": results.get("candidate_score"),
                     "candidate_panel_rmse": results.get("panel_candidate_rmse"),
                     "mean_rmse_improvement": results.get("mean_rmse_improvement"),
                     "fraction_repeats_better_rmse": results.get("fraction_repeats_better_rmse"),

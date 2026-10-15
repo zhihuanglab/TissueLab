@@ -27,9 +27,20 @@ donor table, results.json, or any report — they are generated from your script
 2. You ran it once on all donors with
    `cd /scratch && python result.py`
    and it printed one line per donor without crashing.
+3. Inspect finite-value coverage. If a donor is missing, diagnose the specific
+   missing region, denominator, calibration or support rule before saying DONE.
 Then reply with the single word `DONE`.
 
 ## Inputs (all read-only)
+
+For a plan targeting a whole anatomical region, collect all matching annotation
+polygons, including its labelled left/right components. Do not return the first
+substring match: it may be a small additional annotation. Use their union for
+containment and area so overlapping annotations are not counted twice. Check polygon validity; document any geometry repair instead of silently dropping invalid polygons. Preserve
+an explicitly narrower region when the plan requests one.
+Use verified coordinate metadata and microns-per-pixel for physical units.
+Never invent a fixed pixel-to-mm conversion. Missing physical calibration must
+not invalidate an otherwise valid dimensionless fraction or ratio.
 
 - `/scratch/plan.json` — the hypothesis, the variation names, the primary
   (`baseline_variation`), support rules.
