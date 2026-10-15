@@ -1,9 +1,8 @@
 # Candidate Proposer
 
 Propose exactly one interpretable donor-level biomarker family for the next
-round, as a primary formula plus pre-specified variations. Discovery cohorts are
-small, so this protocol separates hypothesis formulation (you) from statistical
-scoring (the controller's paired repeated nested cross-validation).
+round, as a primary formula plus pre-specified variations. The controller
+selects the evaluation protocol below; you propose hypotheses, not scores.
 
 You receive the research problem, the dataset guide written by the dataset
 scout when there is one (files, slide structure, cell classes, regions,
@@ -25,18 +24,25 @@ Return exactly one JSON object:
 ```json
 {
   "candidate_id": "short_stable_slug",
-  "scientific_question": "one sentence stating the hypothesis, including its expected direction",
+  "scientific_question": "one sentence stating the hypothesis, with an expected direction when predictive",
   "rationale": "why this is the most informative next test; cite prior-round numbers when you refine or avoid something",
+  "biological_anchor": "population / region / niche / biological state",
   "approach": "an exact donor-level recipe: cell population(s), region(s), spatial rule with its parameters, aggregation to one scalar",
   "variations": [
-    {"name": "primary_feature_column", "description": "the pre-specified primary formula", "expected_sign": -1},
-    {"name": "variation_a", "description": "a nearby, coherent alternative (different radius, denominator, band, or region contrast)", "expected_sign": -1},
-    {"name": "variation_b", "description": "another nearby, coherent alternative", "expected_sign": 1}
+    {"name": "primary_feature_column", "description": "the pre-specified primary formula", "expected_sign": -1, "units": "fraction", "measurement_scale": "ratio", "reference_scale": 1},
+    {"name": "variation_a", "description": "a nearby, coherent alternative (different radius, denominator, band, or region contrast)", "expected_sign": -1, "units": "fraction", "measurement_scale": "ratio", "reference_scale": 1},
+    {"name": "variation_b", "description": "another nearby, coherent alternative", "expected_sign": 1, "units": "fraction", "measurement_scale": "ratio", "reference_scale": 1}
   ],
   "baseline_variation": "primary_feature_column",
   "notes": "implementation constraints, minimum-support rule, denominator safeguards"
 }
 ```
+
+The schema illustrates three variations; use the requested variation count.
+The measurement fields illustrate fractions; declare the true units and scales
+of the actual recipe as separate JSON fields, not only inside `description`.
+
+## Predictive evaluation
 
 `expected_sign` is the pre-registered direction of EACH variation: the sign of
 its covariate-adjusted correlation with `{outcome}` (+1: higher value goes with
@@ -79,6 +85,27 @@ flips the sign, so declare it per variation.
 - A rejected primary whose sibling variation was stronger is a signal: say so
   in the rationale and consider making that sibling's logic the new primary.
 
+## Descriptive evaluation
+
+The controller uses all donors in the selected cohort and reports descriptive
+measurements. Clinical context and covariates are documented, not fitted or adjusted.
+
+- Declare each variation's `units`, `measurement_scale` (ratio or interval), and,
+  when justified, a positive `reference_scale` in those units before seeing results.
+  Explain its source in the recipe: e.g. 1 for fractions, 100 for percentages,
+  or an independently established physical scale. Do not inflate rank with a
+  tiny arbitrary constant. `expected_sign` is optional in this mode.
+- Without a reference scale, nonnegative ratio-scale quantities use relative
+  interquartile dispersion. Other unscaled measurements remain unranked observations.
+- Eligible nonzero cohort dispersion drives the descriptive shortlist; additions
+  require distinct biological anchors and replacements must improve the score.
+  Nearby versions of the same anchor should refine or replace it.
+- Coverage and computability are prerequisites, not biological validation.
+  Dispersion is not outcome association. No p-values, correlations, CV metrics,
+  or significance claims are used. Mark unmeasured tissue robustness as unassessed.
+- Use prior descriptive feedback to refine genuine variants, without interpreting
+  missing predictive statistics as a failed biological hypothesis.
+
 ## Rules
 
 - Fix `baseline_variation` before the worker evaluates anything. Return exactly
@@ -98,7 +125,7 @@ flips the sign, so declare it per variation.
 - Select classes by `cell_type` name, never by numeric `class_id`.
 - Do not propose PCA, clustering fitted on the cohort, supervised feature
   selection, arbitrary weighted sums, or learned/embedding-derived scores.
-  The evaluator, not the worker, fits the predictive panel.
+  Only the evaluator may fit a panel when predictive evaluation is selected.
 - Respect measurement quality: a hypothesis that hinges on a hard-to-separate
   class boundary should be robust to boundary noise (e.g. lineage fractions
   rather than absolute counts of the uncertain subclass).

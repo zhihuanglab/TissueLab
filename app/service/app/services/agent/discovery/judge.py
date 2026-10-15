@@ -272,12 +272,12 @@ def review_candidate(
     # Donor tables key on donor_id whatever the cohort calls its identifier.
     cohort = (
         load_cohort(spec, data_dir)
-        .loc[:, [spec.id_column, primary_outcome, *covariates]]
+        .loc[:, [spec.id_column, *([primary_outcome] if primary_outcome else []), *covariates]]
         .rename(columns={spec.id_column: "donor_id"})
         .sort_values("donor_id")
         .reset_index(drop=True)
     )
-    if not cohort[primary_outcome].notna().all():
+    if spec.evaluation_mode != "descriptive" and not cohort[primary_outcome].notna().all():
         raise ValueError("Discovery cohort contains missing outcomes")
     current_members = [dict(member) for member in accepted_panel.get("members", [])]
     current_frame, current_columns = _merge_panel(
@@ -288,6 +288,15 @@ def review_candidate(
         worker_brief, worker_roundup
     )
     variation_columns = _planned_variation_columns(worker_brief, candidate_path, primary_column)
+    if spec.evaluation_mode == "descriptive":
+        from .descriptive import review_descriptive
+        return review_descriptive(
+            spec=spec, panel_frame=current_frame, current_columns=current_columns,
+            current_members=current_members, candidate_path=candidate_path,
+            variation_columns=variation_columns, primary_column=primary_column,
+            worker_brief=worker_brief, worker_roundup=worker_roundup,
+            round_dir=round_dir, config=config,
+        )
     # Pre-registered direction per variation (+1/-1; None = undeclared -> cannot be admitted).
     expected_signs: dict[str, int | None] = {}
     for item in worker_brief.get("variations") or []:

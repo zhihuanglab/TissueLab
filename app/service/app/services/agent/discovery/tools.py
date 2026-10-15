@@ -31,6 +31,12 @@ def load_prompt(name: str, spec: ProblemSpec) -> str:
     `{outcome}` are the only places the dataset enters them.
     """
     text = (PROMPTS_DIR / name).read_text(encoding="utf-8")
+    if name == "proposer.md":
+        common, predictive = text.split("## Predictive evaluation\n", 1)
+        predictive, descriptive = predictive.split("## Descriptive evaluation\n", 1)
+        descriptive, rules = descriptive.split("## Rules\n", 1)
+        guidance = descriptive if spec.evaluation_mode == "descriptive" else predictive
+        text = common + "## Evaluation\n" + guidance + "## Rules\n" + rules
     return text.replace("{problem_context}", spec.prompt_context()).replace("{outcome}", spec.outcome)
 
 

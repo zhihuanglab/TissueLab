@@ -237,7 +237,7 @@ def match_columns(text: str, cohort: dict[str, Any]) -> dict[str, Any]:
     return {"outcome": outcome, "covariates": covariates, "no_adjustment": no_adjustment}
 
 
-_ASK_MODEL = """You set up a predictive analysis from a research program and a cohort table's column names.
+_ASK_MODEL = """You identify research settings from a research program and a cohort table's column names.
 
 Research program:
 {question}
@@ -247,8 +247,9 @@ Columns that can be covariates (numeric, complete, or sex): {covariates}
 
 Choose:
 - "outcome": the column the program wants to predict or explain. If the program names or describes it,
-  use that column. If it does not, choose the most plausible primary target among the outcome columns
-  (not an identifier, a demographic, or a technical/batch variable).
+  use that column. If there is no clearly identified predictive target, return an empty string.
+  Do not invent a predictive goal for an exploratory or descriptive program. Interpret the full
+  meaning, including negation and context, rather than matching keywords.
 - "covariates": the columns the program says to adjust or control for. If the program does not
   mention adjustment at all, choose the plain confounders among the covariate columns (demographics
   such as age or sex), never another candidate outcome. If it says not to adjust, return []. May be empty.
@@ -383,34 +384,23 @@ def program_spec(text: str, data_dir: Path) -> ProblemSpec:
     question = text.strip()
     if not question:
         raise ProblemError("Describe the research program first")
+    from .problem import resolve_evaluation
     if question.lstrip("\ufeff").startswith("---"):
         spec = parse_problem(question)
         lines = question.lstrip("\ufeff").splitlines()
         end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
         header = yaml.safe_load("\n".join(lines[1:end])) or {}
         if "cohort_file" in header:
-            return replace(spec, cohort_selection_reason="The program YAML explicitly sets cohort_file.")
+            return resolve_evaluation(replace(spec, cohort_selection_reason="The program YAML explicitly sets cohort_file."), data_dir)
         cohort, reason = choose_cohort(spec.question, scan_workspace(data_dir)["cohorts"])
         if cohort is None:
             raise ProblemError("No patient table (CSV) found in this folder")
-        return replace(spec, cohort_file=cohort["file"], cohort_selection_reason=reason)
+        return resolve_evaluation(replace(spec, cohort_file=cohort["file"], cohort_selection_reason=reason), data_dir)
     found = resolve_program(question, data_dir)
     cohort = found["cohort"]
     if cohort is None:
         raise ProblemError("No patient table (CSV) found in this folder")
-    candidates = cohort["outcome_candidates"]
-    if not candidates:
-        raise ProblemError(
-            f"No column can be predicted: it must be numeric with a value in every row of {cohort['file']}"
-        )
     outcome = found["outcome"]
-    if not outcome and len(candidates) == 1:
-        outcome = candidates[0]
-    if not outcome:
-        raise ProblemError(
-            f'Couldn\'t tell which column to predict. Name it in the program, e.g. "predict {candidates[0]}". '
-            f"Columns: {', '.join(candidates)}"
-        )
     covariates = [] if found["no_adjustment"] else found["covariates"]
     covariates = [c for c in dict.fromkeys(covariates) if c != outcome]
 
@@ -430,7 +420,7 @@ def program_spec(text: str, data_dir: Path) -> ProblemSpec:
             "named like donor_id, patient_id or case"
         )
     covariates = [c for c in covariates if c != id_column]
-    return ProblemSpec(
+    return resolve_evaluation(ProblemSpec(
         outcome=outcome,
         question=question,
         cohort_selection_reason=found["cohort_selection_reason"],
@@ -439,4 +429,4 @@ def program_spec(text: str, data_dir: Path) -> ProblemSpec:
         id_column=id_column,
         slide_column=layout(cohort["slide_column"]) or _DEFAULT_SPEC.slide_column,
         mpp_column=layout(cohort["mpp_column"]) or _DEFAULT_SPEC.mpp_column,
-    )
+    ), data_dir)

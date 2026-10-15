@@ -87,6 +87,23 @@ def _kickoff_message(plan: dict[str, Any]) -> str:
     )
 
 
+def score_adapter_source(feature_column: str) -> str:
+    """Portable scalar entry point for the selected variation; no donor constants."""
+    return f'''from pathlib import Path
+import importlib.util
+
+def compute_donor_score(*, donor_id, data_root) -> float:
+    source = Path(__file__).with_name("result.py")
+    spec = importlib.util.spec_from_file_location("_biomarker_result", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    fn = getattr(module, "compute_donor_features", None)
+    if fn is not None:
+        return float(fn(donor_id, data_root)[{feature_column!r}])
+    return float(module.compute_donor_score(donor_id=donor_id, data_root=data_root))
+'''
+
+
 def _materialize_script(plan: dict[str, Any]) -> str:
     names = [v.get("name", "") for v in plan.get("variations", [])]
     return f'''
@@ -105,7 +122,11 @@ try:
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
     fn = getattr(mod, "compute_donor_features", None)
     if fn is None:
-        raise AttributeError("result.py does not define compute_donor_features")
+        scalar = getattr(mod, "compute_donor_score", None)
+        if scalar is None or len(names) != 1:
+            raise AttributeError("result.py needs compute_donor_features, or compute_donor_score for one planned variation")
+        def fn(donor_id, data_root):
+            return {{names[0]: scalar(donor_id=donor_id, data_root=data_root)}}
 except Exception as exc:
     report["status"] = "import_failed"; report["import_error"] = "".join(traceback.format_exception(exc))[-3000:]
     json.dump(report, open("/scratch/{MATERIALIZE_REPORT}", "w"), indent=1); sys.exit(0)
@@ -463,6 +484,7 @@ def run_worker(
         "feature_name": plan.get("candidate_id") or primary,
         "feature_column": primary,
         "outcome": spec.outcome,
+        "evaluation_mode": spec.evaluation_mode,
         "covariates": list(spec.covariates),
         "artifacts": {"donor_feature_table": f"/scratch/{TABLE_NAME}"},
         "controller_checks": checks,
