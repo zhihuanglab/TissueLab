@@ -1,21 +1,21 @@
 "use client";
 import React, { useEffect, useRef, useCallback, useState } from 'react';
 import OpenSeadragon from 'openseadragon';
+import { startTileAuth } from '@/hooks/viewer/useTileAuth';
 import { useAnnotatorInstance } from '@/contexts/AnnotatorContext';
 
 interface OSDNavigatorProps {
   navigatorSizeRatio?: number;
   autoHideDelay?: number;
-  authToken: string;
 }
 
 const OSDNavigator: React.FC<OSDNavigatorProps> = ({
   navigatorSizeRatio = 0.2,
   autoHideDelay = 3000,
-  authToken,
 }) => {
   const { viewerInstance } = useAnnotatorInstance();
   const navigatorRef = useRef<any>(null);
+  const stopTileAuthRef = useRef<(() => void) | null>(null);
   const navRotateHandlerRef = useRef<any>(null);
   const navScrollHandlerRef = useRef<any>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -80,7 +80,9 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
             navScrollHandlerRef.current = null;
           }
         }
-        navigatorRef.current.destroy();
+        stopTileAuthRef.current?.();
+      stopTileAuthRef.current = null;
+      navigatorRef.current.destroy();
       } catch (error) {
         console.warn('Error during navigator cleanup:', error);
       } finally {
@@ -226,13 +228,10 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
         // queues on the backend's shared read pool ahead of the tiles the user
         // is actually looking at.
         imageLoaderLimit: 2,
-        ajaxHeaders: {
-          'Content-Type': 'application/json',
-          'Accept': 'image/jpeg,image/png,image/*,*/*',
-          'Authorization': `Bearer ${authToken}`,
-        }
+        ajaxHeaders: { ...(viewerInstance as any).ajaxHeaders }
       } as any);
 
+      stopTileAuthRef.current = startTileAuth(navigatorRef.current);
       navigatorRef.current.addTiledImage({
         tileSource: tiledImage.source,
         originalTiledImage: tiledImage,
@@ -334,13 +333,15 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
       }
       window.removeEventListener('zLayerChanged', handleZLayerChange);
     };
-  }, [viewerInstance, navigatorSizeRatio, updateNavigator, isMacOS, cleanupNavigator, authToken]);
+  }, [viewerInstance, navigatorSizeRatio, updateNavigator, isMacOS, cleanupNavigator]);
 
   // Cleanup effect for fast reload
   useEffect(() => {
     return () => {
       if (navigatorRef.current) {
-        navigatorRef.current.destroy();
+        stopTileAuthRef.current?.();
+      stopTileAuthRef.current = null;
+      navigatorRef.current.destroy();
         navigatorRef.current = null;
       }
     };
