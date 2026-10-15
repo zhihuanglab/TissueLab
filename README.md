@@ -186,7 +186,7 @@ installing Docker while the app was already open.
 
 After Docker is ready:
 
-1. Set a **Responses API** connection in **Preferences → AI Models**.
+1. Set an **OpenAI or OpenAI-compatible** connection and model in **Preferences → AI Models**.
 2. Open a workspace containing slides and a patient/cohort CSV.
 3. Click **Start Research**.
 

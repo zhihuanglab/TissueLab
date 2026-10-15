@@ -122,6 +122,20 @@ def _parse_json_args(arguments: Any) -> Dict[str, Any]:
     return {}
 
 
+def _schema_not_supported(error: Exception) -> bool:
+    """Downgrade only explicit schema-capability rejections, not request failures."""
+    if getattr(error, "status_code", None) not in (400, 422):
+        return False
+    body = getattr(error, "body", None)
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        body = body["error"]
+    message = str(body.get("message", "") if isinstance(body, dict) else error).lower()
+    return "json_schema" in message and any(marker in message for marker in (
+        "not supported", "does not support", "unsupported", "not implemented",
+        "must be one of", "supported values",
+    ))
+
+
 class OpenAIProvider(LLMProvider):
     """OpenAI-compatible provider (Chat Completions or Responses API)."""
 
@@ -180,10 +194,10 @@ class OpenAIProvider(LLMProvider):
         try:
             response = self.client.chat.completions.create(**kwargs)
         except Exception as e:
-            if not json_schema:
+            if not json_schema or not _schema_not_supported(e):
                 raise RuntimeError(f"OpenAI inference failed: {str(e)}") from e
-            # Servers that implement only ``json_object`` (or no response_format
-            # at all) reject the schema form. Retry with the schema inlined in
+            # Servers that implement only ``json_object`` reject the schema
+            # form. Retry with the schema inlined in
             # the system prompt so the model still knows the required shape.
             schema_hint = (
                 "\n\nRespond with a single JSON object that matches this JSON schema exactly, "

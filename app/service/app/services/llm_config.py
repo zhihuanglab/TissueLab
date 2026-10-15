@@ -17,6 +17,7 @@ with a single model needs one variable. A LLM_MODEL saved in Preferences beats
 the per-role variables of .env.local (see :mod:`app.services.llm_settings`).
 """
 import os
+from typing import Optional
 from urllib.parse import urlparse
 
 DEFAULT_CLOUD_MODEL = "gpt-5.2"
@@ -40,21 +41,23 @@ def base_url() -> str:
 
 def is_openai_cloud() -> bool:
     """True when requests go to api.openai.com (no custom base URL)."""
-    url = base_url()
-    if not url:
-        return True
-    host = (urlparse(url).hostname or "").lower()
-    return host == "openai.com" or host.endswith(".openai.com")
+    return resolve_api_mode(base_url()) == "responses"
 
 
 def api_mode() -> str:
     """``"chat"`` or ``"responses"``."""
-    forced = (os.getenv("LLM_API") or "").strip().lower()
+    return resolve_api_mode(base_url(), os.getenv("LLM_API"))
+
+
+def resolve_api_mode(url: Optional[str], forced: Optional[str] = None) -> str:
+    """Resolve a connection's protocol without reading process settings."""
+    forced = (forced or "").strip().lower()
     if forced in ("chat", "chat_completions", "chat-completions", "completions"):
         return "chat"
     if forced in ("responses", "response"):
         return "responses"
-    return "responses" if is_openai_cloud() else "chat"
+    host = (urlparse((url or "").strip() or OPENAI_URL).hostname or "").lower()
+    return "responses" if host == "openai.com" or host.endswith(".openai.com") else "chat"
 
 
 def default_model() -> str:
@@ -85,5 +88,6 @@ __all__ = [
     "is_gpt5",
     "is_openai_cloud",
     "model_for",
+    "resolve_api_mode",
     "web_search_available",
 ]

@@ -70,7 +70,7 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
 
   const show = useCallback((next: ModelSettings) => {
     setSettings(next)
-    setPlain(Object.fromEntries(PLAIN.map((name) => [name, next.fields[name].value])) as Record<PlainName, string>)
+    setPlain(Object.fromEntries(PLAIN.map((name) => [name, next.fields[name]?.value ?? ''])) as Record<PlainName, string>)
     setKeys({ OPENAI_API_KEY: '', DISCOVERY_API_KEY: '' })
     setClearKeys({ OPENAI_API_KEY: false, DISCOVERY_API_KEY: false })
     setShowKeys({ OPENAI_API_KEY: false, DISCOVERY_API_KEY: false })
@@ -115,7 +115,7 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
 
   // What an empty field falls back to.
   const envHint = (name: PlainName, fallback: string) => {
-    const env = settings?.fields[name].env_value
+    const env = settings?.fields[name]?.env_value
     return env ? `default: ${env} (from .env.local)` : `default: ${fallback}`
   }
 
@@ -269,7 +269,7 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
       <div className="space-y-3">
         <h4 className="text-sm font-semibold text-foreground">Research (discovery)</h4>
         <p className="text-xs text-muted-foreground">
-          Needs the OpenAI Responses API. Give it its own endpoint when the Agent runs on a self-hosted model.
+          Supports OpenAI and OpenAI-compatible services. Use a separate connection if needed.
         </p>
         <div className="flex items-center gap-2">
           <Checkbox
@@ -286,7 +286,7 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
         </div>
         {!usesAgent && (
           <>
-            {row('Endpoint', 'Responses API base URL',
+            {row('Endpoint', 'OpenAI-compatible API base URL',
               <Input
                 aria-label="Research endpoint"
                 placeholder={envHint('DISCOVERY_BASE_URL', researchHasKey
