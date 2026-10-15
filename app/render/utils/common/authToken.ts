@@ -1,4 +1,4 @@
-import { getAuth } from 'firebase/auth';
+import { getAuth, onIdTokenChanged } from 'firebase/auth';
 import Cookies from 'js-cookie';
 import { toast } from 'sonner';
 
@@ -185,3 +185,22 @@ const runForceRefresh = async (): Promise<string | null> => {
   }
 };
 
+
+/** Notify holders of long-lived request headers without rebuilding their UI. */
+export const onAuthTokenChange = (listener: (token: string) => void): (() => void) => {
+  let cancelled = false;
+  let unsubscribe: (() => void) | undefined;
+  const auth = getAuth(app);
+  void auth.authStateReady().then(() => {
+    if (cancelled) return;
+    unsubscribe = onIdTokenChanged(auth, (user) => {
+      if (!user) return;
+      void user.getIdToken().then((token) => {
+        if (cancelled || auth.currentUser !== user) return;
+        Cookies.set(AUTH_COOKIE_NAME, token, { expires: 30 });
+        listener(token);
+      }).catch((error) => console.warn('[Auth] Could not read updated tile token:', error));
+    });
+  }).catch((error) => console.warn('[Auth] Could not watch token changes:', error));
+  return () => { cancelled = true; unsubscribe?.(); };
+};

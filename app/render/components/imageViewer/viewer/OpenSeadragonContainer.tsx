@@ -89,6 +89,8 @@ import { apiFetch } from "@/utils/common/apiFetch"; // centralized http client
 import { segFetch } from "@/utils/common/segFetch";
 import { getErrorMessage } from "@/utils/common/apiResponse";
 import { getAuthToken } from "@/utils/common/authToken";
+import { tileAjaxHeaders } from "@/utils/viewer/tileAuth";
+import { useTileAuth } from "@/hooks/viewer/useTileAuth";
 import {
   createTileSource,
   createTileUrlGenerator,
@@ -166,21 +168,17 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
   const lastResetTimestampRef = useRef<number>(0);
   const overlayHostRef = useRef<HTMLDivElement | null>(null);
 
-  // OSD bypasses apiFetch, so resolve the auth token before any tile source
-  // is created. Refresh periodically; changing the token rebuilds the source.
+  // Only the first token gates construction. Later tokens update live headers.
+  const tileAuthTokenRef = useRef<string | null>(null);
   useEffect(() => {
     let cancelled = false;
     setTileAuthToken(null);
-    const refresh = async () => {
-      const token = await getAuthToken();
-      if (!cancelled) setTileAuthToken(token);
-    };
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 50 * 60 * 1000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
+    void getAuthToken().then((token) => {
+      if (cancelled) return;
+      tileAuthTokenRef.current = token;
+      setTileAuthToken(token);
+    });
+    return () => { cancelled = true; };
   }, [instanceId]);
 
   // Instance cleanup is handled at page-level; avoid duplicate scheduling here
@@ -2353,7 +2351,6 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
             getTileUrlForLayer,
             currentInstanceId,
             currentWSIFileInfo,
-            tileAuthToken,
             { zLayer: layer },
           );
 
@@ -2514,7 +2511,6 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
       getTileUrl,
       currentInstanceId,
       currentWSIFileInfo,
-      tileAuthToken,
       { channelSignature },
     );
 
@@ -2579,10 +2575,7 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
         showZoomControl: true,
         loadTilesWithAjax: true,
         imageLoaderLimit: 6, // Limit concurrent requests to allow effective cancellation
-        ajaxHeaders: {
-          Authorization: `Bearer ${tileAuthToken}`,
-          Accept: "image/jpeg,image/png,image/*,*/*",
-        },
+        ajaxHeaders: tileAjaxHeaders(tileAuthTokenRef.current ?? tileAuthToken),
         tileSources: {
           ...tileSource,
           getTileUrl: getTileUrl,
@@ -2939,7 +2932,6 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
     currentWSIInfo,
     currentWSIFileInfo,
     currentInstanceId,
-    authToken: tileAuthToken,
     getTileUrl,
     setAllTilesLoaded,
   });
@@ -3011,6 +3003,11 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
       setViewerInstance((prev: any) => (prev === viewer ? null : prev));
     };
   }, [annotatorInstance, setViewerInstance, isThisInstanceActive]);
+
+  const rememberTileToken = useCallback((token: string) => {
+    tileAuthTokenRef.current = token;
+  }, []);
+  useTileAuth(annotatorInstance?.viewer, rememberTileToken);
 
   // Use annotation handlers hook
   const {
@@ -3114,7 +3111,7 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
 
           {/* OSD Navigator */}
           {viewerInstance && showNavigator && tileAuthToken && (
-            <OSDNavigator navigatorSizeRatio={0.2} autoHideDelay={1000} authToken={tileAuthToken} />
+            <OSDNavigator navigatorSizeRatio={0.2} autoHideDelay={1000} />
           )}
 
           {/*

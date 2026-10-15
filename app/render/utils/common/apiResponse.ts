@@ -178,3 +178,10 @@ export function requireAxiosAppPayload<T = unknown>(axiosResponse: { data: unkno
   }
   return body as T;
 }
+
+/** Distinguish stale credentials from genuine path/access denials. */
+export function isTokenRejectionEnvelope(body: unknown): boolean {
+  if (typeof body !== 'object' || body === null) return false;
+  const { code, data } = body as { code?: unknown; data?: { error_code?: unknown } };
+  return code === 401 || (code === 403 && String(data?.error_code ?? '').startsWith('AUTH_TOKEN_'));
+}

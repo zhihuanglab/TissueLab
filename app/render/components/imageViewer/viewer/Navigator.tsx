@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useCallback, useState } from 'react';
 import OpenSeadragon from 'openseadragon';
+import { startTileAuth } from '@/hooks/viewer/useTileAuth';
 import { useAnnotatorInstance } from '@/contexts/AnnotatorContext';
-import { getAuthToken } from '@/utils/common/authToken';
 
 interface NavigatorProps {
   navigatorId: string;
@@ -10,6 +10,7 @@ interface NavigatorProps {
 const Navigator: React.FC<NavigatorProps> = ({ navigatorId }) => {
   const { viewerInstance } = useAnnotatorInstance();
   const navigatorRef = useRef<any>(null);
+  const stopTileAuthRef = useRef<(() => void) | null>(null);
   const navRotateHandlerRef = useRef<any>(null);
   const navScrollHandlerRef = useRef<any>(null);
   // Brower detection for MacOS
@@ -39,6 +40,8 @@ const Navigator: React.FC<NavigatorProps> = ({ navigatorId }) => {
           navScrollHandlerRef.current = null;
         }
       }
+      stopTileAuthRef.current?.();
+      stopTileAuthRef.current = null;
       navigatorRef.current.destroy();
       navigatorRef.current = null;
 
@@ -49,7 +52,7 @@ const Navigator: React.FC<NavigatorProps> = ({ navigatorId }) => {
   }, [viewerInstance, navigatorId, updateNavigator]);
 
   useEffect(() => {
-    const createNavigator = (authToken: string) => {
+    const createNavigator = () => {
       if (!viewerInstance) return;
       // Create a new container for openSeadragon
       const tiledImage = viewerInstance.world.getItemAt(0);
@@ -82,13 +85,10 @@ const Navigator: React.FC<NavigatorProps> = ({ navigatorId }) => {
         // would otherwise fire its whole tile grid at once and crowd out the
         // main viewer's tiles on the backend read pool.
         imageLoaderLimit: 2,
-        ajaxHeaders: {
-          'Content-Type': 'application/json',
-          'Accept': 'image/jpeg,image/png,image/*,*/*',
-          'Authorization': `Bearer ${authToken}`,
-        }
+        ajaxHeaders: { ...(viewerInstance as any).ajaxHeaders }
       } as any);
 
+      stopTileAuthRef.current = startTileAuth(navigatorRef.current);
       navigatorRef.current.addTiledImage({
         tileSource: tiledImage.source,
         originalTiledImage: tiledImage,
@@ -98,15 +98,13 @@ const Navigator: React.FC<NavigatorProps> = ({ navigatorId }) => {
       viewerInstance.addHandler('animation', updateNavigator);
     }
 
-    const initNavigator = async () => {
+    const initNavigator = () => {
       if (viewerInstance) {
-        const authToken = await getAuthToken();
-        if (!authToken) return;
         cleanupNavigator();
         // Get rotate event before create navigator
         const prevNavRotateEvent = (viewerInstance as any).events['rotate']?.slice() || []
         // Create navigator
-        createNavigator(authToken);
+        createNavigator();
         // Get rotate event after create navigator
         const currentNavRotateEvent = (viewerInstance as any).events['rotate']?.slice() || []
         // extract the handler from the event
