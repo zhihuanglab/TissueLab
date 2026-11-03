@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Body, Query, Request
 from typing import Dict, Any
+import asyncio
 import traceback
 
 from app.core.response import success_response, error_response, permission_denied_response
@@ -10,6 +11,7 @@ from app.core.access import (
     request_uid,
 )
 from app.services.thumbnail import thumbnail_worker, start_thumbnail_worker
+from app.api.schema.thumbnail import PreviewBatchRequest, TaskIdsRequest
 
 # Create router
 thumbnail_router = APIRouter()
@@ -142,6 +144,75 @@ async def submit_preview_task(http_request: Request, request: Dict[str, Any] = B
     except Exception as e:
         traceback.print_exc()
         return error_response("Error submitting preview task")
+
+
+def _cached_or_authorized(http_request: Request, file_path: str, preview_type: str, size: int):
+    """One slide of a preview batch: ``(authorized_path, cached_result, error)``."""
+    try:
+        authorized_path, denied = authorize_read_or_response(
+            http_request, file_path, operation="generate preview"
+        )
+        if denied is not None:
+            return None, None, "READ_ACCESS_DENIED"
+        return authorized_path, thumbnail_worker.cached_preview(authorized_path, preview_type, size), None
+    except Exception:
+        traceback.print_exc()
+        return None, None, "PREVIEW_FAILED"
+
+
+@thumbnail_router.post("/v1/previews/batch")
+async def submit_preview_batch(http_request: Request, payload: PreviewBatchRequest):
+    """Previews for a screenful of slides in one call.
+
+    A slide whose preview is already cached comes back with its result; the
+    rest get a task id to poll with ``/v1/status/batch``. Each slide is checked
+    on its own, and a denied or broken one carries an error code instead of
+    failing the batch. Results are keyed by the path as sent.
+    """
+    paths = list(dict.fromkeys(payload.file_paths))
+    checked = await asyncio.gather(*(
+        asyncio.to_thread(_cached_or_authorized, http_request, path, payload.preview_type, payload.size)
+        for path in paths
+    ))
+    owner_uid = request_uid(http_request) or ""
+    batch_seq = thumbnail_worker.next_batch_seq()
+    results = {}
+    for index, (path, (authorized_path, cached, error)) in enumerate(zip(paths, checked)):
+        if error:
+            results[path] = {"error": error}
+        elif cached:
+            results[path] = {"result": cached}
+        else:
+            task_id = await thumbnail_worker.submit_preview_task(
+                preview_type=payload.preview_type,
+                size=payload.size,
+                file_path=authorized_path,
+                owner_uid=owner_uid,
+                batch=(batch_seq, index),
+            )
+            results[path] = {"task_id": task_id}
+    return success_response({"results": results})
+
+
+@thumbnail_router.post("/v1/status/batch")
+async def get_tasks_status_batch(http_request: Request, payload: TaskIdsRequest):
+    """Status of several of the caller's tasks, keyed by task id. A task that
+    is gone or not the caller's carries an error code."""
+    return success_response({
+        "statuses": thumbnail_worker.get_tasks_status(
+            payload.task_ids, owner_uid=request_uid(http_request) or ""
+        )
+    })
+
+
+@thumbnail_router.post("/v1/cancel")
+async def cancel_tasks(http_request: Request, payload: TaskIdsRequest):
+    """Drop the caller's tasks that have not started — rows scrolled away."""
+    return success_response({
+        "cancelled": thumbnail_worker.cancel_tasks(
+            payload.task_ids, owner_uid=request_uid(http_request) or ""
+        )
+    })
 
 
 @thumbnail_router.get("/v1/status/{task_id}")

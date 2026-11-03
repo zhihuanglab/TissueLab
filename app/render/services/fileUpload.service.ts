@@ -87,7 +87,29 @@ export type SmallFileUploadFilesApi = (
     hasConflicts: boolean,
     relativePaths?: string[],
     keepBoth?: boolean
-) => Promise<void>;
+) => Promise<unknown>;
+
+/**
+ * Storage-relative path the server actually wrote a file to.
+ *
+ * The server may rename on save (sanitize: "A1-1 PAP.ndpi" -> "A1-1_PAP.ndpi";
+ * uniquify: "x.svs" -> "x(1).svs"), so anything queued against the uploaded
+ * file afterwards (e.g. Cytoformer pre-run) must use this, not File.name.
+ *
+ * Chunked complete returns `{ path }`; the small-file endpoint returns
+ * `{ uploaded_files: [{ original_name, actual_name, path }] }`.
+ */
+export function extractUploadedServerPath(result: unknown, originalName?: string): string | undefined {
+    if (!result || typeof result !== 'object') return undefined;
+    const r = result as { path?: unknown; uploaded_files?: unknown };
+    if (typeof r.path === 'string' && r.path.trim()) return r.path.replace(/\\/g, '/');
+    if (Array.isArray(r.uploaded_files)) {
+        const rows = r.uploaded_files as Array<{ original_name?: unknown; path?: unknown }>;
+        const match = (originalName && rows.find((row) => row?.original_name === originalName)) || rows[0];
+        if (match && typeof match.path === 'string' && match.path.trim()) return match.path.replace(/\\/g, '/');
+    }
+    return undefined;
+}
 
 function fileToFileList(file: File): FileList {
     const dt = new DataTransfer();
@@ -104,7 +126,7 @@ export interface SmallFileUploadCallbacks {
         maxRetries: number,
         relPath?: string
     ) => void;
-    onSuccess: (fileId: string, file: File, relPath?: string) => void;
+    onSuccess: (fileId: string, file: File, relPath?: string, serverPath?: string) => void;
     onFailure: (
         fileId: string,
         file: File,
@@ -151,7 +173,7 @@ async function uploadOneSmallFileWithRetry(
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
-            await uploadFiles(
+            const result = await uploadFiles(
                 uploadPath,
                 fileToFileList(file),
                 (percent) => {
@@ -162,7 +184,7 @@ async function uploadOneSmallFileWithRetry(
                 relPath ? [relPath] : undefined,
                 keepBoth
             );
-            callbacks.onSuccess(fileId, file, relPath);
+            callbacks.onSuccess(fileId, file, relPath, extractUploadedServerPath(result, file.name));
             return { successful: 1, cancelled: 0, failed: 0 };
         } catch (error) {
             lastErr = error;
@@ -303,7 +325,7 @@ export interface ChunkedFileUploadCallbacks {
     onUiStatus: (
         status: UiUploadStatus,
         progress: number,
-        extras?: { mergeStartedAt?: number }
+        extras?: { mergeStartedAt?: number; serverPath?: string }
     ) => void;
     onCompleteSuccess: (result: unknown) => void;
     onResumeHintsRefresh: () => void;

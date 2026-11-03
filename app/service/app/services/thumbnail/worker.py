@@ -9,6 +9,7 @@ import asyncio
 import threading
 import time
 import uuid
+import itertools
 from typing import Dict, List, Optional, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
 import traceback
@@ -30,6 +31,11 @@ class ThumbnailWorker:
         self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
         self.tasks = {}  # Task cache
         self.task_lock = threading.Lock()
+        # Set whenever a task is submitted or finishes, so a free worker picks
+        # up the next task at once instead of on the next poll.
+        self._wake = threading.Event()
+        self._last_cleanup = time.time()
+        self._batch_seq = itertools.count(1)
         self.ws_notifier = None
         self.running = False
         self.worker_thread = None
@@ -62,37 +68,70 @@ class ThumbnailWorker:
         self.ws_notifier = notifier_func
         
     def _worker_loop(self):
-        """Main worker loop for processing tasks"""
+        """Main worker loop for processing tasks.
+
+        Hands the executor at most ``max_workers`` tasks at a time, in
+        ``_pick_order``. Handing it every pending task at once queued them in
+        arrival order where nothing could take them back: a file list scrolled
+        past a few hundred slides opened every one of them before the slides
+        left on screen, and a task the client no longer wanted could not be
+        cancelled. Kept here, pending tasks can still be cancelled and the
+        screen the user is looking at goes first.
+        """
         while self.running:
             try:
-                # Process pending tasks
+                # Cleared before the scan, so a wake-up arriving during it is
+                # kept for the wait below rather than lost.
+                self._wake.clear()
                 with self.task_lock:
-                    pending_tasks = [task_id for task_id, task in self.tasks.items() 
-                                   if task['status'] == 'pending']
-                
-                for task_id in pending_tasks:
+                    running = sum(1 for task in self.tasks.values() if task['status'] == 'processing')
+                    free = self.max_workers - running
+                    pending = sorted(
+                        (task for task in self.tasks.values() if task['status'] == 'pending'),
+                        key=self._pick_order,
+                    )[:max(0, free)]
+
+                for task in pending:
                     if not self.running:
                         break
-                    self._process_task(task_id)
-                    
-                time.sleep(0.1)  # Small delay to prevent busy waiting
-                
+                    self._process_task(task['id'])
+
+                if time.time() - self._last_cleanup > 60:
+                    self._last_cleanup = time.time()
+                    self.cleanup_old_tasks()
+
+                self._wake.wait(0.1)
+
             except Exception as e:
                 logger.error(f"Error in worker loop: {str(e)}", exc_info=e)
                 traceback.print_exc()
                 time.sleep(1)  # Wait before retrying
-                
+
+    @staticmethod
+    def _pick_order(task: Dict):
+        """Single requests first, oldest first, as before - their callers poll
+        with a fixed timeout and must not be starved. Then batch requests from
+        the file list: the newest batch (the screen in view) first, and within
+        a batch in the order sent (top of the screen first)."""
+        batch = task.get('batch')
+        if batch is None:
+            return (0, task['created_at'], 0)
+        seq, index = batch
+        return (1, -seq, index)
+
+    def next_batch_seq(self) -> int:
+        return next(self._batch_seq)
+
     def _process_task(self, task_id: str):
         """Process a single task"""
         try:
             with self.task_lock:
-                if task_id not in self.tasks:
+                task = self.tasks.get(task_id)
+                # Cancelled since the loop picked it.
+                if task is None or task['status'] != 'pending':
                     return
-                task = self.tasks[task_id]
-                
-            # Update task status
-            task['status'] = 'processing'
-            task['started_at'] = time.time()
+                task['status'] = 'processing'
+                task['started_at'] = time.time()
             
             # Submit task to thread pool
             future = self.executor.submit(self._execute_task, task)
@@ -330,6 +369,49 @@ class ThumbnailWorker:
                 except:
                     pass
 
+    @staticmethod
+    def _cached_all_previews(resolved_path: str, size: int) -> Optional[Dict]:
+        """The bundled thumbnail/macro/label result, if all three are cached."""
+        cached = {
+            kind: thumbnail_cache_service.get_cached_thumbnail_base64(resolved_path, size, kind)
+            for kind in ("thumbnail", "macro", "label")
+        }
+        if not all(cached.values()):
+            return None
+        return {
+            "status": "success",
+            **cached,
+            "filename": os.path.basename(resolved_path),
+            "available": ["thumbnail", "macro", "label"],
+        }
+
+    @staticmethod
+    def _overlay_cache_type(resolved_path: str, preview_type: str) -> str:
+        """Cache key part for an overlay preview: follows the zarr results it is
+        drawn from, not just the slide file (see ``overlay_signature``)."""
+        from app.services.thumbnail.overlay import PREVIEW_TYPE_TO_OVERLAY_KIND, overlay_signature
+        return f"{preview_type}@{overlay_signature(resolved_path, PREVIEW_TYPE_TO_OVERLAY_KIND[preview_type])}"
+
+    def cached_preview(self, file_path: str, preview_type: str, size: int = 200) -> Optional[Dict]:
+        """A finished preview result straight from the cache, or None.
+
+        Lets a batch submit answer cached slides at once instead of queueing a
+        task and making the client poll for something already on disk.
+        """
+        from app.utils import resolve_path
+        from app.services.thumbnail.overlay import PREVIEW_TYPE_TO_OVERLAY_KIND
+        resolved_path = resolve_path(file_path)
+        if preview_type == "all":
+            return self._cached_all_previews(resolved_path, size)
+        if preview_type in PREVIEW_TYPE_TO_OVERLAY_KIND:
+            cached_b64 = thumbnail_cache_service.get_cached_thumbnail_base64(
+                resolved_path, size, self._overlay_cache_type(resolved_path, preview_type)
+            )
+            if cached_b64:
+                return {"status": "success", preview_type: cached_b64,
+                        "available": [preview_type], "file_path": file_path}
+        return None
+
     def _generate_thumbnail_from_path_isolated(self, file_path: str, size: int = 200, request_id: str = None) -> Dict:
         """Generate thumbnail from file path using isolated slide loading"""
         from app.services.load import get_slide_preview_data
@@ -345,30 +427,11 @@ class ThumbnailWorker:
             # Resolve file path
             resolved_path = resolve_path(file_path)
 
-            # Check cache first for all preview types
-            cached_thumbnail = thumbnail_cache_service.get_cached_thumbnail_base64(
-                resolved_path, size, "thumbnail"
-            )
-            cached_macro = thumbnail_cache_service.get_cached_thumbnail_base64(
-                resolved_path, size, "macro"
-            )
-            cached_label = thumbnail_cache_service.get_cached_thumbnail_base64(
-                resolved_path, size, "label"
-            )
-            
-            # If all previews are cached, return cached data
-            if cached_thumbnail and cached_macro and cached_label:
-                result = {
-                    "status": "success",
-                    "thumbnail": cached_thumbnail,
-                    "macro": cached_macro,
-                    "label": cached_label,
-                    "filename": os.path.basename(resolved_path),
-                    "available": ["thumbnail", "macro", "label"]
-                }
+            cached = self._cached_all_previews(resolved_path, size)
+            if cached:
                 if request_id:
-                    result["request_id"] = request_id
-                return result
+                    cached["request_id"] = request_id
+                return cached
 
             # Create isolated slide object
             slide_obj = self._create_isolated_slide_object(resolved_path)
@@ -436,9 +499,11 @@ class ThumbnailWorker:
             # flow (which JSON-serializes the result) carries it like thumbnail/
             # macro/label. Falls back to the plain thumbnail when the slide has no
             # matching classification.
-            if preview_type in ("cell_overlay", "patch_overlay"):
+            from app.services.thumbnail.overlay import PREVIEW_TYPE_TO_OVERLAY_KIND
+            if preview_type in PREVIEW_TYPE_TO_OVERLAY_KIND:
+                cache_type = self._overlay_cache_type(resolved_path, preview_type)
                 cached_b64 = thumbnail_cache_service.get_cached_thumbnail_base64(
-                    resolved_path, size, preview_type
+                    resolved_path, size, cache_type
                 )
                 if cached_b64:
                     result = {"status": "success", preview_type: cached_b64,
@@ -454,7 +519,7 @@ class ThumbnailWorker:
                 image_bytes = base_bytes
                 try:
                     from app.services.thumbnail.overlay import bake_overlay
-                    kind = "cell" if preview_type == "cell_overlay" else "patch"
+                    kind = PREVIEW_TYPE_TO_OVERLAY_KIND[preview_type]
                     level0_size = getattr(slide_obj, "level_dimensions", [None])[0]
                     if level0_size:
                         baked = bake_overlay(base_bytes, resolved_path, kind, level0_size)
@@ -466,7 +531,7 @@ class ThumbnailWorker:
                 import base64 as _b64
                 data_url = f"data:image/jpeg;base64,{_b64.b64encode(image_bytes).decode()}"
                 thumbnail_cache_service.cache_thumbnail_from_base64(
-                    resolved_path, size, preview_type, data_url
+                    resolved_path, size, cache_type, data_url
                 )
                 result = {"status": "success", preview_type: data_url,
                           "available": [preview_type], "file_path": file_path}
@@ -555,7 +620,8 @@ class ThumbnailWorker:
                 self.tasks[task_id]['completed_at'] = time.time()
                 if result:
                     self.tasks[task_id]['result'] = result
-                    
+        self._wake.set()
+
         # Notify WebSocket clients if notifier is set
         if self.ws_notifier:
             try:
@@ -616,7 +682,8 @@ class ThumbnailWorker:
         
         with self.task_lock:
             self.tasks[task_id] = task
-            
+        self._wake.set()
+
         logger.info(f"Submitted thumbnail task {task_id} for session {session_id}")
         return task_id
         
@@ -628,13 +695,16 @@ class ThumbnailWorker:
         file_path: str = None,
         request_id: str = None,
         owner_uid: str = "",
+        batch: Optional[Tuple[int, int]] = None,
     ) -> str:
-        """Submit a preview generation task"""
+        """Submit a preview generation task. ``batch`` is ``(batch seq, index)``
+        for tasks of a file-list batch (see ``_pick_order``)."""
         task_id = str(uuid.uuid4())
         
         task = {
             'id': task_id,
             'type': 'preview',
+            'batch': batch,
             'session_id': session_id,
             'file_path': file_path,
             'preview_type': preview_type,
@@ -648,7 +718,8 @@ class ThumbnailWorker:
         
         with self.task_lock:
             self.tasks[task_id] = task
-            
+        self._wake.set()
+
         if session_id:
             logger.info(f"Submitted preview task {task_id} for session {session_id}")
         elif file_path:
@@ -729,6 +800,37 @@ class ThumbnailWorker:
                 'result': task.get('result')
             }
             
+    def get_tasks_status(self, task_ids: List[str], owner_uid: str = "") -> Dict[str, Dict]:
+        """``get_task_status`` for several tasks under one lock, keyed by task id."""
+        statuses = {}
+        with self.task_lock:
+            for task_id in task_ids:
+                task = self.tasks.get(task_id)
+                if task is None:
+                    statuses[task_id] = {'error': 'NOT_FOUND'}
+                    continue
+                task_owner = task.get("owner_uid") or ""
+                if not owner_uid or not task_owner or task_owner != owner_uid:
+                    statuses[task_id] = {'error': 'TASK_OWNER_MISMATCH'}
+                    continue
+                statuses[task_id] = {'status': task['status'], 'result': task.get('result')}
+        return statuses
+
+    def cancel_tasks(self, task_ids: List[str], owner_uid: str = "") -> int:
+        """Drop the caller's tasks that have not started. Returns how many.
+
+        A task already running finishes; its result is just never read.
+        """
+        cancelled = 0
+        with self.task_lock:
+            for task_id in task_ids:
+                task = self.tasks.get(task_id)
+                if (task is not None and task['status'] == 'pending'
+                        and owner_uid and task.get("owner_uid") == owner_uid):
+                    del self.tasks[task_id]
+                    cancelled += 1
+        return cancelled
+
     def get_pending_tasks_count(self) -> int:
         """Get the number of pending tasks"""
         with self.task_lock:

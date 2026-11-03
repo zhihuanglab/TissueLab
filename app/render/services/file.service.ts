@@ -1,5 +1,5 @@
 import { AI_SERVICE_API_ENDPOINT } from '@/config/api.config';
-import { apiFetch } from '../utils/common/apiFetch';
+import { apiFetch, requireAxiosAppPayload } from '../utils/common/apiFetch';
 import { shortHashFromString } from '@/utils/common/string.utils';
 
 // Instance management
@@ -562,6 +562,48 @@ export const getPreviewAsync = async (filePath: string, previewType: string = 'a
     console.error('getPreviewAsync error:', error);
     throw error;
   }
+};
+
+export type PreviewBatchEntry = { result?: any; task_id?: string; error?: string };
+export type PreviewTaskStatus = { status?: string; result?: any; error?: string };
+
+/**
+ * Previews for several slides in one request, keyed by the paths as passed.
+ * Cached slides come back with their result; the rest with a task id to poll
+ * with `getPreviewStatusBatch`.
+ */
+export const submitPreviewBatch = async (
+  filePaths: string[],
+  previewType: 'all' | 'cell_overlay' | 'patch_overlay' = 'all',
+  size: number = 200,
+): Promise<Record<string, PreviewBatchEntry>> => {
+  const response = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/thumbnail/v1/previews/batch`, {
+    method: 'POST',
+    body: JSON.stringify({ file_paths: filePaths, preview_type: previewType, size }),
+    returnAxiosFormat: true,
+  });
+  if (response.status !== 200) throw new Error('Failed to submit previews');
+  return (requireAxiosAppPayload(response) as any)?.results ?? {};
+};
+
+/** Status of several preview tasks, keyed by task id. */
+export const getPreviewStatusBatch = async (taskIds: string[]): Promise<Record<string, PreviewTaskStatus>> => {
+  const response = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/thumbnail/v1/status/batch`, {
+    method: 'POST',
+    body: JSON.stringify({ task_ids: taskIds }),
+    returnAxiosFormat: true,
+  });
+  if (response.status !== 200) throw new Error('Failed to read preview status');
+  return (requireAxiosAppPayload(response) as any)?.statuses ?? {};
+};
+
+/** Drop preview tasks that have not started — their rows left the screen. */
+export const cancelPreviewTasks = async (taskIds: string[]): Promise<void> => {
+  await apiFetch(`${AI_SERVICE_API_ENDPOINT}/thumbnail/v1/cancel`, {
+    method: 'POST',
+    body: JSON.stringify({ task_ids: taskIds }),
+    returnAxiosFormat: true,
+  });
 };
 
 // Submit preview task by file path

@@ -1,4 +1,5 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
+import { LISTING_BATCH_SIZE } from '@/utils/dashboard/listingRequest';
 
 interface FileItem {
   name: string;
@@ -92,7 +93,7 @@ const initialState: FileManagerState = {
   },
   pagination: {
     offset: 0,
-    limit: 10,
+    limit: LISTING_BATCH_SIZE,
     total: 0,
     hasMore: false,
   },
@@ -168,9 +169,11 @@ const fileManagerSlice = createSlice({
       state.pagination = { ...state.pagination, ...action.payload };
     },
     resetPagination: (state) => {
+      // A new listing starts from the first batch again; the grown limit
+      // belonged to how far the user had scrolled the previous one.
       state.pagination = {
         offset: 0,
-        limit: state.pagination.limit,
+        limit: LISTING_BATCH_SIZE,
         total: 0,
         hasMore: false,
       };

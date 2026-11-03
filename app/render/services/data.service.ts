@@ -228,6 +228,29 @@ export const getZarrStructure = async (
   return requireAxiosAppPayload(response) as any;
 };
 
+export type AnalysisGroupsResult = { groups?: string[]; error?: string };
+
+/**
+ * Analysis groups holding results (`Cell-Segmentation`, …) for several stores
+ * in one request, keyed by the paths as passed. Drives the file-list badges.
+ */
+export const getAnalysisGroupsBatch = async (
+  filePaths: string[],
+): Promise<Record<string, AnalysisGroupsResult>> => {
+  const response = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/data/v1/analysis_groups/batch`, {
+    method: 'POST',
+    body: JSON.stringify({ file_paths: filePaths }),
+    returnAxiosFormat: true,
+  });
+
+  if (response.status !== 200) {
+    const errorData = response.data;
+    throw new Error(errorData?.detail || 'Failed to read analysis groups');
+  }
+
+  return (requireAxiosAppPayload(response) as any)?.results ?? {};
+};
+
 export const getZarrGroupInfo = async (
   filePath: string,
   groupPath: string,

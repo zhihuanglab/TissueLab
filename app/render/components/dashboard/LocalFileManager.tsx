@@ -18,7 +18,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Table,
   TableBody,
@@ -40,7 +39,7 @@ import {
   MoreVertical,
 } from 'lucide-react';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { FileManagerPagination } from './FileManager/FileManagerPagination';
+import { VirtualRows, renderBlockSpacer, renderTableSpacer, useIsDesktopLayout } from './FileManager/VirtualRows';
 
 import { validateItemName } from '@/utils/common/string.utils';
 import { ConversionJobStatus, enqueueH5ToZarr, getConversionJobStatus } from '@/services/data.service';
@@ -55,7 +54,7 @@ import { useDispatch } from 'react-redux';
 import { toast } from 'sonner';
 import { FileHeader } from './FileManager/FileHeader';
 import ImagePreviewCell from './FileManager/ImagePreviewCell';
-import ZarrBadgesCell from './FileManager/ZarrBadgesCell';
+import ZarrBadgesCell, { revalidateBadges } from './FileManager/ZarrBadgesCell';
 import { 
   formatBytes, 
   formatFileType, 
@@ -101,22 +100,12 @@ const LocalFileManager = () => {
   const [currentDirectory, setCurrentDirectory] = useState<string>('');
   const currentDirectoryRef = useRef<string>(''); // Ref to track current directory without causing re-renders
   const [fileTree, setFileTree] = useState<FileTreeNode[]>([]);
-  const [allFiles, setAllFiles] = useState<FileTreeNode[]>([]); // Store all files for pagination
+  const [allFiles, setAllFiles] = useState<FileTreeNode[]>([]); // Every file in the folder, before filter/sort
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // Pagination state
-  const [pagination, setPagination] = useState<{
-    offset: number;
-    limit: number | null;
-    total: number;
-    hasMore: boolean;
-  }>({
-    offset: 0,
-    limit: 10, // Default page size
-    total: 0,
-    hasMore: false,
-  });
+  // The list's scroll container — virtualized rows measure against it.
+  const listScrollRef = useRef<HTMLDivElement>(null);
+  const isDesktopLayout = useIsDesktopLayout();
 
   const [sortConfig, setSortConfig] = useState<SortConfig>({ key: 'mtime', direction: 'desc' });
   const [showNonImageFiles, setShowNonImageFiles] = useState(false);
@@ -192,23 +181,9 @@ const LocalFileManager = () => {
         }
       }
 
-      // Store all files and reset pagination when navigating to a new directory
-      const previousDirectory = currentDirectoryRef.current;
-      const shouldResetPagination = previousDirectory !== path;
-
       setAllFiles(treeNodes);
       setCurrentDirectory(path);
       currentDirectoryRef.current = path; // Update ref synchronously
-      // Note: Pagination metadata (total, hasMore) will be updated in useEffect
-      // after filtering is applied, so we don't need to set it here
-      if (shouldResetPagination) {
-        setPagination(prev => ({
-          offset: 0,
-          limit: prev.limit, // Keep the limit setting
-          total: 0, // Will be updated by useEffect after filtering
-          hasMore: false, // Will be updated by useEffect after filtering
-        }));
-      }
 
     } catch (err: any) {
       setError(err.message);
@@ -221,7 +196,7 @@ const LocalFileManager = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [electron, rootFolder, currentDirectory, pagination.limit]);
+  }, [electron, rootFolder, currentDirectory]);
 
   // Filter files based on showNonImageFiles setting
   const filterVisibleFiles = useCallback((files: FileTreeNode[]): FileTreeNode[] => {
@@ -235,61 +210,14 @@ const LocalFileManager = () => {
     });
   }, [showNonImageFiles]);
 
-  // Apply filtering and pagination to allFiles and update fileTree
+  // Filter and sort the folder for display. Every row is handed to the
+  // virtualized list, which only renders the ones on screen.
   useEffect(() => {
-    if (allFiles.length === 0) {
-      setFileTree([]);
-      setPagination(prev => ({
-        ...prev,
-        total: 0,
-        hasMore: false,
-      }));
-      return;
-    }
-
     const parentLinks = allFiles.filter(file => (file as any).isParentLink);
     const navigableFiles = allFiles.filter(file => !(file as any).isParentLink);
-
-    // Only count real directory contents in pagination totals.
-    const filteredFiles = filterVisibleFiles(navigableFiles);
-    // Sort the full filtered set before slicing so switching pages keeps the
-    // global ordering (previously sort ran only on the current page rows).
-    const sortedFiles = sortFileTreeData(filteredFiles, sortConfig);
-    const filteredTotal = sortedFiles.length;
-
-    if (pagination.limit === null) {
-      // Show all filtered files if limit is null, plus the synthetic parent link.
-      setFileTree([...parentLinks, ...sortedFiles]);
-      setPagination(prev => ({
-        ...prev,
-        total: filteredTotal,
-        hasMore: false,
-      }));
-    } else {
-      // Apply pagination to sorted files
-      // Bug fix: clamp offset when the filtered total shrinks (e.g. search/filter/delete)
-      // so we don't render an empty page.
-      const { offset, limit } = pagination;
-      const maxOffset = filteredTotal > 0 ? Math.floor((filteredTotal - 1) / limit) * limit : 0;
-      const safeOffset = Math.min(Math.max(0, offset), maxOffset);
-
-      const startIndex = safeOffset;
-      const endIndex = Math.min(sortedFiles.length, safeOffset + limit);
-      const paginatedFiles = sortedFiles.slice(startIndex, endIndex);
-      setFileTree([...parentLinks, ...paginatedFiles]);
-
-      // Update pagination metadata based on filtered files
-      setPagination(prev => ({
-        ...prev,
-        offset: safeOffset,
-        total: filteredTotal,
-        hasMore: endIndex < sortedFiles.length,
-      }));
-    }
-    // Only depend on pagination.offset and pagination.limit, not the entire pagination object
-    // (total and hasMore are set by this effect, so they shouldn't be dependencies)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allFiles, pagination.offset, pagination.limit, filterVisibleFiles, sortConfig]);
+    const sortedFiles = sortFileTreeData(filterVisibleFiles(navigableFiles), sortConfig);
+    setFileTree([...parentLinks, ...sortedFiles]);
+  }, [allFiles, filterVisibleFiles, sortConfig]);
 
   useEffect(() => {
     const activeEntries = Object.entries(conversionJobs).filter(
@@ -517,7 +445,8 @@ const LocalFileManager = () => {
 
         {/* Table Body */}
         <div className="divide-y divide-gray-200">
-          {imageFiles
+          <VirtualRows
+            rows={imageFiles
             .sort((a, b) => {
               if (sortConfig.key === 'name') {
                 return sortConfig.direction === 'asc'
@@ -613,6 +542,10 @@ const LocalFileManager = () => {
                 </div>
               </div>
             ))}
+            scrollRef={listScrollRef}
+            estimateSize={146}
+            renderSpacer={renderBlockSpacer}
+          />
         </div>
       </div>
     );
@@ -780,8 +713,8 @@ const LocalFileManager = () => {
       direction = 'desc';
     }
     setSortConfig({ key, direction });
-    // Keep page 1 so a new global order is visible from the start.
-    setPagination(prev => ({ ...prev, offset: 0 }));
+    // Show the new global order from the start.
+    listScrollRef.current?.scrollTo({ top: 0 });
   };
 
   const sortData = (data: FileTreeNode[], config: SortConfig) => {
@@ -789,32 +722,6 @@ const LocalFileManager = () => {
   };
 
   const filesToRender = fileTree;
-
-  // Pagination handlers
-  const handlePreviousPage = useCallback(() => {
-    if (pagination.offset > 0 && pagination.limit !== null) {
-      const newOffset = Math.max(0, pagination.offset - pagination.limit);
-      setPagination(prev => ({ ...prev, offset: newOffset }));
-    }
-  }, [pagination.offset, pagination.limit]);
-
-  const handleNextPage = useCallback(() => {
-    if (pagination.hasMore && pagination.limit !== null) {
-      const newOffset = pagination.offset + pagination.limit;
-      setPagination(prev => ({ ...prev, offset: newOffset }));
-    }
-  }, [pagination]);
-
-  const handlePageSizeChange = useCallback((newLimit: number | null) => {
-    setPagination(prev => ({ limit: newLimit, offset: 0, total: prev.total, hasMore: false }));
-  }, []);
-
-  const handlePageClick = useCallback((page: number) => {
-    if (pagination.limit !== null) {
-      const newOffset = (page - 1) * pagination.limit;
-      setPagination(prev => ({ ...prev, offset: newOffset }));
-    }
-  }, [pagination.limit]);
 
   const renderItemContextMenu = (item: FileTreeNode) => (
     <DropdownMenu>
@@ -1032,14 +939,28 @@ const LocalFileManager = () => {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {renderFileTableRows(filesToRender)}
+              {isDesktopLayout && (
+                <VirtualRows
+                  rows={renderFileTableRows(filesToRender) as React.ReactElement[]}
+                  scrollRef={listScrollRef}
+                  estimateSize={45}
+                  renderSpacer={renderTableSpacer}
+                />
+              )}
             </TableBody>
           </Table>
         </div>
 
         {/* Mobile cards */}
         <div className="md:hidden px-2">
-          {renderFileCards(filesToRender)}
+          {!isDesktopLayout && (
+            <VirtualRows
+              rows={renderFileCards(filesToRender) as React.ReactElement[]}
+              scrollRef={listScrollRef}
+              estimateSize={92}
+              renderSpacer={renderBlockSpacer}
+            />
+          )}
         </div>
       </div>
     );
@@ -1147,7 +1068,10 @@ const LocalFileManager = () => {
               setViewMode={setViewMode}
               showNonImageFiles={showNonImageFiles}
               setShowNonImageFiles={setShowNonImageFiles}
-              onRefresh={() => fetchFiles(currentDirectory)}
+              onRefresh={() => {
+                fetchFiles(currentDirectory);
+                revalidateBadges();
+              }}
               onNewFolder={() => setDialog({ type: "create-folder" })}
               onOpenFolder={handleOpenRootFolder}
               onGoUp={handleGoUp}
@@ -1156,7 +1080,7 @@ const LocalFileManager = () => {
             />
         </CardHeader>
         <CardContent className="p-0 flex flex-col flex-1 min-h-0 overflow-hidden">
-          <ScrollArea className="flex-1">
+          <div ref={listScrollRef} className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
             {isLoading && <div className="p-4 text-center text-muted-foreground">Loading...</div>}
             {error && <div className="p-4 text-center text-destructive">{error}</div>}
             {!isLoading && !error && !rootFolder && (
@@ -1174,15 +1098,7 @@ const LocalFileManager = () => {
                 {viewMode === 'table' ? renderImageTable() : renderFileTable()}
               </div>
             )}
-          </ScrollArea>
-          <FileManagerPagination
-            pagination={pagination}
-            isLoading={isLoading}
-            onPrevious={handlePreviousPage}
-            onNext={handleNextPage}
-            onPageSizeChange={handlePageSizeChange}
-            onPageClick={handlePageClick}
-          />
+          </div>
         </CardContent>
       </Card>
       {renderDialog()}

@@ -788,6 +788,13 @@ def _chunked_upload_success_response(
         "message": f"File '{upload_info['filename']}' uploaded successfully.",
         "file_path": destination_path,
     }
+    # Storage-relative path and saved name, as the small-file route reports in
+    # uploaded_files: the name may have been sanitized or uniquified on save,
+    # and the pre-run queue needs where the file actually landed.
+    rel_path = os.path.relpath(destination_path, STORAGE_ROOT).replace('\\', '/')
+    if rel_path != '.' and not rel_path.startswith('../'):
+        payload["path"] = rel_path
+        payload["actual_name"] = os.path.basename(destination_path)
     if duplicate:
         payload["duplicate_complete"] = True
     return JSONResponse(content=payload)
