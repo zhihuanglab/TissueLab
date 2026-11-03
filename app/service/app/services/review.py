@@ -3,8 +3,10 @@ from collections import OrderedDict
 import numpy as np
 import json
 import logging
+import contextvars
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional
 import os
 import base64
@@ -15,6 +17,7 @@ from app.utils import resolve_path
 from app.services.tasks import (
     get_cell_review_tile_data,
     get_patch_review_tile_data,
+    _contour_points,
     _int_color_to_hex,
     _get_annotation_dtype,
     _hex_color_to_int,
@@ -44,7 +47,7 @@ logger = logging.getLogger(__name__)
 # ==================================================
 
 _MAX_CACHED_REQUESTS = 32  # bound memory across slides/classes/thresholds
-_last_request_cache = {}   # {cache_key: {key: ..., valid_candidates: [], ...}}
+_last_request_cache = {}   # {cache_key: {key: ..., candidate_idx: ndarray, ...}}
 _request_cache_lock = threading.RLock()
 # Global cache for loaded saved_cells from Zarr (shared across users for same file)
 # Structure: {zarr_path: {data: Dict, mtime: float}}
@@ -60,6 +63,15 @@ _zarr_saved_cells_cache = OrderedDict()  # {zarr_path: {data: Dict, mtime: float
 # jumps, and emits neither between those two lookups. That is an implementation
 # detail, and untrue on a free-threaded build, so nothing below leans on it.
 _zarr_saved_cells_lock = threading.Lock()
+# Per-slide arrays the cell candidate search reads (class indices, per-cell max
+# probability, centroids), keyed by zarr_path and checked against a signature of
+# those arrays' files. A new threshold / side / sort then re-filters in memory
+# instead of re-reading the zarr, and request entries hold only candidate ids.
+_MAX_CACHED_SLIDE_ARRAYS = 4
+_slide_arrays_cache = OrderedDict()  # {zarr_path: {sig: tuple, centroids: ndarray, ...}}
+_slide_arrays_lock = threading.Lock()
+# Review tiles rendered at once per candidate page.
+_TILE_WORKERS = 8
 
 
 def _get_zarr_saved_cells(zarr_path: str) -> Optional[Dict]:
@@ -97,15 +109,7 @@ def _get_request_cache(cache_key: tuple) -> Dict:
         if len(_last_request_cache) >= _MAX_CACHED_REQUESTS:
             # Evict the oldest entry (dicts preserve insertion order)
             _last_request_cache.pop(next(iter(_last_request_cache)), None)
-        entry = {
-            "key": None,
-            "valid_candidates": [],
-            "histogram": [],
-            "centroids": None,
-            "candidate_data": {},
-            "candidates_list": [],
-            "filtered_candidates": []
-        }
+        entry = {"key": None}
         _last_request_cache[cache_key] = entry
         return entry
 
@@ -395,6 +399,191 @@ def _placeholder_image(error_text: str = "Image Error") -> str:
         ).decode('utf-8')
 
 
+def _read_contours(zarr_path: str, cell_ids) -> Dict[int, np.ndarray]:
+    """Contours of just these cells, keyed by cell id (missing ids left out).
+
+    Reads only these cells' rows instead of the whole (N, 32, 2) array, so a
+    page of tiles costs one zarr open rather than one per tile.
+    """
+    if not cell_ids:
+        return {}
+    with open_zarr_cm(zarr_path, 'r') as zf:
+        seg_group = find_segmentation_group(zf)
+        if seg_group is None or ZarrDatasets.CONTOURS not in seg_group:
+            return {}
+        contours = seg_group[ZarrDatasets.CONTOURS]
+        ids = sorted({i for i in cell_ids if 0 <= i < contours.shape[0]})
+        if not ids:
+            return {}
+        return dict(zip(ids, contours.oindex[ids]))
+
+
+def _tree_signature(path: str) -> tuple:
+    """(file count, newest mtime_ns) of everything under path; (0, 0) if absent.
+
+    Rewriting a chunk bumps that chunk file's mtime but not its array
+    directory's, so the files themselves are what tell a rerun apart.
+    """
+    count = newest = 0
+    for dirpath, _, files in os.walk(path):
+        for name in files:
+            try:
+                mtime = os.stat(os.path.join(dirpath, name)).st_mtime_ns
+            except OSError:
+                continue
+            count += 1
+            newest = max(newest, mtime)
+    return count, newest
+
+
+def _cell_arrays_signature(zarr_path: str) -> Optional[tuple]:
+    """Changes whenever segmentation or classification rewrites an array the
+    candidate search reads; None for a store that is not a directory."""
+    if not os.path.isdir(zarr_path):
+        return None
+    seg = os.path.join(zarr_path, ZarrGroups.CELL_SEGMENTATION)
+    cls = os.path.join(zarr_path, ZarrGroups.CELL_CLASSIFICATION)
+    return tuple(_tree_signature(p) for p in (
+        os.path.join(seg, ZarrDatasets.CENTROIDS),
+        os.path.join(seg, ZarrDatasets.PROBABILITIES),
+        os.path.join(cls, ZarrDatasets.CLASS_INDICES),
+        os.path.join(cls, ZarrDatasets.PROBABILITIES),
+        os.path.join(cls, 'classes'),
+    ))
+
+
+def _patch_arrays_signature(zarr_path: str) -> Optional[tuple]:
+    """_cell_arrays_signature for the patch-classification group; None when
+    the store is not a directory or has no such group."""
+    if not os.path.isdir(zarr_path):
+        return None
+    name = 'Patch-Classification'
+    if not os.path.isdir(os.path.join(zarr_path, name, 'class_indices')):
+        with open_zarr_cm(zarr_path, 'r') as zf:
+            name = _find_patch_group(zf)
+        if name is None:
+            return None
+    group = os.path.join(zarr_path, name)
+    return (name,) + tuple(_tree_signature(os.path.join(group, a))
+                           for a in ('class_indices', 'coordinates', 'probabilities', 'classes'))
+
+
+def _load_cell_arrays(zarr_path: str, sig: Optional[tuple], has_saved_cells: bool) -> Dict:
+    """The per-cell arrays the candidate search needs, cached per slide.
+
+    Returns {"error": ...} for a store with no usable segmentation, and leaves
+    "centroids" None (uncached) when there is nothing to review, so that 409
+    comes back without reading a per-cell array.
+    """
+    if sig is not None:
+        with _slide_arrays_lock:
+            entry = _slide_arrays_cache.get(zarr_path)
+        if entry is not None and entry["sig"] == sig:
+            return entry
+
+    with open_zarr_cm(zarr_path, 'r') as zf:
+        seg_group = find_segmentation_group(zf)
+        if seg_group is None:
+            logger.error(f"[AL] No segmentation data found in Zarr file: {zarr_path}")
+            return {"error": "No segmentation data found in Zarr file"}
+        if ZarrDatasets.CENTROIDS not in seg_group:
+            logger.error(f"[AL] No centroids found in morphology group")
+            return {"error": "No centroids data found in Zarr file"}
+
+        classification_group = None
+        classifications = None
+        class_names = None
+        if ZarrGroups.CELL_CLASSIFICATION in zf:
+            classification_group = zf[ZarrGroups.CELL_CLASSIFICATION]
+            if ZarrDatasets.CLASS_INDICES in classification_group:
+                classifications = classification_group[ZarrDatasets.CLASS_INDICES][:]
+            if 'classes/name' in classification_group:
+                class_names = [name.decode() if isinstance(name, bytes) else name for name in classification_group['classes/name'][:]]
+
+        entry = {"sig": sig, "classifications": classifications, "class_names": class_names,
+                 "centroids": None, "max_probs": None, "probs_shape": None}
+        if (classifications is None or class_names is None) and not has_saved_cells:
+            return entry
+
+        entry["centroids"] = seg_group[ZarrDatasets.CENTROIDS][:]  # (N, 2)
+
+        probabilities = None
+        if classification_group is not None:
+            if ZarrDatasets.PROBABILITIES in classification_group:
+                probabilities = classification_group[ZarrDatasets.PROBABILITIES][:]
+            elif ZarrDatasets.PROBABILITIES in seg_group:
+                probabilities = seg_group[ZarrDatasets.PROBABILITIES][:]
+
+    # Only the per-cell max is ever used, so the (N, C) array is not kept.
+    if probabilities is not None:
+        entry["probs_shape"] = probabilities.shape
+        if probabilities.ndim == 2:
+            entry["max_probs"] = np.max(probabilities, axis=1)
+        elif probabilities.ndim == 1:
+            entry["max_probs"] = probabilities  # already a max probability per cell
+
+    if sig is not None:
+        with _slide_arrays_lock:
+            _slide_arrays_cache.pop(zarr_path, None)
+            _slide_arrays_cache[zarr_path] = entry
+            while len(_slide_arrays_cache) > _MAX_CACHED_SLIDE_ARRAYS:
+                _slide_arrays_cache.popitem(last=False)
+    return entry
+
+
+def _select_candidates(classifications, max_probs, target_idx: int, class_name: str,
+                       threshold: float, side: str, sort_order: str) -> np.ndarray:
+    """Indices predicted as target_idx on the requested side of the threshold,
+    ordered by uncertainty |p - 0.5| ("asc" = most uncertain first).
+
+    The argsort is stable so ties keep index order, as the list sort it
+    replaces did (Python's reverse sort is stable too, hence -uncertainty).
+    """
+    max_probs = max_probs[:len(classifications)]
+    # Negative control often has low probabilities by design, so show all of it.
+    effective_threshold = 0.0 if class_name == "Negative control" else threshold
+    in_side = (max_probs >= effective_threshold) if side == "right" else (max_probs < effective_threshold)
+    idx = np.flatnonzero((classifications == target_idx) & in_side)
+    uncertainty = np.abs(max_probs[idx] - 0.5)
+    order = np.argsort(-uncertainty if sort_order == "desc" else uncertainty, kind="stable")
+    # int32 halves what each cached request holds; cell counts stay far below 2**31.
+    return idx[order].astype(np.int32)
+
+
+def _cell_id_ints(ids) -> np.ndarray:
+    """Saved-cell id strings as an int array; ids that are not indices dropped."""
+    return np.fromiter((int(i) for i in ids if str(i).isdigit()), dtype=np.int64)
+
+
+def _call_safely(render, req):
+    try:
+        return render(req)
+    except Exception as e:
+        return e
+
+
+def _render_tiles(render, reqs) -> list:
+    """render(req) for each req, in order, on a small thread pool: every tile
+    opens the slide on its own, so a page no longer waits on serial reads.
+    A tile that raises comes back as its exception."""
+    if len(reqs) <= 1:
+        return [_call_safely(render, r) for r in reqs]
+    with ThreadPoolExecutor(max_workers=min(_TILE_WORKERS, len(reqs))) as pool:
+        # One context copy per task: a Context cannot be entered by two threads.
+        futures = [pool.submit(contextvars.copy_context().run, _call_safely, render, r) for r in reqs]
+        return [f.result() for f in futures]
+
+
+def _is_single_layer(slide_path: str) -> bool:
+    """True when the slide is known not to be a z-stack, so its tiles can skip
+    re-detecting that one by one. False (let each tile check) if unsure."""
+    try:
+        from tissuelab_sdk.wrapper import TiffFileWrapper
+        return not TiffFileWrapper(slide_path).is_zstack
+    except Exception:
+        return False
+
+
 def _build_candidates(params: Dict) -> Dict:
     try:
         slide_path = resolve_path(params["slide_id"])
@@ -402,54 +591,28 @@ def _build_candidates(params: Dict) -> Dict:
         if not os.path.exists(zarr_path):
             return {"success": False, "error": f"Zarr file not found: {zarr_path}"}
 
-        # Check if this is a z-stack request
-        z_layer = params.get("z_layer")  # Optional: specific z-layer to show candidates from
-        show_all_layers = params.get("show_all_layers", False)  # Show candidates from all layers
-
-        if not os.path.exists(zarr_path):
-            return {"success": False, "error": f"File not found: {zarr_path}"}
-        
         class_name = params.get("class_name")
         threshold = params.get("threshold", 0.5)
         sort_order = params.get("sort", "asc")  # "asc" = Low to High, "desc" = High to Low
         limit = params.get("limit", 80)
         offset = params.get("offset", 0)
-        exclude_saved = params.get("exclude_saved", False)  # New parameter
+        exclude_saved = params.get("exclude_saved", False)
         side = params.get("side", "left")  # "left" = prob < threshold, "right" = prob >= threshold
         saved_only = params.get("saved_only", False)  # When true, return only already-saved cells
-        
-        # CHECK CACHE: content-keyed candidate cache. The user_annotation mtime
-        # is part of the key so a Save/Remove (which rewrites user_annotation)
-        # invalidates the cached candidate list. ROI fingerprint is included so
-        # different regions do not share filtered lists.
-        cache_key = (zarr_path, class_name, threshold, sort_order, exclude_saved, side, saved_only,
-                     _user_annotation_mtime(zarr_path),
-                     _roi_cache_key(params.get("roi"), params.get("polygon_points")),
-                     params.get("cell_ids") or None)
-        request_cache = _get_request_cache(cache_key)
-        use_cache = (request_cache["key"] == cache_key and
-                     request_cache["valid_candidates"] and
-                     request_cache["centroids"] is not None)
-        
-        if use_cache:
-            valid_candidates = request_cache["valid_candidates"]
-            target_class_histogram = request_cache["histogram"]
-            centroids = request_cache["centroids"]
-        
-        
+
         # Check for saved cells (both persistent and temporary)
         saved_for_this_class = []
         saved_from_this_class = set()  # Cells to exclude from this class
         saved_to_this_class = set()    # Cells saved TO this class (also exclude from regular candidates)
-        
+
         # All cells already saved in user_annotation for this slide
         all_saved = _load_saved_cells(zarr_path)
-        
+
         if all_saved:
             for cell_id, saved_cell_data in all_saved.items():
                 # Ensure cell_id is always stored as string for consistent comparison
                 cell_id_str = str(cell_id)
-                
+
                 if saved_cell_data["new_class"] == class_name:
                     # This cell was saved TO this class
                     saved_for_this_class.append({
@@ -459,517 +622,240 @@ def _build_candidates(params: Dict) -> Dict:
                         "original_class": saved_cell_data.get("original_original_class", saved_cell_data["original_class"])  # Use true original class
                     })
                     # Also add to the exclusion set to prevent duplicates in regular candidates
-                    # Use string type for consistent comparison
                     saved_to_this_class.add(cell_id_str)
 
                 # Exclude cells that are currently saved FROM this class
                 # This prevents cells from appearing in both their new class AND original class
                 original_original_class = saved_cell_data.get("original_original_class", saved_cell_data["original_class"])
-                
+
                 # Special handling for cells with None original_class (from buggy old data)
                 # These cells should be excluded from ALL classes except their new_class
                 if original_original_class is None:
-                    # If this cell's new_class is NOT the current class, exclude it
                     if saved_cell_data["new_class"] != class_name:
                         saved_from_this_class.add(cell_id_str)
                 else:
-                    # Normal case: check if original matches current class AND new is different
+                    # This cell's TRUE original class is this class AND it's currently saved to a different class
                     if original_original_class == class_name and saved_cell_data["new_class"] != class_name:
-                        # This cell's TRUE original class is this class AND it's currently saved to a different class
-                        # Exclude it from probability candidates to prevent duplicates
                         saved_from_this_class.add(cell_id_str)
-        
-        
-        
-        # SKIP EXPENSIVE OPERATIONS IF CACHE HIT
-        if not use_cache:
-            with open_zarr_cm(zarr_path, 'r') as zf:
-                # Try different Zarr group structures for morphology data using centralized config
-                seg_group = find_segmentation_group(zf)
-                if seg_group is None:
-                    logger.error(f"[AL] No segmentation data found in Zarr file: {zarr_path}")
-                    return {"success": False, "error": "No segmentation data found in Zarr file"}
-                    
-                if ZarrDatasets.CENTROIDS not in seg_group:
-                    logger.error(f"[AL] No centroids found in morphology group")
-                    return {"success": False, "error": "No centroids data found in Zarr file"}
-                    
-                centroids = seg_group[ZarrDatasets.CENTROIDS][:]  # Shape: (N, 2) where N is number of cells
-                contours = seg_group[ZarrDatasets.CONTOURS][:] if ZarrDatasets.CONTOURS in seg_group else None
-                
-                # Try to get classification results from ClassificationNode
-                classification_group = None
-                classifications = None
-                class_names = None
-                
-                if ZarrGroups.CELL_CLASSIFICATION in zf:
-                    classification_group = zf[ZarrGroups.CELL_CLASSIFICATION]
-                    # Read classification results
-                    classifications = classification_group[ZarrDatasets.CLASS_INDICES][:] if ZarrDatasets.CLASS_INDICES in classification_group else None
-                    if 'classes/name' in classification_group:
-                        class_names = [name.decode() if isinstance(name, bytes) else name for name in classification_group['classes/name'][:]]
-                
-                # If no classification data exists, but we have saved cells for this class, we can still show them
-                has_classification_data = classifications is not None and class_names is not None
-                has_saved_cells = len(saved_for_this_class) > 0
-                
-                if not has_classification_data and not has_saved_cells:
-                    logger.error(f"[AL] No ClassificationNode found and no saved cells - classification must be run first")
-                    return {"success": False, "error": "No ClassificationNode found - please run classification first", "code": 409}
-                
-                # Read probabilities - check multiple sources (only if classification group exists)
-                probabilities = None
-                
-                if classification_group is not None:
-                    if ZarrDatasets.PROBABILITIES in classification_group:
-                        probabilities = classification_group[ZarrDatasets.PROBABILITIES][:]
-                    elif ZarrDatasets.PROBABILITIES in seg_group:
-                        probabilities = seg_group[ZarrDatasets.PROBABILITIES][:]
-                
-                # Only return error if we have no probabilities AND no saved cells
-                if probabilities is None and not has_saved_cells:
-                    logger.warning(f"[AL] No probability data found and no saved cells")
-                    return {"success": False, "error": "No probability data found - please run segmentation or classification"}
-            
-            # Filter by target class and apply threshold and sorting  
-            candidate_data = {}
-            
-            # Check if we can process normal candidates (from classification data)
-            can_process_normal_candidates = (probabilities is not None and class_name and 
-                                            classifications is not None and class_names is not None and 
-                                            class_name in class_names)
-            
+
+        has_saved_cells = len(saved_for_this_class) > 0
+        sig = _cell_arrays_signature(zarr_path)
+        arrays = _load_cell_arrays(zarr_path, sig, has_saved_cells)
+        if "error" in arrays:
+            return {"success": False, "error": arrays["error"]}
+        classifications = arrays["classifications"]
+        class_names = arrays["class_names"]
+        if (classifications is None or class_names is None) and not has_saved_cells:
+            logger.error(f"[AL] No ClassificationNode found and no saved cells - classification must be run first")
+            return {"success": False, "error": "No ClassificationNode found - please run classification first", "code": 409}
+        centroids = arrays["centroids"]
+        max_probs = arrays["max_probs"]
+        has_probabilities = arrays["probs_shape"] is not None
+
+        if not has_probabilities and not has_saved_cells:
+            logger.warning(f"[AL] No probability data found and no saved cells")
+            return {"success": False, "error": "No probability data found - please run segmentation or classification"}
+
+        can_process_normal_candidates = (has_probabilities and class_name and
+                                         classifications is not None and class_names is not None and
+                                         class_name in class_names)
+        if not can_process_normal_candidates and not has_saved_cells:
+            if class_names is not None and class_name not in class_names:
+                logger.warning(f"[AL] Target class '{class_name}' not found in available classes: {class_names}")
+                return {"success": False, "error": f"Target class '{class_name}' not found in classification data"}
+            logger.warning(f"[AL] No classification data available for class '{class_name}'")
+            return {"success": False, "error": "No classification data available"}
+        if can_process_normal_candidates and max_probs is None:
+            shape = arrays["probs_shape"]
+            logger.error(f"[AL] Invalid probabilities shape: {shape}, expected (N_cells, N_classes) or (N_cells,)")
+            return {"success": False, "error": f"Invalid probabilities shape: {shape}"}
+
+        # CHECK CACHE: the threshold-filtered, sorted candidates for this
+        # slide + class + filter. Keyed on the array signature so a rerun of
+        # classification invalidates it; saved cells are excluded per request
+        # below, so a Save/Remove needs no new entry.
+        cache_key = ("cell", zarr_path, sig, class_name, threshold, sort_order, side,
+                     _roi_cache_key(params.get("roi"), params.get("polygon_points")),
+                     params.get("cell_ids") or None)
+        request_cache = _get_request_cache(cache_key)
+        if sig is not None and request_cache["key"] == cache_key:
+            candidate_idx = request_cache["candidate_idx"]
+            target_class_histogram = request_cache["histogram"]
+        else:
             if can_process_normal_candidates:
                 target_class_idx = class_names.index(class_name)
-            elif not has_saved_cells:
-                # No normal candidates AND no saved cells - return error
-                if class_names is not None and class_name not in class_names:
-                    logger.warning(f"[AL] Target class '{class_name}' not found in available classes: {class_names}")
-                    return {"success": False, "error": f"Target class '{class_name}' not found in classification data"}
-                else:
-                    logger.warning(f"[AL] No classification data available for class '{class_name}'")
-                    return {"success": False, "error": "No classification data available"}
-            else:
-                # No normal candidates BUT we have saved cells - continue with only saved cells
-                pass
-            
-            if can_process_normal_candidates:
-                # Calculate max probabilities and uncertainty
-                # probabilities shape can be:
-                #  - (N_cells, N_classes): per-class probabilities
-                #  - (N_cells,): single max probability per cell (fallback)
-                if probabilities is not None:
-                    if probabilities.ndim == 2:
-                        max_probs = np.max(probabilities, axis=1)
-                    elif probabilities.ndim == 1:
-                        # Treat as already max probability per cell
-                        max_probs = probabilities
-                    else:
-                        logger.error(f"[AL] Invalid probabilities shape: {probabilities.shape}, expected (N_cells, N_classes) or (N_cells,)")
-                        return {"success": False, "error": f"Invalid probabilities shape: {probabilities.shape}"}
-                    
-                    uncertainties = np.abs(max_probs - 0.5)
-                
-                # Find cells for active learning: predicted as target class OR saved to target class
-                valid_candidates = []
-                
-                # Get IDs of cells that have been saved to this target class
-                saved_cell_ids = set(int(cell["cell_id"]) for cell in saved_for_this_class)
-                
-                # Generate histogram from ALL predicted cells (regardless of threshold)
-                # This gives user full visibility of probability distribution
-                all_target_class_max_probs = max_probs[classifications == target_class_idx]
+                # Histogram over ALL cells predicted as the class (regardless of
+                # threshold) so the user sees the full probability distribution.
+                all_target_class_max_probs = max_probs[:len(classifications)][classifications == target_class_idx]
                 if len(all_target_class_max_probs) > 0:
                     target_class_histogram, _ = np.histogram(all_target_class_max_probs, bins=20, range=(0.0, 1.0))
                     target_class_histogram = [int(x) for x in target_class_histogram.tolist()]
                 else:
                     target_class_histogram = [0] * 20
                     logger.warning(f"[AL] No cells predicted as {class_name}, using empty histogram")
-                
-                for idx in range(len(classifications)):
-                    predicted_class = int(classifications[idx])
-                    max_prob = float(max_probs[idx])
-                    uncertainty = float(uncertainties[idx])
-                    
-                    # Convert idx to string for set comparison
-                    idx_str = str(idx)
-                    
-                    # Include cells if: 1) predicted as target class, OR 2) saved to target class
-                    # BUT exclude cells that have been saved FROM this class
-                    is_predicted = predicted_class == target_class_idx
-                    is_saved_to = idx in saved_cell_ids
-                    is_saved_from = idx_str in saved_from_this_class
 
-                    should_include = (is_predicted or is_saved_to) and not is_saved_from
-                    # exclude_saved: a cell already saved to this class is done —
-                    # it must leave the regular "To Review" pool (a "Yes" cell is
-                    # saved TO the current class, so is_saved_to alone would
-                    # otherwise keep it visible after Save).
-                    if exclude_saved and is_saved_to:
-                        should_include = False
+                candidate_idx = _select_candidates(classifications, max_probs, target_class_idx,
+                                                   class_name, threshold, side, sort_order)
 
-                    if should_include:
-                        # Apply threshold based on side parameter
-                        # SPECIAL HANDLING: Negative control class often has low probabilities by design
-                        # Use a lower threshold (0.0) for NC to show all predicted NC cells
-                        effective_threshold = 0.0 if class_name == "Negative control" else threshold
-                        
-                        # Filter by side: 'left' = prob < threshold, 'right' = prob >= threshold
-                        if side == "right":
-                            # Right side: prob >= threshold (high confidence)
-                            if max_prob >= effective_threshold:
-                                valid_candidates.append((idx, max_prob, uncertainty))
-                        else:
-                            # Left side: prob < threshold (low confidence, default behavior)
-                            if max_prob < effective_threshold:
-                                valid_candidates.append((idx, max_prob, uncertainty))
-                
-                # Sort by uncertainty (lowest uncertainty first = most uncertain cells)
-                # uncertainty = |max_prob - 0.5|, where 0 = most uncertain, 0.5 = most certain
-                # "asc" = Low to High uncertainty (most uncertain first), "desc" = High to Low uncertainty  
-                reverse_sort = (sort_order == "desc")
-                valid_candidates.sort(key=lambda x: x[2], reverse=reverse_sort)  # Sort by uncertainty (lower = more uncertain)
-                
                 # Apply spatial filtering: prefer ROI bbox/polygon over legacy cell_ids CSV
                 if params.get("roi"):
-                    valid_candidates = _filter_candidates_by_roi(
-                        valid_candidates,
-                        centroids,
-                        params.get("roi"),
-                        params.get("polygon_points"),
-                    )
+                    candidate_idx = _filter_candidates_by_roi(
+                        candidate_idx, centroids, params.get("roi"), params.get("polygon_points"))
                 elif params.get("cell_ids"):
                     try:
                         # Parse comma-separated cell IDs (legacy path)
-                        allowed_cell_ids = set(int(cid.strip()) for cid in params.get("cell_ids").split(",") if cid.strip())
-                        
-                        id_filtered_candidates = []
-                        for idx, max_prob, uncertainty in valid_candidates:
-                            if idx in allowed_cell_ids:
-                                id_filtered_candidates.append((idx, max_prob, uncertainty))
-                        valid_candidates = id_filtered_candidates
-                        
+                        allowed_cell_ids = np.array(
+                            [int(cid.strip()) for cid in params.get("cell_ids").split(",") if cid.strip()],
+                            dtype=np.int64)
+                        candidate_idx = candidate_idx[np.isin(candidate_idx, allowed_cell_ids)]
                     except (ValueError, AttributeError) as e:
                         logger.error(f"[AL] Error parsing cell_ids parameter: {e}", exc_info=e)
-                else:
-                    pass
-                
-                # Note: target_class_histogram is already generated above (before threshold filtering)
-                # This ensures the histogram always shows the full distribution
             else:
-                # No normal candidates - initialize empty data structures
-                # (We'll only show saved cells)
-                valid_candidates = []
+                # No normal candidates - only saved cells will be shown
+                candidate_idx = np.empty(0, dtype=np.int32)
                 target_class_histogram = [0] * 20
-            
-            # Build candidate_data for all valid_candidates
-            candidate_data = {}
-            for cell_idx, max_prob, uncertainty in valid_candidates:
-                candidate_data[str(cell_idx)] = {
-                    'prob': float(max_prob),
-                    'uncertainty': float(uncertainty),
-                    'centroid': {'x': float(centroids[cell_idx, 0]), 'y': float(centroids[cell_idx, 1])}
-                }
-            
-            # Build candidates_list from candidate_data
-            candidates_list = list(candidate_data.items())
-            
-            # Cache filtered results for this instance
-            request_cache["valid_candidates"] = valid_candidates
+
+            request_cache["candidate_idx"] = candidate_idx
             request_cache["histogram"] = target_class_histogram
-            request_cache["centroids"] = centroids
-            request_cache["candidate_data"] = candidate_data
-            request_cache["candidates_list"] = candidates_list
             # Last, because it is the flag readers test: the entry is shared
             # between concurrent requests for the same key, and setting it
             # first let a reader past the guard while the fields it guards
             # were still half-written.
             request_cache["key"] = cache_key
-        else:
-            # Use cached data
-            candidate_data = request_cache["candidate_data"]
-            candidates_list = request_cache["candidates_list"]
-        
-        # First, prepare saved items (these will always appear first)
-        saved_items = []
-        existing_cell_ids = set()
-        
-        for saved_cell in saved_for_this_class:
-            try:
-                # Ensure consistent string type for cell_id
-                cell_id_str = str(saved_cell["cell_id"])
-                cell_id = int(cell_id_str)
-                
-                # Skip if already processed (avoid duplicates)
-                if cell_id_str in existing_cell_ids:
-                    logger.warning(f"[AL] Skipping duplicate saved cell {cell_id_str}")
-                    continue
-                existing_cell_ids.add(cell_id_str)
-                
-                # Get cell data from Zarr file for the saved cell
-                if cell_id in range(len(centroids)):
-                    centroid = centroids[cell_id]
-                    
-                    # Saved-cell tiles are rendered later, for the visible
-                    # page only (see the page loop below). Rendering a tile
-                    # per saved cell here does not scale — a class with
-                    # thousands of saved cells would hang the request.
-                    try:
-                        tile_data = {"success": False}
-                        
-                        if tile_data.get("success", False):
-                            crop_data = tile_data.get("data", {})
-                            image_b64 = crop_data.get("image")
-                            bounds = crop_data.get("bounds", {"x": 0, "y": 0, "w": 128, "h": 128})
-                            bbox = crop_data.get("bbox", {"x": 54, "y": 54, "w": 20, "h": 20})
-                            contour_from_api = crop_data.get("contour", [])
-                            # Z-stack info
-                            is_zstack_recl = crop_data.get("is_zstack", False)
-                            num_z_layers_recl = crop_data.get("num_z_layers", None)
-                            image_format_recl = crop_data.get("image_format", "jpeg")
-                        else:
-                            logger.warning(f"[AL] Failed to get image for saved cell {cell_id}: {tile_data.get('error', 'unknown')}")
-                            image_b64 = _placeholder_image(f"Cell {cell_id}\nImage Error")
-                            bounds = {"x": 0, "y": 0, "w": 128, "h": 128}
-                            bbox = {"x": 54, "y": 54, "w": 20, "h": 20}
-                            contour_from_api = []
-                            is_zstack_recl = False
-                            num_z_layers_recl = None
-                            image_format_recl = "jpeg"
-                            
-                    except Exception as img_error:
-                        logger.warning(f"[AL] Failed to generate image for saved cell {cell_id}: {img_error}")
-                        image_b64 = _placeholder_image(f"Saved\nCell {cell_id}")
-                        bounds = {"x": 0, "y": 0, "w": 128, "h": 128}
-                        bbox = {"x": 54, "y": 54, "w": 20, "h": 20}
-                        contour_from_api = []
-                        is_zstack_recl = False
-                        num_z_layers_recl = None
-                        image_format_recl = "jpeg"
-                    
-                    # Extract contour from Zarr data if available and API didn't provide it
-                    contour_from_zarr = []
-                    if not contour_from_api and contours is not None and cell_id < len(contours):
-                        try:
-                            cell_contour = contours[cell_id]
-                            if cell_contour.size > 0 and cell_contour.ndim == 2 and cell_contour.shape[1] == 2:
-                                contour_from_zarr = [{"x": float(pt[0]), "y": float(pt[1])} for pt in cell_contour]
-                        except Exception as contour_error:
-                            logger.warning(f"[AL] Error processing contour for saved cell {cell_id}: {contour_error}")
-                    
-                    # Use API contour if available, otherwise Zarr contour
-                    final_contour = contour_from_api if contour_from_api else contour_from_zarr
-                    
-                    # Create candidate item for saved cell
-                    saved_item = {
-                        "cell_id": cell_id_str,
-                        "prob": saved_cell["prob"],
-                        "centroid": {"x": float(centroid[0]), "y": float(centroid[1])},
-                        "label": None,  # No label yet for the new class
-                        "saved": True,
-                        "original_class": saved_cell["original_class"],
-                        "crop": {
-                            "image": image_b64,
-                            "bbox": bbox,
-                            "bounds": bounds,
-                            "contour": final_contour,
-                            # Z-stack metadata
-                            "is_zstack": is_zstack_recl,
-                            "num_z_layers": num_z_layers_recl,
-                            "image_format": image_format_recl
-                        }
-                    }
-                    saved_items.append(saved_item)
-                    
-            except Exception as e:
-                logger.warning(f"[AL] Error processing saved cell {saved_cell['cell_id']}: {e}")
-                continue
-        
-        # Reuse cached filtered data for this instance when available
-        # Saved cells might change between requests, so check
-        saved_cells_changed = (request_cache.get("saved_hash") != 
-                              (len(saved_from_this_class), len(saved_to_this_class), len(saved_items)))
-        
-        if use_cache and not saved_cells_changed and request_cache.get("filtered_candidates"):
-            # Use cached filtered and unified data
-            filtered_candidates = request_cache["filtered_candidates"]
-            all_items_data = request_cache["all_items_data"]
-            total_candidates = request_cache["total_candidates"]
-        else:
-            # Filter out saved cells from candidates_list
-            filtered_candidates = []
-            excluded_count = 0
-            for cell_idx_str, cell_data in candidates_list:
-                if (cell_idx_str not in saved_from_this_class and 
-                    cell_idx_str not in saved_to_this_class):
-                    filtered_candidates.append((cell_idx_str, cell_data))
-                else:
-                    excluded_count += 1
 
-            # Create the unified list. In saved_only mode, return just the cells
-            # already saved (reviewed) for this class; otherwise saved
-            # items first, then the regular candidates.
-            if saved_only:
-                total_candidates = len(saved_items)
-                all_items_data = [('saved', item) for item in saved_items]
+        # Saved cells always come first. Only their ids are checked here; tiles
+        # are built below for the visible page only, since a class can hold
+        # thousands of saved cells.
+        n_cells = len(centroids)
+        saved_cells = []
+        seen_saved = set()
+        for saved_cell in saved_for_this_class:
+            cell_id_str = str(saved_cell["cell_id"])
+            if not cell_id_str.isdigit():
+                logger.warning(f"[AL] Error processing saved cell {cell_id_str}: not a cell index")
+                continue
+            if cell_id_str in seen_saved:
+                logger.warning(f"[AL] Skipping duplicate saved cell {cell_id_str}")
+                continue
+            seen_saved.add(cell_id_str)
+            if int(cell_id_str) < n_cells:
+                saved_cells.append(saved_cell)
+
+        excluded = _cell_id_ints(saved_from_this_class | saved_to_this_class)
+        regular_idx = candidate_idx[~np.isin(candidate_idx, excluded)] if len(excluded) else candidate_idx
+
+        if saved_only:
+            shown_saved, shown_regular = saved_cells, regular_idx[:0]
+        else:
+            shown_saved, shown_regular = ([] if exclude_saved else saved_cells), regular_idx
+        total_candidates = len(shown_saved) + len(shown_regular)
+
+        # Paginate over [saved..., regular...] without materialising the list
+        end_idx = min(offset + limit, total_candidates)
+        page = []
+        for pos in range(offset, end_idx):
+            if pos < len(shown_saved):
+                saved_cell = shown_saved[pos]
+                page.append((int(saved_cell["cell_id"]), saved_cell))
             else:
-                total_candidates = len(filtered_candidates) + (0 if exclude_saved else len(saved_items))
-                all_items_data = []
-                # Add saved items first (always at the beginning, regardless of sort order)
-                if not exclude_saved:
-                    for item in saved_items:
-                        all_items_data.append(('saved', item))
-                # Add regular candidates (these will be sorted by probability)
-                for cell_idx_str, cell_data in filtered_candidates:
-                    all_items_data.append(('regular', (cell_idx_str, cell_data)))
-            
-            # Cache filtered and unified data for this instance
-            if use_cache:
-                request_cache["filtered_candidates"] = filtered_candidates
-                request_cache["all_items_data"] = all_items_data
-                request_cache["total_candidates"] = total_candidates
-                request_cache["saved_hash"] = (len(saved_from_this_class), len(saved_to_this_class), len(saved_items))
-        
-        # Apply pagination to the unified list
-        start_idx = offset
-        end_idx = min(offset + limit, len(all_items_data))
-        page_items_data = all_items_data[start_idx:end_idx]
-        
-        # Use the target class histogram we generated above
-        hist = target_class_histogram if 'target_class_histogram' in locals() else [0] * 20
-        
-        # Generate final items list
+                page.append((int(shown_regular[pos - len(shown_saved)]), None))
+
+        page_ids = [cell_idx for cell_idx, _ in page]
+        try:
+            page_contours = _read_contours(zarr_path, page_ids)
+        except Exception as contour_error:
+            # Best effort: each tile then reads its own contour.
+            logger.warning(f"[AL] Error reading contours for page: {contour_error}")
+            page_contours = {}
+        skip_zstack = bool(page) and _is_single_layer(slide_path[:-5] if slide_path.lower().endswith(".zarr") else slide_path)
+
+        tile_reqs = []
+        for cell_idx in page_ids:
+            req = {
+                "slide_id": params["slide_id"],
+                "cell_id": cell_idx,
+                "centroid": {"x": float(centroids[cell_idx, 0]), "y": float(centroids[cell_idx, 1])},
+                "window_size_px": 128,
+                "target_fov_um": 20.0,  # Standard FOV for cell review
+                "padding_ratio": 0.1,   # Less padding to keep cell more centered
+                "return_contour": True,
+                "skip_classification": True,
+                "skip_zstack": skip_zstack,
+                # Gallery thumbnails render at ~100 CSS px (the enlarged view
+                # fetches its own tile), so 256px at q85 cuts the page payload
+                # ~4x vs the default 512px q95.
+                "output_size_px": 256,
+                "jpeg_quality": 85,
+            }
+            points = _contour_points(page_contours[cell_idx]) if cell_idx in page_contours else None
+            if points is not None:
+                req["contour"] = points
+            tile_reqs.append(req)
+        tiles = _render_tiles(get_cell_review_tile_data, tile_reqs)
+
         items = []
-        for item_type, item_data in page_items_data:
-            if item_type == 'saved':
-                # Render the real tile now (the saved loop used a placeholder
-                # so it would not render thousands of tiles up-front)
-                cell_idx = int(str(item_data["cell_id"]))
-                try:
-                    tile = get_cell_review_tile_data({
-                        "slide_id": params["slide_id"],
-                        "cell_id": cell_idx,
-                        "centroid": {
-                            "x": float(centroids[cell_idx, 0]),
-                            "y": float(centroids[cell_idx, 1])
-                        },
-                        "window_size_px": 128,
-                        "target_fov_um": 20.0,
-                        "padding_ratio": 0.1,
-                        "return_contour": True
-                    })
-                    if tile.get("success", False):
-                        td = tile.get("data", {})
-                        if td.get("image"):
-                            item_data["crop"]["image"] = td["image"]
-                        if td.get("bounds"):
-                            item_data["crop"]["bounds"] = td["bounds"]
-                        if td.get("bbox"):
-                            item_data["crop"]["bbox"] = td["bbox"]
-                        if td.get("contour"):
-                            item_data["crop"]["contour"] = td["contour"]
-                        item_data["crop"]["is_zstack"] = td.get("is_zstack", False)
-                        item_data["crop"]["num_z_layers"] = td.get("num_z_layers")
-                        item_data["crop"]["image_format"] = td.get("image_format", "jpeg")
-                except Exception as e:
-                    logger.warning(f"[AL] Failed to render saved tile for cell {cell_idx}: {e}")
-                items.append(item_data)
+        for (cell_idx, saved_cell), req, tile in zip(page, tile_reqs, tiles):
+            if isinstance(tile, Exception):
+                logger.error(f"[AL] Error generating image for cell {cell_idx}: {tile}", exc_info=tile)
+                tile = {"success": False, "error": str(tile)}
+                placeholder = f"Cell {cell_idx}\nGeneration Error"
             else:
-                # Process regular candidate
-                cell_idx_str, cell_data = item_data
-                cell_idx = int(cell_idx_str)
-                
-                # Extract centroid ONLY for this cell (not all 218k!)
-                centroid_x = float(centroids[cell_idx, 0])
-                centroid_y = float(centroids[cell_idx, 1])
-                
-                # Get cell image
-                try:
-                    cell_image_data = get_cell_review_tile_data({
-                        "slide_id": params["slide_id"],
-                        "cell_id": cell_idx,
-                        "centroid": {
-                            "x": centroid_x,
-                            "y": centroid_y
-                        },
-                        "window_size_px": 128,
-                        "target_fov_um": 20.0,  # Standard FOV for cell review
-                        "padding_ratio": 0.1,   # Less padding to keep cell more centered
-                        "return_contour": True
-                    })
-                    
-                    if cell_image_data.get("success", False):
-                        crop_data = cell_image_data.get("data", {})
-                        image_b64 = crop_data.get("image")
-                        bounds = crop_data.get("bounds", {"x": 0, "y": 0, "w": 128, "h": 128})
-                        bbox = crop_data.get("bbox", {"x": 54, "y": 54, "w": 20, "h": 20})
-                        contour = crop_data.get("contour", [])
-                        # Z-stack info
-                        is_zstack = crop_data.get("is_zstack", False)
-                        num_z_layers = crop_data.get("num_z_layers", None)
-                        image_format = crop_data.get("image_format", "jpeg")
-                    else:
-                        logger.warning(f"[AL] Failed to get image for cell {cell_idx}: {cell_image_data.get('error', 'unknown')}")
-                        # Generate a placeholder image with error message
-                        image_b64 = _placeholder_image(f"Cell {cell_idx}\nImage Error")
-                        bounds = {"x": 0, "y": 0, "w": 128, "h": 128}
-                        bbox = {"x": 54, "y": 54, "w": 20, "h": 20}
-                        contour = []
-                        is_zstack = False
-                        num_z_layers = None
-                        image_format = "jpeg"
-                        
-                except Exception as img_error:
-                    logger.error(f"[AL] Error generating image for cell {cell_idx}: {img_error}", exc_info=img_error)
-                    # Generate a placeholder image with error message
-                    image_b64 = _placeholder_image(f"Cell {cell_idx}\nGeneration Error")
-                    bounds = {"x": 0, "y": 0, "w": 128, "h": 128}
-                    bbox = {"x": 54, "y": 54, "w": 20, "h": 20}
-                    contour = []
-                    is_zstack = False
-                    num_z_layers = None
-                    image_format = "jpeg"
-                
-                candidate_item = {
-                    "cell_id": cell_idx_str,  # Keep as string for JSON
-                    "prob": float(cell_data['prob']),
-                    "centroid": {
-                        "x": centroid_x,
-                        "y": centroid_y
-                    },
+                placeholder = f"Cell {cell_idx}\nImage Error"
+            if tile.get("success", False):
+                crop_data = tile.get("data", {})
+            else:
+                logger.warning(f"[AL] Failed to get image for cell {cell_idx}: {tile.get('error', 'unknown')}")
+                crop_data = {"image": _placeholder_image(placeholder)}
+            bounds = crop_data.get("bounds") or {"x": 0, "y": 0, "w": 128, "h": 128}
+            bbox = crop_data.get("bbox") or {"x": 54, "y": 54, "w": 20, "h": 20}
+            crop = {
+                "image": crop_data.get("image") or _placeholder_image(placeholder),
+                "bounds": {
+                    "x": int(bounds.get("x", 0)),
+                    "y": int(bounds.get("y", 0)),
+                    "w": int(bounds.get("w", 128)),
+                    "h": int(bounds.get("h", 128))
+                },
+                "bbox": {
+                    "x": int(bbox.get("x", 54)),
+                    "y": int(bbox.get("y", 54)),
+                    "w": int(bbox.get("w", 20)),
+                    "h": int(bbox.get("h", 20))
+                },
+                "contour": crop_data.get("contour") or req.get("contour") or [],
+                # Z-stack metadata
+                "is_zstack": crop_data.get("is_zstack", False),
+                "num_z_layers": crop_data.get("num_z_layers"),
+                "image_format": crop_data.get("image_format", "jpeg")
+            }
+            if saved_cell is not None:
+                items.append({
+                    "cell_id": str(saved_cell["cell_id"]),
+                    "prob": saved_cell["prob"],
+                    "centroid": req["centroid"],
+                    "label": None,  # No label yet for the new class
+                    "saved": True,
+                    "original_class": saved_cell["original_class"],
+                    "crop": crop,
+                })
+            else:
+                items.append({
+                    "cell_id": str(cell_idx),  # Keep as string for JSON
+                    "prob": float(max_probs[cell_idx]),
+                    "centroid": req["centroid"],
                     "saved": False,
-                    "crop": {
-                        "image": image_b64,
-                        "bounds": {
-                            "x": int(bounds.get("x", 0)),
-                            "y": int(bounds.get("y", 0)),
-                            "w": int(bounds.get("w", 128)),
-                            "h": int(bounds.get("h", 128))
-                        },
-                        "bbox": {
-                            "x": int(bbox.get("x", 54)),
-                            "y": int(bbox.get("y", 54)),
-                            "w": int(bbox.get("w", 20)),
-                            "h": int(bbox.get("h", 20))
-                        },
-                        "contour": contour if contour else [],
-                        # Z-stack metadata
-                        "is_zstack": is_zstack,
-                        "num_z_layers": num_z_layers,
-                        "image_format": image_format
-                    }
-                }
-                items.append(candidate_item)
-        
+                    "crop": crop,
+                })
+
         return {
             "success": True,
             "data": {
                 "total": int(total_candidates),
-                "hist": hist,  # Use actual histogram data
+                "hist": target_class_histogram,
                 "items": items
             }
         }
-            
+
     except Exception as e:
         logger.error(f"Error in _build_candidates: {str(e)}", exc_info=e)
         return {"success": False, "error": f"Error fetching candidates: {str(e)}"}
@@ -1033,12 +919,12 @@ def _build_patch_candidates(params: Dict) -> Dict:
         saved_only = params.get("saved_only", False)
 
         # Content-keyed cache; the "patch" tag keeps it separate from cell entries.
-        cache_key = ("patch", zarr_path, class_name, threshold, sort_order,
-                     exclude_saved, side, saved_only, _user_annotation_mtime(zarr_path))
+        # Keyed on the array signature so rerunning patch classification
+        # invalidates it; saved patches are excluded per request below.
+        sig = _patch_arrays_signature(zarr_path)
+        cache_key = ("patch", zarr_path, sig, class_name, threshold, sort_order, side)
         request_cache = _get_request_cache(cache_key)
-        use_cache = (request_cache["key"] == cache_key and
-                     request_cache["valid_candidates"] and
-                     request_cache["centroids"] is not None)
+        use_cache = sig is not None and request_cache["key"] == cache_key
 
         # ---- saved patches: split into to/from the current class ----
         saved_for_this_class = []
@@ -1089,7 +975,6 @@ def _build_patch_candidates(params: Dict) -> Dict:
             ])
 
             max_probs = np.max(probabilities, axis=1)
-            uncertainties = np.abs(max_probs - 0.5)
 
             # Histogram over ALL patches predicted as the target class
             tgt_probs = max_probs[classifications == target_idx]
@@ -1098,49 +983,21 @@ def _build_patch_candidates(params: Dict) -> Dict:
             else:
                 target_class_histogram = [0] * 20
 
-            saved_cell_ids = set(int(c["cell_id"]) for c in saved_for_this_class)
-            valid_candidates = []
-            for idx in range(len(classifications)):
-                idx_str = str(idx)
-                is_predicted = int(classifications[idx]) == target_idx
-                is_saved_to = idx in saved_cell_ids
-                is_saved_from = idx_str in saved_from_this_class
-                should_include = (is_predicted or is_saved_to) and not is_saved_from
-                if exclude_saved and is_saved_to:
-                    should_include = False  # already saved to this class -> not a candidate
-                if not should_include:
-                    continue
-                max_prob = float(max_probs[idx])
-                effective_threshold = 0.0 if class_name == "Negative control" else threshold
-                if side == "right":
-                    if max_prob >= effective_threshold:
-                        valid_candidates.append((idx, max_prob, float(uncertainties[idx])))
-                else:
-                    if max_prob < effective_threshold:
-                        valid_candidates.append((idx, max_prob, float(uncertainties[idx])))
+            candidate_idx = _select_candidates(classifications, max_probs, target_idx,
+                                               class_name, threshold, side, sort_order)
 
-            # Sort by uncertainty (lower = more uncertain = shown first for "asc")
-            valid_candidates.sort(key=lambda x: x[2], reverse=(sort_order == "desc"))
-
-            candidate_data = {str(i): {"prob": float(p), "uncertainty": float(u)}
-                              for i, p, u in valid_candidates}
-            candidates_list = list(candidate_data.items())
-
-            request_cache["valid_candidates"] = valid_candidates
+            request_cache["candidate_idx"] = candidate_idx
             request_cache["histogram"] = target_class_histogram
             request_cache["centroids"] = centroids
             request_cache["coordinates"] = coordinates
             request_cache["max_probs"] = max_probs
-            request_cache["candidate_data"] = candidate_data
-            request_cache["candidates_list"] = candidates_list
             # Published last — see the note in the cell-candidate path.
             request_cache["key"] = cache_key
         else:
             centroids = request_cache["centroids"]
             coordinates = request_cache["coordinates"]
             max_probs = request_cache["max_probs"]
-            candidate_data = request_cache["candidate_data"]
-            candidates_list = request_cache["candidates_list"]
+            candidate_idx = request_cache["candidate_idx"]
             target_class_histogram = request_cache["histogram"]
 
         def _patch_item(patch_idx: int, saved_flag: bool, original_class=None) -> Dict:
@@ -1191,37 +1048,34 @@ def _build_patch_candidates(params: Dict) -> Dict:
             }
 
         # ---- assemble the unified list (saved items first, then candidates) ----
-        filtered_candidates = [(cid, cd) for cid, cd in candidates_list
-                               if cid not in saved_from_this_class and cid not in saved_to_this_class]
+        excluded = _cell_id_ints(saved_from_this_class | saved_to_this_class)
+        regular_idx = candidate_idx[~np.isin(candidate_idx, excluded)] if len(excluded) else candidate_idx
         if saved_only:
-            total_candidates = len(saved_for_this_class)
-            all_items_data = [('saved', sc) for sc in saved_for_this_class]
+            shown_saved, shown_regular = saved_for_this_class, regular_idx[:0]
         else:
-            total_candidates = len(filtered_candidates) + (0 if exclude_saved else len(saved_for_this_class))
-            all_items_data = []
-            if not exclude_saved:
-                for sc in saved_for_this_class:
-                    all_items_data.append(('saved', sc))
-            for cid, cd in filtered_candidates:
-                all_items_data.append(('regular', (cid, cd)))
+            shown_saved, shown_regular = ([] if exclude_saved else saved_for_this_class), regular_idx
+        total_candidates = len(shown_saved) + len(shown_regular)
 
         # Paginate, then build tiles only for the visible page
-        page_items = all_items_data[offset:min(offset + limit, len(all_items_data))]
+        page_args = []
         seen = set()
-        items = []
-        for item_type, item_data in page_items:
-            if item_type == 'saved':
-                pidx = int(str(item_data["cell_id"]))
+        for pos in range(offset, min(offset + limit, total_candidates)):
+            if pos < len(shown_saved):
+                saved = shown_saved[pos]
+                pidx = int(str(saved["cell_id"]))
                 if str(pidx) in seen or pidx < 0 or pidx >= len(coordinates):
                     continue
                 seen.add(str(pidx))
-                items.append(_patch_item(pidx, True, item_data.get("original_class")))
+                page_args.append((pidx, True, saved.get("original_class")))
             else:
-                cid, cd = item_data
-                pidx = int(cid)
+                pidx = int(shown_regular[pos - len(shown_saved)])
                 if pidx < 0 or pidx >= len(coordinates):
                     continue
-                items.append(_patch_item(pidx, False))
+                page_args.append((pidx, False, None))
+        items = _render_tiles(lambda args: _patch_item(*args), page_args)
+        for item in items:
+            if isinstance(item, Exception):
+                raise item
 
         return {
             "success": True,
@@ -1276,26 +1130,23 @@ def _roi_cache_key(roi, polygon_points) -> tuple:
     return (box, poly)
 
 
-def _filter_candidates_by_roi(valid_candidates, centroids, roi, polygon_points):
-    """Keep candidates whose centroids fall in roi bbox (and optional polygon)."""
-    if not roi or centroids is None or len(valid_candidates) == 0:
-        return valid_candidates
+def _filter_candidates_by_roi(candidate_idx, centroids, roi, polygon_points):
+    """Keep candidate indices whose centroids fall in roi bbox (and optional polygon), in order."""
+    if not roi or centroids is None or len(candidate_idx) == 0:
+        return candidate_idx
     try:
         x1 = float(roi["x1"]); y1 = float(roi["y1"])
         x2 = float(roi["x2"]); y2 = float(roi["y2"])
     except Exception:
-        return valid_candidates
+        return candidate_idx
 
-    idxs = np.asarray([c[0] for c in valid_candidates], dtype=np.int64)
     # Guard out-of-range indices
-    valid_mask = (idxs >= 0) & (idxs < len(centroids))
-    idxs_safe = idxs[valid_mask]
-    pts = np.asarray(centroids)[idxs_safe]
-    in_bbox = (
+    idxs = candidate_idx[(candidate_idx >= 0) & (candidate_idx < len(centroids))]
+    pts = np.asarray(centroids)[idxs]
+    keep = (
         (x1 <= pts[:, 0]) & (pts[:, 0] <= x2) &
         (y1 <= pts[:, 1]) & (pts[:, 1] <= y2)
     )
-    keep_local = in_bbox
     if polygon_points and isinstance(polygon_points, (list, tuple)) and len(polygon_points) >= 3:
         try:
             from matplotlib.path import Path
@@ -1305,13 +1156,10 @@ def _filter_candidates_by_roi(valid_candidates, centroids, roi, polygon_points):
                 if isinstance(p, (list, tuple)) and len(p) >= 2
             ]
             if len(poly) >= 3:
-                inside = Path(poly).contains_points(pts, radius=-1e-9)
-                keep_local = in_bbox & inside
+                keep &= Path(poly).contains_points(pts, radius=-1e-9)
         except Exception as e:
             logger.warning(f"[AL] ROI polygon filter failed, using bbox only: {e}")
-
-    allowed = set(int(i) for i in idxs_safe[keep_local])
-    return [c for c in valid_candidates if int(c[0]) in allowed]
+    return idxs[keep]
 
 
 def _normalize_cell_ids(cell_ids) -> Optional[str]:

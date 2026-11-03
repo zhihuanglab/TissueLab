@@ -366,6 +366,12 @@ function directModelPredecessors(
     .filter((n): n is GraphNode => Boolean(n && n.kind === "model" && n.modelId))
 }
 
+const multiStageNodesOf = (graphNodes: GraphNode[]) =>
+  graphNodes.filter(
+    (n): n is GraphNode & { modelId: string } =>
+      n.kind === "model" && !!n.modelId && RUNTIME_SUBSTAGE_FROM_TEMPLATE_IDS.has(n.modelId)
+  )
+
 const zeroRuntimeTemplateSubStagesForNodes = (graphNodes: GraphNode[]) => {
   const next: Record<string, SubStage[]> = {}
   for (const node of graphNodes) {
@@ -675,6 +681,18 @@ export const WorkflowGraph: React.FC = () => {
     return toLocalWorkflowZarrPath(currentPath)
   }, [currentPath])
 
+  // Dragging a node rewrites activeWf.nodes every animation frame, so the refresh
+  // below keys on which multi-stage nodes exist rather than on the array —
+  // otherwise each frame re-posts workflow_stage_status.
+  const activeNodesRef = useRef(activeWf.nodes)
+  useEffect(() => {
+    activeNodesRef.current = activeWf.nodes
+  }, [activeWf.nodes])
+  const multiStageNodesKey = useMemo(
+    () => multiStageNodesOf(activeWf.nodes).map((n) => `${n.id}:${n.modelId}`).join("|"),
+    [activeWf.nodes]
+  )
+
   /**
    * Idle-only: fill `preProcessed` substages from backend stage_progress so an
    * already-processed slide shows prereq bars as done (same mapping as live SSE).
@@ -683,10 +701,7 @@ export const WorkflowGraph: React.FC = () => {
     if (isRunning || workflowStatus !== "idle") return
     const zarrPath = getWorkflowZarrPath()
     if (!zarrPath) return
-    const multiStageNodes = activeWf.nodes.filter(
-      (n): n is GraphNode & { modelId: string } =>
-        n.kind === "model" && !!n.modelId && RUNTIME_SUBSTAGE_FROM_TEMPLATE_IDS.has(n.modelId)
-    )
+    const multiStageNodes = multiStageNodesOf(activeNodesRef.current)
     if (multiStageNodes.length === 0) return
     try {
       const result = await fetchWorkflowStageStatus(
@@ -762,7 +777,6 @@ export const WorkflowGraph: React.FC = () => {
       // best effort
     }
   }, [
-    activeWf.nodes,
     dispatch,
     fetchWorkflowStageStatus,
     getWorkflowZarrPath,
@@ -772,7 +786,7 @@ export const WorkflowGraph: React.FC = () => {
 
   useEffect(() => {
     void refreshPreProcessedSubstages()
-  }, [refreshPreProcessedSubstages])
+  }, [refreshPreProcessedSubstages, multiStageNodesKey])
 
   // Switching slides must drop sticky local bars AND Redux stage/progress from the
   // previous zarr. Same-slide re-runs (Update / Run) keep Done bars until the next

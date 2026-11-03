@@ -2473,6 +2473,8 @@ def _render_review_tile(req: dict) -> dict:
             - centroid: {"x": float, "y": float} in original image coordinates
             - window_size_px: Size of the patch window in pixels
             - contour_type: None (no contour), 'polygon' (precise contour), 'rect' (bbox contour)
+            - output_size_px: Side of the returned image in pixels (default 512)
+            - jpeg_quality: JPEG quality of a single-layer tile (default 95)
     """
     try:
         from tissuelab_sdk.wrapper import TiffSlideWrapper, TiffFileWrapper
@@ -2483,11 +2485,12 @@ def _render_review_tile(req: dict) -> dict:
         centroid = req.get("centroid", {})
         patchsize = req.get("window_size_px", 512)  
         contour_type = req.get("contour_type", None)  
-        windowsize = 512
+        windowsize = int(req.get("output_size_px", 512))
+        jpeg_quality = int(req.get("jpeg_quality", 95))
         fixed_z_layer = req.get("fixed_z_layer", None)  
         
-        # Validate input
-        if not all([slide_id, cell_id, "x" in centroid, "y" in centroid]):
+        # Validate input. Not all([...]): cell 0 is a real cell, not a missing id.
+        if not slide_id or cell_id is None or cell_id == "" or "x" not in centroid or "y" not in centroid:
             return {"success": False, "error": "Invalid input parameters"}
         
         center_x = float(centroid["x"])
@@ -2838,7 +2841,7 @@ def _render_review_tile(req: dict) -> dict:
                 
                 # Convert to base64
                 buffered = BytesIO()
-                final_image.save(buffered, format="JPEG", quality=95, optimize=True)
+                final_image.save(buffered, format="JPEG", quality=jpeg_quality, optimize=True)
                 img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
                 image_data_url = f"data:image/jpeg;base64,{img_base64}"
             
@@ -2899,7 +2902,9 @@ def get_cell_review_tile_data(req: dict) -> dict:
     cell's classification from Zarr.
     """
     result = _render_review_tile(req)
-    if result.get("success"):
+    # Callers that only show the tile (review candidate pages) pass
+    # skip_classification to spare a zarr open and four reads per tile.
+    if result.get("success") and not req.get("skip_classification"):
         try:
             slide_id = req.get("slide_id", "")
             cell_id = req.get("cell_id", "")
@@ -2976,7 +2981,8 @@ def _get_cell_classification(zarr_path: str, cell_id: str) -> Optional[Dict]:
                 # Get predicted class
                 if 'nuclei_class' in class_group:
                     nuclei_class_dataset = class_group['nuclei_class']
-                    if cell_idx < len(nuclei_class_dataset):
+                    # Sizes via .shape: zarr v3 arrays have no len() (see _get_cell_contour).
+                    if cell_idx < nuclei_class_dataset.shape[0]:
                         # Decode if it's bytes
                         predicted_class = nuclei_class_dataset[cell_idx]
                         if isinstance(predicted_class, bytes):
@@ -2989,9 +2995,9 @@ def _get_cell_classification(zarr_path: str, cell_id: str) -> Optional[Dict]:
                     if dataset_name.startswith('nuclei_probs_') or 'prob' in dataset_name.lower():
                         try:
                             prob_dataset = class_group[dataset_name] 
-                            if cell_idx < len(prob_dataset) and len(prob_dataset[cell_idx]) == 1:
+                            if prob_dataset.ndim == 2 and prob_dataset.shape[1] == 1 and cell_idx < prob_dataset.shape[0]:
                                 class_name = dataset_name.replace('nuclei_probs_', '').replace('_prob', '')
-                                probs_dict[class_name] = float(prob_dataset[cell_idx])
+                                probs_dict[class_name] = float(prob_dataset[cell_idx, 0])
                         except Exception as e:
                             logger.warning(f"Could not read probability dataset {dataset_name}: {e}")
                             continue
@@ -3000,7 +3006,7 @@ def _get_cell_classification(zarr_path: str, cell_id: str) -> Optional[Dict]:
                 if not probs_dict and 'nuclei_probs' in class_group:
                     try:
                         probs_dataset = class_group['nuclei_probs']
-                        if cell_idx < len(probs_dataset) and len(probs_dataset[cell_idx]) > 0:
+                        if cell_idx < probs_dataset.shape[0] and len(probs_dataset[cell_idx]) > 0:
                             # Assume first column is prob for first class, etc.
                             # You may need to adjust this based on your actual data structure
                             prob_values = probs_dataset[cell_idx]
@@ -3032,7 +3038,7 @@ def _get_cell_classification(zarr_path: str, cell_id: str) -> Optional[Dict]:
                         user_group = zf['User-Annotations']
                         if 'nuclei_annotation' in user_group:
                             user_dataset = user_group['nuclei_annotation']
-                            if cell_idx < len(user_dataset):
+                            if cell_idx < user_dataset.shape[0]:
                                 user_label = user_dataset[cell_idx]
                                 if isinstance(user_label, bytes):
                                     user_label = user_label.decode('utf-8')
@@ -3050,6 +3056,16 @@ def _get_cell_classification(zarr_path: str, cell_id: str) -> Optional[Dict]:
     except Exception as e:
         logger.warning(f"Error reading classification from Zarr file {zarr_path}: {str(e)}")
         return None
+
+def _contour_points(cell_contour) -> Optional[List[Dict[str, float]]]:
+    """A stored (max_points, 2) contour as [{"x", "y"}] with the zero padding
+    dropped (real coordinates are > 0); None when fewer than 3 points remain."""
+    pts = np.asarray(cell_contour, dtype=np.float64)
+    pts = pts[(pts[:, 0] > 0) & (pts[:, 1] > 0)]
+    if len(pts) < 3:
+        return None
+    return [{"x": x, "y": y} for x, y in pts.tolist()]
+
 
 def _get_cell_contour(zarr_path: str, cell_id: str) -> Optional[List[Dict[str, float]]]:
     """
@@ -3085,21 +3101,10 @@ def _get_cell_contour(zarr_path: str, cell_id: str) -> Optional[List[Dict[str, f
                     
                     # Get contour for specific cell
                     # Shape is (max_points, 2) where max_points is typically 32
-                    cell_contour = contours_dataset[cell_idx]
-                    
-                    # Filter out zero points (padding) and convert to list of dicts
-                    valid_points = []
-                    for point in cell_contour:
-                        x, y = float(point[0]), float(point[1])
-                        # Skip zero-padded points (assuming real coordinates are > 0)
-                        if x > 0 and y > 0:
-                            valid_points.append({"x": x, "y": y})
-                    
-                    if len(valid_points) >= 3:  # Need at least 3 points for a valid contour
-                        return valid_points
-                    else:
-                        logger.warning(f"Cell {cell_id} has insufficient valid contour points: {len(valid_points)}")
-                        return None
+                    valid_points = _contour_points(contours_dataset[cell_idx])
+                    if valid_points is None:
+                        logger.warning(f"Cell {cell_id} has fewer than 3 valid contour points")
+                    return valid_points
                         
             logger.info(f"No contour data found for cell {cell_id} in Zarr file")
             return None
