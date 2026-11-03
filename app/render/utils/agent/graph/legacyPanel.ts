@@ -16,11 +16,11 @@ export function mergeModelPanelDefaults(
   const modelDefaults = registryNodes[modelId]?.panel
   if (!Array.isArray(modelDefaults) || modelDefaults.length === 0) return content
   const existingKeys = new Set(content.map((item) => item.key))
+  const missingDefaults = modelDefaults.filter((item) => !existingKeys.has(item.key))
+  if (missingDefaults.length === 0) return content
   return [
     ...content,
-    ...modelDefaults
-      .filter((item) => !existingKeys.has(item.key))
-      .map((item) => ({ ...item })),
+    ...missingDefaults.map((item) => ({ ...item })),
   ] as WorkflowPanel["content"]
 }
 

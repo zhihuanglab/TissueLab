@@ -35,8 +35,10 @@ import {
   setClassificationEnabled,
   setNucleiClasses,
   setPatchClassificationData,
+  setPatchNegativeCounts,
   type PatchOverlayEntry,
 } from "@/store/slices/viewer/annotationSlice";
+import { patchNegativeCountsFromPayload } from "@/utils/agent/patchClassification.utils";
 import {
   RectangleCoords,
   resetShapeData,
@@ -876,6 +878,7 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
         }
 
         dispatch(setPatchClassificationData(serverData));
+        dispatch(setPatchNegativeCounts(patchNegativeCountsFromPayload(payload)));
 
         // Same rule as the cell overrides: PatchOverlay paints
         // `patchOverrides[idx] || classColors[class_id]`, so a manual tissue mark
@@ -909,6 +912,7 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
         } else {
           dispatch(setPatchClassificationData(getDefaultPatchData()));
         }
+        dispatch(setPatchNegativeCounts(patchNegativeCountsFromPayload(payload)));
       }
     } catch (error) {
       if (

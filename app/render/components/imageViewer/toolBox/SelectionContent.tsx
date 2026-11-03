@@ -8,11 +8,13 @@ import { useDispatch, useSelector } from "react-redux"
 import { useActiveSlidePath, useInstanceSlidePath } from "@/utils/viewer/slidePath";
 import { AppDispatch, RootState } from "@/store"
 import { isSegmentationHandlerNotReadyError, segFetch } from '@/utils/common/segFetch'
+import { patchNegativeCountsFromPayload } from "@/utils/agent/patchClassification.utils";
 import { getErrorMessage } from "@/utils/common/apiResponse"
 import { toast } from "sonner"
 import {
   selectPatchClassificationData,
   setPatchClassificationData,
+  setPatchNegativeCounts,
   updatePatchOverlayColors,
   clearPatchOverridesForIds,
   addNucleiClass,
@@ -333,6 +335,7 @@ export default function SelectionContent({
       }
 
       dispatch(setPatchClassificationData(mergedData));
+      dispatch(setPatchNegativeCounts(patchNegativeCountsFromPayload(payload)));
     } catch (error) {
       if (isSegmentationHandlerNotReadyError(error)) return;
       console.warn('Failed to refresh patch classification data:', error);

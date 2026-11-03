@@ -1,4 +1,5 @@
 import { apiFetch, requireAxiosAppPayload } from '@/utils/common/apiFetch';
+import { segFetch } from '@/utils/common/segFetch';
 import { isApiResponse } from '@/utils/common/apiResponse';
 import { AI_SERVICE_API_ENDPOINT, CTRL_SERVICE_API_ENDPOINT } from '@/config/api.config';
 import { getAuthToken } from '@/utils/common/authToken';
@@ -1101,6 +1102,23 @@ export const autoFindAndLoadRadiologyMask = async (
 export interface MaskOption {
   key: string
   label: string
+}
+
+/**
+ * Rename a class in the palette the user's marks are stored against, so marks
+ * made before the next Update stay with the renamed class. Handler-bound.
+ */
+export const renameAnnotationClass = async (
+  instanceId: string,
+  zarrPath: string,
+  kind: 'cell' | 'patch',
+  oldName: string,
+  newName: string,
+): Promise<void> => {
+  await segFetch(instanceId, `${AI_SERVICE_API_ENDPOINT}/seg/v1/rename-annotation-class`, {
+    method: 'POST',
+    body: JSON.stringify({ file_path: zarrPath, kind, old_name: oldName, new_name: newName }),
+  })
 }
 
 export const getMaskOptions = async (filePath: string): Promise<{ success: boolean; options?: MaskOption[]; error?: string }> => {

@@ -33,6 +33,8 @@ interface AnnotationState<T extends BaseAnnotation> {
   nuclei_segmentation: T[];
   tissue_segmentation: string[];
   patchOverrides: Record<number, string>;
+  /** Patches marked "not <class>", by class name (from /seg/v1/patch_classification). */
+  patchNegativeCounts: Record<string, number>;
   isEditPanelOpen: boolean;
   editAnnotation: undefined | string;
   isGenerating: boolean;
@@ -52,6 +54,7 @@ const initialState: AnnotationState<BaseAnnotation> = {
   nuclei_segmentation: [],
   tissue_segmentation: [],
   patchOverrides: {},
+  patchNegativeCounts: {},
   isEditPanelOpen: false,
   editAnnotation: undefined,
   isGenerating: false,
@@ -155,6 +158,9 @@ const annotationSlice = createSlice({
     },
     clearPatchOverrides: (state) => {
       state.patchOverrides = {};
+    },
+    setPatchNegativeCounts: (state, action: PayloadAction<Record<string, number>>) => {
+      state.patchNegativeCounts = action.payload;
     },
     clearPatchOverridesForIds: (state, action: PayloadAction<number[]>) => {
       action.payload.forEach((id) => {
@@ -344,6 +350,7 @@ export const {
   setTissueSegmentation,
   clearTissueSegmentation,
   clearPatchOverrides,
+  setPatchNegativeCounts,
   clearPatchOverridesForIds,
   updatePatchOverlayColors,
   setNucleiSegmentation,
