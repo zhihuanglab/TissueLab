@@ -8,6 +8,7 @@
  * classes are managed exactly like NuClass.
  */
 import type { WorkflowPanel } from "@/store/slices/chat/workflowSlice";
+import { parseOvrClassifierPaths } from "@/utils/agent/workflow/panelContent";
 
 
 export const CYTOFORMER_ORGANS: string[] = [
@@ -86,18 +87,31 @@ export function cytoformerOrganError(
   return null;
 }
 
-/** A row of the panel's class list: label counts plus its colour. */
-type CytoformerClassEntry = {
-  name: string;
-  color: string;
-  /** Cells labelled AS this class. */
-  count?: number;
-  /** Cells marked "not this type"; a class can have these and no positives. */
-  negativeCount?: number;
-};
+type OvrClass = { name: string; count?: number };
 
-function isAnnotated(cls: CytoformerClassEntry): boolean {
-  return (cls.count ?? 0) > 0 || (cls.negativeCount ?? 0) > 0;
+/**
+ * One-vs-Rest: a class's binary comes from its attached classifier or, on
+ * Update, from the cells marked as it — as multiclass trains on annotations.
+ * Only the rest go to the organ head, so an organ is required only when no class
+ * has either. (With nothing marked as not-the-class, the tasknode stands
+ * unannotated cells in for the negatives.)
+ */
+export function cytoformerOvrOrganError(
+  value: unknown,
+  classes: OvrClass[],
+  classifierPaths: unknown,
+  afterAnnotation = false,
+): string | null {
+  const unknownOrgan = validateCytoformerOrgan(value);
+  if (unknownOrgan) return unknownOrgan;
+  const paths = parseOvrClassifierPaths(classifierPaths);
+  // An Update fired by a mark may run before the counts show it.
+  const supervised = afterAnnotation || classes.some((c) =>
+    c.name.trim().toLowerCase() !== "negative control" && (Boolean(paths?.[c.name]) || (c.count ?? 0) > 0));
+  if (!normalizeCytoformerOrgan(value) && !supervised) {
+    return "Select an organ, or mark cells of a class — Cytoformer One-vs-Rest needs one of them to predict.";
+  }
+  return null;
 }
 
 /**
@@ -108,21 +122,25 @@ function isAnnotated(cls: CytoformerClassEntry): boolean {
  *
  * `organ` is optional and is NOT inherited from the viewer's global organ (that
  * one is free text; this is a fixed enum). Empty just means the run has to be
- * supervised, which the tasknode decides from the presence of annotations.
+ * supervised, using annotations or attached classifiers.
  */
 export function applyCytoformerClassificationInput(
   inputObject: Record<string, any>,
   panel: WorkflowPanel,
+  classes: OvrClass[],
+  afterAnnotation = false,
 ): void {
   const organ = normalizeCytoformerOrgan(
     panel.content.find((item) => item.key === "organ")?.value,
   );
-  const organError = validateCytoformerOrgan(organ);
+  const organError = inputObject.classifier_mode === "one-vs-rest"
+    ? cytoformerOvrOrganError(organ, classes, inputObject.classifier_paths, afterAnnotation)
+    : validateCytoformerOrgan(organ);
   if (organError) {
     throw new Error(organError);
   }
   inputObject.organ = organ;
-  // Match NuClass semantics: labelled cells train the head, and the tasknode
-  // falls back to organ zero-shot on its own when there are none.
+  // Match NuClass semantics: annotations allow training; attached classifiers
+  // can predict without annotations. The tasknode chooses the prediction path.
   inputObject.use_supervised = true;
 }

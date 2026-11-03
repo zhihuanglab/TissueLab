@@ -9,6 +9,7 @@ import {
 } from "@/store/slices/chat/workflowSlice";
 import { AppDispatch, store } from "@/store";
 import eventBus from "@/utils/common/eventBus";
+import { parseOvrClassifierPaths } from "@/utils/agent/workflow/panelContent";
 
 /**
  * Resets workflow state and closes SSE connection before starting a new workflow.
@@ -151,6 +152,7 @@ function flushCoalescedWorkflowFollowupsAfterRun(): void {
         eventBus.emit("trigger-nuclei-update", {
           zarrPath: p.zarrPath,
           source: p.source ?? "coalesced-nuclei-follow-up",
+          afterAnnotation: true,
         });
       }
     }
@@ -197,6 +199,8 @@ export function scheduleCoalescedClassificationAfterAnnotation(
     eventBus.emit("trigger-nuclei-update", {
       zarrPath: params.zarrPath,
       source: params.source ?? "coalesced-nuclei",
+      // Fired by a mark: the counts may not show it yet (see buildStartWorkflowPayload).
+      afterAnnotation: true,
     });
     return;
   }
@@ -265,6 +269,21 @@ export function injectClassifierSaveIntoPayload(
     }
   }
 
+  // "Update Classifier" writes back into the loaded classifier unless a
+  // separate destination is set — the same rule as the panels' Update button.
+  if (options.updateClassifier === true) {
+    for (const key of Object.keys(payload)) {
+      const input = key.startsWith("step") ? payload[key]?.input : undefined;
+      if (input?.classifier_mode === "one-vs-rest" && !parseOvrClassifierPaths(input.save_classifier_paths)) {
+        const paths = parseOvrClassifierPaths(input.classifier_paths);
+        if (paths) input.save_classifier_paths = paths;
+        else delete input.save_classifier_paths;
+      } else if (input && input.classifier_mode !== "one-vs-rest" && !input.save_classifier_path && input.classifier_path) {
+        input.save_classifier_path = input.classifier_path;
+      }
+    }
+  }
+
   if (options.updateClassifier === false) {
     for (const key of Object.keys(payload)) {
       if (key.startsWith("step") && payload[key]?.input) {
@@ -275,6 +294,16 @@ export function injectClassifierSaveIntoPayload(
         // each .tlcls.
         delete payload[key].input.save_classifier_paths;
       }
+    }
+  }
+
+  // A previous multiclass path must not become the fallback model (or save
+  // destination) if an OvR run has no usable per-class classifiers.
+  for (const key of Object.keys(payload)) {
+    const input = key.startsWith("step") ? payload[key]?.input : undefined;
+    if (input?.classifier_mode === "one-vs-rest") {
+      input.classifier_path = null;
+      input.save_classifier_path = null;
     }
   }
 

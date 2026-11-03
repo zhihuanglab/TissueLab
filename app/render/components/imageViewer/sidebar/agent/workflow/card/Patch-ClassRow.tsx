@@ -11,6 +11,8 @@ export interface PatchClassRowProps {
   count: number;
   /** Cells marked "not this type" for this class; hidden when zero. */
   negativeCount?: number;
+  /** What a row counts, for its tooltips: "cell" (default) or "patch". */
+  unit?: "cell" | "patch";
   color: string;
   isSelected: boolean;
   isDeletable: boolean;
@@ -40,6 +42,7 @@ export const PatchClassRow: React.FC<PatchClassRowProps> = ({
   index,
   count,
   negativeCount = 0,
+  unit = "cell",
   color,
   isSelected,
   isDeletable,
@@ -179,7 +182,7 @@ export const PatchClassRow: React.FC<PatchClassRowProps> = ({
         {negativeCount > 0 && (
           <span
             className="flex items-center gap-0.5 shrink-0 rounded-[4px] border border-border bg-muted px-1 py-0.5 text-[10px] text-muted-foreground"
-            title={`${negativeCount} cell${negativeCount === 1 ? "" : "s"} marked "not ${name}"`}
+            title={`${negativeCount} ${unit}${negativeCount === 1 ? "" : "s"} marked "not ${name}"`}
           >
             <Ban className="h-2.5 w-2.5" />
             {negativeCount}

@@ -32,11 +32,9 @@ export function mergePanelContentWithFactoryDefaults(
   const defaults = cfg?.defaultContent;
   if (!defaults?.length) return content;
   const keys = new Set(content.map((c) => c.key).filter(Boolean) as string[]);
-  const merged = [...content];
-  for (const d of defaults) {
-    if (d.key && !keys.has(d.key)) merged.push({ ...d } as ContentItem);
-  }
-  return merged;
+  const missing = defaults.filter((d) => d.key && !keys.has(d.key));
+  if (missing.length === 0) return content;
+  return [...content, ...missing.map((d) => ({ ...d } as ContentItem))];
 }
 
 export function getCodingAgentCardBadge(args: {

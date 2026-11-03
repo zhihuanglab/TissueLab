@@ -621,6 +621,8 @@ export const WorkflowGraph: React.FC = () => {
   // One-vs-rest Save: {class: path} keyed by nodeId. Injected at run start so
   // ClassificationPanel content-sync cannot clobber paths before the payload is built.
   const ovrSavePathsRef = useRef<Record<string, Record<string, string>>>({})
+  // One OvR Save at a time: the dialog stays open while its files are created.
+  const ovrSaveBusyRef = useRef(false)
   const [batchDialogOpen, setBatchDialogOpen] = useState(false)
   const [isStoppingWorkflowLocal, setIsStoppingWorkflowLocal] = useState(false)
   const isStoppingWorkflow = isStoppingWorkflowLocal || batchRuntime.isStopping
@@ -1006,7 +1008,7 @@ export const WorkflowGraph: React.FC = () => {
   useEffect(() => {
     const startClassificationUpdate = async (
       kind: "nuclei" | "patch",
-      eventData?: { zarrPath?: string; saveClassifierPath?: string }
+      eventData?: { zarrPath?: string; saveClassifierPath?: string; afterAnnotation?: boolean }
     ) => {
       const ctx = classificationTriggerCtxRef.current
       if (store.getState().workflow.isRunning) return
@@ -1055,6 +1057,8 @@ export const WorkflowGraph: React.FC = () => {
           x2: ctx.bboxBounds.x2,
           y2: ctx.bboxBounds.y2,
           shapeData: ctx.shapeData,
+          // "Update after every annotation" (scheduleCoalescedClassificationAfterAnnotation).
+          afterAnnotation: eventData?.afterAnnotation === true,
         }
         const { payload } = buildStartWorkflowPayload([panel], zarrPath, buildCtx)
         const pendingOvrSave = ovrSavePathsRef.current[node.id]
@@ -1091,7 +1095,7 @@ export const WorkflowGraph: React.FC = () => {
       }
     }
 
-    const onNuclei = (eventData?: { zarrPath?: string; saveClassifierPath?: string }) => {
+    const onNuclei = (eventData?: { zarrPath?: string; saveClassifierPath?: string; afterAnnotation?: boolean }) => {
       void startClassificationUpdate("nuclei", eventData)
     }
     const onPatch = (eventData?: { zarrPath?: string; saveClassifierPath?: string }) => {
@@ -3113,96 +3117,145 @@ export const WorkflowGraph: React.FC = () => {
   // save_classifier_paths ({class: <folder>/<name>.tlcls}), run ONE training pass
   // (the tasknode trains every listed class's binary), then publish the classes
   // whose toggle is on — each independently.
+  // submitOvrSave awaits the file creates; the panel is re-read after them.
+  const ensureLegacyPanelRef = useRef(ensureLegacyPanel)
+  ensureLegacyPanelRef.current = ensureLegacyPanel
+
   const submitOvrSave = useCallback(async () => {
     const s = ovrSave
-    if (!s || s.rows.length === 0) return
+    if (!s || s.rows.length === 0 || ovrSaveBusyRef.current) return
     const node = activeWf.nodes.find((n) => n.id === s.nodeId)
-    if (!node) return
-    const panel = ensureLegacyPanel(node)
-    if (!panel) return
-
-    let folder = (selectedFolder ?? "").trim()
-    if (!folder && currentPath) {
-      const norm = formatPath(currentPath)
-      const sep = norm.includes("\\") ? "\\" : "/"
-      const idx = norm.lastIndexOf(sep)
-      folder = idx > 0 ? norm.slice(0, idx) : norm
-    }
-    if (!folder) {
-      toast.error("Choose a folder in the sidebar to save into, or open a slide first.")
-      return
-    }
-    const sep = folder.includes("\\") ? "\\" : "/"
-    const savePaths: Record<string, string> = {}
-    const toPublish: Array<{ path: string; fileName: string; name: string }> = []
-    for (const r of s.rows) {
-      const stem =
-        sanitizeFilename((r.saveName || r.className).replace(/\.tlcls$/i, "")).slice(0, 120) ||
-        sanitizeFilename(r.className) || "class"
-      const fileName = `${stem}.tlcls`
-      const full = `${folder.replace(/[/\\]+$/, "")}${sep}${fileName}`
-      savePaths[r.className] = full
-      if (r.publish) toPublish.push({ path: full, fileName, name: r.className })
-    }
-
-    // Scope the run to exactly these classes: an explicit save_classifier_paths in
-    // panel.content (the panels prefer it over deriving one path per class).
-    let nextContent = upsertContentStringValue(panel.content, "classifier_mode", "one-vs-rest")
-    nextContent = upsertContentStringValue(nextContent, "save_classifier_paths", JSON.stringify(savePaths))
-    nextContent = upsertContentStringValue(nextContent, "save_classifier_path", Object.values(savePaths)[0] || "")
-    // Stash for race-free injection at run time (panelStates can be clobbered
-    // by a ClassificationPanel content-sync effect before the trigger fires).
-    ovrSavePathsRef.current[s.nodeId] = savePaths
-    handleLegacyPanelChange(panel.id, { ...panel, content: nextContent })
-    dispatch(setUpdateClassifier(true))
-    if (s.isPatch) dispatch(setUpdatePatchAfterEveryAnnotation(true))
-    else dispatch(setUpdateAfterEveryAnnotation(true))
-
-    setOvrSave(null)
-    const updateEvent = s.isPatch ? "trigger-patch-update" : "trigger-nuclei-update"
-    const updateZarrPath = formatPath(currentPath ?? "")
-    // Paths already in ovrSavePathsRef — emit sync; handler injects them into the payload.
-    const kickOffTraining = () =>
-      eventBus.emit(updateEvent, { zarrPath: updateZarrPath, source: "ovr-classifier-save" })
-
-    const nTrain = s.rows.length
-    if (toPublish.length === 0) {
-      toast.success(`Training ${nTrain} classifier${nTrain > 1 ? "s" : ""}…`)
-      kickOffTraining()
-      return
-    }
-    const meta = node.modelId ? registryNodes[node.modelId] : undefined
-    const pubToast = toast.loading(
-      `Training ${nTrain} classifier${nTrain > 1 ? "s" : ""} — will publish ${toPublish.length} when done…`
-    )
-    // Waiter must be registered before the run starts or a fast finish is missed.
-    const finishedPromise = waitForWorkflowCompleteSignal()
-    kickOffTraining()
-    void (async () => {
-      try {
-        const finished = await finishedPromise
-        if (!finished.success) {
-          toast.error("Training failed — nothing was published.", { id: pubToast })
+    if (!node || !ensureLegacyPanel(node)) return
+    ovrSaveBusyRef.current = true
+    try {
+      let folder = (selectedFolder ?? "").trim()
+      if (!folder && currentPath) {
+        const norm = formatPath(currentPath)
+        const sep = norm.includes("\\") ? "\\" : "/"
+        const idx = norm.lastIndexOf(sep)
+        folder = idx > 0 ? norm.slice(0, idx) : norm
+      }
+      if (!folder) {
+        toast.error("Choose a folder in the sidebar to save into, or open a slide first.")
+        return
+      }
+      const sep = folder.includes("\\") ? "\\" : "/"
+      const savePaths: Record<string, string> = {}
+      const toPublish: Array<{ path: string; fileName: string; name: string }> = []
+      // Names this Save already took: the server reuses an empty file, so two
+      // rows with one name would both get the file the first row just created.
+      const taken = new Set<string>()
+      for (const r of s.rows) {
+        const stem =
+          sanitizeFilename((r.saveName || r.className).replace(/\.tlcls$/i, "")).slice(0, 120) ||
+          sanitizeFilename(r.className) || "class"
+        let fileName = `${stem}.tlcls`
+        for (let k = 1; taken.has(fileName.toLowerCase()); k++) fileName = `${stem}_${k}.tlcls`
+        let full = `${folder.replace(/[/\\]+$/, "")}${sep}${fileName}`
+        // Create each file empty first, as the multiclass Save does: on a name
+        // collision the backend auto-suffixes and returns what it wrote. The file is
+        // also attached as the class's classifier below, so an existing file kept
+        // under that name would have its old rows merged into the new classifier.
+        try {
+          const saveResp = await saveClassifierFileOnServer({
+            path: normalizePathForSegClassifierApi(full),
+            fail_if_exists: true,
+          })
+          const serverName = (saveResp?.path || "").split(/[/\\]/).pop()
+          if (serverName && serverName !== fileName) {
+            fileName = serverName
+            full = `${folder.replace(/[/\\]+$/, "")}${sep}${serverName}`
+          }
+        } catch (e) {
+          const msg = e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e)
+          toast.error(`Save failed for ${r.className}: ${msg}`)
           return
         }
-        toast.dismiss(pubToast)
-        for (const p of toPublish) {
-          const info: PublishInfo = {
-            destFull: p.path,
-            destFileName: p.fileName,
-            name: p.name,
-            description: "",
-            author: "",
-            tags: [],
-            modelId: node.modelId || "",
-            factory: meta?.factory,
-          }
-          await publishClassifierToCommunity(info, makeDialogReporter())
+        if (taken.has(fileName.toLowerCase())) {
+          toast.error(`Save failed for ${r.className}: ${fileName} is already used by another class in this save.`)
+          return
         }
-      } catch {
-        toast.error("Stopped waiting for training — re-run an update to publish.", { id: pubToast })
+        taken.add(fileName.toLowerCase())
+        savePaths[r.className] = full
+        if (r.publish) toPublish.push({ path: full, fileName, name: r.className })
       }
-    })()
+
+      // The panel as it is now, not as it was before the creates.
+      const panel = ensureLegacyPanelRef.current(node)
+      if (!panel) return
+      // Scope the run to exactly these classes: an explicit save_classifier_paths in
+      // panel.content (the panels prefer it over deriving one path per class).
+      let nextContent = upsertContentStringValue(panel.content, "classifier_mode", "one-vs-rest")
+      nextContent = upsertContentStringValue(nextContent, "save_classifier_paths", JSON.stringify(savePaths))
+      // The saved files become the classes' classifiers, as multiclass Save-as sets
+      // classifier_path to the new file: a later Update refines them (the tasknode
+      // merges only an attached classifier's rows), and removing one clears both.
+      {
+        let attached: Record<string, string> = {}
+        const raw = panel.content.find((it) => it.key === "classifier_paths")?.value
+        if (typeof raw === "string" && raw) {
+          try { attached = JSON.parse(raw) } catch { attached = {} }
+        }
+        nextContent = upsertContentStringValue(nextContent, "classifier_paths", JSON.stringify({ ...attached, ...savePaths }))
+      }
+      // save_classifier_path stays the multiclass destination: one class's binary
+      // there would be overwritten by a multiclass Update after a mode switch.
+      // Stash for race-free injection at run time (panelStates can be clobbered
+      // by a ClassificationPanel content-sync effect before the trigger fires).
+      ovrSavePathsRef.current[s.nodeId] = savePaths
+      handleLegacyPanelChange(panel.id, { ...panel, content: nextContent })
+      dispatch(setUpdateClassifier(true))
+      if (s.isPatch) dispatch(setUpdatePatchAfterEveryAnnotation(true))
+      else dispatch(setUpdateAfterEveryAnnotation(true))
+
+      setOvrSave(null)
+      const updateEvent = s.isPatch ? "trigger-patch-update" : "trigger-nuclei-update"
+      const updateZarrPath = formatPath(currentPath ?? "")
+      // Paths already in ovrSavePathsRef — emit sync; handler injects them into the payload.
+      const kickOffTraining = () =>
+        eventBus.emit(updateEvent, { zarrPath: updateZarrPath, source: "ovr-classifier-save" })
+
+      const nTrain = s.rows.length
+      if (toPublish.length === 0) {
+        toast.success(`Training ${nTrain} classifier${nTrain > 1 ? "s" : ""}…`)
+        kickOffTraining()
+        return
+      }
+      const meta = node.modelId ? registryNodes[node.modelId] : undefined
+      const pubToast = toast.loading(
+        `Training ${nTrain} classifier${nTrain > 1 ? "s" : ""} — will publish ${toPublish.length} when done…`
+      )
+      // Waiter must be registered before the run starts or a fast finish is missed.
+      const finishedPromise = waitForWorkflowCompleteSignal()
+      kickOffTraining()
+      void (async () => {
+        try {
+          const finished = await finishedPromise
+          if (!finished.success) {
+            toast.error("Training failed — nothing was published.", { id: pubToast })
+            return
+          }
+          toast.dismiss(pubToast)
+          for (const p of toPublish) {
+            const info: PublishInfo = {
+              destFull: p.path,
+              destFileName: p.fileName,
+              name: p.name,
+              description: "",
+              author: "",
+              tags: [],
+              modelId: node.modelId || "",
+              factory: meta?.factory,
+            }
+            await publishClassifierToCommunity(info, makeDialogReporter())
+          }
+        } catch {
+          toast.error("Stopped waiting for training — re-run an update to publish.", { id: pubToast })
+        }
+      })()
+    } finally {
+      ovrSaveBusyRef.current = false
+    }
   }, [ovrSave, activeWf.nodes, ensureLegacyPanel, selectedFolder, currentPath, handleLegacyPanelChange, dispatch, waitForWorkflowCompleteSignal, publishClassifierToCommunity])
 
   const submitClassifierSave = useCallback(async () => {
@@ -4080,7 +4133,7 @@ export const WorkflowGraph: React.FC = () => {
       setNodes((prev) => prev.map((n) => (n.id === id ? { ...n, loadedClassifier: undefined } : n)))
       // The panel banner falls back to the FileBrowser selection in Redux, so a
       // node-only clear would leave "Selected Classifier" behind. Clear both,
-      // exactly like the banner's own X does (which also drops update mode).
+      // exactly like the banner's own X does. Keep the update preference.
       let targetPath = selectedFolder || ""
       if (!targetPath && currentPath) {
         const separator = isWebMode ? "/" : currentPath.includes("\\") ? "\\" : "/"
@@ -4088,7 +4141,6 @@ export const WorkflowGraph: React.FC = () => {
         targetPath = lastIndex !== -1 ? currentPath.substring(0, lastIndex) : isWebMode ? "" : currentPath
       }
       dispatch(clearSelectedModelForPath(targetPath))
-      dispatch(setUpdateClassifier(false))
       setPanelStates((prev) => {
         const panel = prev[id]
         if (!panel) return prev

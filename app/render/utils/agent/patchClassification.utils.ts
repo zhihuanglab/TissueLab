@@ -5,6 +5,21 @@ export interface PatchClassificationData {
   class_counts?: number[];
 }
 
+/**
+ * "Not <class>" patch counts by class name from a /seg/v1/patch_classification
+ * payload (`negative_class_counts_by_name`); {} when absent.
+ */
+export const patchNegativeCountsFromPayload = (payload: unknown): Record<string, number> => {
+  const raw = (payload as { negative_class_counts_by_name?: unknown } | null)?.negative_class_counts_by_name;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out: Record<string, number> = {};
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) out[name] = n;
+  }
+  return out;
+};
+
 // Negative control constants
 export const NEGATIVE_CONTROL_CLASS_NAME = 'Negative control';
 export const NEGATIVE_CONTROL_COLOR = '#aaaaaa';

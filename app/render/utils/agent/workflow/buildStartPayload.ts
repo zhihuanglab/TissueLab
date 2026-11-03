@@ -19,6 +19,9 @@ export type BuildWorkflowPayloadContext = {
   y2: string;
   /** Nuclei segmentation bbox is taken only from `rectangleCoords` here, not from x1–y2 (which may be full-slide for tissue). */
   shapeData: { rectangleCoords?: { x1: number; y1: number; x2: number; y2: number }; polygonPoints?: unknown } | null | undefined;
+  /** Update fired by a mark: counts may not show it yet, so the run counts as
+   *  supervised (Cytoformer One-vs-Rest then needs no organ). */
+  afterAnnotation?: boolean;
 };
 
 /** Panel `organ` wins if non-empty; else global (Redux) organ; else "" — matches legacy classification workflow. */
@@ -48,7 +51,7 @@ export function buildStartWorkflowPayload(
   const workflowPayload: Record<string, any> = { zarr_path: zarrPath };
   const orderedBackendNodeIds: string[] = [];
 
-  const { currentPath, nucleiClasses, currentOrgan, reduxPatchClassificationData, x1, y1, x2, y2, shapeData } = ctx;
+  const { currentPath, nucleiClasses, currentOrgan, reduxPatchClassificationData, x1, y1, x2, y2, shapeData, afterAnnotation } = ctx;
 
   panelsToRun.forEach((panel, index) => {
     const stepKey = `step${index + 1}`;
@@ -117,16 +120,14 @@ export function buildStartWorkflowPayload(
       const loadPath = panel.content.find((item) => item.key === "classifier_path")?.value;
       const savePath = panel.content.find((item) => item.key === "save_classifier_path")?.value;
 
-      inputObject.classifier_path = loadPath || null;
-      inputObject.save_classifier_path = savePath || null;
+      inputObject.classifier_path = inputObject.classifier_mode === "one-vs-rest" ? null : loadPath || null;
+      inputObject.save_classifier_path = inputObject.classifier_mode === "one-vs-rest" ? null : savePath || null;
 
       if (nodeId === "CytoformerClassification") {
-        applyCytoformerClassificationInput(inputObject, panel);
+        applyCytoformerClassificationInput(inputObject, panel, nucleiClasses, afterAnnotation);
       }
-      // Both models: a supervised run must not be handed classes nobody
-      // annotated. Left in, a class list still carrying an earlier zero-shot
-      // run's organ cell types makes the node train on a taxonomy the user
-      // never chose.
+      // Multiclass trims unannotated classes from earlier zero-shot runs;
+      // OvR retains them as candidates for its zero-shot fallback.
       restrictClassesToAnnotated(inputObject, nucleiClasses);
     }
 
@@ -138,8 +139,8 @@ export function buildStartWorkflowPayload(
         const loadPath = panel.content.find((item) => item.key === "classifier_path")?.value;
         const savePath = panel.content.find((item) => item.key === "save_classifier_path")?.value;
 
-        inputObject.classifier_path = loadPath || null;
-        inputObject.save_classifier_path = savePath || null;
+        inputObject.classifier_path = inputObject.classifier_mode === "one-vs-rest" ? null : loadPath || null;
+        inputObject.save_classifier_path = inputObject.classifier_mode === "one-vs-rest" ? null : savePath || null;
       }
     }
 

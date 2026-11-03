@@ -10,7 +10,6 @@ export interface ClassificationHeaderProps {
   updateClassifierId: string;
   updateClassifierChecked: boolean;
   onUpdateClassifierChange: (checked: boolean) => void;
-  updateClassifierDisabled: boolean;
   updateClassifierTitle?: string;
   // Action buttons props
   onAddClass: () => void;
@@ -27,7 +26,6 @@ export const ClassificationHeader: React.FC<ClassificationHeaderProps> = ({
   updateClassifierId,
   updateClassifierChecked,
   onUpdateClassifierChange,
-  updateClassifierDisabled,
   updateClassifierTitle,
   onAddClass,
   onReset,
@@ -53,7 +51,7 @@ export const ClassificationHeader: React.FC<ClassificationHeaderProps> = ({
           checked={updateClassifierChecked}
           onCheckedChange={onUpdateClassifierChange}
           label="Update Classifier"
-          disabled={updateClassifierDisabled || writeDisabled}
+          disabled={writeDisabled}
           title={writeDisabled ? writeDisabledTitle : updateClassifierTitle}
           className="flex items-center gap-2"
         />

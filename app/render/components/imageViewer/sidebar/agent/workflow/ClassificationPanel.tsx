@@ -67,10 +67,12 @@ import { useActiveSlidePath } from "@/utils/viewer/slidePath";
 import { toast } from "sonner";
 import { cellTypeOptions } from "@/constants/workflow.constants";
 import { ClassificationPanelProps } from "@/types/workflow.types";
+import { renameAnnotationClass } from "@/services/data.service";
 import { restrictClassesToAnnotated } from "@/utils/annotations/nucleiClassList";
 import {
   applyCytoformerClassificationInput,
   cytoformerOrganError,
+  cytoformerOvrOrganError,
   CYTOFORMER_ORGAN_LABEL,
   CYTOFORMER_ORGANS,
 } from "@/utils/agent/workflow/cytoformer";
@@ -78,6 +80,7 @@ import {
   getClassifierDisplayBasename,
   getContentStringValue,
   hasClassifierLoaded,
+  parseOvrClassifierPaths,
   removeClassifierPathContent,
   upsertContentStringValue,
 } from "@/utils/agent/workflow/panelContent";
@@ -171,33 +174,31 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
   const isOvrMode = classifierMode === "one-vs-rest";
   // One-vs-rest: per-class attached .tlcls, stored as JSON in panel.content
   // under `classifier_paths` ({className: absolutePath}).
-  const ovrClassifierPaths = useMemo<Record<string, string>>(() => {
-    const v = panel.content.find(item => item.key === 'classifier_paths')?.value;
-    if (typeof v === 'string' && v) {
-      try { return JSON.parse(v) as Record<string, string>; } catch { return {}; }
-    }
-    return {};
-  }, [panel.content]);
-
-  // Remove one class's attached .tlcls (clear button on the row).
-  const clearOvrClassifier = useCallback((className: string) => {
-    const map = { ...ovrClassifierPaths };
-    delete map[className];
-    const newContent = panel.content.some(it => it.key === 'classifier_paths')
-      ? panel.content.map(it => it.key === 'classifier_paths' ? { ...it, value: JSON.stringify(map) } : it)
-      : [...panel.content, { key: 'classifier_paths', type: 'input', value: JSON.stringify(map) }];
-    onContentChange(panel.id, { ...panel, content: newContent });
-  }, [ovrClassifierPaths, panel, onContentChange]);
+  const ovrClassifierPaths = useMemo(() =>
+    parseOvrClassifierPaths(panel.content.find((item) => item.key === 'classifier_paths')?.value) ?? {},
+  [panel.content]);
 
   // One-vs-rest: per-class TRAIN+SAVE destinations (`save_classifier_paths`),
   // assembled by the OvR Save dialog. Each configured class trains + writes on next run.
-  const ovrSaveClassifierPaths = useMemo<Record<string, string>>(() => {
-    const v = panel.content.find(item => item.key === 'save_classifier_paths')?.value;
-    if (typeof v === 'string' && v) {
-      try { return JSON.parse(v) as Record<string, string>; } catch { return {}; }
+  const ovrSaveClassifierPaths = useMemo(() =>
+    parseOvrClassifierPaths(panel.content.find((item) => item.key === 'save_classifier_paths')?.value) ?? {},
+  [panel.content]);
+  // Removing a class's classifier drops its save destination too, as the
+  // multiclass Clear drops both classifier_path and save_classifier_path:
+  // otherwise the next Update keeps training into — and predicting with — the
+  // file the user just removed.
+  const clearOvrClassifier = useCallback((className: string) => {
+    const load = { ...ovrClassifierPaths };
+    delete load[className];
+    let content = upsertContentStringValue(panel.content, 'classifier_paths', JSON.stringify(load));
+    if (className in ovrSaveClassifierPaths) {
+      const save = { ...ovrSaveClassifierPaths };
+      delete save[className];
+      content = upsertContentStringValue(content, 'save_classifier_paths', JSON.stringify(save));
     }
-    return {};
-  }, [panel.content]);
+    onContentChange(panel.id, { ...panel, content });
+  }, [ovrClassifierPaths, ovrSaveClassifierPaths, panel, onContentChange]);
+
   const clearOvrSaveClassifier = useCallback((className: string) => {
     const map = { ...ovrSaveClassifierPaths };
     delete map[className];
@@ -1061,6 +1062,18 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
 
       if (oldName && trimmedName && oldName !== trimmedName) {
         pendingRenameOpsRef.current.push({ from: oldName, to: trimmedName });
+        // The marks' stored palette takes the new name now, so a mark made
+        // before the Update stays with the class (the Update renames the rest).
+        const zarrPath = getDefaultOutputPath(formattedPath);
+        if (pathWritable && activeInstanceId && zarrPath) {
+          renameAnnotationClass(activeInstanceId, zarrPath, 'cell', oldName, trimmedName)
+            // The slide's results and counts took the new name: show them (a
+            // merge also moves cells between classes).
+            .then(() => { eventBus.emit("refresh-websocket-path", { path: zarrPath, forceReload: true }); })
+            .catch((e) => {
+              console.error(`[Classification] Failed to persist rename ${oldName} -> ${trimmedName}:`, e);
+            });
+        }
       }
     } else {
       // Check if class already exists (case-insensitive)
@@ -1146,9 +1159,31 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
 
     if (!cls.persisted) {
       dispatch(deleteNucleiClass(index));
-      return;
+    } else {
+      await performDelete(index, cls.name, NEGATIVE_CONTROL);
     }
-    await performDelete(index, cls.name, NEGATIVE_CONTROL);
+    // The row was the class's one-vs-rest attachment: a class added back under
+    // this name starts without the old file instead of quietly running it.
+    if (cls.name in ovrClassifierPaths || cls.name in ovrSaveClassifierPaths) {
+      clearOvrClassifier(cls.name);
+    }
+  };
+
+  // Reset starts the classes over, so no class keeps a one-vs-rest classifier or
+  // save destination. Both maps are keyed by class name: a class added back after
+  // the reset would otherwise run the old file and, with Update Classifier on,
+  // train into it. The files stay on disk.
+  const latestPanelRef = useRef({ panel, onContentChange });
+  latestPanelRef.current = { panel, onContentChange };
+  const detachOvrClassifiers = () => {
+    const { panel: p, onContentChange: write } = latestPanelRef.current;
+    const keys = ['classifier_paths', 'save_classifier_paths'];
+    const attached = p.content.some((it) =>
+      keys.includes(it.key) && Object.keys(parseOvrClassifierPaths(it.value) ?? {}).length > 0);
+    if (!attached) return;
+    let content = p.content;
+    for (const key of keys) content = upsertContentStringValue(content, key, JSON.stringify({}));
+    write(p.id, { ...p, content });
   };
   
   // Reset function
@@ -1195,6 +1230,7 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
           ));
           dispatch(setAnnotations([]));
           dispatch(clearAnnotationTypes());
+          detachOvrClassifiers();
 
           // Emit websocket refresh first to trigger handler reload
           eventBus.emit("refresh-websocket-path", { path: outputPath, forceReload: true });
@@ -1324,17 +1360,14 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
     // The previous `classifier_display_name === ""` short-circuit caused real path
     // values to be discarded right when the user clicked Save — display_name is
     // only a UI label, not a source of truth.
-    let finalLoadPath = getContentStringValue(panel.content, "classifier_path");
-    let finalSavePath = getContentStringValue(panel.content, "save_classifier_path");
-
-    // Ensure save_path is cleared if updateClassifier is false
-    if (!updateClassifier) {
-      finalSavePath = null;
-    }
-
-    // Normalize: convert undefined to null for consistency
-    finalLoadPath = finalLoadPath ?? null;
-    finalSavePath = finalSavePath ?? null;
+    const finalLoadPath = getContentStringValue(panel.content, "classifier_path") ?? null;
+    // "Update Classifier" writes back into the classifier the run loads unless a
+    // separate destination is set. Multiclass only: one-vs-rest loads per-class
+    // files, and a leftover classifier_path is not one of them.
+    const writeBackPath = classifierMode === "one-vs-rest" ? null : finalLoadPath;
+    const finalSavePath: string | null = updateClassifier
+      ? getContentStringValue(panel.content, "save_classifier_path") || writeBackPath
+      : null;
     
     console.log('[ClassificationPanel] Workflow paths:', {
       finalLoadPath,
@@ -1349,53 +1382,24 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
       adds: pendingAddOpsRef.current,
     });
 
-    // One-vs-rest. SAVE paths are still auto-derived from the single save base
-    // path (dirname + sanitized class name) — training writes one binary per
-    // class there. LOAD paths, however, are the per-class .tlcls the user
-    // explicitly attached on each cell-type row (ovrClassifierPaths); classes
-    // with nothing attached are simply omitted (→ no classifier → the tasknode
-    // falls back to zero-shot for them). Negative control is never an OvR target.
+    // One-vs-rest writes back to the attached per-class files unless an
+    // explicit save map (the One-vs-Rest Save dialog) overrides it; a remembered
+    // multiclass destination must not leak into this mode. Classes with nothing
+    // attached and nothing marked fall back to zero-shot in the tasknode.
     const isOvr = classifierMode === "one-vs-rest";
-    const deriveOvrPaths = (basePath: string | null): Record<string, string> | undefined => {
-      if (!basePath) return undefined;
-      const norm = basePath.replace(/\\/g, "/");
-      const dir = norm.includes("/") ? norm.slice(0, norm.lastIndexOf("/")) : "";
-      const out: Record<string, string> = {};
-      for (const c of nucleiClasses) {
-        if (c.name.trim().toLowerCase() === "negative control") continue;
-        const safe = c.name.replace(/[^\w.\- ]+/g, "_").replace(/\s+/g, "_").slice(0, 120) || "class";
-        out[c.name] = dir ? `${dir}/${safe}.tlcls` : `${safe}.tlcls`;
-      }
-      return Object.keys(out).length ? out : undefined;
-    };
-    // Prefer an explicit scoped map written by the One-vs-Rest Save dialog (train
-    // only the classes the user chose); otherwise derive one path per class.
-    const explicitOvrSavePaths = (() => {
-      const v = panel.content.find(it => it.key === 'save_classifier_paths')?.value;
-      if (typeof v === 'string' && v) {
-        try { const o = JSON.parse(v); if (o && typeof o === 'object' && Object.keys(o).length) return o as Record<string, string>; } catch { /* ignore */ }
-      }
-      return undefined;
-    })();
-    const ovrSavePaths = isOvr ? (explicitOvrSavePaths ?? deriveOvrPaths(finalSavePath)) : undefined;
-    // Explicit per-class attachments (skip Negative control / blank paths).
     const ovrLoadPaths = isOvr
-      ? (() => {
-          const out: Record<string, string> = {};
-          for (const [name, p] of Object.entries(ovrClassifierPaths)) {
-            if (!p || name.trim().toLowerCase() === "negative control") continue;
-            out[name] = p;
-          }
-          return Object.keys(out).length ? out : undefined;
-        })()
+      ? parseOvrClassifierPaths(panel.content.find((item) => item.key === "classifier_paths")?.value)
+      : undefined;
+    const ovrSavePaths = isOvr && updateClassifier
+      ? parseOvrClassifierPaths(panel.content.find((item) => item.key === "save_classifier_paths")?.value) ?? ovrLoadPaths
       : undefined;
 
     const input: Record<string, unknown> = {
       nuclei_classes: nucleiClasses.map(cls => cls.name),
       nuclei_colors: nucleiClasses.map(cls => cls.color),
       organ: organValue,
-      classifier_path: finalLoadPath,
-      save_classifier_path: finalSavePath,
+      classifier_path: isOvr ? null : finalLoadPath,
+      save_classifier_path: isOvr ? null : finalSavePath,
       classifier_mode: classifierMode,
       ...(ovrSavePaths ? { save_classifier_paths: ovrSavePaths } : {}),
       ...(ovrLoadPaths ? { classifier_paths: ovrLoadPaths } : {}),
@@ -1410,27 +1414,16 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
       const hasAnnotations = nucleiClasses.some(
         (cls) => (cls.count ?? 0) > 0 || (cls.negativeCount ?? 0) > 0,
       );
-      // An attached classifier is a supervised run too — the tasknode branches
-      // on CLASSIFIER_PATH alone, and the organ only ever feeds the zero-shot
-      // head. In one-vs-rest every target class has to be covered: a class with
-      // no classifier still falls back to zero-shot, which does need the organ.
-      const ovrTargets = nucleiClasses.filter(
-        (cls) => cls.name.trim().toLowerCase() !== "negative control",
-      );
-      const hasClassifier = isOvr
-        ? ovrTargets.length > 0 && ovrTargets.every((cls) => Boolean(ovrLoadPaths?.[cls.name]))
-        : Boolean(finalLoadPath);
-      const organError = cytoformerOrganError(
-        organValue,
-        hasAnnotations || hasClassifier,
-      );
+      const organError = isOvr
+        ? cytoformerOvrOrganError(organValue, nucleiClasses, ovrLoadPaths)
+        : cytoformerOrganError(organValue, hasAnnotations || Boolean(finalLoadPath));
       if (organError) {
         toast.error(organError);
         return;
       }
-      applyCytoformerClassificationInput(input as Record<string, any>, panel);
+      applyCytoformerClassificationInput(input as Record<string, any>, panel, nucleiClasses);
     }
-    // Both models — see buildStartWorkflowPayload.
+    // Multiclass trims unannotated classes; OvR retains zero-shot candidates.
     restrictClassesToAnnotated(input as Record<string, any>, nucleiClasses);
 
     const workflowPayload = {
@@ -1468,7 +1461,6 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
     selectedModelForCurrentPath,
     nucleiClasses,
     classifierMode,
-    ovrClassifierPaths,
     graphStartWorkflow,
     dispatch,
     panel,
@@ -1494,10 +1486,6 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
       targetPath = lastIndex !== -1 ? currentPath.substring(0, lastIndex) : (isWebMode ? '' : currentPath);
     }
     dispatch(clearSelectedModelForPath(targetPath));
-    // "Updating Classifier" targets the selected one, so it goes with it:
-    // otherwise the checkbox stays ticked with nothing to update, and the next
-    // classifier picked silently lands in update mode.
-    dispatch(setUpdateClassifier(false));
     const stripped = removeClassifierPathContent(panel.content).filter(
       (item) => item.key !== "classifier_display_name"
     );
@@ -1552,6 +1540,9 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
   // Handle update classifier checkbox change
   const handleUpdateClassifierChange = (checked: boolean) => {
     dispatch(setUpdateClassifier(checked));
+    // OvR destinations are resolved from the per-class maps at run time.
+    // Toggling must not copy or clear the unrelated multiclass paths.
+    if (isOvrMode) return;
 
     if (checked && selectedModelForCurrentPath) {
       let modelPath;
@@ -1573,8 +1564,6 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
   };
 
   const panelClassifierLoadPath = getContentStringValue(panel.content, "classifier_path");
-  const classifierResolvedForUpdate =
-    Boolean(selectedModelForCurrentPath) || Boolean(panelClassifierLoadPath?.trim());
 
   // Handle color change with optimistic update (no API call, will be saved on Update button click)
   const handleColorChange = (index: number, newColor: string) => {
@@ -1731,8 +1720,9 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
             </SelectContent>
           </Select>
           <p className="text-[10px] text-muted-foreground">
-            Only needed to predict without annotations (zero-shot; unsure cells
-            become “Negative control”). Once you have annotations, training uses your labels.
+            {isOvrMode
+              ? "Used for classes with neither an attached classifier nor marked cells; required when no class has either."
+              : "Only required for zero-shot prediction without annotations or an attached classifier."}
           </p>
         </div>
       )}
@@ -1744,13 +1734,14 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
           updateClassifierId={`updateClassifier-${panel.id}`}
           updateClassifierChecked={updateClassifier}
           onUpdateClassifierChange={handleUpdateClassifierChange}
-          updateClassifierDisabled={!classifierResolvedForUpdate}
           updateClassifierTitle={
-            selectedModelForCurrentPath
+            isOvrMode
+              ? "Write back to the attached per-class classifiers, or use their configured save destinations"
+              : selectedModelForCurrentPath
               ? "Update the selected classifier"
               : panelClassifierLoadPath
                 ? "Update the classifier file loaded into this node (same path as load)"
-                : "No classifier selected"
+                : "Save updates when a classifier file or save destination is configured"
           }
           onAddClass={openAddClassModal}
           onReset={() => setShowResetModal(true)}
@@ -1762,17 +1753,19 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
       </div>
 
       <div>
-        <ClassifierStatusBanner
-          selectedModelForCurrentPath={selectedModelForCurrentPath}
-          updateClassifier={updateClassifier}
-          actualClassifierPath={getContentStringValue(panel.content, "classifier_path")}
-          actualSaveClassifierPath={getContentStringValue(panel.content, "save_classifier_path")}
-          actualClassifierName={getClassifierDisplayBasename(panel.content)}
-          onClear={handleClassifierClear}
-          onClearSave={() => handleUpdateClassifierChange(false)}
-          onRename={handleClassifierRename}
-          onRenameSave={handleSaveClassifierRename}
-        />
+        {!isOvrMode && (
+          <ClassifierStatusBanner
+            selectedModelForCurrentPath={selectedModelForCurrentPath}
+            updateClassifier={updateClassifier}
+            actualClassifierPath={getContentStringValue(panel.content, "classifier_path")}
+            actualSaveClassifierPath={getContentStringValue(panel.content, "save_classifier_path")}
+            actualClassifierName={getClassifierDisplayBasename(panel.content)}
+            onClear={handleClassifierClear}
+            onClearSave={() => handleUpdateClassifierChange(false)}
+            onRename={handleClassifierRename}
+            onRenameSave={handleSaveClassifierRename}
+          />
+        )}
 
         {/* Annotations tools - Nuclei Classification specific */}
         <div className="flex gap-1 items-center my-2">

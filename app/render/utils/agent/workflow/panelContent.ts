@@ -45,7 +45,22 @@ export const upsertContentStringValue = (
 ): ContentItem[] => {
   const index = content.findIndex(item => item.key === key);
   if (index > -1) {
+    if (content[index].value === value) return content;
     return content.map((item, itemIndex) => itemIndex === index ? { ...item, value } : item);
   }
   return [...content, { key, type: "input", value }];
+};
+
+/** OvR task inputs accept JSON or objects. NC never owns a binary classifier.
+ *  Undefined when the map names no class: an emptied map is no destination. */
+export const parseOvrClassifierPaths = (value: unknown): Record<string, string> | undefined => {
+  let parsed = value;
+  if (typeof parsed === "string") {
+    try { parsed = JSON.parse(parsed); } catch { return undefined; }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const map = Object.fromEntries(Object.entries(parsed).filter(([name, path]) =>
+    name.trim().toLowerCase() !== "negative control" && typeof path === "string" && path.trim().length > 0,
+  ));
+  return Object.keys(map).length ? map : undefined;
 };

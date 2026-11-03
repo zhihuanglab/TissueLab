@@ -201,13 +201,14 @@ function pendingAddedClassNames(inputObject: Record<string, any>): Set<string> {
  * class with a one-vs-rest classifier attached — the tasknode runs each `.tlcls`
  * only `if c in name_to_idx`, so dropping the name silently ignored a classifier
  * the user attached (multiclass re-adds the classifier's own classes, OvR does not).
- * With nothing annotated anywhere the run is zero-shot and the organ owns the
- * taxonomy, so the list is left untouched.
+ * OvR keeps the full panel list: classes without binaries participate in the
+ * zero-shot fallback. With no annotations, the list is also left untouched.
  */
 export function restrictClassesToAnnotated(
   inputObject: Record<string, any>,
   nucleiClasses: ClassListRow[],
 ): void {
+  if (inputObject.classifier_mode === "one-vs-rest") return;
   if (!nucleiClasses.some(isAnnotated)) return;
   const justAdded = pendingAddedClassNames(inputObject);
   const hasClassifier = classesWithOwnClassifier(inputObject);

@@ -27,13 +27,14 @@ import {
   PatchClassificationData,
   selectPatchClassificationData,
   setPatchClassificationData,
+  setPatchNegativeCounts,
 } from "@/store/slices/viewer/annotationSlice";
 import { useRefreshGtHighlightIndices } from '@/hooks/viewer/useRefreshGtHighlightIndices';
 import eventBus from '@/utils/common/eventBus';
 import { apiFetch } from '@/utils/common/apiFetch'
 import { isSegmentationHandlerNotReadyError, segFetch } from '@/utils/common/segFetch';
 import { getErrorMessage } from '@/utils/common/apiResponse';
-import { isNegativeControl, mergePatchClassificationData, NEGATIVE_CONTROL_CLASS_NAME, NEGATIVE_CONTROL_COLOR, normalizePatchClassificationData } from "@/utils/agent/patchClassification.utils";
+import { isNegativeControl, mergePatchClassificationData, NEGATIVE_CONTROL_CLASS_NAME, NEGATIVE_CONTROL_COLOR, normalizePatchClassificationData, patchNegativeCountsFromPayload } from "@/utils/agent/patchClassification.utils";
 import { formatPath } from "@/utils/common/path.utils";
 ;
 import {
@@ -49,6 +50,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useDispatch, useSelector } from "react-redux";
 import { useActiveSlidePath } from "@/utils/viewer/slidePath";
 import { toast } from 'sonner';
+import { renameAnnotationClass } from "@/services/data.service";
 import { ClassificationFooter } from "./card/ClassificationFooter";
 import { ClassificationHeader } from "./card/ClassificationHeader";
 import { ClassifierStatusBanner } from "./card/ClassifierStatusBanner";
@@ -58,7 +60,9 @@ import {
   getClassifierDisplayBasename,
   getContentStringValue,
   hasClassifierLoaded,
+  parseOvrClassifierPaths,
   removeClassifierPathContent,
+  upsertContentStringValue,
 } from "@/utils/agent/workflow/panelContent";
 import { PatchClassificationPanelProps } from "@/types/workflow.types";
 import { InlineSpinner } from '@/components/assets/PageLoading';
@@ -99,14 +103,6 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
     }
     return {};
   }, [panel.content]);
-  const clearOvrClassifier = useCallback((className: string) => {
-    const map = { ...ovrClassifierPaths };
-    delete map[className];
-    const newContent = panel.content.some(it => it.key === 'classifier_paths')
-      ? panel.content.map(it => it.key === 'classifier_paths' ? { ...it, value: JSON.stringify(map) } : it)
-      : [...panel.content, { key: 'classifier_paths', type: 'input', value: JSON.stringify(map) }];
-    onContentChange(panel.id, { ...panel, content: newContent });
-  }, [ovrClassifierPaths, panel, onContentChange]);
   // One-vs-rest: per-class TRAIN+SAVE destinations, stored as JSON in panel.content
   // under `save_classifier_paths` ({className: absolutePath}). Assembled by the OvR
   // Save dialog; each class configured here will be trained + written on the next run.
@@ -125,9 +121,26 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
       : [...panel.content, { key: 'save_classifier_paths', type: 'input', value: JSON.stringify(map) }];
     onContentChange(panel.id, { ...panel, content: newContent });
   }, [ovrSaveClassifierPaths, panel, onContentChange]);
+
+  // Removing a class's classifier drops its save destination too, as the
+  // multiclass Clear drops both classifier_path and save_classifier_path:
+  // otherwise the next Update keeps training into — and predicting with — the
+  // file the user just removed.
+  const clearOvrClassifier = useCallback((className: string) => {
+    const load = { ...ovrClassifierPaths };
+    delete load[className];
+    let content = upsertContentStringValue(panel.content, 'classifier_paths', JSON.stringify(load));
+    if (className in ovrSaveClassifierPaths) {
+      const save = { ...ovrSaveClassifierPaths };
+      delete save[className];
+      content = upsertContentStringValue(content, 'save_classifier_paths', JSON.stringify(save));
+    }
+    onContentChange(panel.id, { ...panel, content });
+  }, [ovrClassifierPaths, ovrSaveClassifierPaths, panel, onContentChange]);
   const isOvrModePatch = classifierMode === "one-vs-rest";
   const dispatch = useDispatch<AppDispatch>();
   const patchClassificationData = useSelector(selectPatchClassificationData);
+  const patchNegativeCounts = useSelector((state: RootState) => state.annotations.patchNegativeCounts);
   const updatePatchAfterEveryAnnotation = useSelector((state: any) => state.workflow.updatePatchAfterEveryAnnotation as boolean);
   const patchClassifierPath = useSelector((state: any) => state.workflow.patchClassifierPath as string | null);
   const patchClassifierSavePath = useSelector((state: any) => state.workflow.patchClassifierSavePath as string | null);
@@ -258,6 +271,7 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
         class_hex_color: colors,
         class_counts: counts,
       } as any));
+      dispatch(setPatchNegativeCounts(patchNegativeCountsFromPayload(payload)));
     } catch (e) {
       if (!isSegmentationHandlerNotReadyError(e)) {
         console.warn('[PatchClassificationPanel] Failed to sync patch classes from backend in classifier mode', e);
@@ -502,6 +516,21 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
     };
   }, []);
 
+  // The marks' stored palette takes the new name now, so a mark made before the
+  // Update stays with the class.
+  const persistClassRename = (oldName: string, newName: string) => {
+    if (!pathWritable || !activeInstanceId) return;
+    const zarrPath = getDefaultOutputPath(currentPath || '');
+    if (!zarrPath) return;
+    renameAnnotationClass(activeInstanceId, zarrPath, 'patch', oldName, newName)
+      // The slide's results and counts took the new name: show them (a merge
+      // also moves patches between classes).
+      .then(() => { eventBus.emit('refresh-patches'); })
+      .catch((e) => {
+        console.error(`[PatchClassification] Failed to persist rename ${oldName} -> ${newName}:`, getErrorMessage(e, 'request failed'));
+      });
+  };
+
   const handleAddClass = () => {
     const currentData = normalizePatchClassificationData(patchClassificationData as PatchClassificationData);
     const nextData: PatchClassificationData = {
@@ -518,6 +547,7 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
       const newName = String(newClassName ?? "").trim();
       if (oldName && newName && oldName !== newName) {
         pendingRenameOpsRef.current.push({ from: oldName, to: newName });
+        persistClassRename(oldName, newName);
       }
     } else {
       const newId = nextData.class_id.length > 0 ? Math.max(...nextData.class_id) + 1 : 0;
@@ -606,6 +636,7 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
             : getDefaultPatchData();
         dispatch(setPatchClassificationData(baseline as PatchClassificationData));
         dispatch(clearPatchOverrides()); // wipe persisted manual-annotation color overrides, else refetch re-applies them
+        dispatch(setPatchNegativeCounts({}));
         refreshGtHighlightIndices(currentPath);
         eventBus.emit('refresh-patches');
         setIsResetting(false);
@@ -652,6 +683,9 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
               : getDefaultPatchData();
           dispatch(setPatchClassificationData(baselineSnapshot));
           dispatch(clearPatchOverrides()); // wipe persisted manual-annotation color overrides, else refetch re-applies them
+          // The marks are gone; a refetch after a reset can come back with no
+          // classes at all and would not overwrite these.
+          dispatch(setPatchNegativeCounts({}));
           refreshGtHighlightIndices(currentPath);
 
           // Request fresh viewport patches from the clean handler.
@@ -768,8 +802,6 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
       targetPath = lastIndex !== -1 ? currentPath.substring(0, lastIndex) : (isWebMode ? '' : currentPath);
     }
     dispatch(clearSelectedModelForPath(targetPath));
-    // The update target is the selected classifier; clearing one clears both.
-    dispatch(setUpdateClassifier(false));
     const stripped = removeClassifierPathContent(panel.content).filter(
       (item) => item.key !== "classifier_display_name"
     );
@@ -802,8 +834,6 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
   };
 
   const patchPanelClassifierLoadPath = getContentStringValue(panel.content, "classifier_path");
-  const patchClassifierResolvedForUpdate =
-    Boolean(selectedModelForCurrentPath) || Boolean(patchPanelClassifierLoadPath?.trim());
 
   const handlePatchUpdate = useCallback(async () => {
     if (store.getState().workflow.isRunning) {
@@ -841,34 +871,13 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
         adds: pendingAddOpsRef.current,
       });
 
-      // One-vs-rest: derive a per-class save destination ({class: <dir>/<class>.tlcls})
-      // from the single save path so the tasknode trains one binary per class.
-      // Negative control is never an OvR target.
+      // One-vs-rest saves to the map the One-vs-Rest Save dialog wrote (only the
+      // chosen classes), else back into the per-class files the run loads — as the
+      // cell panel and the graph node do. A multiclass save_classifier_path left
+      // in the panel is no destination here. Negative control is never a target.
       const isOvr = classifierMode === "one-vs-rest";
-      // Prefer an explicit scoped map written by the One-vs-Rest Save dialog (train
-      // only the chosen classes); otherwise derive one path per class.
-      const explicitOvrSavePaths = (() => {
-        const v = panel.content.find(it => it.key === 'save_classifier_paths')?.value;
-        if (typeof v === 'string' && v) {
-          try { const o = JSON.parse(v); if (o && typeof o === 'object' && Object.keys(o).length) return o as Record<string, string>; } catch { /* ignore */ }
-        }
-        return undefined;
-      })();
-      const ovrSavePaths = !isOvr
-        ? undefined
-        : explicitOvrSavePaths ?? (finalSavePath
-            ? (() => {
-                const norm = finalSavePath.replace(/\\/g, "/");
-                const dir = norm.includes("/") ? norm.slice(0, norm.lastIndexOf("/")) : "";
-                const out: Record<string, string> = {};
-                for (const name of normalizedPatchData.class_name) {
-                  if (String(name).trim().toLowerCase() === "negative control") continue;
-                  const safe = String(name).replace(/[^\w.\- ]+/g, "_").replace(/\s+/g, "_").slice(0, 120) || "class";
-                  out[name] = dir ? `${dir}/${safe}.tlcls` : `${safe}.tlcls`;
-                }
-                return Object.keys(out).length ? out : undefined;
-              })()
-            : undefined);
+      const explicitOvrSavePaths = parseOvrClassifierPaths(
+        panel.content.find(it => it.key === 'save_classifier_paths')?.value);
       // Explicit per-class attachments the user Loaded onto rows (skip NC / blank).
       const ovrLoadPaths = isOvr
         ? (() => {
@@ -880,6 +889,7 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
             return Object.keys(out).length ? out : undefined;
           })()
         : undefined;
+      const ovrSavePaths = isOvr && updateClassifier ? explicitOvrSavePaths ?? ovrLoadPaths : undefined;
 
       const workflowPayload = {
         zarr_path: zarrPath,
@@ -888,8 +898,8 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
           input: {
             tissue_classes: normalizedPatchData.class_name,
             tissue_colors: normalizedPatchData.class_hex_color,
-            classifier_path: finalLoadPath,
-            save_classifier_path: finalSavePath,
+            classifier_path: isOvr ? null : finalLoadPath,
+            save_classifier_path: isOvr ? null : finalSavePath,
             classifier_mode: classifierMode,
             ...(ovrSavePaths ? { save_classifier_paths: ovrSavePaths } : {}),
             ...(ovrLoadPaths ? { classifier_paths: ovrLoadPaths } : {}),
@@ -927,6 +937,8 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
     normalizedPatchData.class_hex_color,
     graphStartWorkflow,
     patchClassifyNodeId,
+    classifierMode,
+    ovrClassifierPaths,
   ]);
 
   return (
@@ -938,13 +950,12 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
         updateClassifierId={`updateClassifier-${panel.id}`}
         updateClassifierChecked={updateClassifier}
         onUpdateClassifierChange={handleUpdateClassifierChange}
-        updateClassifierDisabled={!patchClassifierResolvedForUpdate}
         updateClassifierTitle={
           selectedModelForCurrentPath
             ? "Update the selected classifier"
             : patchPanelClassifierLoadPath
               ? "Update the classifier file loaded into this node (same path as load)"
-              : "No classifier selected"
+              : "Save updates when a classifier file or save destination is configured"
         }
         onAddClass={openAddClassModal}
         onReset={() => setShowResetConfirm(true)}
@@ -976,6 +987,8 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
               name={className}
               index={index}
               count={normalizedPatchData.class_counts?.[index] ?? 0}
+              negativeCount={patchNegativeCounts[className] ?? 0}
+              unit="patch"
               color={ensureHash(normalizedPatchData.class_hex_color[index])}
               isSelected={selectedClassIndex === index}
               isDeletable={pathWritable && !isNegativeControl(className)}
