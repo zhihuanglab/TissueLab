@@ -41,6 +41,7 @@ from app.config.zarr_config import (
 from app.config.zarr_compat import (
     open_zarr,
     open_zarr_cm,
+    zarr_lock,
     create_array,
     create_bytes_array,
     prepare_zarr_for_workflow,
@@ -854,6 +855,74 @@ def register_custom_node_endpoint(model_name: str, python_version: str,
             pass
     return ok
 
+
+def _align_annotation_palette(group_anno, kind, names, colors=None, *, dataset=None, existing=None, pin=True):
+    """Make every class in ``names`` part of the ``kind`` palette without changing
+    what earlier marks mean.
+
+    Each User-Annotations row stores an index into the palette pinned on the
+    group: ``k`` is "this IS class k", ``-(2 + k)`` is "NOT class k". The panel
+    sends its own class list with every save, and writing that list over the
+    pinned one re-labels every earlier mark whenever the order differs (a Tumor
+    mark read back as Stroma). So the pinned order is kept and a class it lacks
+    is appended; ``colors`` update the colours of the classes they name. Rows
+    are only re-indexed when one name is pinned twice (a class renamed to a name
+    already there); a classification run re-orders the palette to its own
+    classes, once per run (the tasknodes' _align_user_annotation_palette).
+    New marks index the returned list by name.
+
+    The rows live either on disk (``dataset``, the structured array) or in
+    memory (``existing``, ``{id: {'class': int, ...}}`` as save_patch holds
+    them). Returns ``(names, colors, reindexed)``: the palette now pinned (index
+    new marks against it) and whether any stored row changed. With in-memory
+    rows the caller passes ``pin=False`` and pins the palette after it has saved
+    them: pinned first, a failed save would leave old rows read through the new
+    palette.
+    """
+    given = [str(n) for n in names]
+    given_colors = [str(c) for c in (colors or [])][:len(given)]
+    given_colors += ['#aaaaaa'] * (len(given) - len(given_colors))
+    color_of = dict(zip(given, given_colors))
+    old_names, old_colors = read_user_anno_class_palette(group_anno, kind)
+    old_names = [str(n) for n in old_names]
+    names, colors = [], []
+    for i, n in enumerate(old_names + given):
+        if n not in names:
+            names.append(n)
+            colors.append(color_of.get(n) or (str(old_colors[i]) if i < len(old_colors) else '#aaaaaa'))
+    lut = np.array([names.index(n) for n in old_names], dtype=np.int64)
+    reindexed = False
+    if len(lut) and not np.array_equal(lut, np.arange(len(lut))):
+        def remap(c):
+            if 0 <= c < len(lut):
+                return int(lut[c])
+            if c <= -2 and -c - 2 < len(lut):
+                return -(2 + int(lut[-c - 2]))
+            return c
+        if existing is not None:
+            for ann in existing.values():
+                c = ann.get('class') if isinstance(ann, dict) else None
+                if isinstance(c, (int, np.integer)) and not isinstance(c, bool):
+                    ann['class'] = remap(int(c))
+                    reindexed = reindexed or ann['class'] != c
+        elif dataset is not None and dataset.shape and dataset.dtype.names and 'class' in dataset.dtype.names:
+            rows = dataset[:]
+            old = rows['class'].astype(np.int64)
+            new = old.copy()
+            pos = (old >= 0) & (old < len(lut))
+            new[pos] = lut[old[pos]]
+            neg = (old <= -2) & (-old - 2 < len(lut))
+            new[neg] = -(2 + lut[-old[neg] - 2])
+            if not np.array_equal(old, new):
+                rows['class'] = new
+                dataset[:] = rows
+                reindexed = True
+                logger.info(f"[palette] re-indexed {int(np.sum(old != new))} {kind} marks (duplicate class names merged)")
+    if pin:
+        write_user_anno_class_palette(group_anno, kind, names, colors)
+    return names, colors, reindexed
+
+
 def _get_annotation_dtype():
     """Get the structured array dtype for annotations.
     
@@ -969,29 +1038,39 @@ def load_patch_annotations(zarr_path: str, zarr_file=None) -> Dict[int, Dict[str
         return {}
     if arr.dtype.names is None or 'class' not in arr.dtype.names:
         return {}
-    result: Dict[int, Dict[str, Any]] = {}
-    for i in range(len(arr)):
-        cls = int(arr['class'][i])
-        if cls == -1:
-            continue
-        result[i] = {
-            'class': cls,
-            'color': int(arr['color'][i]) if 'color' in arr.dtype.names else -1,
-            'datetime': int(arr['datetime'][i]) if 'datetime' in arr.dtype.names else 0,
-            'method': str(arr['method'][i]) if 'method' in arr.dtype.names else '',
-            'annotator': str(arr['annotator'][i]) if 'annotator' in arr.dtype.names else '',
-        }
-    return result
+    # Only marked rows: the array has one row per patch, almost all unmarked.
+    # Columns are converted to Python values in one go, not cell by cell.
+    idx = np.flatnonzero(arr['class'] != -1)
+    rows = arr[idx]
+    names = arr.dtype.names
+
+    def column(field, default):
+        return rows[field].tolist() if field in names else [default] * len(idx)
+
+    return {
+        i: {'class': c, 'color': col, 'datetime': dt, 'method': str(m), 'annotator': str(a)}
+        for i, c, col, dt, m, a in zip(idx.tolist(), rows['class'].tolist(), column('color', -1),
+                                       column('datetime', 0), column('method', ''), column('annotator', ''))
+    }
 
 
-def save_patch_annotations(zarr_path: str, annotations: Dict[Any, Dict[str, Any]], n_patches: int = None, class_names: List[str] = None) -> None:
+def save_patch_annotations(zarr_path: str, annotations: Dict[Any, Dict[str, Any]], n_patches: int = None,
+                           class_names: List[str] = None, changed_ids=None) -> Dict[int, Dict[str, Any]]:
     """Persist patch annotations as a dense structured array under User-Annotations/patch.
 
-    ``annotations`` is a sparse ``{patch_id: ann_dict}`` (the in-memory form).
-    ``ann_dict['class']`` may be either an int class index (≥0) or a class
-    name string — pass ``class_names`` to enable name→index resolution; if not
-    provided, falls back to ``User-Annotations/patch.attrs.class_names`` then
+    ``annotations`` is a sparse ``{patch_id: ann_dict}`` (the in-memory form) holding
+    every mark. ``ann_dict['class']`` may be either an int class index (≥0) or a
+    class name string — pass ``class_names`` to enable name→index resolution; if
+    not provided, falls back to the pinned palette then
     ``Patch-Classification/classes/name``.
+
+    ``changed_ids`` names the rows this save set or removed. When the array on disk
+    already has this shape and dtype, only those rows are written: a save touches
+    a handful of patches, and rewriting the whole array re-compresses every chunk.
+    Without it (or after the palette re-indexed every row) the whole array is written.
+
+    Returns the marks as ``load_patch_annotations`` would read them back, so a
+    caller can refresh its cache without re-reading the array.
     """
     dtype = _get_annotation_dtype()
     if n_patches is None:
@@ -1014,14 +1093,16 @@ def save_patch_annotations(zarr_path: str, annotations: Dict[Any, Dict[str, Any]
             class_names = []
     name_to_idx = {n: i for i, n in enumerate(class_names or [])}
 
-    arr = np.zeros(n_patches, dtype=dtype)
-    if n_patches > 0:
-        arr['class'][:] = -1
-        arr['color'][:] = -1
-        for region in ('region_x1', 'region_y1', 'region_x2', 'region_y2'):
-            if region in arr.dtype.names:
-                arr[region][:] = -1
+    def as_int(value, default):
+        if isinstance(value, str):
+            return _hex_color_to_int(value)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
+    marks: Dict[int, Dict[str, Any]] = {}
+    stored_form = {'class', 'color', 'datetime', 'method', 'annotator'}
     for patch_id, ann in annotations.items():
         try:
             i = int(patch_id)
@@ -1030,33 +1111,57 @@ def save_patch_annotations(zarr_path: str, annotations: Dict[Any, Dict[str, Any]
         if i < 0 or i >= n_patches:
             continue
         cls_val = ann.get('class', -1)
-        if isinstance(cls_val, str):
-            cls_int = name_to_idx.get(cls_val, -1)
-        else:
-            try:
-                cls_int = int(cls_val)
-            except (TypeError, ValueError):
-                cls_int = -1
-        arr['class'][i] = cls_int
-        color_val = ann.get('color', -1)
-        if isinstance(color_val, str):
-            color_val = _hex_color_to_int(color_val)
-        try:
-            arr['color'][i] = int(color_val)
-        except (TypeError, ValueError):
-            arr['color'][i] = -1
-        try:
-            arr['datetime'][i] = int(ann.get('datetime', 0))
-        except (TypeError, ValueError):
-            arr['datetime'][i] = 0
-        arr['method'][i] = _truncate_field(str(ann.get('method', '')), 32, 'method')
-        arr['annotator'][i] = _truncate_field(str(ann.get('annotator', '')), 64, 'annotator')
+        # A mark loaded from the array is already in stored form: keep it as is
+        # (a save touches a few marks and carries every other one along).
+        if type(cls_val) is int and ann.keys() == stored_form and type(ann['color']) is int \
+                and type(ann['datetime']) is int:
+            if cls_val != -1:
+                marks[i] = ann
+            continue
+        cls_int = name_to_idx.get(cls_val, -1) if isinstance(cls_val, str) else as_int(cls_val, -1)
+        if cls_int == -1:
+            continue  # an empty row, as load_patch_annotations reads it
+        marks[i] = {
+            'class': cls_int,
+            'color': as_int(ann.get('color', -1), -1),
+            'datetime': as_int(ann.get('datetime', 0), 0),
+            'method': _truncate_field(str(ann.get('method', '')), 32, 'method'),
+            'annotator': _truncate_field(str(ann.get('annotator', '')), 64, 'annotator'),
+        }
+
+    empty_fields = [f for f in ('class', 'color', 'region_x1', 'region_y1', 'region_x2', 'region_y2')
+                    if f in dtype.names]
+
+    def rows_for(ids):
+        rows = np.zeros(len(ids), dtype=dtype)
+        for name in empty_fields:
+            rows[name] = -1
+        for j, i in enumerate(ids.tolist()):
+            m = marks.get(i)
+            if m is not None:
+                for name, value in m.items():
+                    rows[name][j] = value
+        return rows
 
     with open_zarr_cm(zarr_path, "a") as zf:
         ua = zf.require_group('User-Annotations')
-        if 'patch' in ua:
-            del ua['patch']
-        create_array(ua, 'patch', data=arr, dtype=dtype, overwrite=True)
+        ds = ua['patch'] if 'patch' in ua else None
+        if changed_ids is not None and ds is not None and ds.shape == (n_patches,) and ds.dtype == dtype:
+            ids = np.unique(np.asarray([int(i) for i in changed_ids], dtype=np.int64))
+            ids = ids[(ids >= 0) & (ids < n_patches)]
+            if ids.size:
+                ds.set_orthogonal_selection((ids,), rows_for(ids))
+        else:
+            arr = np.zeros(n_patches, dtype=dtype)
+            for name in empty_fields:
+                arr[name] = -1
+            if marks:
+                ids = np.fromiter(marks.keys(), dtype=np.int64, count=len(marks))
+                arr[ids] = rows_for(ids)
+            if ds is not None:
+                del ua['patch']
+            create_array(ua, 'patch', data=arr, dtype=dtype, overwrite=True)
+    return marks
 
 
 def _truncate_field(value: str, max_len: int, field_name: str) -> str:
@@ -1375,8 +1480,12 @@ def save_annotation(handler, req: dict, _background_tasks=None) -> dict:
             # Check if dataset exists and is in correct format
             needs_replacement = False
             if ds_name in group_anno:
-                # Verify it's a structured array with correct format
-                if group_anno.attrs.get('annotation_format') != 'structured':
+                # Replace only an array that really is not the structured format —
+                # judged by its dtype, not by a flag: mark-as-ground-truth creates
+                # the array with the flag on the array, not the group, and reading
+                # that as "wrong format" wiped every mark it had just written.
+                existing_fields = getattr(group_anno[ds_name].dtype, 'names', None) or ()
+                if not {'class', 'color'}.issubset(existing_fields):
                     logger.warning(f"[save_annotation] Dataset exists but format is not 'structured'. Expected structured array format.")
                     # Mark for safe replacement (atomic operation)
                     needs_replacement = True
@@ -1580,11 +1689,34 @@ def save_annotation(handler, req: dict, _background_tasks=None) -> dict:
 
             # Get structured array dataset
             annotations_dataset = group_anno[ds_name]
+            # The marks below index the panel's list; earlier marks index the
+            # pinned palette. Bring the two together before writing anything.
+            if not ui_nuclei_classes:
+                # No panel list (an empty panel): the pinned palette is the list, so
+                # earlier marks keep their classes and this save appends to it.
+                pinned, pinned_colors = read_user_anno_class_palette(group_anno, 'cell')
+                ui_nuclei_classes = list(pinned)
+                ui_nuclei_colors = list(pinned_colors) if len(pinned_colors or []) == len(pinned) \
+                    else ['#aaaaaa'] * len(pinned)
+                if not ui_nuclei_classes:
+                    # A palette built from nothing starts with Negative control, as
+                    # every list the panel sends does (marks are read against it).
+                    ui_nuclei_classes, ui_nuclei_colors = ["Negative control"], ["#aaaaaa"]
+            if ui_nuclei_classes:
+                ui_nuclei_classes, ui_nuclei_colors, _ = _align_annotation_palette(
+                    group_anno, 'cell', ui_nuclei_classes, ui_nuclei_colors, dataset=annotations_dataset)
+            ui_nuclei_colors = list(ui_nuclei_colors or [])
+            # A class the list does not have yet is added (as save_patch does),
+            # never read as another class's index.
+            for extra in ([classification] if classification else []) + list(exclude_classes or [])[:1]:
+                if isinstance(extra, str) and extra.strip() and extra not in ui_nuclei_classes:
+                    ui_nuclei_classes.append(extra)
+                    ui_nuclei_colors.append(color if (extra == classification and color) else '#aaaaaa')
 
             # Negative selection ("No" type): store in same array, cell_class = -(2 + class_index) so -2 = exclude class 0, -3 = exclude class 1, ...
             if (classification is None or (isinstance(classification, str) and (classification or "").strip() == "")) and exclude_classes and ui_nuclei_classes:
                 class_name_neg = exclude_classes[0]
-                class_index_neg = ui_nuclei_classes.index(class_name_neg) if class_name_neg in ui_nuclei_classes else 0
+                class_index_neg = ui_nuclei_classes.index(class_name_neg)
                 exclude_cell_class = -(2 + class_index_neg)
                 valid_indices_neg = np.array([int(i) for i in matching_indices if isinstance(i, (int, float)) and 0 <= int(i) < centroids_len], dtype=np.int64)
                 valid_indices_neg = np.unique(valid_indices_neg)
@@ -1605,7 +1737,32 @@ def save_annotation(handler, req: dict, _background_tasks=None) -> dict:
                     new_data_neg['datetime'] = now_ts
                     new_data_neg['method'] = method_neg
                     new_data_neg['annotator'] = annotator_neg
+                    # A cell that held an "is X" mark loses it: X's stored count drops.
+                    # (A contiguous read, as the positive path does: zarr v3 cannot
+                    # coordinate-index a structured array.)
+                    replaced_positive: Dict[str, int] = {}
+                    try:
+                        _lo, _hi = int(valid_indices_neg[0]), int(valid_indices_neg[-1]) + 1
+                        _old = np.asarray(annotations_dataset[_lo:_hi]['class'][valid_indices_neg - _lo])
+                        for k in _old[(_old >= 0) & (_old < len(ui_nuclei_classes))]:
+                            name = ui_nuclei_classes[int(k)]
+                            replaced_positive[name] = replaced_positive.get(name, 0) + 1
+                    except Exception as e:
+                        logger.warning(f"[save_annotation] Could not read the replaced marks: {e}")
                     annotations_dataset[valid_indices_neg] = new_data_neg
+                    if replaced_positive and "cell_class_counts" in group_anno:
+                        try:
+                            raw = group_anno["cell_class_counts"][()]
+                            counts = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray, np.bytes_)) else str(raw))
+                            for name, n in replaced_positive.items():
+                                if name in counts:
+                                    counts[name] = max(0, int(counts[name]) - n)
+                                    if counts[name] == 0:
+                                        del counts[name]
+                            _safe_replace_dataset(group_anno, "cell_class_counts",
+                                                  data=json.dumps(counts, ensure_ascii=False).encode("utf-8"))
+                        except Exception as e:
+                            logger.warning(f"[save_annotation] Could not update class counts after exclude: {e}")
                     # A negative/exclude selection is a drawn region too — record
                     # its shape (polygon, rectangle corners, or for a single
                     # excluded cell its own contour), same as a positive save.
@@ -1630,10 +1787,16 @@ def save_annotation(handler, req: dict, _background_tasks=None) -> dict:
                     if neg_geom:
                         _persist_selection_geometry(
                             group_anno, "cell", now_ts, method_neg, annotator_neg, neg_geom)
+                    # The rows above may name a class the list just gained.
+                    write_user_anno_class_palette(group_anno, 'cell', ui_nuclei_classes, ui_nuclei_colors)
                 handler.invalidate_user_counts_cache()
                 try:
                     if handler.zarr_file and os.path.exists(handler.zarr_file):
                         with open_zarr_cm(handler.zarr_file, 'r') as zarr_file:
+                            # The cells' earlier mark ("is X", or "not X" that retracted
+                            # X) no longer holds: start from the prediction again.
+                            from app.services.seg import restore_predicted_class_ids
+                            restore_predicted_class_ids(handler, zarr_file, valid_indices_neg)
                             handler._apply_manual_nuclei_annotations(zarr_file)
                 except Exception as e:
                     logger.warning(f"[save_annotation] Re-apply after exclude: {e}")
@@ -2113,117 +2276,137 @@ def save_patch(handler, req: dict, background_tasks=None):
     # ... (Rest of the Zarr saving logic using temp file - this part seems okay) ...
     # It correctly iterates through `matching_indices` and saves info to `tissue_annotations` dataset.
     try:
-        # Work directly with the zarr file without copying
-        with open_zarr_cm(zarr_path, "a") as zf:
-            # ... (get or create user_annotation group) ...
-            ann_group_path = "User-Annotations"
-            group_anno = zf.require_group(ann_group_path)
+        # Load, re-index, save the rows and pin their palette as one critical
+        # section: another save landing in between would read rows of one
+        # palette through the other and re-label them.
+        with zarr_lock(zarr_path):
+            # Work directly with the zarr file without copying
+            with open_zarr_cm(zarr_path, "a") as zf:
+                # ... (get or create user_annotation group) ...
+                ann_group_path = "User-Annotations"
+                group_anno = zf.require_group(ann_group_path)
 
-            # Load existing patch annotations as a sparse dict (helper handles
-            # the dense-structured-array unpacking under the hood).
-            existing_dict = load_patch_annotations(zarr_path)
-            existing_dict = {str(k): v for k, v in existing_dict.items()}
+                # Load existing patch annotations as a sparse dict (helper handles
+                # the dense-structured-array unpacking under the hood).
+                existing_dict = load_patch_annotations(zarr_path)
+                existing_dict = {str(k): v for k, v in existing_dict.items()}
 
-            # One ms-int timestamp for the whole save (shared by all patches in
-            # this region), matching cell's save_annotation. Written to each
-            # patch row's datetime AND used as the selection_geometry key, so
-            # the export can join the drawn shape back to its patch rows.
-            save_ts = int(datetime.now().timestamp() * 1000)
-            # Negative/weak patch selection: store the EXCLUDED class as
-            # -(2 + k) (k = its class index), mirroring cell's save_annotation,
-            # so it's recorded as a weak label instead of just removing the
-            # patch. Only when the excluded class resolves to an index.
-            neg_class_int = None
-            if exclude_classes and classification is None:
-                patch_names = [
-                    n.decode('utf-8') if isinstance(n, (bytes, bytearray)) else str(n)
-                    for n in (handler.patch_class_name
-                              if getattr(handler, 'patch_class_name', None) is not None else [])
-                ]
-                excl_name = str(exclude_classes[0])
-                if excl_name in patch_names:
-                    neg_class_int = -(2 + patch_names.index(excl_name))
-            for idx in matching_indices:
-                key = str(idx)
-                new_item = {
-                    "patch_ID": int(idx),
-                    # NAME string (resolved to index on save) for positives;
-                    # a pre-computed negative int for weak/exclude selections.
-                    "class": (neg_class_int if neg_class_int is not None else classification),
-                    "annotator": annotator,
-                    "datetime": save_ts,
-                    "method": method,
-                }
-                if exclude_classes:
-                    new_item["exclude_classes"] = list(exclude_classes)
-                if color and (classification is None or exclude_classes):
-                    new_item["color"] = color
-                if classification is None and neg_class_int is None:
-                    # No resolvable exclude target — treat as a removal.
-                    existing_dict.pop(key, None)
-                else:
-                    existing_dict[key] = new_item
+                # Resolve the class list + colors. Source priority:
+                #   1. Payload `tissue_classes` / `tissue_colors` from the frontend
+                #      panel — authoritative global ordering. The only source that
+                #      knows the user's intent before any zarr group exists.
+                #   2. handler.patch_class_name / patch_class_hex_color (canonical
+                #      mirror of Patch-Classification/classes after load_file).
+                #   3. The patch dataset's own attrs (`class_names`/`class_colors`).
+                tissue_class_names = []
+                tissue_class_colors = []
 
-            # Resolve the class list + colors. Source priority:
-            #   1. Payload `tissue_classes` / `tissue_colors` from the frontend
-            #      panel — authoritative global ordering. The only source that
-            #      knows the user's intent before any zarr group exists.
-            #   2. handler.patch_class_name / patch_class_hex_color (canonical
-            #      mirror of Patch-Classification/classes after load_file).
-            #   3. The patch dataset's own attrs (`class_names`/`class_colors`).
-            tissue_class_names = []
-            tissue_class_colors = []
+                ui_tissue_classes = req.get('tissue_classes')
+                ui_tissue_colors = req.get('tissue_colors')
+                if isinstance(ui_tissue_classes, list) and ui_tissue_classes:
+                    tissue_class_names = [str(n) for n in ui_tissue_classes]
+                    if isinstance(ui_tissue_colors, list) and ui_tissue_colors:
+                        tissue_class_colors = [str(c) for c in ui_tissue_colors]
 
-            ui_tissue_classes = req.get('tissue_classes')
-            ui_tissue_colors = req.get('tissue_colors')
-            if isinstance(ui_tissue_classes, list) and ui_tissue_classes:
-                tissue_class_names = [str(n) for n in ui_tissue_classes]
-                if isinstance(ui_tissue_colors, list) and ui_tissue_colors:
-                    tissue_class_colors = [str(c) for c in ui_tissue_colors]
-
-            if not tissue_class_names and getattr(handler, 'patch_class_name', None) is not None:
-                tissue_class_names = [
-                    n.decode('utf-8') if isinstance(n, bytes) else str(n)
-                    for n in (handler.patch_class_name.tolist() if hasattr(handler.patch_class_name, 'tolist') else handler.patch_class_name)
-                ]
-                if getattr(handler, 'patch_class_hex_color', None) is not None:
-                    tissue_class_colors = [
-                        c.decode('utf-8') if isinstance(c, bytes) else str(c)
-                        for c in (handler.patch_class_hex_color.tolist() if hasattr(handler.patch_class_hex_color, 'tolist') else handler.patch_class_hex_color)
+                if not tissue_class_names and getattr(handler, 'patch_class_name', None) is not None:
+                    tissue_class_names = [
+                        n.decode('utf-8') if isinstance(n, bytes) else str(n)
+                        for n in (handler.patch_class_name.tolist() if hasattr(handler.patch_class_name, 'tolist') else handler.patch_class_name)
                     ]
+                    if getattr(handler, 'patch_class_hex_color', None) is not None:
+                        tissue_class_colors = [
+                            c.decode('utf-8') if isinstance(c, bytes) else str(c)
+                            for c in (handler.patch_class_hex_color.tolist() if hasattr(handler.patch_class_hex_color, 'tolist') else handler.patch_class_hex_color)
+                        ]
 
-            if not tissue_class_names:
-                tissue_class_names, tissue_class_colors = read_user_anno_class_palette(group_anno, 'patch')
+                if not tissue_class_names:
+                    tissue_class_names, tissue_class_colors = read_user_anno_class_palette(group_anno, 'patch')
 
-            # Pad / truncate colors to match names.
-            while len(tissue_class_colors) < len(tissue_class_names):
-                tissue_class_colors.append('#aaaaaa')
-            tissue_class_colors = tissue_class_colors[:len(tissue_class_names)]
+                # Pad / truncate colors to match names.
+                while len(tissue_class_colors) < len(tissue_class_names):
+                    tissue_class_colors.append('#aaaaaa')
+                tissue_class_colors = tissue_class_colors[:len(tissue_class_names)]
 
-            if classification is not None:
-                if classification not in tissue_class_names:
-                    tissue_class_names.append(classification)
-                    tissue_class_colors.append(color or '#aaaaaa')
-                else:
-                    idx = tissue_class_names.index(classification)
-                    if color and idx < len(tissue_class_colors) and color != tissue_class_colors[idx]:
-                        tissue_class_colors[idx] = color
+                if classification is not None:
+                    if classification not in tissue_class_names:
+                        tissue_class_names.append(classification)
+                        tissue_class_colors.append(color or '#aaaaaa')
+                    else:
+                        idx = tissue_class_names.index(classification)
+                        if color and idx < len(tissue_class_colors) and color != tissue_class_colors[idx]:
+                            tissue_class_colors[idx] = color
 
-        # Now persist the updated dict as a dense structured array. We exit the
-        # 'with zarr.open' block first so save_patch_annotations can open the
-        # store on its own (it manages its own context).
-        save_patch_annotations(zarr_path, existing_dict, class_names=tissue_class_names)
-        # Pin patch palette on the PARENT User-Annotations group attrs under
-        # `patch_class_names` / `patch_class_colors` (v3). cell and patch
-        # palettes now sit side-by-side on one group's .zattrs instead of
-        # patch hiding on the subarray attrs.
-        try:
-            with open_zarr_cm(zarr_path, "a") as zf2:
-                write_user_anno_class_palette(
-                    zf2['User-Annotations'], 'patch', tissue_class_names, tissue_class_colors,
-                )
-        except Exception as attrs_err:
-            print(f"[save_patch] Warning: could not pin patch class attrs: {attrs_err}")
+                # existing_dict holds indices into the pinned palette; the new marks
+                # index tissue_class_names. Re-index the old ones by name first.
+                reindexed = False
+                if tissue_class_names:
+                    tissue_class_names, tissue_class_colors, reindexed = _align_annotation_palette(
+                        group_anno, 'patch', tissue_class_names, tissue_class_colors,
+                        existing=existing_dict, pin=False)
+
+                # Negative/weak patch selection ("not <class>"): store the EXCLUDED
+                # class as -(2 + k), mirroring cell's save_annotation. k indexes the
+                # same list the positives resolve against (and that is pinned as the
+                # patch palette below), so "not Tumor" cannot turn into "not Stroma"
+                # when the last classification run ordered its classes differently.
+                # A class the list does not have yet is added, as for a positive.
+                neg_class_int = None
+                if exclude_classes and classification is None:
+                    excl_name = str(exclude_classes[0])
+                    if excl_name not in tissue_class_names:
+                        tissue_class_names.append(excl_name)
+                        tissue_class_colors.append('#aaaaaa')
+                    neg_class_int = -(2 + tissue_class_names.index(excl_name))
+
+                # One ms-int timestamp for the whole save (shared by all patches in
+                # this region), matching cell's save_annotation. Written to each
+                # patch row's datetime AND used as the selection_geometry key, so
+                # the export can join the drawn shape back to its patch rows.
+                save_ts = int(datetime.now().timestamp() * 1000)
+                for idx in matching_indices:
+                    key = str(idx)
+                    new_item = {
+                        "patch_ID": int(idx),
+                        # NAME string (resolved to index on save) for positives;
+                        # a pre-computed negative int for weak/exclude selections.
+                        "class": (neg_class_int if neg_class_int is not None else classification),
+                        "annotator": annotator,
+                        "datetime": save_ts,
+                        "method": method,
+                    }
+                    if exclude_classes:
+                        new_item["exclude_classes"] = list(exclude_classes)
+                    if color and (classification is None or exclude_classes):
+                        new_item["color"] = color
+                    if classification is None and neg_class_int is None:
+                        # No resolvable exclude target — treat as a removal.
+                        existing_dict.pop(key, None)
+                    else:
+                        existing_dict[key] = new_item
+
+            # Now persist the updated dict as a dense structured array. We exit the
+            # 'with zarr.open' block first so save_patch_annotations can open the
+            # store on its own (it manages its own context).
+            saved_marks = save_patch_annotations(
+                zarr_path, existing_dict, class_names=tissue_class_names,
+                changed_ids=None if reindexed else matching_indices)
+            # Pin patch palette on the PARENT User-Annotations group attrs under
+            # `patch_class_names` / `patch_class_colors` (v3). cell and patch
+            # palettes now sit side-by-side on one group's .zattrs instead of
+            # patch hiding on the subarray attrs.
+            try:
+                with open_zarr_cm(zarr_path, "a") as zf2:
+                    write_user_anno_class_palette(
+                        zf2['User-Annotations'], 'patch', tissue_class_names, tissue_class_colors,
+                    )
+            except Exception as attrs_err:
+                print(f"[save_patch] Warning: could not pin patch class attrs: {attrs_err}")
+            # The viewer colours patches from handler.tissue_annotations (read when
+            # the slide opened); without this a new mark — positive or "not <class>"
+            # — would not show until the slide is reopened. Set under the store
+            # lock, so a concurrent save cannot leave its older snapshot last.
+            handler.tissue_annotations = saved_marks
+            handler.tissue_annotation_palette = list(tissue_class_names)
 
         # Persist the drawn selection geometry — rectangle AND polygon both
         # land in patch.attrs['selection_geometry'], symmetric with cell. A
@@ -2245,13 +2428,6 @@ def save_patch(handler, req: dict, background_tasks=None):
                     )
             except Exception as geom_err:
                 print(f"[save_patch] Warning: could not persist selection geometry: {geom_err}")
-
-        # Re-apply manual patch annotations on handler so next get_patches returns correct colors.
-        with open_zarr_cm(zarr_path, "a") as zf3:
-            try:
-                handler._apply_manual_patch_annotations(zf3)
-            except Exception as apply_err:
-                print(f"[save_patch] Warning: failed to re-apply manual patch annotations on handler: {apply_err}")
 
         # Work directly with zarr file - no need to replace
 
@@ -3131,7 +3307,8 @@ def _clear_user_annotation_kind(zf, kind: str) -> bool:
     if counts_key in ua:
         del ua[counts_key]
         removed = True
-    for attr in (f'{kind}_class_names', f'{kind}_class_colors'):
+    # The drawn shapes of those marks (keyed by save time) go with them.
+    for attr in (f'{kind}_class_names', f'{kind}_class_colors', f'{kind}_selection_geometry'):
         if attr in ua.attrs:
             del ua.attrs[attr]
             removed = True

@@ -39,6 +39,7 @@ from app.services.seg import (
     set_segmentation_types,
     update_class_color_service,
     update_patch_class_color_service,
+    rename_annotation_class_service,
     query_patches_in_viewport,
     get_segmentation_mask,
     list_mask_options,
@@ -665,6 +666,39 @@ async def update_class_color(
         raise HTTPException(status_code=500, detail=f"Error updating class color: {str(e)}")
 
 
+@seg_router.post("/v1/rename-annotation-class")
+async def rename_annotation_class(
+    request: Request,
+    kind: str = Body(..., description="'cell' or 'patch'"),
+    old_name: str = Body(..., description="The class's current name"),
+    new_name: str = Body(..., description="The class's new name"),
+):
+    """Rename a class in the palette the user's marks are stored against."""
+    try:
+        file_path = get_file_path(await request.json())
+        if not file_path:
+            raise HTTPException(status_code=400, detail="File path is required.")
+        handler, denied = _get_owned_handler(request)
+        if denied is not None:
+            return denied
+        _, denied = await guard_write_path_async(request, file_path, "rename annotation class")
+        if denied is not None:
+            return denied
+        result = await asyncio.to_thread(
+            rename_annotation_class_service, handler, kind, old_name, new_name, file_path
+        )
+        return success_response(result)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error renaming class: {str(e)}")
+
+
 @seg_router.post("/v1/update-patch-class-color")
 async def update_patch_class_color(
     request: Request,
@@ -1156,14 +1190,19 @@ def patch_classification(request: Request):
         handler, denied = _get_owned_handler(request)
         if denied is not None:
             return denied
-        class_id, class_name, class_hex_color, class_counts = handler.get_patch_classification()
+        # "Not <class>" marks per class, keyed by name: the panel edits its class
+        # list locally (adds, deletes, renames), so an index-aligned list would
+        # drift; a name finds its row whatever the order.
+        class_id, class_name, class_hex_color, class_counts, negative_counts = \
+            handler.get_patch_classification(with_negatives=True)
 
         # The data needs to be wrapped in a 'data' key for the frontend
         response_data = {
             "class_id": class_id,
             "class_name": class_name,
             "class_hex_color": class_hex_color,
-            "class_counts": class_counts
+            "class_counts": class_counts,
+            "negative_class_counts_by_name": negative_counts,
         }
         return success_response(response_data)
 
@@ -1803,9 +1842,10 @@ def classifier_file_model_names(request: Request, body: dict = Body(...)):
                     and 0 < os.path.getsize(abs_path) <= 50 * 1024 * 1024
                 ):
                     import xgboost as xgb
-                    clf = xgb.XGBClassifier()
-                    clf.load_model(abs_path)
-                    _booster = clf.get_booster()
+                    # The bare Booster: XGBClassifier needs scikit-learn, which
+                    # the packaged service does not ship.
+                    _booster = xgb.Booster()
+                    _booster.load_model(abs_path)
                     model_name = (_booster.attr("model_name") or "").strip()
                     _inh = _booster.attr("inherit_from")
                     if _inh:

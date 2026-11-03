@@ -62,6 +62,12 @@ from app.utils.bundle import load_catalog as service_load_catalog
 from app.utils.bundle import start_bundle_install as service_start_bundle_install
 from app.utils.common.request import get_client_ip
 from app.utils.workflow.model_store import model_store
+from app.utils.workflow.ovr_classifiers import (
+    OVR_NON_BINARY_ERROR_CODE,
+    non_binary_ovr_classifiers,
+    non_binary_ovr_message,
+)
+from app.utils.workflow.path_fields import convert_paths_recursive
 from app.utils.workflow.register import (
     list_available_conda_envs,
     stop_custom_node_env,
@@ -381,27 +387,29 @@ class ClearWorkflowRequest(BaseModel):
     workflow_id: Optional[int] = None
 
 def _patch_dict_paths(req: dict):
-    for key in ["zarr_path", "file_path", "path", "classifier_path", "save_classifier_path"]:
-        if key in req and isinstance(req[key], str):
-            req[key] = resolve_path(req[key])
-    return req
+    return convert_paths_recursive(req, resolve_path)
 
 # function to patch paths recursively
 
 def patch_paths_recursive(obj):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k in ["zarr_path", "file_path", "path", "classifier_path", "save_classifier_path"] and isinstance(v, str):
-                obj[k] = resolve_path(v)
-            else:
-                patch_paths_recursive(v)
-    elif isinstance(obj, list):
-        for item in obj:
-            patch_paths_recursive(item)
-    return obj
+    return convert_paths_recursive(obj, resolve_path)
 
 
-def _patch_batch_items(raw_items: list, request: Request):
+async def _non_binary_ovr_response(payloads: list):
+    """400 listing the non-binary classifiers attached in One-vs-Rest mode, or
+    None. `data.classifiers` drives the frontend's replace-classifier dialog."""
+    problems = await asyncio.to_thread(non_binary_ovr_classifiers, payloads)
+    if not problems:
+        return None
+    return error_response(
+        non_binary_ovr_message(problems),
+        code=400,
+        data={"classifiers": problems},
+        error_code=OVR_NON_BINARY_ERROR_CODE,
+    )
+
+
+async def _patch_batch_items(raw_items: list, request: Request):
     """Validate + path-patch start/append batch items. Returns (patched_list, error_response_or_None)."""
     patched_items = []
     for raw in raw_items:
@@ -418,6 +426,9 @@ def _patch_batch_items(raw_items: list, request: Request):
         if isinstance(payload, dict):
             payload = patch_paths_recursive(payload)
         patched_items.append({"path": path, "zarr_path": zarr_path, "payload": payload})
+    ovr_error = await _non_binary_ovr_response([item["payload"] for item in patched_items])
+    if ovr_error is not None:
+        return None, ovr_error
     return patched_items, None
 
 
@@ -640,7 +651,7 @@ async def start_batch(frontend_data: dict, request: Request, auth_user: AuthUser
     if not isinstance(raw_items, list) or not raw_items:
         return error_response("items must be a non-empty list", code=400)
 
-    patched_items, err = _patch_batch_items(raw_items, request)
+    patched_items, err = await _patch_batch_items(raw_items, request)
     if err is not None:
         return err
 
@@ -670,7 +681,7 @@ async def append_batch(frontend_data: dict, request: Request, auth_user: AuthUse
     if not isinstance(raw_items, list) or not raw_items:
         return error_response("items must be a non-empty list", code=400)
 
-    patched_items, err = _patch_batch_items(raw_items, request)
+    patched_items, err = await _patch_batch_items(raw_items, request)
     if err is not None:
         return err
 
@@ -757,6 +768,11 @@ async def start_workflow_from_frontend(frontend_data: dict, background_tasks: Ba
         return denied
     
     frontend_data = patch_paths_recursive(frontend_data)
+
+    # One-vs-Rest can't use a multiclass classifier; refuse before queueing.
+    ovr_error = await _non_binary_ovr_response([frontend_data])
+    if ovr_error is not None:
+        return ovr_error
     
     # Call service layer's start_workflow_from_frontend function with uid
     from app.services.tasks import start_workflow_from_frontend as service_start_workflow

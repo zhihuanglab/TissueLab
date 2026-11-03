@@ -1,5 +1,6 @@
 from collections import defaultdict, deque
 import asyncio
+import copy
 import logging
 import os
 import requests
@@ -15,6 +16,7 @@ from app.utils.workflow.register import (
     mark_node_executing,
     unmark_node_executing,
 )
+from app.utils.workflow.path_fields import convert_paths_recursive
 
 logger = logging.getLogger(__name__)
 
@@ -404,24 +406,10 @@ class TaskNodeManager:
             # Not a remote node or no mnt_path, return as-is
             return data
         
-        # Path fields that need conversion
-        path_fields = ["zarr_path", "file_path", "path", "classifier_path", "save_classifier_path"]
-        
-        if isinstance(data, dict):
-            converted = {}
-            for key, value in data.items():
-                if key in path_fields and isinstance(value, str):
-                    # Convert path
-                    converted[key] = self._convert_path_for_remote_node(value, mnt_path)
-                else:
-                    # Recursively process nested structures
-                    converted[key] = self._convert_paths_in_data(value, node_name)
-            return converted
-        elif isinstance(data, list):
-            return [self._convert_paths_in_data(item, node_name) for item in data]
-        else:
-            # Primitive type, return as-is
-            return data
+        return convert_paths_recursive(
+            copy.deepcopy(data),
+            lambda path: self._convert_path_for_remote_node(path, mnt_path),
+        )
 
     def cleanup(self):
         """Cleanup all node processes"""

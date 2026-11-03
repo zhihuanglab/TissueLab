@@ -335,10 +335,13 @@ class ZarrFileHandler:
                     parent_path = array_path.rsplit('/', 1)[0]
                     user_anno_group = self._get_object_by_path(parent_path)
                     if isinstance(user_anno_group, zarr.Group) and hasattr(user_anno_group, 'attrs'):
-                        # For tissue_annotations, use tissue_class_names; for nuclei_annotations, use class_names
+                        # The palette the marks index; legacy attrs on older stores.
+                        palette = self._user_anno_class_names(array_path, 'patch' if is_tissue_annotations else 'cell')
+                        if palette:
+                            result["class_names"] = palette
                         attr_name = 'tissue_class_names' if is_tissue_annotations else 'class_names'
                         
-                        if attr_name in user_anno_group.attrs:
+                        if not palette and attr_name in user_anno_group.attrs:
                             class_names_raw = user_anno_group.attrs[attr_name]
                             # Handle different formats
                             if isinstance(class_names_raw, (list, tuple)):
@@ -517,10 +520,32 @@ class ZarrFileHandler:
         except Exception as e:
             return f"<Cannot preview: {str(e)}>", [], 0
     
+    def _user_anno_class_names(self, array_path: Optional[str], kind: str) -> List[str]:
+        """The class palette the marks of User-Annotations/<kind> index (the
+        `<kind>_class_names` attrs on the group); [] when unknown."""
+        if not array_path or 'User-Annotations' not in array_path:
+            return []
+        try:
+            from app.config.zarr_config import read_user_anno_class_palette
+            group = self._get_object_by_path(array_path.rsplit('/', 1)[0])
+            if isinstance(group, zarr.Group):
+                return [str(n) for n in read_user_anno_class_palette(group, kind)[0]]
+        except Exception:
+            pass
+        return []
+
+    @staticmethod
+    def _mark_label(mark: int, class_names: List[str]) -> str:
+        """A mark as the user made it: "Tumor" for "is class k" (k >= 0),
+        "Not Tumor" for "not class k" (-(2 + k))."""
+        k = mark if mark >= 0 else -(mark + 2)
+        name = class_names[k] if 0 <= k < len(class_names) else str(k)
+        return name if mark >= 0 else f"Not {name}"
+
     def _get_nuclei_annotations_preview_paginated(self, array, page: int, limit: int, array_path: str = None) -> Tuple[Any, List[int], int]:
         """Special handling for User-Annotations/cell structured array.
         
-        Returns only valid annotations (cell_class >= 0 and cell_color >= 0) in a simplified format:
+        Returns only the marked cells ("is" and "not" marks) in a simplified format:
         - Each row is [cell_id, cell_class_name] where cell_class_name is the class name string
         - Total count only includes valid annotations, not all cells
         
@@ -547,8 +572,9 @@ class ZarrFileHandler:
             # legacy ones; surfaced as the 3rd preview column when available.
             annotator_data = full_array['annotator'] if 'annotator' in array.dtype.names else None
 
-            # Filter valid annotations: cell_class >= 0 and cell_color >= 0
-            valid_mask = (cell_class_ids >= 0) & (cell_color_data >= 0)
+            # Every mark: "is class k" (k >= 0) and "not class k" (-(2 + k));
+            # -1 is unmarked. Color is display only and may be unset.
+            valid_mask = cell_class_ids != -1
             valid_indices = np.where(valid_mask)[0]
             valid_class_ids = cell_class_ids[valid_indices]
             
@@ -558,39 +584,7 @@ class ZarrFileHandler:
             if total_valid_items == 0:
                 return [], [0, 3], 0
             
-            # Try to get class_names from user_annotation group attributes
-            class_names = None
-            if array_path:
-                try:
-                    # Extract parent group path (user_annotation)
-                    if 'User-Annotations' in array_path:
-                        # Get the user_annotation group
-                        parent_path = array_path.rsplit('/', 1)[0]  # Get path before /nuclei_annotations
-                        if parent_path.endswith('/user_annotation') or parent_path == 'User-Annotations':
-                            user_anno_group = self._get_object_by_path(parent_path)
-                            if isinstance(user_anno_group, zarr.Group) and hasattr(user_anno_group, 'attrs'):
-                                if 'class_names' in user_anno_group.attrs:
-                                    class_names_raw = user_anno_group.attrs['class_names']
-                                    # Handle different formats: list, numpy array, bytes
-                                    if isinstance(class_names_raw, (list, tuple)):
-                                        class_names = [str(name) for name in class_names_raw]
-                                    elif isinstance(class_names_raw, np.ndarray):
-                                        # Handle string arrays (bytes) or regular arrays
-                                        if class_names_raw.dtype.kind == 'S':  # String/bytes array
-                                            class_names = [name.decode('utf-8') if isinstance(name, bytes) else str(name) for name in class_names_raw]
-                                        else:
-                                            class_names = [str(name) for name in class_names_raw]
-                                    elif isinstance(class_names_raw, bytes):
-                                        # Try to decode as JSON or split by newline
-                                        try:
-                                            class_names = json.loads(class_names_raw.decode('utf-8'))
-                                        except:
-                                            class_names = [class_names_raw.decode('utf-8')]
-                                    else:
-                                        class_names = [str(class_names_raw)]
-                except Exception as e:
-                    # If we can't get class_names, continue with numeric IDs
-                    pass
+            class_names = self._user_anno_class_names(array_path, 'cell')
             
             # Calculate pagination indices for valid items
             start_idx = (page - 1) * limit
@@ -611,12 +605,7 @@ class ZarrFileHandler:
                 cell_id_int = int(cell_id)
                 class_id_int = int(class_id)
 
-                # Convert class_id to class_name if class_names is available
-                if class_names and 0 <= class_id_int < len(class_names):
-                    class_name = class_names[class_id_int]
-                else:
-                    # Fall back to numeric ID if class_names not available or out of range
-                    class_name = str(class_id_int)
+                class_name = self._mark_label(class_id_int, class_names)
 
                 # 3rd column: annotator (stored as the Firebase uid). Empty for
                 # legacy arrays that predate the field.
@@ -644,10 +633,12 @@ class ZarrFileHandler:
             patch_arr = array[:]
             if not (hasattr(patch_arr, 'dtype') and patch_arr.dtype.names and 'class' in patch_arr.dtype.names):
                 return [], [0, 3], 0
-            class_names = list(array.attrs.get('class_names') or [])
+            class_names = (self._user_anno_class_names(array_path, 'patch')
+                           or [str(n) for n in (array.attrs.get('class_names') or [])])
             class_field = patch_arr['class']
             annotator_field = patch_arr['annotator'] if 'annotator' in patch_arr.dtype.names else None
-            mask = class_field >= 0
+            # "Not class k" marks (-(2 + k)) are marks too; -1 is unmarked.
+            mask = class_field != -1
             valid_indices = np.where(mask)[0]
             total_valid_items = int(valid_indices.size)
             if total_valid_items == 0:
@@ -660,7 +651,7 @@ class ZarrFileHandler:
             converted_data = []
             for i in page_indices:
                 ci = int(class_field[i])
-                cls_name = class_names[ci] if 0 <= ci < len(class_names) else f"class_{ci}"
+                cls_name = self._mark_label(ci, class_names)
                 annotator = str(annotator_field[i]) if annotator_field is not None else ''
                 converted_data.append([int(i), cls_name, annotator])
             return converted_data, [len(converted_data), 3], total_valid_items
@@ -725,11 +716,11 @@ class ZarrFileHandler:
                 if 'class' not in array.dtype.names or 'color' not in array.dtype.names:
                     return {"success": False, "message": "Missing required fields (cell_class, cell_color)"}
                 
-                # A cell is annotated when it has a class (cell_class >= 0).
-                # cell_color is only a display attribute and may be unset, so it
-                # must not gate deletion — this keeps "annotated" consistent with
-                # how saved cells are read elsewhere (cell_class >= 0).
-                if full_array['class'][cell_id] < 0:
+                # A cell is annotated when it carries a mark: "is class k" (k >= 0)
+                # or "not class k" (-(2 + k)); -1 is unmarked. cell_color is only
+                # a display attribute and may be unset, so it must not gate
+                # deletion.
+                if full_array['class'][cell_id] == -1:
                     return {"success": False, "message": f"Cell {cell_id} is not annotated (already deleted or never annotated)"}
                 
                 # Get the old class name before deleting (for updating counts)
@@ -746,20 +737,12 @@ class ZarrFileHandler:
                     
                     if parent_path_clean in zf:
                         user_anno_group = zf[parent_path_clean]
-                        if isinstance(user_anno_group, zarr.Group) and hasattr(user_anno_group, 'attrs'):
-                            if 'class_names' in user_anno_group.attrs:
-                                class_names_raw = user_anno_group.attrs['class_names']
-                                # Handle different formats
-                                if isinstance(class_names_raw, (list, tuple)):
-                                    class_names = [str(name) for name in class_names_raw]
-                                elif isinstance(class_names_raw, np.ndarray):
-                                    if class_names_raw.dtype.kind == 'S':
-                                        class_names = [name.decode('utf-8') if isinstance(name, bytes) else str(name) for name in class_names_raw]
-                                    else:
-                                        class_names = [str(name) for name in class_names_raw]
-                                
-                                if class_names and 0 <= old_class_index < len(class_names):
-                                    old_class_name = class_names[old_class_index]
+                        if isinstance(user_anno_group, zarr.Group):
+                            # The marks index the cell palette pinned on the group.
+                            from app.config.zarr_config import read_user_anno_class_palette
+                            class_names, _ = read_user_anno_class_palette(user_anno_group, 'cell')
+                            if class_names and 0 <= old_class_index < len(class_names):
+                                old_class_name = class_names[old_class_index]
                 
                 # Delete the annotation by setting to -1
                 full_array['class'][cell_id] = -1
@@ -846,7 +829,21 @@ class ZarrFileHandler:
                         except Exception:
                             pass
                         pass
-                
+
+                # Every viewer of the slide shows the cell's prediction again and
+                # recounts, as a region clear does.
+                try:
+                    from app.services.seg import SegmentationHandler, restore_predicted_class_ids
+                    from app.services.seg_registry import iter_annotation_handlers
+                    for _, bound in iter_annotation_handlers():
+                        if bound is None or not getattr(bound, 'zarr_file', None) \
+                                or not SegmentationHandler._same_zarr_path(bound.zarr_file, self.file_path):
+                            continue
+                        restore_predicted_class_ids(bound, zf, [cell_id])
+                        bound.invalidate_user_counts_cache()
+                except Exception as e:
+                    print(f"[delete_nuclei_annotation] could not refresh the slide's viewers: {e}")
+
                 return {"success": True, "message": f"Annotation for cell {cell_id} deleted successfully"}
             
         except Exception as e:
@@ -902,317 +899,145 @@ class ZarrFileHandler:
                 if cell_id < 0 or cell_id >= array.size:
                     return {"success": False, "message": f"Cell ID {cell_id} out of range (0-{array.size-1})"}
                 
-                # Get class_names from user_annotation group to find the class index
-                class_names = None
-                if 'User-Annotations' in array_path:
-                    parent_path = array_path.rsplit('/', 1)[0]
-                    if parent_path.startswith('/'):
-                        parent_path_clean = parent_path[1:]
-                    else:
-                        parent_path_clean = parent_path
-                    
-                    if parent_path_clean in zf:
-                        user_anno_group = zf[parent_path_clean]
-                        if isinstance(user_anno_group, zarr.Group) and hasattr(user_anno_group, 'attrs'):
-                            if 'class_names' in user_anno_group.attrs:
-                                class_names_raw = user_anno_group.attrs['class_names']
-                                # Handle different formats
-                                if isinstance(class_names_raw, (list, tuple)):
-                                    class_names = [str(name) for name in class_names_raw]
-                                elif isinstance(class_names_raw, np.ndarray):
-                                    if class_names_raw.dtype.kind == 'S':
-                                        class_names = [name.decode('utf-8') if isinstance(name, bytes) else str(name) for name in class_names_raw]
-                                    else:
-                                        class_names = [str(name) for name in class_names_raw]
-                
+                # The marks index the cell palette pinned on the group.
+                parent_path_clean = array_path_clean.rsplit('/', 1)[0] if '/' in array_path_clean else ''
+                user_anno_group = zf[parent_path_clean] if parent_path_clean and parent_path_clean in zf else None
+                class_names, class_colors = [], []
+                if isinstance(user_anno_group, zarr.Group):
+                    from app.config.zarr_config import read_user_anno_class_palette
+                    class_names, class_colors = read_user_anno_class_palette(user_anno_group, 'cell')
+                    class_names = [str(n) for n in class_names]
                 if not class_names:
                     return {"success": False, "message": "Could not retrieve class names from metadata"}
-                
-                # Find the index of the new class name
-                try:
-                    new_class_index = class_names.index(new_class_name)
-                except ValueError:
+                if new_class_name not in class_names:
                     return {"success": False, "message": f"Class name '{new_class_name}' not found in available classes"}
-                
-                # Read the structured array
-                full_array = array[:]
-                
-                # Check required fields
+                new_class_index = class_names.index(new_class_name)
+
                 if 'class' not in array.dtype.names or 'color' not in array.dtype.names:
                     return {"success": False, "message": "Missing required fields (cell_class, cell_color)"}
-                
-                # Check if this cell is actually annotated
-                if full_array['class'][cell_id] < 0 or full_array['color'][cell_id] < 0:
+                row = array[cell_id:cell_id + 1]
+                old_mark = int(row['class'][0])
+                # Any mark can be changed ("not X" too: it becomes "is Y"); -1 is unmarked.
+                if old_mark == -1:
                     return {"success": False, "message": f"Cell {cell_id} is not annotated (cannot update unannotated cell)"}
-                
-                # Get the old class index and name before updating
-                old_class_index = int(full_array['class'][cell_id])
-                old_class_name = class_names[old_class_index] if 0 <= old_class_index < len(class_names) else None
-                
-                # Update the cell_class
-                full_array['class'][cell_id] = new_class_index
-                
-                # Write back to zarr
-                array[:] = full_array
-                
-                # Update class_counts in user_annotation group
+                if old_mark == new_class_index:
+                    return {"success": True, "message": f"Annotation for cell {cell_id} is already '{new_class_name}'"}
+                old_class_name = class_names[old_mark] if 0 <= old_mark < len(class_names) else None
+
+                from app.services.tasks import _hex_color_to_int
+                color = class_colors[new_class_index] if new_class_index < len(class_colors) else None
+                color_int = _hex_color_to_int(str(color)) if color else -1
+                row['class'][0] = new_class_index
+                row['color'][0] = color_int if color_int >= 0 else _hex_color_to_int("#808080")
+                array[cell_id:cell_id + 1] = row
+
+                # The positive-mark counts: the old class loses one, the new gains one.
                 try:
-                    if parent_path_clean in zf:
-                        user_anno_group = zf[parent_path_clean]
-                        if isinstance(user_anno_group, zarr.Group):
-                            counts_ds_name = "cell_class_counts"
-                            counts_dict = {}
-                            
-                            # Load existing counts
-                            if counts_ds_name in user_anno_group:
-                                counts_raw = user_anno_group[counts_ds_name][()]
-                                if counts_raw:
-                                    try:
-                                        if isinstance(counts_raw, bytes):
-                                            counts_dict = json.loads(counts_raw.decode("utf-8"))
-                                        else:
-                                            counts_dict = json.loads(counts_raw) if isinstance(counts_raw, str) else counts_raw
-                                    except Exception as e:
-                                        # If parsing fails, start fresh
-                                        counts_dict = {}
-                            
-                            # Decrement old class count
-                            if old_class_name:
-                                if old_class_name in counts_dict:
-                                    counts_dict[old_class_name] = max(0, counts_dict[old_class_name] - 1)
-                                    if counts_dict[old_class_name] == 0:
-                                        # Remove zero counts to keep dict clean
-                                        del counts_dict[old_class_name]
-                            
-                            # Increment new class count
-                            if new_class_name not in counts_dict:
-                                counts_dict[new_class_name] = 0
-                            counts_dict[new_class_name] = counts_dict[new_class_name] + 1
-                            
-                            # Save updated counts
-                            counts_out_str = json.dumps(counts_dict, ensure_ascii=False)
-                            counts_bytes = counts_out_str.encode("utf-8")
-                            
-                            if counts_ds_name in user_anno_group:
-                                existing_ds = user_anno_group[counts_ds_name]
-                                # Try to overwrite in-place if size allows
-                                if existing_ds.shape == () and len(counts_bytes) <= existing_ds.nbytes:
-                                    existing_ds[()] = counts_bytes
-                                else:
-                                    # Size mismatch - need to replace
-                                    del user_anno_group[counts_ds_name]
-                                    create_array(user_anno_group, counts_ds_name, data=np.array(counts_bytes, dtype=f"S{max(1, len(counts_bytes))}"), overwrite=True)
-                            else:
-                                # Create new dataset
-                                create_array(user_anno_group, counts_ds_name, data=np.array(counts_bytes, dtype=f"S{max(1, len(counts_bytes))}"), overwrite=True)
+                    counts_ds_name = "cell_class_counts"
+                    counts_dict = {}
+                    if counts_ds_name in user_anno_group:
+                        counts_raw = user_anno_group[counts_ds_name][()]
+                        if counts_raw:
+                            try:
+                                counts_dict = json.loads(counts_raw.decode("utf-8") if isinstance(counts_raw, (bytes, np.bytes_)) else str(counts_raw))
+                            except Exception:
+                                counts_dict = {}
+                    if old_class_name and old_class_name in counts_dict:
+                        counts_dict[old_class_name] = max(0, int(counts_dict[old_class_name]) - 1)
+                        if counts_dict[old_class_name] == 0:
+                            del counts_dict[old_class_name]
+                    counts_dict[new_class_name] = int(counts_dict.get(new_class_name, 0)) + 1
+                    counts_bytes = json.dumps(counts_dict, ensure_ascii=False).encode("utf-8")
+                    if counts_ds_name in user_anno_group:
+                        del user_anno_group[counts_ds_name]
+                    create_array(user_anno_group, counts_ds_name, data=np.array(counts_bytes, dtype=f"S{max(1, len(counts_bytes))}"), overwrite=True)
                 except Exception as e:
-                    # Log error but don't fail the update - the annotation was already updated
-                    # The counts will be recalculated on next save_annotation call
                     try:
                         logger.error(f"cell_class_counts update failed after class change: {e}", exc_info=True)
                     except Exception:
                         pass
-                    pass
-                
+
+                # Every viewer of the slide shows the cell as the new class.
+                try:
+                    from app.services.seg import SegmentationHandler
+                    from app.services.seg_registry import iter_annotation_handlers
+                    for _, bound in iter_annotation_handlers():
+                        if bound is None or not getattr(bound, 'zarr_file', None) \
+                                or not SegmentationHandler._same_zarr_path(bound.zarr_file, self.file_path):
+                            continue
+                        bound.invalidate_user_counts_cache()
+                        bound._apply_manual_nuclei_annotations(zf)
+                        if hasattr(bound, '_viewport_cache'):
+                            bound._viewport_cache.clear()
+                except Exception as e:
+                    print(f"[update_nuclei_annotation_class] could not refresh the slide's viewers: {e}")
+
                 return {"success": True, "message": f"Annotation for cell {cell_id} updated to '{new_class_name}' successfully"}
             
         except Exception as e:
             return {"success": False, "message": f"Error updating annotation: {str(e)}"}
     
     def _update_tissue_annotation_class(self, zf, array, array_path: str, patch_id: int, new_class_name: str) -> Dict[str, Any]:
-        """Update the tissue_class for a single tissue annotation (JSON format).
-        
-        Args:
-            zf: Open Zarr file object
-            array: The tissue_annotations array
-            array_path: Path to the tissue_annotations array
-            patch_id: The patch ID to update
-            new_class_name: The new class name to assign
-            
-        Returns:
-            Dict with success status and message
-        """
+        """Change a patch mark ("is X" or "not X") into "is ``new_class_name``"
+        in the structured User-Annotations/patch array, the way every patch-mark
+        write goes (load .. save under the store's lock, only that row written),
+        and show it in every viewer of the slide."""
         try:
-            # Read the JSON data
-            if hasattr(array, 'shape') and array.shape == ():
-                # Scalar array - use [()] to read
-                raw_data = array[()]
-            else:
-                raw_data = array[:]
-            
-            # Convert to JSON string
-            if isinstance(raw_data, bytes):
-                json_str = raw_data.decode('utf-8')
-            elif isinstance(raw_data, np.ndarray):
-                if raw_data.dtype.kind == 'S' or raw_data.dtype.kind == 'U':
-                    if raw_data.ndim == 0:
-                        json_str = str(raw_data.item())
-                    else:
-                        json_str = str(raw_data.flat[0])
-                    if isinstance(json_str, bytes):
-                        json_str = json_str.decode('utf-8')
-                else:
-                    json_str = str(raw_data.flat[0]) if raw_data.size > 0 else '{}'
-            elif isinstance(raw_data, str):
-                json_str = raw_data
-            else:
-                json_str = str(raw_data)
-            
-            # Parse JSON
-            try:
-                annotations_dict = json.loads(json_str)
-            except (json.JSONDecodeError, TypeError) as e:
-                return {"success": False, "message": f"Failed to parse tissue_annotations JSON: {str(e)}"}
-            
-            if not isinstance(annotations_dict, dict):
-                return {"success": False, "message": "tissue_annotations data is not a valid dictionary"}
-            
-            # Check if patch_id exists
-            patch_id_str = str(patch_id)
-            if patch_id_str not in annotations_dict:
-                return {"success": False, "message": f"Patch ID {patch_id} not found in annotations"}
-            
-            annotation_data = annotations_dict[patch_id_str]
-            if not isinstance(annotation_data, dict):
-                return {"success": False, "message": f"Invalid annotation data for patch {patch_id}"}
-            
-            # Get old class name
-            old_class_name = annotation_data.get('class', 'Unknown')
-            
-            # Update the tissue_class
-            annotation_data['class'] = new_class_name
-            
-            # Update the dictionary
-            annotations_dict[patch_id_str] = annotation_data
-            
-            # Convert back to JSON string
-            updated_json_str = json.dumps(annotations_dict, ensure_ascii=False)
-            
-            # Write back to zarr array
-            # For scalar arrays, we need to encode as bytes
-            encoded_bytes = updated_json_str.encode('utf-8')
-            
-            if hasattr(array, 'shape') and array.shape == ():
-                # Scalar array - encode and write
-                # Check if it fits in the array's dtype
-                if hasattr(array, 'dtype') and array.dtype.kind == 'S':
-                    max_len = array.dtype.itemsize
-                    if len(encoded_bytes) > max_len:
-                        # Need to recreate the dataset with larger size
-                        # Get the dataset name from the path
-                        dataset_name = array_path.rsplit('/', 1)[-1]
-                        parent_path = array_path.rsplit('/', 1)[0]
-                        if parent_path.startswith('/'):
-                            parent_path = parent_path[1:]
-                        
-                        if parent_path in zf:
-                            parent_group = zf[parent_path]
-                            # Delete old dataset and create new one with larger size
-                            # Add 50% buffer for future growth
-                            new_size = int(len(encoded_bytes) * 1.5)
-                            del parent_group[dataset_name]
-                            create_array(
-                                parent_group,
-                                dataset_name,
-                                data=np.array(encoded_bytes, dtype=f'S{new_size}'),
-                                overwrite=True,
-                            )
-                        else:
-                            return {"success": False, "message": f"Parent group not found: {parent_path}"}
-                    else:
-                        array[()] = encoded_bytes
-                else:
-                    array[()] = encoded_bytes
-            else:
-                # Regular array - encode and write
-                array[:] = encoded_bytes
-            
-            # Update patch_class_counts in user_annotation group
-            try:
-                parent_path = array_path.rsplit('/', 1)[0]
-                if parent_path.startswith('/'):
-                    parent_path_clean = parent_path[1:]
-                else:
-                    parent_path_clean = parent_path
-                
-                if parent_path_clean in zf:
-                    user_anno_group = zf[parent_path_clean]
-                    if isinstance(user_anno_group, zarr.Group):
-                        counts_ds_name = "patch_class_counts"
-                        counts_dict = {}
-                        
-                        # Load existing counts
-                        if counts_ds_name in user_anno_group:
-                            counts_dataset = user_anno_group[counts_ds_name]
-                            # Handle scalar array (0-dimensional)
-                            if hasattr(counts_dataset, 'shape') and counts_dataset.shape == ():
-                                counts_raw = counts_dataset[()]
-                            else:
-                                counts_raw = counts_dataset[:]
-                            
-                            if isinstance(counts_raw, bytes):
-                                counts_dict = json.loads(counts_raw.decode('utf-8'))
-                            elif isinstance(counts_raw, str):
-                                counts_dict = json.loads(counts_raw)
-                            elif isinstance(counts_raw, dict):
-                                counts_dict = counts_raw
-                            else:
-                                # Try to decode if it's a numpy array
-                                if isinstance(counts_raw, np.ndarray):
-                                    if counts_raw.dtype.kind == 'S' or counts_raw.dtype.kind == 'U':
-                                        if counts_raw.ndim == 0:
-                                            json_str = str(counts_raw.item())
-                                        else:
-                                            json_str = str(counts_raw.flat[0])
-                                        if isinstance(json_str, bytes):
-                                            json_str = json_str.decode('utf-8')
-                                        counts_dict = json.loads(json_str)
-                                    else:
-                                        counts_dict = {}
-                                else:
-                                    counts_dict = {}
+            from app.config.zarr_config import read_user_anno_class_palette
+            from app.services.tasks import load_patch_annotations, save_patch_annotations, _hex_color_to_int
+            parent_path_clean = array_path.strip('/').rsplit('/', 1)[0]
+            group = zf[parent_path_clean] if parent_path_clean in zf else None
+            class_names, class_colors = (read_user_anno_class_palette(group, 'patch')
+                                         if isinstance(group, zarr.Group) else ([], []))
+            class_names = [str(n) for n in class_names]
+            if new_class_name not in class_names:
+                return {"success": False, "message": f"Class name '{new_class_name}' not found in available classes"}
+            new_idx = class_names.index(new_class_name)
 
-                        # Update counts: decrement old class, increment new class
-                        if old_class_name and old_class_name in counts_dict:
-                            old_count = counts_dict[old_class_name]
-                            counts_dict[old_class_name] = max(0, old_count - 1)
+            with zarr_lock(self.file_path):
+                marks = load_patch_annotations(self.file_path) or {}
+                mark = marks.get(patch_id)
+                if not mark:
+                    return {"success": False, "message": f"Patch {patch_id} is not annotated (cannot update unannotated patch)"}
+                old = int(mark.get('class', -1))
+                if old == new_idx:
+                    return {"success": True, "message": f"Annotation for patch {patch_id} is already '{new_class_name}'"}
+                color = class_colors[new_idx] if new_idx < len(class_colors) else None
+                color_int = _hex_color_to_int(str(color)) if color else -1
+                marks[patch_id] = {**mark, 'class': new_idx,
+                                   'color': color_int if color_int >= 0 else _hex_color_to_int("#808080")}
+                saved = save_patch_annotations(self.file_path, marks, n_patches=int(array.shape[0]),
+                                               changed_ids=[patch_id])
 
-                        if new_class_name not in counts_dict:
-                            counts_dict[new_class_name] = 0
-                        counts_dict[new_class_name] = counts_dict[new_class_name] + 1
+                from app.services.seg import SegmentationHandler
+                from app.services.seg_registry import iter_annotation_handlers
+                for _, h in iter_annotation_handlers():
+                    if h is None or not getattr(h, 'zarr_file', None) \
+                            or not SegmentationHandler._same_zarr_path(h.zarr_file, self.file_path):
+                        continue
+                    h.tissue_annotations = dict(saved) if isinstance(saved, dict) else load_patch_annotations(self.file_path)
+                    h.invalidate_patch_counts_cache()
+                    if hasattr(h, '_viewport_cache'):
+                        try:
+                            h._viewport_cache.clear()
+                        except Exception:
+                            pass
 
-                        # Save updated counts
-                        counts_json = json.dumps(counts_dict, ensure_ascii=False)
-                        counts_bytes = counts_json.encode('utf-8')
-                        
-                        if counts_ds_name in user_anno_group:
-                            existing_ds = user_anno_group[counts_ds_name]
-                            # Try to overwrite in-place if size allows (for scalar arrays)
-                            if hasattr(existing_ds, 'shape') and existing_ds.shape == () and len(counts_bytes) <= existing_ds.nbytes:
-                                existing_ds[()] = counts_bytes
-                            else:
-                                # Size mismatch or not scalar - need to replace
-                                del user_anno_group[counts_ds_name]
-                                create_array(user_anno_group, counts_ds_name, data=np.array(counts_bytes, dtype=f"S{max(1, len(counts_bytes))}"), overwrite=True)
-                        else:
-                            # Create new dataset
-                            create_array(user_anno_group, counts_ds_name, data=np.array(counts_bytes, dtype=f"S{max(1, len(counts_bytes))}"), overwrite=True)
-            except Exception as e:
-                # Log but don't fail the update
-                print(f"[_update_tissue_annotation_class] Warning: Failed to update patch_class_counts: {e}")
-            
-            return {"success": True, "message": f"Updated annotation for patch {patch_id} from '{old_class_name}' to '{new_class_name}'"}
-            
+            old_label = self._mark_label(old, class_names)
+            return {"success": True, "message": f"Updated annotation for patch {patch_id} from '{old_label}' to '{new_class_name}'"}
+
         except Exception as e:
+            traceback.print_exc()
             return {"success": False, "message": f"Error updating tissue annotation: {str(e)}"}
     
     def _delete_patch_annotation(self, zf, array, array_path: str, patch_id: int) -> Dict[str, Any]:
-        """Delete a single patch annotation from the structured
-        User-Annotations/patch array.
+        """Delete a single patch mark ("is class k" or "not class k") from the
+        structured User-Annotations/patch array.
 
-        Mirrors the cell delete: resets the row to the unannotated placeholder
-        (class/color = -1, cleared metadata), writes back, prunes the row's
-        orphaned selection-geometry, and decrements patch_class_counts.
+        Goes the way every patch-mark removal goes (``_drop_patch_marks``): the
+        row is reset, its orphaned selection shape pruned, and every viewer of
+        the slide drops the mark and shows the patch's prediction again. Patch
+        counts are computed from the array, so they follow by themselves.
         """
         try:
             full_array = array[:]
@@ -1221,73 +1046,30 @@ class ZarrFileHandler:
                 return {"success": False, "message": "Not a structured patch array"}
             if patch_id < 0 or patch_id >= full_array.size:
                 return {"success": False, "message": f"Patch ID {patch_id} out of range (0-{full_array.size - 1})"}
-            if int(full_array['class'][patch_id]) < 0:
+            # -1 is unmarked; k >= 0 is "is class k", -(2 + k) is "not class k".
+            if int(full_array['class'][patch_id]) == -1:
                 return {"success": False, "message": f"Patch {patch_id} is not annotated (already deleted or never annotated)"}
 
-            old_class_index = int(full_array['class'][patch_id])
-            parent_path = array_path.rsplit('/', 1)[0]
-            parent_path_clean = parent_path[1:] if parent_path.startswith('/') else parent_path
-            user_anno_group = zf[parent_path_clean] if parent_path_clean in zf else None
-
-            # Resolve old class name (for the counts decrement) from the palette.
-            old_class_name = None
-            if user_anno_group is not None and hasattr(user_anno_group, 'attrs'):
-                raw_names = user_anno_group.attrs.get('patch_class_names') or user_anno_group.attrs.get('class_names')
-                if raw_names is not None:
-                    class_names = [str(n) for n in raw_names]
-                    if 0 <= old_class_index < len(class_names):
-                        old_class_name = class_names[old_class_index]
-
-            # Clear the row -> unannotated placeholder.
-            full_array['class'][patch_id] = -1
-            full_array['color'][patch_id] = -1
-            if 'annotator' in names:
-                full_array['annotator'][patch_id] = ''
-            if 'datetime' in names:
-                full_array['datetime'][patch_id] = 0
-            if 'method' in names:
-                full_array['method'][patch_id] = ''
-            array[:] = full_array
-
-            # Drop the deleted patch's now-orphan selection-geometry.
-            try:
-                from app.services.tasks import prune_orphan_selection_geometry
-                if user_anno_group is not None:
-                    prune_orphan_selection_geometry(user_anno_group, 'patch')
-            except Exception:
-                pass
-
-            # Decrement patch_class_counts for the removed class.
-            try:
-                if user_anno_group is not None and isinstance(user_anno_group, zarr.Group):
-                    counts_ds_name = "patch_class_counts"
-                    counts_dict = {}
-                    if counts_ds_name in user_anno_group:
-                        cd = user_anno_group[counts_ds_name]
-                        raw = cd[()] if (hasattr(cd, 'shape') and cd.shape == ()) else cd[:]
-                        if isinstance(raw, bytes):
-                            counts_dict = json.loads(raw.decode('utf-8'))
-                        elif isinstance(raw, str):
-                            counts_dict = json.loads(raw)
-                        elif isinstance(raw, np.ndarray) and raw.dtype.kind in ('S', 'U'):
-                            s = raw.item() if raw.ndim == 0 else raw.flat[0]
-                            counts_dict = json.loads(s.decode('utf-8') if isinstance(s, bytes) else str(s))
-                    if old_class_name and old_class_name in counts_dict:
-                        counts_dict[old_class_name] = max(0, counts_dict[old_class_name] - 1)
-                        if counts_dict[old_class_name] == 0:
-                            del counts_dict[old_class_name]
-                    counts_bytes = json.dumps(counts_dict, ensure_ascii=False).encode('utf-8')
-                    if counts_ds_name in user_anno_group:
-                        ex = user_anno_group[counts_ds_name]
-                        if hasattr(ex, 'shape') and ex.shape == () and len(counts_bytes) <= ex.nbytes:
-                            ex[()] = counts_bytes
-                        else:
-                            del user_anno_group[counts_ds_name]
-                            create_array(user_anno_group, counts_ds_name, data=np.array(counts_bytes, dtype=f"S{max(1, len(counts_bytes))}"), overwrite=True)
-                    else:
-                        create_array(user_anno_group, counts_ds_name, data=np.array(counts_bytes, dtype=f"S{max(1, len(counts_bytes))}"), overwrite=True)
-            except Exception as e:
-                print(f"[_delete_patch_annotation] Warning: Failed to update patch_class_counts: {e}")
+            from app.services.seg import SegmentationHandler, _drop_patch_marks
+            from app.services.seg_registry import iter_annotation_handlers
+            bound = [h for _, h in iter_annotation_handlers()
+                     if h is not None and getattr(h, 'zarr_file', None)
+                     and SegmentationHandler._same_zarr_path(h.zarr_file, self.file_path)]
+            # Under the store's lock (held by the caller): the first viewer's
+            # caches are updated by the drop, the others' right after.
+            removed, _ = _drop_patch_marks(bound[0] if bound else None, self.file_path, lambda _m, _p: [patch_id])
+            if not removed:
+                return {"success": False, "message": f"Patch {patch_id} is not annotated (already deleted or never annotated)"}
+            for h in bound[1:]:
+                if isinstance(getattr(h, 'tissue_annotations', None), dict):
+                    h.tissue_annotations.pop(patch_id, None)
+                    h.tissue_annotations.pop(str(patch_id), None)
+                h.invalidate_patch_counts_cache()
+                if hasattr(h, '_viewport_cache'):
+                    try:
+                        h._viewport_cache.clear()
+                    except Exception:
+                        pass
 
             return {"success": True, "message": f"Annotation for patch {patch_id} deleted successfully"}
 
