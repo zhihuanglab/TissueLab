@@ -23,8 +23,6 @@ export const useOpenSeadragonGestures = ({
   setMagnification
 }: UseOpenSeadragonGesturesProps) => {
   const trackerRef = useRef<any>(null);
-  const lastWheelTimeRef = useRef<number>(0);
-  const isGestureActiveRef = useRef<boolean>(false);
 
   useEffect(() => {
     if (annotatorInstance && viewerRef.current) {
@@ -40,17 +38,8 @@ export const useOpenSeadragonGestures = ({
         event.preventDefault();
         event.stopPropagation();
 
-        // Debounce wheel events to prevent rapid firing
-        const now = Date.now();
-        if (now - lastWheelTimeRef.current < 16) { // ~60fps
-          return;
-        }
-        lastWheelTimeRef.current = now;
-
-        // Mark that we're actively handling gestures
-        isGestureActiveRef.current = true;
-        // Set global flag to prevent viewport sync during gestures
-        (window as any).__isGestureActive = true;
+        // OSD merges target changes in its animation loop. Dropping input events
+        // here loses trackpad distance and makes high-rate gestures uneven.
 
         if (!viewer?.container) {
           return;
@@ -90,11 +79,6 @@ export const useOpenSeadragonGestures = ({
           // Don't call applyConstraints() to prevent automatic reset
           // viewer.viewport.applyConstraints();
           
-          // Reset gesture active flag after a longer delay to ensure all events are processed
-          setTimeout(() => {
-            isGestureActiveRef.current = false;
-            (window as any).__isGestureActive = false;
-          }, 300);
         } else if (trackpadGesture) {
           // Pan with trackpad gesture (no Ctrl key)
           const currentZoom = viewer.viewport.getZoom();
@@ -156,14 +140,16 @@ export const useOpenSeadragonGestures = ({
         });
 
         // viewport update the image bounds and zoom
-        const viewportUpdateHandler = () => {
+        let statusTimer: ReturnType<typeof setTimeout> | null = null;
+        const publishViewport = () => {
+          if (statusTimer !== null) clearTimeout(statusTimer);
+          statusTimer = null;
+          // Bail during teardown before accessing viewport/world.
+          if (!viewer.element) return;
           const bounds = viewer.viewport.getBounds();
           const tiledImage = viewer.world.getItemAt(0);
           const topLeft = tiledImage ? tiledImage.viewportToImageCoordinates(bounds.getTopLeft()) : viewer.viewport.viewportToImageCoordinates(bounds.getTopLeft());
           const bottomRight = tiledImage ? tiledImage.viewportToImageCoordinates(bounds.getBottomRight()) : viewer.viewport.viewportToImageCoordinates(bounds.getBottomRight());
-
-          // Bail during teardown.
-          if (!viewer.element) return;
 
           // A `coordinates` object was assembled here and never read. It cost a
           // getBoundingClientRect() — a forced layout — on every viewport
@@ -183,12 +169,20 @@ export const useOpenSeadragonGestures = ({
           const zoom = viewer.viewport.getZoom();
           setMagnification(zoom);
         };
+        const viewportUpdateHandler = () => {
+          // Image movement stays in OSD's animation loop; React status/sidebar
+          // consumers need at most 10Hz while moving, then the exact final state.
+          if (statusTimer === null) statusTimer = setTimeout(publishViewport, 100);
+        };
         
         viewer.addHandler('update-viewport', viewportUpdateHandler);
+        viewer.addHandler('animation-finish', publishViewport);
+        publishViewport();
 
         // Return cleanup function for both gestures and MouseTracker
         return () => {
           cleanupGestures();
+          if (statusTimer !== null) clearTimeout(statusTimer);
           if (trackerRef.current) {
             trackerRef.current.destroy();
             trackerRef.current = null;
@@ -196,6 +190,7 @@ export const useOpenSeadragonGestures = ({
           // Only remove the specific viewport handler we added
           if (viewer && viewportUpdateHandler) {
             viewer.removeHandler('update-viewport', viewportUpdateHandler);
+            viewer.removeHandler('animation-finish', publishViewport);
           }
         };
       }

@@ -554,17 +554,11 @@ async def handle_segmentation_message(
                     else:
                         set_annotation_handler(instance_id, existing_handler)
 
-                    # Sync session slide path for HTTP APIs that resolve via X-Instance-ID.
-                    try:
-                        from app.services.load import sessions, session_lock
-                        with session_lock:
-                            if instance_id in sessions:
-                                # Prefer canonical zarr path so HTTP/session match handler.zarr_file.
-                                sessions[instance_id]["current_file_path"] = file_path
-                    except Exception as e:
-                        logger.warning(
-                            f"WebSocket: Failed to sync session path for instance {instance_id}: {e}"
-                        )
+                    # The session path belongs to the slide reader. Keep the
+                    # sidecar path on the annotation handler: overwriting the
+                    # image path here breaks tile cache identity and makes an
+                    # idle reader reopen the .zarr directory as a slide. HTTP
+                    # segmentation APIs derive the sidecar with as_zarr_path.
 
                     stored_handler = get_annotation_handler(instance_id)
                     request_type = data.get("type")

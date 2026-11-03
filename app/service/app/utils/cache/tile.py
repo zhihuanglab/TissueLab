@@ -1,372 +1,208 @@
-#!/usr/bin/env python3
-"""
-Tile Cache Service for TissueLab AI Service
-Provides in-memory LRU caching for tiles
-"""
-
-import os
+"""Byte-bounded encoded tile cache. File I/O belongs to slide-open, never lookup."""
 import hashlib
 import json
-import time
+import os
 import threading
-import base64
-from typing import Dict, Optional, Tuple, Any, List
-from functools import lru_cache
+import time
+from app.tile_resources import default_cache_bytes, total_memory_bytes
 from collections import OrderedDict
+from typing import Any, Dict
 
-from app.core import logger
+# A cache entry is a plain tuple (data: bytes, created: float, path: str).
+# CPython stops tracking exact tuples of atomic values for garbage collection,
+# so a full cache adds nothing to each full collection's scan; a dataclass or
+# NamedTuple entry stays tracked and costs ~12 ms per collection at 130k tiles.
+_DATA, _CREATED, _PATH = 0, 1, 2
 
 
 class TileCacheService:
-    """In-memory LRU tile cache service"""
-    
-    def __init__(self, max_size: int = 1000, max_age_seconds: int = 3600):
-        """
-        Initialize tile cache service
-        
-        Args:
-            max_size: Maximum number of tiles to cache
-            max_age_seconds: Maximum age of cache entries in seconds
-        """
-        self.max_size = max_size
+    def __init__(self, max_size=1000, max_age_seconds=3600, max_bytes=128 * 1024 * 1024):
+        self.max_size = max(1, int(max_size))
         self.max_age_seconds = max_age_seconds
-        
-        # Thread safety
+        self.max_bytes = max(1, int(max_bytes))
         self._lock = threading.RLock()
-        
-        # LRU cache using OrderedDict
         self._cache = OrderedDict()
-        self._timestamps = {}
-        
-        # File hash cache to avoid recomputing hashes
+        self._keys_by_path = {}   # path -> keys of its cached tiles, for O(own tiles) clears
         self._file_hash_cache = {}
-        self._file_hash_timestamps = {}
-        
-        # Start cleanup thread
-        self._cleanup_thread = threading.Thread(target=self._periodic_cleanup, daemon=True)
-        self._cleanup_thread.start()
-        
-        logger.info(f"Tile cache service initialized with max_size={max_size}, max_age={max_age_seconds}s")
-    
-    def _generate_file_hash(self, file_path: str) -> str:
-        """Generate SHA-1 hash for file (optimized for large files with caching).
+        self._bytes = 0
+        self._revision = 0
 
-        Zarr stores are directories — never open them as binary files (Windows raises
-        PermissionError / Errno 13). Use dir metadata (+ zarr.json mtime when present).
+    @property
+    def revision(self):
+        """Cheap scheduling hint; misses can be reused until cache mutation.
+
+        Writers increment under the cache lock. Readers still validate file
+        identity and use locked cache lookups whenever this hint changes.
         """
-        if not os.path.exists(file_path):
-            return hashlib.sha1(file_path.encode()).hexdigest()
-        
-        try:
-            # Check if we have a cached hash for this file
-            current_time = time.time()
-            if (file_path in self._file_hash_cache and 
-                file_path in self._file_hash_timestamps and
-                current_time - self._file_hash_timestamps[file_path] < 300):  # 5 minute cache
-                return self._file_hash_cache[file_path]
-            
-            stat = os.stat(file_path)
-            file_size = stat.st_size
-            mtime = stat.st_mtime
+        return self._revision
 
-            # Directory store (Zarr / similar): sample metadata only.
-            if os.path.isdir(file_path):
-                marker_mtime = mtime
-                for marker in ('zarr.json', '.zgroup', '.zattrs'):
-                    marker_path = os.path.join(file_path, marker)
-                    try:
-                        if os.path.isfile(marker_path):
-                            marker_mtime = max(marker_mtime, os.path.getmtime(marker_path))
-                            break
-                    except OSError:
-                        continue
-                hash_input = f"{file_path}:dir:{file_size}:{mtime}:{marker_mtime}"
-                file_hash = hashlib.sha1(hash_input.encode()).hexdigest()
-                self._file_hash_cache[file_path] = file_hash
-                self._file_hash_timestamps[file_path] = current_time
-                return file_hash
+    @staticmethod
+    def _path(path):
+        return os.path.normcase(os.path.abspath(path))
 
-            # Regular file: size + mtime + first/last 8KB samples
-            with open(file_path, 'rb') as f:
-                first_chunk = f.read(8192)
-                if file_size > 16384:
-                    f.seek(-8192, 2)
-                    last_chunk = f.read(8192)
-                else:
-                    last_chunk = b''
-            
-            hash_input = f"{file_path}:{file_size}:{mtime}:{first_chunk.hex()}:{last_chunk.hex()}"
-            file_hash = hashlib.sha1(hash_input.encode()).hexdigest()
-            
-            self._file_hash_cache[file_path] = file_hash
-            self._file_hash_timestamps[file_path] = current_time
-            
-            return file_hash
-            
-        except Exception as e:
-            logger.warning(f"Failed to generate file hash for {file_path}: {e}")
-            # Fallback to simple path hash
-            return hashlib.sha1(file_path.encode()).hexdigest()
-    
-    def _generate_cache_key(self, file_path: str, level: int, col: int, row: int, 
-                           scale_factor: float = 1.0, color_mode: str = None, 
-                           channels: List[int] = None, colors: List[List[int]] = None) -> str:
-        """Generate cache key for tile parameters using file hash"""
-        # Get file hash instead of using file path
-        file_hash = self._generate_file_hash(file_path)
-        
-        # Create a hash of all parameters
-        key_data = {
-            'file_hash': file_hash,
-            'level': level,
-            'col': col,
-            'row': row,
-            'scale_factor': scale_factor,
-            'color_mode': color_mode,
-            'channels': channels or [],
-            'colors': colors or []
-        }
-        
-        key_string = json.dumps(key_data, sort_keys=True)
-        return hashlib.sha1(key_string.encode()).hexdigest()
-    
-    def _is_cache_valid(self, cache_key: str) -> bool:
-        """Check if cache entry is valid (not expired)"""
-        if cache_key not in self._timestamps:
+    def register_file(self, file_path):
+        """Refresh identity on open/reopen; invalidate changed files outside tile traffic.
+
+        No global cache lock is held while stat-ing a potentially slow network path.
+        On-disk mutation of an open slide requires reopening it (the reader itself
+        also retains pixels). Missing files raise here instead of caching an alias.
+        """
+        path = self._path(file_path)
+        stat = os.stat(path)
+        token = hashlib.sha1(f'{path}:{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}'.encode()).hexdigest()
+        with self._lock:
+            previous = self._file_hash_cache.get(path)
+            if previous != token:
+                self._revision += 1
+                self._clear_file_unlocked(path)
+                for alias in tuple(self._file_hash_cache):
+                    if alias.startswith(path + '_z') and alias[len(path)+2:].isdigit():
+                        self._clear_file_unlocked(alias)
+                        self._file_hash_cache[alias] = token
+            self._file_hash_cache[path] = token
+        return token
+
+    def identity(self, file_path):
+        path = self._path(file_path)
+        with self._lock:
+            # Compatibility for non-WSI callers: deterministic identity with no I/O.
+            return self._file_hash_cache.setdefault(path, hashlib.sha1(path.encode()).hexdigest())
+
+    def register_alias(self, alias, source):
+        path = self._path(alias)
+        with self._lock:
+            # Keep source identity and alias assignment atomic with file reopen.
+            token = self.identity(source)
+            previous = self._file_hash_cache.get(path)
+            if previous != token:
+                self._revision += 1
+                self._clear_file_unlocked(path)
+            self._file_hash_cache[path] = token
+
+    def _generate_cache_key(self, file_path, level, col, row, scale_factor=1.0,
+                            color_mode=None, channels=None, colors=None, *, identity=None):
+        data = [self._path(file_path), self.identity(file_path) if identity is None else identity, level, col, row,
+                float(scale_factor), color_mode, channels or [], colors or []]
+        return hashlib.sha1(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+    def _remove(self, key):
+        tile = self._cache.pop(key, None)
+        if tile is not None:
+            self._revision += 1
+            self._bytes -= len(tile[_DATA])
+            keys = self._keys_by_path.get(tile[_PATH])
+            if keys is not None:
+                keys.discard(key)
+                if not keys:
+                    del self._keys_by_path[tile[_PATH]]
+
+    def _get_cached_key(self, key):
+        # Caller owns _lock; reuse a prepared key during scheduler scans.
+        tile = self._cache.get(key)
+        if tile is None:
+            return None
+        if time.monotonic() - tile[_CREATED] > self.max_age_seconds:
+            self._remove(key)
+            return None
+        self._cache.move_to_end(key)
+        return tile[_DATA]
+
+    def bind_tile_lookup(self, file_path, level, col, row, scale_factor=1.0,
+                         color_mode=None, channels=None, colors=None, *, expected_identity):
+        """Bind one request's identity/key without repeated path/hash work.
+
+        Neither closure does filesystem I/O. Registration/clear invalidates
+        both closures; a cache write becomes visible on the next lookup.
+        """
+        path = self._path(file_path)
+        key = self._generate_cache_key(path, level, col, row, scale_factor,
+                                       color_mode, channels, colors, identity=expected_identity)
+        def current():
+            with self._lock:
+                return self._file_hash_cache.get(path) == expected_identity
+        def lookup():
+            with self._lock:
+                if self._file_hash_cache.get(path) != expected_identity:
+                    return None
+                return self._get_cached_key(key)
+        # The key covers file identity and every display parameter, so it also
+        # serves as the tile's HTTP validator.
+        return current, lookup, key
+
+    def get_cached_tile(self, file_path, level, col, row, scale_factor=1.0,
+                        color_mode=None, channels=None, colors=None):
+        with self._lock:
+            key = self._generate_cache_key(file_path, level, col, row, scale_factor,
+                                           color_mode, channels, colors)
+            return self._get_cached_key(key)
+
+    def cache_tile(self, file_path, level, col, row, scale_factor, color_mode,
+                   channels, colors, tile_bytes, *, expected_identity=None):
+        data = bytes(tile_bytes)
+        if len(data) > self.max_bytes:
             return False
-        
-        current_time = time.time()
-        return current_time - self._timestamps[cache_key] <= self.max_age_seconds
-    
-    def _move_to_end(self, cache_key: str):
-        """Move cache key to end (most recently used)"""
-        if cache_key in self._cache:
-            self._cache.move_to_end(cache_key)
-    
-    def _evict_oldest(self):
-        """Remove oldest cache entry"""
-        if self._cache:
-            oldest_key = next(iter(self._cache))
-            del self._cache[oldest_key]
-            if oldest_key in self._timestamps:
-                del self._timestamps[oldest_key]
-    
-    def get_cached_tile(self, file_path: str, level: int, col: int, row: int,
-                       scale_factor: float = 1.0, color_mode: str = None,
-                       channels: List[int] = None, colors: List[List[int]] = None) -> Optional[bytes]:
-        """
-        Get cached tile bytes
-        
-        Args:
-            file_path: Path to the source file
-            level: Tile level
-            col: Column index
-            row: Row index
-            scale_factor: Scale factor
-            color_mode: Color mode
-            channels: Channel indices
-            colors: Color values
-            
-        Returns:
-            Cached tile bytes if found and valid, None otherwise
-        """
         with self._lock:
-            try:
-                cache_key = self._generate_cache_key(
-                    file_path, level, col, row, scale_factor, color_mode, channels, colors
-                )
-                
-                if not self._is_cache_valid(cache_key):
-                    return None
-                
-                # Get tile bytes from memory cache
-                tile_bytes = self._cache.get(cache_key)
-                if tile_bytes is None:
-                    return None
-                
-                # Move to end (most recently used)
-                self._move_to_end(cache_key)
-                
-                logger.debug(f"Cache hit for tile: {cache_key}")
-                return tile_bytes
-                
-            except Exception as e:
-                logger.error(f"Failed to get cached tile: {e}", exc_info=e)
-                return None
-    
-    def cache_tile(self, file_path: str, level: int, col: int, row: int,
-                   scale_factor: float, color_mode: str, channels: List[int],
-                   colors: List[List[int]], tile_bytes: bytes) -> bool:
-        """
-        Cache tile bytes
-        
-        Args:
-            file_path: Path to the source file
-            level: Tile level
-            col: Column index
-            row: Row index
-            scale_factor: Scale factor
-            color_mode: Color mode
-            channels: Channel indices
-            colors: Color values
-            tile_bytes: Tile image bytes
-            
-        Returns:
-            True if successfully cached, False otherwise
-        """
-        with self._lock:
-            try:
-                cache_key = self._generate_cache_key(
-                    file_path, level, col, row, scale_factor, color_mode, channels, colors
-                )
-                
-                # Check if we need to evict old entries
-                while len(self._cache) >= self.max_size:
-                    self._evict_oldest()
-                
-                # Store tile bytes in memory cache
-                self._cache[cache_key] = tile_bytes
-                self._timestamps[cache_key] = time.time()
-                
-                # Move to end (most recently used)
-                self._move_to_end(cache_key)
-                
-                logger.debug(f"Cached tile: {cache_key}")
-                return True
-                
-            except Exception as e:
-                logger.error(f"Failed to cache tile: {e}", exc_info=e)
+            if expected_identity is not None and self.identity(file_path) != expected_identity:
                 return False
-    
-    def get_cached_tile_base64(self, file_path: str, level: int, col: int, row: int,
-                              scale_factor: float = 1.0, color_mode: str = None,
-                              channels: List[int] = None, colors: List[List[int]] = None) -> Optional[str]:
-        """
-        Get cached tile as base64 string
-        
-        Args:
-            file_path: Path to the source file
-            level: Tile level
-            col: Column index
-            row: Row index
-            scale_factor: Scale factor
-            color_mode: Color mode
-            channels: Channel indices
-            colors: Color values
-            
-        Returns:
-            Base64 encoded tile string if found and valid, None otherwise
-        """
-        tile_bytes = self.get_cached_tile(
-            file_path, level, col, row, scale_factor, color_mode, channels, colors
-        )
-        
-        if tile_bytes:
-            return base64.b64encode(tile_bytes).decode('utf-8')
-        return None
-    
-    def _periodic_cleanup(self):
-        """Periodic cleanup of expired cache entries"""
-        while True:
-            try:
-                time.sleep(300)  # Run every 5 minutes
-                self._cleanup_expired()
-            except Exception as e:
-                logger.error(f"Error in periodic cleanup: {e}", exc_info=e)
-    
-    def _cleanup_expired(self):
-        """Remove expired cache entries"""
+            key = self._generate_cache_key(file_path, level, col, row, scale_factor,
+                                           color_mode, channels, colors)
+            self._remove(key)
+            while self._cache and (len(self._cache) >= self.max_size or self._bytes + len(data) > self.max_bytes):
+                self._remove(next(iter(self._cache)))
+            path = self._path(file_path)
+            self._cache[key] = (data, time.monotonic(), path)
+            self._keys_by_path.setdefault(path, set()).add(key)
+            self._bytes += len(data)
+            self._revision += 1
+        return True
+
+    def _clear_file_unlocked(self, path):
+        # Only this file's entries: a scan of a full cache held the lock ~40 ms.
+        for key in tuple(self._keys_by_path.get(path, ())):
+            self._remove(key)
+
+    def clear_cache(self, file_path=None):
         with self._lock:
-            current_time = time.time()
-            expired_keys = []
-            
-            # Clean up tile cache
-            for cache_key, timestamp in self._timestamps.items():
-                if current_time - timestamp > self.max_age_seconds:
-                    expired_keys.append(cache_key)
-            
-            for cache_key in expired_keys:
-                if cache_key in self._cache:
-                    del self._cache[cache_key]
-                if cache_key in self._timestamps:
-                    del self._timestamps[cache_key]
-            
-            # Clean up file hash cache (older than 5 minutes)
-            expired_file_hashes = []
-            for file_path, timestamp in self._file_hash_timestamps.items():
-                if current_time - timestamp > 300:  # 5 minutes
-                    expired_file_hashes.append(file_path)
-            
-            for file_path in expired_file_hashes:
-                if file_path in self._file_hash_cache:
-                    del self._file_hash_cache[file_path]
-                if file_path in self._file_hash_timestamps:
-                    del self._file_hash_timestamps[file_path]
-            
-            if expired_keys or expired_file_hashes:
-                logger.info(f"Cleaned up {len(expired_keys)} expired cache entries and {len(expired_file_hashes)} file hashes")
-    
-    def clear_cache(self, file_path: str = None):
-        """
-        Clear cache entries
-        
-        Args:
-            file_path: If provided, clear only entries for this file. Otherwise clear all.
-        """
-        with self._lock:
-            if file_path:
-                # Clear entries for specific file
-                file_hash = self._generate_file_hash(file_path)
-                keys_to_remove = []
-                
-                for cache_key in self._cache.keys():
-                    # Check if cache key contains the file hash
-                    if file_hash in cache_key:
-                        keys_to_remove.append(cache_key)
-                
-                for key in keys_to_remove:
-                    if key in self._cache:
-                        del self._cache[key]
-                    if key in self._timestamps:
-                        del self._timestamps[key]
-                
-                # Also clear file hash cache for this file
-                if file_path in self._file_hash_cache:
-                    del self._file_hash_cache[file_path]
-                if file_path in self._file_hash_timestamps:
-                    del self._file_hash_timestamps[file_path]
-                
-                logger.info(f"Cleared cache for file: {file_path}")
+            self._revision += 1
+            if file_path is not None:
+                path = self._path(file_path)
+                # Z-layer aliases belong to the source file as well.
+                for candidate in tuple(self._file_hash_cache):
+                    if candidate == path or (candidate.startswith(path + '_z') and candidate[len(path)+2:].isdigit()):
+                        self._clear_file_unlocked(candidate)
+                        self._file_hash_cache.pop(candidate, None)
             else:
-                # Clear all entries
                 self._cache.clear()
-                self._timestamps.clear()
+                self._keys_by_path.clear()
                 self._file_hash_cache.clear()
-                self._file_hash_timestamps.clear()
-                logger.info("Cleared all cache entries")
-    
+                self._bytes = 0
+
     def get_cache_stats(self) -> Dict[str, Any]:
-        """Get cache statistics"""
         with self._lock:
-            total_entries = len(self._cache)
-            total_size_bytes = sum(len(tile_bytes) for tile_bytes in self._cache.values())
-            file_hash_entries = len(self._file_hash_cache)
-            
-            return {
-                'total_entries': total_entries,
-                'total_size_bytes': total_size_bytes,
-                'total_size_mb': total_size_bytes / (1024 * 1024),
-                'max_entries': self.max_size,
-                'max_age_seconds': self.max_age_seconds,
-                'file_hash_entries': file_hash_entries,
-                'cache_type': 'in_memory_lru_with_file_hash'
-            }
+            return dict(total_entries=len(self._cache), total_size_bytes=self._bytes,
+                        total_size_mb=self._bytes / (1024 * 1024), max_entries=self.max_size,
+                        max_size_bytes=self.max_bytes, max_age_seconds=self.max_age_seconds,
+                        file_hash_entries=len(self._file_hash_cache),
+                        cache_type='in_memory_lru_with_registered_file_identity')
 
 
-# Global tile cache instance with reasonable defaults
-_tile_cache = TileCacheService(max_size=500, max_age_seconds=3600)  # 500 tiles, 1 hour
+def _default_cache_bytes():
+    # 1/128 of RAM between 128 MB and 4 GB: unchanged on an 8 GB laptop, 4 GB
+    # on a 755 GB server, where 500 tiles were evicted by a few viewers.
+    try:
+        megabytes = int(os.environ['TL_TILE_CACHE_MB'])
+    except (KeyError, ValueError):
+        return default_cache_bytes(total_memory_bytes())
+    return max(16, megabytes) << 20
 
 
-def get_tile_cache() -> TileCacheService:
-    """Get the global tile cache instance"""
+_cache_bytes = _default_cache_bytes()
+# A 512 px JPEG tile is ~20-60 KB; the byte bound normally binds first.
+# Keys carry the file identity, so an old entry is never wrong, only cold: a
+# day lets viewers returning after a break hit; the byte bound limits memory.
+_tile_cache = TileCacheService(max_size=max(500, _cache_bytes // (32 << 10)), max_bytes=_cache_bytes,
+                               max_age_seconds=24 * 3600)
+
+
+def get_tile_cache():
     return _tile_cache

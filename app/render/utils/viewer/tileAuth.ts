@@ -106,6 +106,7 @@ export function guardTileSource(source: any): void {
 export function watchTileAuth(viewer: any, onToken?: (token: string) => void): () => void {
   let disposed = false;
   let phase: "idle" | "reading" | "forcing" = "idle";
+  let readAgain = false;
   let epoch = 0;
   // A tile was refused and no token has worked since.
   let refused = false;
@@ -141,12 +142,20 @@ export function watchTileAuth(viewer: any, onToken?: (token: string) => void): (
     const stale = epoch !== startEpoch;
     const changed = !stale && apply(token);
     phase = "idle";
+    // The network may return before an earlier offline Firebase call rejects.
+    // Preserve that wake signal so the failed read cannot consume it.
+    if (readAgain) {
+      readAgain = false;
+      void run("read");
+      return;
+    }
     // The same token came back but the server refuses it (revoked, clock skew).
     if (step === "read" && !stale && !changed && refused && forceAllowed()) void run("force");
   };
 
   const read = () => {
     if (phase === "idle") void run("read");
+    else readAgain = true;
   };
 
   const onTileFailed = (event: any) => {
@@ -181,6 +190,9 @@ export function watchTileAuth(viewer: any, onToken?: (token: string) => void): (
   viewer.addHandler("tile-load-failed", onTileFailed);
   viewer.addHandler("tile-loaded", onTileLoaded);
   document.addEventListener("visibilitychange", onVisible);
+  window.addEventListener("online", read);
+  window.addEventListener("pageshow", onVisible);
+  document.addEventListener("resume", onVisible);
   // A token pushed by Firebase is applied directly, whatever the phase.
   const unsubscribe = onAuthTokenChange(apply);
 
@@ -191,5 +203,8 @@ export function watchTileAuth(viewer: any, onToken?: (token: string) => void): (
     viewer.removeHandler("tile-load-failed", onTileFailed);
     viewer.removeHandler("tile-loaded", onTileLoaded);
     document.removeEventListener("visibilitychange", onVisible);
+    window.removeEventListener("online", read);
+    window.removeEventListener("pageshow", onVisible);
+    document.removeEventListener("resume", onVisible);
   };
 }

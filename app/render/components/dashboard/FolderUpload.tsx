@@ -105,10 +105,9 @@ const FolderUpload: React.FC<FolderUploadProps> = ({ onFolderSelect, onWsiUpload
       const uploadData = await uploadFilePath(relativePath);
       setUploadStatus('WSI file uploaded successfully. Loading slide...');
 
-      const loadData = await loadFileData(uploadData.fileName);
-      
-      // Create instance for the WSI
+      // Create the viewer instance before attaching its loading version.
       const instanceData = await createInstance(uploadData.fileName);
+      const loadData = await loadFileData(uploadData.fileName, instanceData);
       
       let fileInfo = {
         fileName: path.basename(relativePath.replace(/\\/g, '/')), // Normalize path separators
@@ -118,10 +117,7 @@ const FolderUpload: React.FC<FolderUploadProps> = ({ onFolderSelect, onWsiUpload
       // Replace current instance with new WSI data (overwrite current window)
       dispatch(replaceCurrentInstance({
         instanceId: instanceData.instanceId,
-        wsiInfo: {
-          ...loadData,
-          instanceId: instanceData.instanceId
-        },
+        wsiInfo: loadData,
         fileInfo: fileInfo
       }));
       

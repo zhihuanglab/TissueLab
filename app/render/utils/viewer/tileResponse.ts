@@ -37,6 +37,17 @@ export function isTileTokenRejection(request: XMLHttpRequest | null | undefined)
   return isTokenRejectionEnvelope(readTileEnvelope(request));
 }
 
+/**
+ * The backend no longer has this viewer's session (a service restart dropped
+ * it), or holds it at another tile epoch. tileSession restores the session and
+ * reloads the tiles, so neither is a permanent failure.
+ */
+export function isTileSessionLost(request: XMLHttpRequest | null | undefined): boolean {
+  if (!request) return false;
+  if (request.status === 409) return true;
+  return readTileEnvelope(request)?.data?.error_code === "INSTANCE_OWNER_MISMATCH";
+}
+
 // Codes that may pass: auth (a new token), timeout, rate limit.
 const RETRYABLE_4XX = new Set([401, 408, 429]);
 const isPermanentCode = (code: unknown): boolean =>
@@ -48,7 +59,7 @@ const isPermanentCode = (code: unknown): boolean =>
  * errors may pass, so they are not permanent.
  */
 export function isPermanentTileFailure(request: XMLHttpRequest | null | undefined): boolean {
-  if (!request) return false;
+  if (!request || isTileSessionLost(request)) return false;
   if (request.status !== 200) return isPermanentCode(request.status);
   const body = readTileEnvelope(request);
   if (!body) return false;

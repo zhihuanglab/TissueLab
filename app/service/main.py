@@ -64,6 +64,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 import uvicorn
 import asyncio
 import atexit
+import gc
 import signal
 from concurrent.futures import ThreadPoolExecutor
 import anyio.to_thread
@@ -191,6 +192,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[ERROR] Failed to start FastAPI service: {e}")
 
+    # A full collection holds the GIL, so it stalls the event loop whichever
+    # thread runs it. Move the ~100k objects built at startup (modules,
+    # settings, routes) out of the collector's reach: full collections then
+    # scan only what the service creates afterwards.
+    gc.collect()
+    gc.freeze()
+
     yield
 
     # Shutdown
@@ -257,6 +265,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["X-Download-Count"],  # Explicitly expose custom headers
+    # Let browsers reuse a preflight for an hour (as Google APIs do; Chrome caps
+    # at 2h) instead of Starlette's default 600s.
+    max_age=3600,
 )
 
 # middlewares

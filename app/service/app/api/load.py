@@ -155,6 +155,17 @@ def _guard_session(
         return _instance_access_denied(request, operation)
 
 
+def _tile_error_response(message: str, status_code: int) -> Response:
+    """Use the application envelope with HTTP failure status for OSD tile requests."""
+    response = error_response(message, code=status_code)
+    response.status_code = status_code
+    response.headers["Content-Type"] = "application/json"
+    response.headers["Cache-Control"] = "no-store"
+    if status_code >= 500:
+        response.headers["Retry-After"] = "1"
+    return response
+
+
 def _secure_jpeg_response(image_bytes: bytes, extra_headers: Optional[Dict[str, str]] = None) -> Response:
     """Create a JPEG response with the shared security headers."""
     headers = {
@@ -188,6 +199,8 @@ async def create_instance(request: Request):
         try:
             data = await _parse_json_body(request)
             file_path = data.get('file_path', '') or data.get('relative_path', '')
+            # Set by a viewer restoring its own instance after a service restart.
+            instance_id = data.get('instance_id') or None
         except ValueError:
             return error_response("Invalid JSON format", code=400)
 
@@ -202,9 +215,14 @@ async def create_instance(request: Request):
         # at 48 ms for a 1024x1024 test store, and a whole-slide image is
         # orders of magnitude larger.
         result = await asyncio.to_thread(
-            create_instance_from_path, authorized_path, uid=request_uid(request)
+            create_instance_from_path, authorized_path, uid=request_uid(request),
+            instance_id=instance_id,
         )
         if result["status"] == "error":
+            if result.get("http_status") == 403:
+                return _instance_access_denied(request, "create viewer instance")
+            if result.get("http_status"):
+                return error_response(result["message"], code=result["http_status"])
             return error_response(result["message"])
 
         return success_response(result)
@@ -363,6 +381,7 @@ def load_slide_with_session(filename: str, request: Request, session_id: str = "
         return success_response({
             "message": result["message"],
             "slideInfo": result["slideInfo"],
+            "tile_epoch": result["tile_epoch"],
         })
 
     except Exception as e:
@@ -414,10 +433,10 @@ async def get_tile_api_with_header(
     # classification colors) for the detail popup's second OSD layer.
     if overlay in ("cell", "patch"):
         from app.services.load import get_overlay_tile_for_api
-        from app.core.executors import tile_executor
-        # Opens the zarr and rasterises cells with PIL — same pool as base tiles.
+        from app.core.executors import overlay_executor
+        # Opens the zarr and rasterises cells with PIL — isolated from native image readers.
         result = await asyncio.get_running_loop().run_in_executor(
-            tile_executor,
+            overlay_executor,
             lambda: get_overlay_tile_for_api(
                 level, col_row, overlay, session_id=instance_id_final, dot_radius=dot
             ),
@@ -451,7 +470,7 @@ async def get_tile_api_with_session(
         # can still save work; once the job is on a pool thread it runs to
         # completion regardless.
         if await request.is_disconnected():
-            return Response(status_code=499)
+            return _tile_error_response("Tile request disconnected", 499)
 
         result = await get_tile_for_api(
             level=level,
@@ -460,24 +479,40 @@ async def get_tile_api_with_session(
             color_mode=color_mode,
             query_params=request.query_params,
             session_id=session_id,
+            disconnected=request.is_disconnected,
+            if_none_match=request.headers.get("if-none-match"),
+            tile_priority=request.headers.get("x-tile-priority"),
+            tile_distance=request.headers.get("x-tile-distance"),
         )
+        # With content_epoch the URL names fixed pixels: a path change or an
+        # on-disk rewrite bumps the epoch (set_session_file_path), and a
+        # request for an old epoch is answered 409, never with pixels. Browsers
+        # may then reuse the tile for a day without asking. Without it, they
+        # revalidate each time; the ETag (file identity + display parameters)
+        # answers 304 without decoding or sending pixels.
+        cache_headers = None
+        if result.get("etag"):
+            freshness = "private, max-age=86400" if "content_epoch" in request.query_params else "private, no-cache"
+            cache_headers = {"ETag": result["etag"], "Cache-Control": freshness}
+        if result["status"] == "not_modified":
+            return Response(status_code=304, headers=cache_headers)
         # Slide switched while this was queued. 409 rather than an error body:
         # nothing is wrong, the tile just belongs to a slide nobody is showing,
         # and the viewer discards it without logging a failure.
         if result["status"] == "stale":
-            return Response(status_code=409)
+            return _tile_error_response(result.get("message", "Tile request is stale"), 409)
 
         if result["status"] == "error":
-            return error_response(result["message"])
+            return _tile_error_response(result["message"], result.get("http_status", 500))
 
         if "image_data" not in result or not result["image_data"]:
-            return error_response("Empty image data returned")
+            return _tile_error_response("Empty image data returned", 500)
 
-        return _secure_jpeg_response(result["image_data"])
+        return _secure_jpeg_response(result["image_data"], cache_headers)
 
-    except Exception as e:
+    except Exception:
         traceback.print_exc()
-        return error_response(f"Error getting tile: {str(e)}")
+        return _tile_error_response("Error getting tile", 500)
 
 @load_router.get("/v1/pyramid")
 def get_pyramid(request: Request):

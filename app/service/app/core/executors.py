@@ -1,17 +1,16 @@
 """Shared thread pools for slide-scoped blocking work.
 
-Tile reads use ``loop.run_in_executor(None, ...)`` — and so does
-``asyncio.to_thread``. Opening a slide fires a tile burst that fills that
-default pool, so a bind handed to ``to_thread`` at the same moment queues behind
-it (measured: 51 ms on its own pool, ~790 ms sharing). Hence a separate one.
+Tile reads use an admitted dedicated pool; metadata and overlays have their
+own pools so slow image decoding does not block their work.
 
 Sync FastAPI endpoints do not need this: FastAPI already runs them on anyio's
 worker threads, which are separate from the tile pool. Use this only where the
 caller must stay async.
 """
 
-import os
 from concurrent.futures import ThreadPoolExecutor
+
+from app.core.tile_scheduler import TILE_WORKERS
 
 # Filesystem-bound; sized for isolation from the tile burst, not parallelism.
 slide_metadata_executor = ThreadPoolExecutor(
@@ -33,14 +32,9 @@ zarr_structure_executor = ThreadPoolExecutor(
     thread_name_prefix="zarr-structure",
 )
 
-# Sized well under the default pool on purpose. Each tile job runs a libvips
-# pipeline that opens a threadpool of its own (2-6 workers observed), so 32
-# concurrent tiles put ~190 threads on a 20-core box and the wall-clock cost per
-# tile grew with the oversubscription rather than the work. Capping the tile
-# jobs keeps total threads near the core count. VIPS_CONCURRENCY is still unset,
-# so libvips sizes each pipeline off the core count; lowering it would cut the
-# thread count further, at the cost of the pyramid-conversion path that wants it.
-tile_executor = ThreadPoolExecutor(
-    max_workers=max(4, min(12, os.cpu_count() or 4)),
-    thread_name_prefix="tile",
-)
+# Admission and per-viewer fairness live in TileScheduler. Native worker
+# processes have their own VIPS_CONCURRENCY; conversion keeps its current setting.
+tile_executor = ThreadPoolExecutor(max_workers=TILE_WORKERS, thread_name_prefix="tile")
+
+# Local overlay rasterization should continue while disk/native readers are slow.
+overlay_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tile-overlay")

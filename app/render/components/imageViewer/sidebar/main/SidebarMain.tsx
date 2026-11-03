@@ -170,7 +170,6 @@ const MainSidebar: React.FC = () => {
         newChanges.forEach(channelIndex => {
           dispatch(toggleChannel(channelIndex));
         });
-        window.dispatchEvent(new CustomEvent('updateChannels'));
         setPendingChannelChanges(new Set());
       }, 500);
 
@@ -182,10 +181,6 @@ const MainSidebar: React.FC = () => {
   const throttledColorChange = useRef(
     throttle((index: number, color: string) => {
       dispatch(setChannelColor({ index, color }));
-      // Use setTimeout to ensure state update completes before triggering event
-      setTimeout(() => {
-        window.dispatchEvent(new CustomEvent('updateChannels'));
-      }, 50);
     }, 100) // Reduced throttle time for more responsive updates
   ).current;
 
@@ -208,10 +203,6 @@ const MainSidebar: React.FC = () => {
       color: getRandomColor()
     }));
     dispatch(batchUpdateChannelColors(newColors));
-    // Use setTimeout to ensure state update completes before triggering event
-    setTimeout(() => {
-      window.dispatchEvent(new CustomEvent('updateChannels'));
-    }, 50);
   };
 
   const allSelected = channels.length > 0 && channels.every(channel => channel.isVisible);
@@ -220,11 +211,6 @@ const MainSidebar: React.FC = () => {
     console.log('[Toggle All Channels] Called, current allSelected:', allSelected);
     dispatch(setAllChannelsVisibility(!allSelected));
     
-    // Use setTimeout to ensure state update completes before triggering event
-    setTimeout(() => {
-      console.log('[Toggle All Channels] Triggering updateChannels event');
-      window.dispatchEvent(new CustomEvent('updateChannels'));
-    }, 50);
   };
 
 
@@ -237,8 +223,9 @@ const MainSidebar: React.FC = () => {
       if (batchUpdateTimeoutRef.current) {
         clearTimeout(batchUpdateTimeoutRef.current);
       }
+      throttledColorChange.cancel();
     };
-  }, []);
+  }, [throttledColorChange]);
 
   return (
     <div className="space-y-6 h-screen overflow-y-auto p-4 custom-scrollbar">

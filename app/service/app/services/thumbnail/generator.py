@@ -10,6 +10,7 @@ from PIL import Image
 import traceback
 
 from app.services.load import get_session_data
+from app.wrapper.shared_slide_wrapper import read_whole_level
 from app.utils.cache.thumbnail import thumbnail_cache_service
 from app.core import logger
 THUMBNAIL_MAX_WORKERS = 4
@@ -166,7 +167,7 @@ class ThumbnailGenerator:
                         target_width = int(level_width * scale)
                         target_height = int(level_height * scale)
 
-                        thumbnail_img = session_slide.read_region((0, 0), thumbnail_level, (level_width, level_height))
+                        thumbnail_img = read_whole_level(session_slide, thumbnail_level)
                         if thumbnail_img.mode != 'RGB':
                             thumbnail_img = thumbnail_img.convert('RGB')
                         thumbnail_img = thumbnail_img.resize((target_width, target_height), Image.Resampling.LANCZOS)
@@ -197,7 +198,7 @@ class ThumbnailGenerator:
                         # use lower resolution level as macro image
                         macro_level = min(len(session_slide.level_dimensions) - 1, 2)
                         level_width, level_height = session_slide.level_dimensions[macro_level]
-                        macro_img = session_slide.read_region((0, 0), macro_level, (level_width, level_height))
+                        macro_img = read_whole_level(session_slide, macro_level)
 
                     if macro_img:
                         if macro_img.mode != 'RGB':
@@ -311,7 +312,7 @@ class ThumbnailGenerator:
                     target_width = int(level_width * scale)
                     target_height = int(level_height * scale)
 
-                    img = session_slide.read_region((0, 0), thumbnail_level, (level_width, level_height))
+                    img = read_whole_level(session_slide, thumbnail_level)
                     if img.mode != 'RGB':
                         img = img.convert('RGB')
                     img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
@@ -324,7 +325,7 @@ class ThumbnailGenerator:
                 else:
                     macro_level = min(len(session_slide.level_dimensions) - 1, 2)
                     level_width, level_height = session_slide.level_dimensions[macro_level]
-                    img = session_slide.read_region((0, 0), macro_level, (level_width, level_height))
+                    img = read_whole_level(session_slide, macro_level)
 
             elif preview_type == "label":
                 if hasattr(session_slide, 'associated_images') and 'label' in session_slide.associated_images:

@@ -434,7 +434,7 @@ const LocalFileManager = () => {
       console.log('LocalFileManager: instanceData:', instanceData);
 
       // Step 3: Load file data
-      const loadData = await loadFileData(uploadData.fileName);
+      const loadData = await loadFileData(uploadData.fileName, instanceData);
       console.log('LocalFileManager: loadData:', loadData);
 
       // Step 4: Set slide metadata in Redux (path lives on the WSI instance)
@@ -453,10 +453,7 @@ const LocalFileManager = () => {
       // Step 5: Replace current instance with new WSI data (overwrite current window)
       dispatch(replaceCurrentInstance({
         instanceId: instanceData.instanceId,
-        wsiInfo: {
-          ...loadData,
-          instanceId: instanceData.instanceId
-        },
+        wsiInfo: loadData,
         fileInfo: {
           fileName: absolutePath.split(/[\\/]/).pop() || '',
           filePath: absolutePath,

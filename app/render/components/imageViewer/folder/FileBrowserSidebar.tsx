@@ -600,7 +600,7 @@ const FileBrowserSidebar: React.FC = () => {
     try {
       const uploadData = await uploadFilePath(absolutePath);
       const instanceData = await createInstance(uploadData.filePath ?? uploadData.fileName);
-      const loadData = await loadFileData(uploadData.fileName);
+      const loadData = await loadFileData(uploadData.fileName, instanceData);
       
       dispatch(updateInstanceWSIInfo(loadData));
       dispatch(setOutputPath(absolutePath ? absolutePath + '.zarr' : ''));
@@ -613,10 +613,7 @@ const FileBrowserSidebar: React.FC = () => {
 
       dispatch(replaceCurrentInstance({
         instanceId: instanceData.instanceId,
-        wsiInfo: {
-          ...loadData,
-          instanceId: instanceData.instanceId
-        },
+        wsiInfo: loadData,
         fileInfo: {
           fileName: absolutePath.split(/[\\/]/).pop() || '',
           filePath: absolutePath,

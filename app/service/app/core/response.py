@@ -158,6 +158,9 @@ def permission_denied_response(
 
     Default ``error_code`` follows Ctrl FM naming when ``access_mode`` is known:
     viewer → VIEW_ONLY_FORBIDDEN, samples → PUBLIC_READ_ONLY_FORBIDDEN.
+
+    Never cacheable: a denial is HTTP 200, so a cached one would answer the
+    retry made after a token refresh (tiles are cached per URL).
     """
     mode = access_mode or "forbidden"
     op = operation or "access resource"
@@ -177,7 +180,7 @@ def permission_denied_response(
         message = f"{op} is not available for the read-only Samples area."
     else:
         message = "You do not have permission to perform this operation."
-    return error_response(
+    response = error_response(
         message=message,
         code=403,
         request_id=request_id or "",
@@ -187,6 +190,8 @@ def permission_denied_response(
             "operation": op,
         },
     )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def exception_response(
