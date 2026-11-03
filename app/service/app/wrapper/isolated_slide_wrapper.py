@@ -15,6 +15,7 @@ import threading
 import time
 import types
 import weakref
+from collections.abc import Mapping
 from app.tile_resources import (
     available_cpu_count, default_native_concurrency, default_reader_budget_mb,
     default_readers_per_slide, default_tile_workers, total_memory_bytes, integer_setting,
@@ -271,6 +272,79 @@ def _pil(width, height, bands, dtype, data):
     from PIL import Image
     array = _array(width, height, bands, dtype, data)
     return Image.fromarray(array[..., 0] if bands == 1 else array[..., :3])
+
+
+def _vips_pil(image):
+    # Scale deeper samples to 8 bits as the tile path does; a plain cast clips
+    # a 16-bit image to white.
+    if image.format == 'ushort':
+        image = (image >> 8).cast('uchar')
+    elif image.format != 'uchar':
+        peak = image.max()
+        image = (image * (255.0 / peak) if peak > 0 else image).cast('uchar')
+    return _pil(*_raw(image))
+
+
+class _PreviewAssociated(Mapping):
+    def __init__(self, reader):
+        self._reader = reader
+
+    def __getitem__(self, name):
+        if name not in self._reader.associated_names:
+            raise KeyError(name)
+        return _vips_pil(self._reader.read_associated_vips(name))
+
+    def __contains__(self, name):
+        return name in self._reader.associated_names
+
+    def __iter__(self):
+        return iter(self._reader.associated_names)
+
+    def __len__(self):
+        return len(self._reader.associated_names)
+
+
+class PreviewSlide:
+    """In-process slide for file-list previews (thumbnail, label, macro).
+
+    Opens with the tile readers' decoders, in the same order, so previews come
+    from the decoder that serves the slide's tiles and see its label and macro
+    photos. Previews read only the coarsest level and the associated images,
+    so they run in-process rather than in a reader process.
+    """
+    def __init__(self, path):
+        from app.wrapper.pyvips_slide_wrapper import PyvipsSlideWrapper
+        sequential = False
+        try:
+            self._reader = PyvipsSlideWrapper(path, reject_sequential=True)
+        except Exception as error:
+            sequential = 'Sequential-only' in str(error)
+            try:
+                self._reader = _FastSlideReader(path)
+            except Exception:
+                if not sequential:
+                    raise
+                self._reader = PyvipsSlideWrapper(path)
+        self.dimensions = tuple(self._reader.dimensions)
+        self.level_dimensions = [tuple(d) for d in self._reader.level_dimensions]
+        self.level_downsamples = list(self._reader.level_downsamples)
+        self.properties = dict(self._reader.properties)
+        self.associated_images = _PreviewAssociated(self._reader)
+
+    @property
+    def associated_names(self):
+        return list(getattr(self._reader, 'associated_names', ()))
+
+    def read_associated_vips(self, name):
+        return self._reader.read_associated_vips(name)
+
+    def read_region(self, location, level, size, **kwargs):
+        scale = self.level_downsamples[level]
+        x, y = int(location[0] / scale), int(location[1] / scale)
+        return _vips_pil(self._reader.read_region_vips(level, x, y, *size))
+
+    def close(self):
+        self._reader.close()
 
 
 _readers = weakref.WeakSet()

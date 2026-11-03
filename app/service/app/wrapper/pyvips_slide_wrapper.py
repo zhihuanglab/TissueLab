@@ -79,6 +79,8 @@ class PyvipsSlideWrapper:
         self._tif_subifd_indices = []
         self._thumbnail_page = None
         self._overview_image = None
+        # Label/macro/thumbnail photos (SVS series[1+]): name -> TIFF IFD index.
+        self._associated_pages = {}
 
         if _tifffile is not None:
             try:
@@ -101,6 +103,13 @@ class PyvipsSlideWrapper:
                     except Exception:
                         # Detection itself failed; the IFD scan below still finds the pyramid.
                         series_levels = []
+                    try:
+                        for series in tf.series[1:]:
+                            name = (series.name or '').lower()
+                            if name in ('label', 'macro', 'thumbnail') and series.pages:
+                                self._associated_pages.setdefault(name, int(series.pages[0].index))
+                    except Exception:
+                        pass
                     level_pages = []
                     if series_levels is not None:
                         level_pages = [lvl.pages[0] for lvl in series_levels]
@@ -377,6 +386,26 @@ class PyvipsSlideWrapper:
             if ds <= limit:
                 best = i
         return best
+
+    @property
+    def associated_names(self):
+        """Associated images the isolated reader reports (label, macro, thumbnail)."""
+        return list(self._associated_pages)
+
+    def read_associated_vips(self, name):
+        if name not in self._associated_pages:
+            raise KeyError(name)
+        # Small strip images that libvips' random-access loader rejects as an
+        # out-of-order read, so decode them with tifffile instead.
+        import numpy as np
+        with _tifffile.TiffFile(self.path) as tf:
+            array = tf.pages[self._associated_pages[name]].asarray()
+        if array.ndim == 2:
+            array = np.stack([array] * 3, axis=-1)
+        if array.dtype == np.uint16:
+            array = array >> 8
+        array = np.ascontiguousarray(array[..., :3].astype(np.uint8, copy=False))
+        return pyvips.Image.new_from_memory(array.tobytes(), array.shape[1], array.shape[0], 3, 'uchar')
 
     def read_overview_vips(self):
         """Display fallback only; an associated thumbnail is not a pyramid level."""

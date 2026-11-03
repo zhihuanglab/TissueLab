@@ -213,6 +213,16 @@ class ThumbnailWorker:
         from app.services.load import get_file_extension
         file_ext = get_file_extension(file_path)
 
+        # Prefer the tile readers' decoders (pyvips, then fastslide) for the
+        # formats the viewer opens with them: they see SVS label and macro
+        # photos, which TiffFileWrapper does not.
+        if file_ext in ['tif', 'tiff', 'btf', 'svs']:
+            from app.wrapper.isolated_slide_wrapper import PreviewSlide
+            try:
+                return PreviewSlide(file_path)
+            except Exception as e:
+                logger.info(f"Preview falls back to the SDK reader for {file_path}: {e}")
+
         if file_ext in ['tif', 'tiff', 'btf']:
             slide_obj = TiffFileWrapper(file_path)
         elif file_ext in ['svs', 'qptiff']:

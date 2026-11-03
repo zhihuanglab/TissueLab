@@ -2693,8 +2693,13 @@ def get_slide_macro(slide_obj, size=200):
             macro_img = slide_obj.associated_images['overview']
         else:
             # use lower resolution level as macro image
-            macro_level = min(len(slide_obj.level_dimensions) - 1, 2)
-            level_width, level_height = slide_obj.level_dimensions[macro_level]
+            levels = slide_obj.level_dimensions
+            macro_level = min(len(levels) - 1, 2)
+            # The result is resized to `size`: read the coarsest level that
+            # still covers it, not a whole level of a large pyramid.
+            while macro_level + 1 < len(levels) and max(levels[macro_level + 1]) >= size:
+                macro_level += 1
+            level_width, level_height = levels[macro_level]
             macro_img = slide_obj.read_region((0, 0), macro_level, (level_width, level_height))
         
         if macro_img:
