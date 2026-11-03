@@ -208,7 +208,10 @@ def _worker_main(connection, path, backend, concurrency):
                     if not 0 <= level < len(slide.level_dimensions):
                         raise ValueError(f'Pyramid level {level} does not exist')
                     def render(reader):
-                        region = reader.read_region_vips(level, x, y, w, h)
+                        coarse = getattr(reader, 'read_coarse_region_vips', None)
+                        region = coarse(level, x, y, w, h, out_w, out_h) if coarse else None
+                        if region is None:
+                            region = reader.read_region_vips(level, x, y, w, h)
                         region = _resize_vips_tile_to_exact(region, out_w, out_h)
                         return _encode_tile_vips(region, quality)
                     try:
@@ -337,6 +340,19 @@ class PreviewSlide:
 
     def read_associated_vips(self, name):
         return self._reader.read_associated_vips(name)
+
+    def coarse_preview(self, size):
+        """The whole slide fitted to ``size`` px from the reader's coarse copy of a
+        large single-level slide (see PyvipsSlideWrapper.coarse_overview); None
+        for slides whose coarsest level is already small enough to read."""
+        from PIL import Image
+        coarse = getattr(self._reader, 'coarse_overview', lambda: None)()
+        if coarse is None:
+            return None
+        width, height = self.level_dimensions[0]
+        scale = min(size / width, size / height)
+        target = (max(1, int(width * scale)), max(1, int(height * scale)))
+        return _vips_pil(coarse).resize(target, Image.Resampling.LANCZOS)
 
     def read_region(self, location, level, size, **kwargs):
         scale = self.level_downsamples[level]

@@ -2660,6 +2660,10 @@ def get_slide_thumbnail(slide_obj, size=200):
     Generate thumbnail image from slide
     """
     try:
+        # A large single-level slide: its only level is the whole base image.
+        coarse = slide_obj.coarse_preview(size) if hasattr(slide_obj, 'coarse_preview') else None
+        if coarse is not None:
+            return coarse
         thumbnail_level = len(slide_obj.level_dimensions) - 1
         level_width, level_height = slide_obj.level_dimensions[thumbnail_level]
         
@@ -2691,6 +2695,8 @@ def get_slide_macro(slide_obj, size=200):
             macro_img = slide_obj.associated_images['macro']
         elif hasattr(slide_obj, 'associated_images') and 'overview' in slide_obj.associated_images:
             macro_img = slide_obj.associated_images['overview']
+        elif hasattr(slide_obj, 'coarse_preview') and (coarse := slide_obj.coarse_preview(size)) is not None:
+            macro_img = coarse
         else:
             # use lower resolution level as macro image
             levels = slide_obj.level_dimensions
