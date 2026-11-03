@@ -141,15 +141,19 @@ def cleanup_v2_meta_backup(store_path: str) -> bool:
 
 
 def is_pure_v3_store(store_path: str) -> bool:
-    """True when root has valid ``zarr.json`` and no v2 / corrupt v3 leftovers."""
+    """True when root has valid ``zarr.json`` and no v2 / corrupt v3 leftovers.
+
+    A root with no metadata at all (only nested nodes, e.g. a copied-out
+    ``CustomAnnotations/`` subtree) counts too, or its backup would never be
+    dropped and every open would take the write lock to retry.
+    """
     root_json = os.path.join(store_path, _ZARR_V3_META)
-    if not is_valid_zarr_v3_json(root_json):
+    if os.path.exists(root_json) and not is_valid_zarr_v3_json(root_json):
         return False
-    if has_any_v2_metadata_files(store_path):
+    unreadable, _v2_only, any_v2, any_v3 = scan_node_metadata(store_path)
+    if not any_v3 or any_v2:
         return False
-    if has_invalid_zarr_json(store_path):
-        return False
-    return True
+    return not any(is_stably_invalid_zarr_json(fp) for fp in unreadable)
 
 
 def cleanup_v2_meta_backup_if_pure_v3(store_path: str) -> bool:
@@ -167,14 +171,6 @@ def has_any_v2_metadata_files(path: str) -> bool:
     """True if any v2 metadata file exists anywhere under the store."""
     for _root, files in walk_node_dirs(path):
         if any(fn in _V2_META_FILES for fn in files):
-            return True
-    return False
-
-
-def has_any_v3_metadata_files(path: str) -> bool:
-    """True if any ``zarr.json`` exists anywhere under the store."""
-    for _root, files in walk_node_dirs(path):
-        if _ZARR_V3_META in files:
             return True
     return False
 
@@ -265,22 +261,53 @@ def is_stably_invalid_zarr_json(filepath: str, settle_sec: float = _SETTLE_SEC) 
     return True
 
 
-def iter_invalid_zarr_json(path: str) -> Iterator[str]:
-    """Yield absolute paths of ``zarr.json`` files that are *stably* invalid.
+def scan_node_metadata(path: str) -> Tuple[List[str], bool, bool, bool]:
+    """``(unreadable, v2_only, any_v2, any_v3)`` in one walk that reads each
+    ``zarr.json`` once (for ``needs_v3_conversion`` and :func:`is_pure_v3_store`).
 
-    Files a writer currently holds open are skipped — see
-    :func:`is_stably_invalid_zarr_json`.
+    ``unreadable`` lists the ``zarr.json`` that do not parse *now*; callers put
+    them through :func:`is_stably_invalid_zarr_json` before calling them
+    corrupt. ``v2_only`` / ``any_v2`` match :func:`iter_v2_only_nodes` and
+    :func:`has_any_v2_metadata_files`. One walk instead of one per check:
+    ~30 ms per store open on a large slide.
     """
+    unreadable: List[str] = []
+    v2_only = any_v2 = any_v3 = False
+    for root, dirs, files in os.walk(path):
+        valid = False
+        if _ZARR_V3_META in files:
+            any_v3 = True
+            fp = os.path.join(root, _ZARR_V3_META)
+            node_type = v3_node_type(fp)
+            valid = node_type is not None
+            if not valid:
+                unreadable.append(fp)
+            if node_type == "array":
+                dirs[:] = []  # only chunks below (see walk_node_dirs)
+        if any(fn in _V2_META_FILES for fn in files):
+            any_v2 = True
+            if not valid and any(fn in _V2_NODE_META for fn in files):
+                v2_only = True
+    return unreadable, v2_only, any_v2, any_v3
+
+
+def metadata_fingerprint(path: str) -> frozenset:
+    """``(relpath, mtime_ns, size)`` of every node metadata file under the store.
+
+    Chunk writes leave it alone; any metadata write (a new node, a resize, a
+    repair) changes it — which is what decides whether a failed migration is
+    worth retrying.
+    """
+    out = set()
     for root, files in walk_node_dirs(path):
-        if _ZARR_V3_META not in files:
-            continue
-        fp = os.path.join(root, _ZARR_V3_META)
-        if is_stably_invalid_zarr_json(fp):
-            yield fp
-
-
-def has_invalid_zarr_json(path: str) -> bool:
-    return next(iter_invalid_zarr_json(path), None) is not None
+        for fn in files:
+            if fn != _ZARR_V3_META and fn not in _V2_META_FILES:
+                continue
+            fp = os.path.join(root, fn)
+            stat = _meta_fingerprint(fp)
+            if stat is not None:
+                out.add((os.path.relpath(fp, path), *stat))
+    return frozenset(out)
 
 
 def repair_invalid_zarr_json(path: str) -> Tuple[List[str], List[str]]:

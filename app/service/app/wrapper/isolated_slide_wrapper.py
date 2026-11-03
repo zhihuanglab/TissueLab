@@ -49,6 +49,43 @@ def _raw(image):
     return (image.width, image.height, image.bands, image.format, bytes(image.write_to_memory()))
 
 
+def _ventana_properties(path):
+    """OpenSlide-style scan properties of a Ventana BIF; None for anything else.
+
+    Detected by content, not suffix: BIF scans are routinely uploaded as .tif.
+    Neither decoder reports their resolution, which lives only in the iScan
+    XMP element (ScanRes in um/px, Magnification), as OpenSlide reads it.
+    """
+    try:
+        import tifffile
+        with tifffile.TiffFile(path) as tiff:
+            if not tiff.is_bif:
+                return None
+            xmps = [page.tags.valueof(700) for page in tiff.pages[:3]]
+    except Exception:
+        return None
+    # A BIF whose scan metadata is missing or malformed is still a BIF.
+    properties = {}
+    xmp = next((x for x in xmps if isinstance(x, bytes) and b'<iScan' in x), None)
+    if xmp is None:
+        return properties
+    try:
+        from xml.etree import ElementTree
+        # The XMP ends in NUL padding after the closing tag.
+        scan = ElementTree.fromstring(xmp[:xmp.rfind(b'>') + 1]).find('iScan')
+    except Exception:
+        return properties
+    for attribute, keys in (('ScanRes', ('openslide.mpp-x', 'openslide.mpp-y')),
+                            ('Magnification', ('openslide.objective-power',))):
+        value = scan.get(attribute) if scan is not None else None
+        try:
+            if value and 0 < float(value) < float('inf'):
+                properties.update(dict.fromkeys(keys, value))
+        except ValueError:
+            pass
+    return properties
+
+
 def _overview_source(slide):
     if hasattr(slide, 'read_overview_vips'):
         return slide.read_overview_vips()
@@ -61,8 +98,19 @@ class _FastSlideReader:
         import fastslide
         self._slide = fastslide.FastSlide.from_file_path(path)
         self.dimensions = self._slide.dimensions
-        self.level_dimensions = list(self._slide.level_dimensions)
-        self.level_downsamples = list(self._slide.level_downsamples)
+        # fastslide lists a Ventana BIF label page (1003x3260 beside a
+        # 44480x71616 base) as a pyramid level. Keep only levels with the base
+        # aspect ratio, allowing rounding/padding (5%, or 2 px on tiny levels),
+        # so the pyramid matches the pyvips reader's and a fallback switch is
+        # not refused as a pyramid change.
+        base_w, base_h = self.dimensions
+        def pyramid_level(width, height):
+            expected = width * base_h / base_w
+            return abs(height - expected) <= max(2, .05 * expected)
+        self._levels = [index for index, (width, height) in enumerate(self._slide.level_dimensions)
+                        if pyramid_level(width, height)]
+        self.level_dimensions = [tuple(self._slide.level_dimensions[i]) for i in self._levels]
+        self.level_downsamples = [self._slide.level_downsamples[i] for i in self._levels]
         self.properties = dict(self._slide.properties)
         for source, target in (('mpp_x', 'openslide.mpp-x'), ('mpp_y', 'openslide.mpp-y'),
                                ('objective_magnification', 'openslide.objective-power')):
@@ -70,6 +118,8 @@ class _FastSlideReader:
                 self.properties.setdefault(target, str(self.properties[source]))
         self.properties.setdefault('channels', '3')
         self.properties['vendor'] = 'fastslide'
+        if 'levels' in self.properties:
+            self.properties['levels'] = len(self._levels)
         # Label/macro photos (NDPI, SVS); not pyramid levels.
         self.associated_names = list(self._slide.associated_images.keys())
         self._overview_image = None
@@ -97,7 +147,7 @@ class _FastSlideReader:
         import numpy as np
         if w * h * 4 > 128 * 1024 * 1024:
             raise ValueError('Fastslide region too large; use a coarser pyramid level')
-        array = self._slide.read_region((x, y), level=level, size=(w, h)).numpy()
+        array = self._slide.read_region((x, y), level=self._levels[level], size=(w, h)).numpy()
         if array.dtype != np.uint8 or array.ndim != 3:
             raise ValueError('Unsupported fastslide pixel type')
         return pyvips.Image.new_from_memory(array.tobytes(), array.shape[1], array.shape[0], array.shape[2], 'uchar')
@@ -126,14 +176,23 @@ def _worker_main(connection, path, backend, concurrency):
     from app.wrapper.tile_encoding import _resize_vips_tile_to_exact, _encode_tile_vips
     slide = None
     try:
+        sequential = False
         if backend != 'fastslide':
             try:
-                slide = PyvipsSlideWrapper(path)
+                slide = PyvipsSlideWrapper(path, reject_sequential=True)
                 backend = 'pyvips_tiff'
-            except Exception:
+            except Exception as error:
+                sequential = 'Sequential-only' in str(error)
                 backend = 'fastslide'
         if slide is None:
-            slide = _FastSlideReader(path)
+            try:
+                slide = _FastSlideReader(path)
+            except Exception:
+                if not sequential:
+                    raise
+                # Slow whole-level reads beat a slide that does not open.
+                slide = PyvipsSlideWrapper(path)
+                backend = 'pyvips_tiff'
         metadata = _metadata(slide, backend)
         metadata['properties']['native_tile_concurrency'] = str(concurrency)
         connection.send(('ok', metadata))
@@ -266,15 +325,25 @@ class IsolatedSlideWrapper:
         self._inflight = self._waiting = self._warming = 0
         self._closed = False
         self._worker_target = _worker_target or _worker_main
+        # NDPI and Ventana BIF start on fastslide. libvips spends 11-14 s of
+        # JPEG decoding on the first read of a BIF level (JPEG tiles, YCbCr
+        # 2:1; 44k x 71k base), past the reader timeout, so a restarted pyvips
+        # reader never warms up; it also rejects levels smaller than one
+        # 1024 px tile. fastslide reads the same tile in ~50 ms, matching
+        # OpenSlide's pixels.
+        ventana = _ventana_properties(path)
         self._backend = self._initial_backend = (
-            'fastslide' if os.path.splitext(path)[1].lower() == '.ndpi' else 'pyvips_tiff')
+            'fastslide' if ventana is not None or os.path.splitext(path)[1].lower() == '.ndpi'
+            else 'pyvips_tiff')
         self.restarts = 0
+        self._fallback_refused = False
         try:
             metadata = self._rpc(None, (), metadata_only=True)
             self.dimensions = metadata['dimensions']
             self.level_dimensions = metadata['level_dimensions']
             self.level_downsamples = metadata['level_downsamples']
-            self.properties = metadata['properties']
+            # fastslide reports 0 mpp / objective power for BIF.
+            self.properties = {**metadata['properties'], **(ventana or {})}
             self.properties['decoder_backend'] = metadata['backend']
             self.associated_names = metadata['associated']
             self.level_count = len(self.level_dimensions)
@@ -303,8 +372,11 @@ class IsolatedSlideWrapper:
             failed, self._slots[index] = self._slots[index], None
             self.restarts += 1
             # Recover from native crashes/timeouts with the fallback decoder,
-            # unless that decoder is what produced a different pyramid.
-            self._backend = self._initial_backend if isinstance(error, _PyramidMismatch) else 'fastslide'
+            # unless it has produced a different pyramid for this file: then
+            # every later timeout would fail one more tile on the same mismatch.
+            if isinstance(error, _PyramidMismatch):
+                self._fallback_refused = True
+            self._backend = self._initial_backend if self._fallback_refused else 'fastslide'
         self._stop(failed)
 
     def _start(self, index):

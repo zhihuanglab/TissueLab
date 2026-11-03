@@ -147,15 +147,6 @@ def is_legacy_v2(path: str) -> bool:
     )
 
 
-def is_mixed_v2_v3(path: str) -> bool:
-    """True when v2 and v3 metadata coexist (typically a crashed conversion)."""
-    if not os.path.isdir(path):
-        return False
-    from app.utils.zarr_store import has_any_v2_metadata_files, has_any_v3_metadata_files
-
-    return has_any_v2_metadata_files(path) and has_any_v3_metadata_files(path)
-
-
 def needs_v3_conversion(path: str) -> bool:
     """True for pure-v2 stores, nested v2-only islands, leftover v2+v3 meta,
     or corrupt ``zarr.json`` that still needs repair / remigration.
@@ -165,23 +156,18 @@ def needs_v3_conversion(path: str) -> bool:
     """
     if not os.path.isdir(path):
         return False
-    from app.utils.zarr_store import (
-        has_any_v2_metadata_files,
-        has_any_v3_metadata_files,
-        has_invalid_zarr_json,
-        iter_v2_only_nodes,
-    )
+    from app.utils.zarr_store import is_stably_invalid_zarr_json, scan_node_metadata
 
+    # One walk of the tree for all three checks (this runs on every store open).
+    unreadable, v2_only, any_v2, any_v3 = scan_node_metadata(path)
     # Truncated / bogus zarr.json must be repaired (or reported) before use.
-    if has_invalid_zarr_json(path):
+    if any(is_stably_invalid_zarr_json(fp) for fp in unreadable):
         return True
     # Any directory with .zarray/.zgroup but no valid zarr.json (root or nested).
-    if next(iter_v2_only_nodes(path), None) is not None:
+    if v2_only:
         return True
     # v2 sidecars still sitting next to zarr.json somewhere in the tree.
-    if has_any_v2_metadata_files(path) and (
-        has_v3_metadata(path) or has_any_v3_metadata_files(path)
-    ):
+    if any_v2 and (has_v3_metadata(path) or any_v3):
         return True
     return False
 
@@ -211,7 +197,9 @@ def lock_path_for(path: str) -> str:
     never used for locking, and user folders stay clean. ``FileLock`` leaves
     empty lock files in place by design; that is intentional.
     """
-    abs_path = os.path.normcase(os.path.abspath(os.path.normpath(path)))
+    # realpath: a Viewer/Editor share reaches the owner's store through a
+    # directory symlink, and both sides must contend on the same lock.
+    abs_path = os.path.normcase(os.path.realpath(path))
     digest = hashlib.sha256(abs_path.encode("utf-8")).hexdigest()
     return os.path.join(_ZARR_LOCK_DIR, f"{digest}.lock")
 
@@ -331,11 +319,62 @@ def _remove_v2_metadata(path: str) -> None:
                 pass
 
 
+def _install_vlen_utf8_migration(migrate_module) -> None:
+    """Teach zarr's migrator v2 string arrays.
+
+    A v2 string array (``dtype "|O"``) stores its values through a ``vlen-utf8``
+    *filter*; zarr 3.1's migrator only maps filters to v3 array->array codecs,
+    so it raises on them and the whole store stays v2 (retried on every open).
+    In v3 the same chunks are a ``string`` array whose array->bytes codec is
+    ``vlen-utf8`` (numcodecs' encoding, byte for byte) followed by the v2
+    compressor, so the migration stays metadata-only. Every other array goes
+    through the migrator's own conversion unchanged.
+    """
+    original = getattr(migrate_module, "_convert_array_metadata", None)
+    if original is None or getattr(original, "_tissuelab_vlen_utf8", False):
+        return
+
+    def convert(metadata_v2):
+        filters = metadata_v2.filters or ()
+        if [getattr(f, "codec_id", None) for f in filters] != ["vlen-utf8"]:
+            return original(metadata_v2)
+        if metadata_v2.order == "F" and len(metadata_v2.shape) > 1:
+            # v3 has no ``order``; the migrator spells F as a transpose codec.
+            # Dropping it reads the array scrambled, and zarr 3.1's transpose +
+            # vlen-utf8 scrambles every write. Leave the store v2 (zarr 3 reads
+            # and writes F-order v2 strings correctly). 1-D F is C.
+            raise NotImplementedError(
+                "F-order multi-dimensional string array cannot be migrated to v3"
+            )
+        from zarr.codecs import VLenUTF8Codec
+        from zarr.core.chunk_key_encodings import V2ChunkKeyEncoding
+        from zarr.core.metadata.v3 import ArrayV3Metadata
+
+        codecs = [VLenUTF8Codec()]
+        if metadata_v2.compressor is not None:
+            codecs.append(migrate_module._convert_compressor(metadata_v2.compressor, metadata_v2.dtype))
+        return ArrayV3Metadata(
+            shape=metadata_v2.shape,
+            data_type=metadata_v2.dtype,
+            chunk_grid=metadata_v2.chunk_grid,
+            chunk_key_encoding=V2ChunkKeyEncoding(separator=metadata_v2.dimension_separator),
+            fill_value=metadata_v2.fill_value,
+            codecs=codecs,
+            attributes=metadata_v2.attributes,
+            dimension_names=None,
+            storage_transformers=None,
+        )
+
+    convert._tissuelab_vlen_utf8 = True  # type: ignore[attr-defined]
+    migrate_module._convert_array_metadata = convert
+
+
 def _import_migrator():
     """Locate zarr's official v2->v3 metadata migrator across zarr 3.x layouts."""
     try:  # zarr >= 3.1
-        from zarr.metadata.migrate_v3 import migrate_v2_to_v3  # type: ignore
-        return migrate_v2_to_v3
+        import zarr.metadata.migrate_v3 as migrate_module  # type: ignore
+        _install_vlen_utf8_migration(migrate_module)
+        return migrate_module.migrate_v2_to_v3
     except Exception:
         pass
     try:  # some builds re-export from zarr.storage
@@ -451,6 +490,10 @@ def _try_restore_from_v2_backup(path: str) -> bool:
     return True
 
 
+# realpath -> metadata fingerprint of a store whose migration failed (see ensure_v3).
+_FAILED_MIGRATIONS: Dict[str, frozenset] = {}
+
+
 def ensure_v3(path: str) -> bool:
     """Ensure the ``.zarr`` store at ``path`` uses zarr v3 metadata on disk.
 
@@ -464,15 +507,22 @@ def ensure_v3(path: str) -> bool:
     recovered from ``<store>.tissuelab-v2-meta-backup.zip`` when present. The
     backup is removed automatically once the store is pure v3.
 
+    Symlinked stores are left alone. A migration that fails is not retried in
+    this process until the store's metadata changes (the error is raised once).
+
     Returns ``True`` if a conversion / repair was performed.
     """
     from app.utils.zarr_store import (
         cleanup_v2_meta_backup_if_pure_v3,
         has_v2_meta_backup_artifacts,
-        is_valid_zarr_v3_json,
+        metadata_fingerprint,
     )
 
     if not os.path.isdir(path):
+        return False
+    if os.path.islink(path):
+        # Viewer / Editor shares: migrating would write through to the owner's
+        # store and can fail the overlay bind. The owner's own open converts it.
         return False
 
     if not needs_v3_conversion(path):
@@ -487,66 +537,79 @@ def ensure_v3(path: str) -> bool:
         else:
             return False
 
+    key = os.path.realpath(path)
+    failed = _FAILED_MIGRATIONS.get(key)
+    if failed is not None:
+        if failed == metadata_fingerprint(path):
+            logger.debug("Skipping zarr v2->v3 conversion that already failed on this store: %s", path)
+            return False
+        _FAILED_MIGRATIONS.pop(key, None)
+
     migrate_v2_to_v3 = _import_migrator()
 
     with zarr_lock(path):
-        # Re-check inside the lock: another worker may have just converted it.
-        if not needs_v3_conversion(path):
-            cleanup_v2_meta_backup_if_pure_v3(path)
-            return False
+        try:
+            return _ensure_v3_locked(path, migrate_v2_to_v3)
+        except ZarrMetadataError:
+            raise
+        except Exception:
+            # The migrator rolled the store back to where it was, so the next
+            # open would only fail the same way — after the write lock, a full
+            # migrate and a rollback. Retry once its metadata changes.
+            _FAILED_MIGRATIONS[key] = metadata_fingerprint(path)
+            raise
 
+
+def _ensure_v3_locked(path: str, migrate_v2_to_v3) -> bool:
+    """Body of :func:`ensure_v3`, run under :func:`zarr_lock`."""
+    from app.utils.zarr_store import cleanup_v2_meta_backup_if_pure_v3, is_valid_zarr_v3_json
+
+    # Re-check inside the lock: another worker may have just converted it.
+    if not needs_v3_conversion(path):
+        cleanup_v2_meta_backup_if_pure_v3(path)
+        return False
+
+    from app.utils.zarr_store import (
+        repair_invalid_zarr_json,
+        v3_covers_all_v2_nodes,
+    )
+
+    # Drop truncated/bogus zarr.json when v2 sidecars can still remigrate.
+    removed, unrecoverable = repair_invalid_zarr_json(path)
+    if removed:
+        logger.warning(
+            "Removed %d corrupt zarr.json file(s) (v2 sidecar present, will remigrate): %s",
+            len(removed),
+            path,
+        )
+    if unrecoverable:
+        root_json = os.path.join(path, _V3_META)
+        root_norm = os.path.normpath(root_json)
+        root_valid = is_valid_zarr_v3_json(root_json)
+        root_broken = (not root_valid) or any(
+            os.path.normpath(fp) == root_norm for fp in unrecoverable
+        )
         from app.utils.zarr_store import (
-            repair_invalid_zarr_json,
-            v3_covers_all_v2_nodes,
+            has_any_v2_metadata_files,
+            remove_partial_v3_metadata,
         )
 
-        # Drop truncated/bogus zarr.json when v2 sidecars can still remigrate.
-        removed, unrecoverable = repair_invalid_zarr_json(path)
-        if removed:
+        # Corrupt zarr.json that still has v2 nearby, but os.remove failed:
+        # clear all zarr.json and remigrate from the remaining v2 instead of
+        # jumping straight to a nuclear backup restore.
+        if root_broken and has_any_v2_metadata_files(path):
             logger.warning(
-                "Removed %d corrupt zarr.json file(s) (v2 sidecar present, will remigrate): %s",
-                len(removed),
+                "Corrupt zarr.json could not be deleted in-place; "
+                "clearing all zarr.json to remigrate from v2: %s",
                 path,
             )
-        if unrecoverable:
-            root_json = os.path.join(path, _V3_META)
-            root_norm = os.path.normpath(root_json)
-            root_valid = is_valid_zarr_v3_json(root_json)
-            root_broken = (not root_valid) or any(
-                os.path.normpath(fp) == root_norm for fp in unrecoverable
-            )
-            from app.utils.zarr_store import (
-                has_any_v2_metadata_files,
-                remove_partial_v3_metadata,
-            )
-
-            # Corrupt zarr.json that still has v2 nearby, but os.remove failed:
-            # clear all zarr.json and remigrate from the remaining v2 instead of
-            # jumping straight to a nuclear backup restore.
-            if root_broken and has_any_v2_metadata_files(path):
-                logger.warning(
-                    "Corrupt zarr.json could not be deleted in-place; "
-                    "clearing all zarr.json to remigrate from v2: %s",
-                    path,
-                )
-                remove_partial_v3_metadata(path)
-            elif root_broken:
-                # Nuclear remigrate from backup only when the store root itself
-                # is unreadable — avoids wiping a healthy tree because of one
-                # nested garbage zarr.json.
-                if _try_restore_from_v2_backup(path):
-                    pass
-                else:
-                    preview = ", ".join(unrecoverable[:5])
-                    more = (
-                        f" (+{len(unrecoverable) - 5} more)"
-                        if len(unrecoverable) > 5
-                        else ""
-                    )
-                    raise ZarrMetadataError(
-                        f"Corrupt root zarr.json with no v2 sidecar "
-                        f"(and no metadata backup) under {path}: {preview}{more}"
-                    )
+            remove_partial_v3_metadata(path)
+        elif root_broken:
+            # Nuclear remigrate from backup only when the store root itself
+            # is unreadable — avoids wiping a healthy tree because of one
+            # nested garbage zarr.json.
+            if _try_restore_from_v2_backup(path):
+                pass
             else:
                 preview = ", ".join(unrecoverable[:5])
                 more = (
@@ -555,42 +618,53 @@ def ensure_v3(path: str) -> bool:
                     else ""
                 )
                 raise ZarrMetadataError(
-                    f"Corrupt nested zarr.json with no v2 sidecar under {path}: "
-                    f"{preview}{more}"
+                    f"Corrupt root zarr.json with no v2 sidecar "
+                    f"(and no metadata backup) under {path}: {preview}{more}"
                 )
-
-        # Fast path: migrate already wrote valid ``zarr.json`` for every v2 node,
-        # but crashed before (or during) deleting the v2 sidecars. Just finish
-        # the cleanup — do not roll back and re-migrate.
-        if has_v3_metadata(path) and v3_covers_all_v2_nodes(path):
-            logger.info("Repairing mixed zarr store (strip leftover v2 metadata): %s", path)
-            _strip_v2_with_backup(path)
-            if not needs_v3_conversion(path):
-                logger.info("Repaired zarr store to pure v3: %s", path)
-                return True
-            # Still inconsistent — fall through to (re)migrate remaining islands.
-
-        # Whole-store migrate when the root itself is still pure v2.
-        if is_legacy_v2(path) or (
-            has_v2_metadata(path) and not has_v3_metadata(path)
-        ):
-            logger.info("Converting legacy / partial zarr v2 store to v3: %s", path)
-            _migrate_v2_subtree(path, migrate_v2_to_v3)
-            _strip_v2_with_backup(path)
-            logger.info("Converted zarr store to v3: %s", path)
-            return True
-
-        # Root is already v3 (or mixed at root with coverage incomplete): migrate
-        # every nested v2-only island recursively, then strip leftover v2 sidecars.
-        n = _migrate_nested_v2_islands(path, migrate_v2_to_v3)
-        _strip_v2_with_backup(path)
-        if n:
-            logger.info(
-                "Converted %d nested zarr v2 island(s) under v3 root: %s", n, path
-            )
         else:
-            logger.info("Stripped leftover v2 metadata under store: %s", path)
+            preview = ", ".join(unrecoverable[:5])
+            more = (
+                f" (+{len(unrecoverable) - 5} more)"
+                if len(unrecoverable) > 5
+                else ""
+            )
+            raise ZarrMetadataError(
+                f"Corrupt nested zarr.json with no v2 sidecar under {path}: "
+                f"{preview}{more}"
+            )
+
+    # Fast path: migrate already wrote valid ``zarr.json`` for every v2 node,
+    # but crashed before (or during) deleting the v2 sidecars. Just finish
+    # the cleanup — do not roll back and re-migrate.
+    if has_v3_metadata(path) and v3_covers_all_v2_nodes(path):
+        logger.info("Repairing mixed zarr store (strip leftover v2 metadata): %s", path)
+        _strip_v2_with_backup(path)
+        if not needs_v3_conversion(path):
+            logger.info("Repaired zarr store to pure v3: %s", path)
+            return True
+        # Still inconsistent — fall through to (re)migrate remaining islands.
+
+    # Whole-store migrate when the root itself is still pure v2.
+    if is_legacy_v2(path) or (
+        has_v2_metadata(path) and not has_v3_metadata(path)
+    ):
+        logger.info("Converting legacy / partial zarr v2 store to v3: %s", path)
+        _migrate_v2_subtree(path, migrate_v2_to_v3)
+        _strip_v2_with_backup(path)
+        logger.info("Converted zarr store to v3: %s", path)
         return True
+
+    # Root is already v3 (or mixed at root with coverage incomplete): migrate
+    # every nested v2-only island recursively, then strip leftover v2 sidecars.
+    n = _migrate_nested_v2_islands(path, migrate_v2_to_v3)
+    _strip_v2_with_backup(path)
+    if n:
+        logger.info(
+            "Converted %d nested zarr v2 island(s) under v3 root: %s", n, path
+        )
+    else:
+        logger.info("Stripped leftover v2 metadata under store: %s", path)
+    return True
 
 
 def prepare_zarr_for_workflow(path: str) -> None:
@@ -599,14 +673,29 @@ def prepare_zarr_for_workflow(path: str) -> None:
     Batch processing and cohort runs call ``/tasks/v1/start_workflow`` without
     opening the slide in the viewer, so they never hit ``upload_file_path``'s
     eager migration. Call this at workflow submission time so Model Zoo task
-    nodes always see a v3 store (metadata migrated before any node opens it).
+    nodes see a v3 store (metadata migrated before any node opens it).
+
+    A store the migrator cannot convert stays v2 and the workflow runs on it,
+    as every other open does; only unrecoverable corruption fails the start.
     """
     if not os.path.exists(path):
         open_zarr(path, mode="a")
         return
     if not os.path.isdir(path):
         raise NotADirectoryError(path)
-    ensure_v3(path)
+    _auto_convert(path)
+
+
+def _auto_convert(path: str) -> None:
+    """Best-effort :func:`ensure_v3` before an open: only corruption is fatal."""
+    if not os.path.isdir(path):
+        return
+    try:
+        ensure_v3(path)
+    except ZarrMetadataError:
+        raise
+    except Exception as exc:
+        logger.warning("zarr v2->v3 auto-conversion failed for %s: %s", path, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -620,16 +709,11 @@ def open_zarr(path: str, mode: str = "r", *, auto_convert: bool = True, **kwargs
 
     When ``auto_convert`` is True (default), a legacy v2 store is migrated to
     v3 on disk before the handle is opened — for both read and write modes.
-    Symlinked stores (Viewer / Editor shares) are opened in place: migrating
-    would write through to the owner's zarr and can fail the overlay bind.
+    Symlinked stores (Viewer / Editor shares) are opened in place, unconverted
+    (see :func:`ensure_v3`).
     """
-    if auto_convert and os.path.isdir(path) and not os.path.islink(path):
-        try:
-            ensure_v3(path)
-        except ZarrMetadataError:
-            raise
-        except Exception as exc:  # pragma: no cover - best effort
-            logger.warning("zarr v2->v3 auto-conversion failed for %s: %s", path, exc)
+    if auto_convert:
+        _auto_convert(path)
     return zarr.open(path, mode=mode, **kwargs)
 
 
@@ -653,13 +737,8 @@ def open_zarr_cm(
     ``lock=True`` to force locking on a read.
     """
     use_lock = (mode != "r") if lock is None else lock
-    if auto_convert and os.path.isdir(path) and not os.path.islink(path):
-        try:
-            ensure_v3(path)
-        except ZarrMetadataError:
-            raise
-        except Exception as exc:  # pragma: no cover
-            logger.warning("zarr v2->v3 auto-conversion failed for %s: %s", path, exc)
+    if auto_convert:
+        _auto_convert(path)
     if use_lock:
         with zarr_lock(path):
             yield zarr.open(path, mode=mode, **kwargs)
@@ -669,13 +748,8 @@ def open_zarr_cm(
 
 def open_group(path: str, mode: str = "r", *, auto_convert: bool = True, **kwargs: Any):
     """Like :func:`open_zarr` but always returns a group (``zarr.open_group``)."""
-    if auto_convert and os.path.isdir(path) and not os.path.islink(path):
-        try:
-            ensure_v3(path)
-        except ZarrMetadataError:
-            raise
-        except Exception as exc:  # pragma: no cover
-            logger.warning("zarr v2->v3 auto-conversion failed for %s: %s", path, exc)
+    if auto_convert:
+        _auto_convert(path)
     return zarr.open_group(path, mode=mode, **kwargs)
 
 

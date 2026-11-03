@@ -64,7 +64,7 @@ class PyvipsSlideWrapper:
     automatic OpenSlide selection is never used.
     """
 
-    def __init__(self, file_path):
+    def __init__(self, file_path, reject_sequential=False):
         if os.path.splitext(file_path)[1].lower() == '.ndpi':
             raise ValueError('NDPI requires fastslide for bounded region decoding')
         self.path = file_path
@@ -138,6 +138,21 @@ class PyvipsSlideWrapper:
                         # when this constructor raises.
                         raise ValueError('Aperio JPEG 2000 requires fastslide')
                     entries.sort(key=lambda e: e[0], reverse=True)
+                    if (reject_sequential and entries and entries[0][3] is None
+                            and pages[entries[0][2]].tags.valueof(322) is not None):
+                        # libvips reads some tiled pages only sequentially (JPEG
+                        # YCbCr 2:1, e.g. Ventana BIF). A random read then decodes
+                        # the whole level first: 11-14 s and a multi-GB temp file
+                        # that a reader killed on timeout leaves behind (seen on
+                        # macOS). A header read; fastslide reads by tile. Opt-in:
+                        # only the isolated reader has fastslide to fall back to.
+                        try:
+                            _, loaded = pyvips.Image.tiffload(file_path, page=entries[0][2], access="random", flags=True)
+                            sequential = not int(loaded['flags']) & 1   # VIPS_FOREIGN_PARTIAL
+                        except pyvips.Error:
+                            sequential = False
+                        if sequential:
+                            raise ValueError('Sequential-only tiled TIFF requires fastslide')
                     self.level_dimensions = [(w, h) for w, h, _, _ in entries]
                     self._tif_page_indices = [pi for _, _, pi, _ in entries]
                     if entries:
