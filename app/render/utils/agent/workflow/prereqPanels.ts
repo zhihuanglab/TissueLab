@@ -78,6 +78,49 @@ export function hasCytoformerEmbeddings(structure: ZarrStructure | undefined): b
   )
 }
 
+/**
+ * NuClass-space embeddings: the PLIP 768-d vectors StarDist / CellCast /
+ * InstanSeg write (no `embedding_*` attrs). Only these make NuClass the right
+ * classifier; anything else (no store, Cytoformer, legacy UNI2 1536-d) goes to
+ * Cytoformer.
+ */
+export function hasNuClassEmbeddings(structure: ZarrStructure | undefined): boolean {
+  const dataset = findZarrObject(structure?.root, "Cell-Segmentation/embeddings")
+  if (!dataset) return false
+  const shape = dataset.shape
+  if (!Array.isArray(shape) || shape.length !== 2 || shape[0] <= 0 || shape[1] !== 768) return false
+  const centroids = findZarrObject(structure?.root, "Cell-Segmentation/centroids")?.shape
+  if (!Array.isArray(centroids) || centroids[0] !== shape[0]) return false
+  const model = String(zarrAttrValue(dataset.attributes, "embedding_model") ?? "").trim().toLowerCase()
+  return model !== "cytoformer"
+}
+
+/**
+ * Patch-Segmentation/embeddings is one slot shared by every patch embedding
+ * node, and the feature width is the only thing that identifies the producer
+ * (MUSK 1024, H-optimus-0 1536, Virchow 2560 — the embedding tasknodes use the
+ * same rule to decide whether to reuse the store). A classifier handed another
+ * model's width raises "requires [N, D] embeddings", so "Run all" must re-run
+ * the embedding step unless the width already matches.
+ */
+const PATCH_EMBEDDING_DIM: Record<string, number> = {
+  MuskEmbedding: 1024,
+  HOptimusEmbedding: 1536,
+  VirchowEmbedding: 2560,
+}
+
+export function hasPatchEmbeddingsFor(structure: ZarrStructure | undefined, embeddingModelId: string): boolean {
+  const dim = PATCH_EMBEDDING_DIM[embeddingModelId]
+  if (!dim) return false
+  const dataset = findZarrObject(structure?.root, "Patch-Segmentation/embeddings")
+  if (!dataset) return false
+  const shape = dataset.shape
+  return Array.isArray(shape) && shape.length === 2 && shape[0] > 0 && shape[1] === dim
+}
+
+/** StarDist / CellCast / InstanSeg all write the 768-d NuClass-space embeddings. */
+const NUCLASS_SPACE_SEG_NODES = new Set(["CellCast", "StarDist", "InstanSegNode"])
+
 function synthesizeDefaultPanelByKey(panelKey: string): WorkflowPanel | null {
   const cfg = panelMap[panelKey]
   if (!cfg) return null
@@ -107,9 +150,13 @@ export async function augmentPanelsWithPrereqs(
   const presentTypes = new Set(orderedGraphNodes.map((n) => n.modelId).filter(Boolean) as string[])
   const existingPaths = new Set<string>()
   let hasReusableCytoformerEmbeddings = false
+  let hasReusableNuClassEmbeddings = false
+  let resolvedStructure: ZarrStructure | undefined
   try {
     const resolved = structure ?? (await getZarrStructure(zarrPath, "/", true, 2))
+    resolvedStructure = resolved
     hasReusableCytoformerEmbeddings = hasCytoformerEmbeddings(resolved)
+    hasReusableNuClassEmbeddings = hasNuClassEmbeddings(resolved)
     const walk = (obj: ZarrStructure["root"] | undefined, parentPath = "") => {
       if (!obj || typeof obj !== "object") return
       const children = Array.isArray(obj.children) ? obj.children : []
@@ -134,8 +181,16 @@ export async function augmentPanelsWithPrereqs(
 
   const outputGroupHasData = (group: string, modelType: string): boolean => {
     const g = group.toLowerCase()
+    // Shared embedding slots: "the array exists" is not enough, it has to be
+    // the right producer's, or the downstream classifier rejects its width.
     if (modelType === "Cytoformer") {
       return hasReusableCytoformerEmbeddings
+    }
+    if (NUCLASS_SPACE_SEG_NODES.has(modelType)) {
+      return hasReusableNuClassEmbeddings
+    }
+    if (PATCH_EMBEDDING_DIM[modelType]) {
+      return hasPatchEmbeddingsFor(resolvedStructure, modelType)
     }
     const required = PREREQ_OUTPUT_REQUIRED_ARRAYS[group]
     if (!required || required.length === 0) {

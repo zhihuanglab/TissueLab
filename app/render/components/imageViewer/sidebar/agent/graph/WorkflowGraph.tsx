@@ -1986,6 +1986,64 @@ export const WorkflowGraph: React.FC = () => {
           continue
         }
 
+        // Patch classification (MUSK / H-optimus-0 / Virchow): bar0 embedding is a
+        // DIFFERENT backend node (the embedding node, usually synthesized by "Run
+        // all" and not drawn on canvas), so it never shows up under this node's
+        // own SSE keys. Read it the way the VISTA branch does, or the bar sits at
+        // 0 for the whole embedding step and then the classification stream lands
+        // on it.
+        if (
+          isTissueClassifyModelId(node.modelId) &&
+          nextStages.length >= 2 &&
+          nextStages[0]?.key === "embedding" &&
+          CHILD_TO_PARENT[node.modelId]?.parentType
+        ) {
+          const embKeys = runtimeKeyCandidates(CHILD_TO_PARENT[node.modelId].parentType)
+          const embStatus = firstNumericRuntimeValue(embKeys.map((k) => statusMap?.[k]))
+          const embProgress = firstNumericRuntimeValue(embKeys.map((k) => progressMap?.[k]))
+          const embBreakdown = stageBreakdownForKeys(embKeys)
+          // Once this node itself has started, its embedding prerequisite is done
+          // (a skipped / already-computed prereq never streams SSE).
+          const clsStarted =
+            status === 1 || status === 2 || (typeof progress === "number" && progress > 0)
+          const embBar =
+            clsStarted || embStatus === 2
+              ? 100
+              : embStatus === 1 && typeof embProgress === "number"
+                ? clampProgress(embProgress)
+                : Math.max(
+                    clampProgress(embBreakdown?.embedding),
+                    clampProgress(stageBreakdown?.embedding)
+                  )
+          nextStages[0] = { ...nextStages[0], progress: embBar }
+
+          const prevCls = runtimeNodeSubStagesByIdRef.current[node.id]?.[1]?.progress ?? 0
+          const clsLive = resolveLiveOrStickyProgress({
+            status,
+            runtimeIsActive,
+            liveProgress: typeof progress === "number" ? clampProgress(progress) : 0,
+            previousProgress: prevCls,
+          })
+          // Not part of this run (status/progress absent, e.g. an embedding-only
+          // Re-run): keep the classification bar it already shows, as the
+          // cell-seg branch does, instead of dropping a finished bar to 0.
+          const notInRun = status === undefined && typeof progress !== "number"
+          nextStages[1] = {
+            ...nextStages[1],
+            progress:
+              status === 1 || status === 2
+                ? clsLive
+                : runtimeIsActive
+                  ? notInRun
+                    ? prevCls
+                    : 0
+                  : Math.max(prevCls, nextStages[1].progress, clsLive),
+          }
+          if (nextStages.every((s) => s.progress >= 100)) doneIds.add(node.id)
+          nextRuntimeSubStagesById[node.id] = nextStages
+          continue
+        }
+
         if (status === 2) {
           nextStages = nextStages.map((s) => ({ ...s, progress: 100 }))
           nextRuntimeSubStagesById[node.id] = nextStages
