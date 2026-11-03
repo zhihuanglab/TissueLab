@@ -2963,6 +2963,9 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
       {/*@ts-ignore*/}
       <OpenSeadragonAnnotator
         autoSave
+        // useAnnotatorInitialization owns Cmd/Ctrl+Z (it keeps disk in sync). Annotorious' own
+        // listener on the viewer element would also undo the canvas while typing in a popup input.
+        disableUndoRedoKeys
         drawingEnabled={dynamicDrawingEnabled}
         tool={currentTool === 'move' || currentTool === 'lasso' ? undefined : currentTool === 'filter' ? 'rectangle' : currentTool}
         userSelectAction={
