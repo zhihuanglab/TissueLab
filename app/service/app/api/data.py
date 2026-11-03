@@ -21,6 +21,7 @@ from app.core.executors import zarr_structure_executor
 from app.services import sidecar
 from app.services.data import (
     get_file_structure,
+    get_analysis_groups,
     get_group_info,
     get_array_info,
     read_array_data,
@@ -45,7 +46,7 @@ from app.services.data import (
     enqueue_h5_to_zarr_job,
     get_conversion_job,
 )
-from app.api.schema.data import H5ToZarrConversionRequest
+from app.api.schema.data import H5ToZarrConversionRequest, AnalysisGroupsBatchRequest
 
 data_router = APIRouter()
 
@@ -163,6 +164,41 @@ async def get_zarr_structure(
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error getting structure: {str(e)}")
+
+
+def _read_analysis_groups(request: Request, raw_path: str) -> dict:
+    """One store of a batch: the same resolution and ACL as the structure route."""
+    try:
+        file_path = get_file_path({"file_path": raw_path})
+        if not file_path:
+            return {"error": "INVALID_PATH"}
+        _, denied = authorize_read_or_response(request, file_path, operation="read Zarr structure")
+        if denied is not None:
+            return {"error": "READ_ACCESS_DENIED"}
+        validate_file_path_and_security(file_path, open_store=False)
+        return {"groups": get_analysis_groups(file_path)}
+    except Exception:
+        # Per store, not per request: one missing or broken store must not
+        # cost the rest of the screen their badges.
+        return {"error": "READ_FAILED"}
+
+
+@data_router.post("/v1/analysis_groups/batch")
+async def get_analysis_groups_batch(request: Request, payload: AnalysisGroupsBatchRequest):
+    """Which analysis results each store holds — what the file-list badges show.
+
+    The file list asks for a screenful of slides at once. One request per
+    store cost a network round trip each, and capped at a few in flight they
+    queued behind each other. Results are keyed by the path as sent; a store
+    that fails carries an error code instead of groups.
+    """
+    loop = asyncio.get_running_loop()
+    paths = list(dict.fromkeys(payload.file_paths))
+    results = await asyncio.gather(*(
+        loop.run_in_executor(zarr_structure_executor, _read_analysis_groups, request, p)
+        for p in paths
+    ))
+    return success_response({"results": dict(zip(paths, results))})
 
 
 @data_router.get("/v1/groups/{group_path:path}")

@@ -7,7 +7,7 @@ import {
     mapUploadErrorMessage,
     UPLOAD_PROGRESS_PRE_MERGE_MAX,
 } from '@/services/chunkedUpload.utils';
-import type { UploadCounts } from '@/services/fileUpload.service';
+import { extractUploadedServerPath, type UploadCounts } from '@/services/fileUpload.service';
 import type { SmallFileUploadCallbacks } from '@/services/fileUpload.service';
 import type { ChunkedFileUploadCallbacks } from '@/services/fileUpload.service';
 import { getUploadUnitWeight, type UploadBatchUnit } from '@/services/uploadBatch.utils';
@@ -17,11 +17,20 @@ import { setUploadSettings } from '@/store/slices/fileManagerSlice';
 
 export type UploadUiStatus = 'Pending' | 'Uploading' | 'Cancelled' | 'Error' | 'Completed' | 'Merging';
 
+/** Per-upload extras carried alongside a status update. */
+export interface UploadStatusExtras {
+    mergeStartedAt?: number;
+    /** Storage-relative path the server actually wrote (may differ from File.name after sanitize/uniquify). */
+    serverPath?: string;
+}
+
 export interface UploadStatusEntry {
     progress: number;
     status: UploadUiStatus;
     error?: string;
     mergeStartedAt?: number;
+    /** Storage-relative path reported by the server on completion. */
+    serverPath?: string;
     retryCount?: number;
     startTime?: number;
     fileSize?: number;
@@ -44,12 +53,12 @@ export interface UnitUploadCallbacks {
         opts?: {
             status?: UploadUiStatus;
             message?: string;
-            extras?: { mergeStartedAt?: number };
+            extras?: UploadStatusExtras;
             debounceOverallMs?: number;
         }
     ) => void;
     setMerging: (mergeStartedAt: number) => void;
-    setCompleted: () => void;
+    setCompleted: (serverPath?: string) => void;
     setFailed: (status: 'Cancelled' | 'Error', message?: string) => void;
     setRetrying: (attempt: number, maxRetries: number) => void;
     toSmallFailureCounts: (error: unknown) => UploadCounts;
@@ -130,7 +139,7 @@ export function useUploadProgress() {
         error?: string,
         displayPath?: string,
         displayFileSize?: number,
-        extras?: { mergeStartedAt?: number }
+        extras?: UploadStatusExtras
     ) => {
         const currentTime = Date.now();
         const prevStatus = uploadStatusRef.current.get(fileId);
@@ -145,6 +154,7 @@ export function useUploadProgress() {
             progress,
             status,
             mergeStartedAt,
+            serverPath: extras?.serverPath ?? prevStatus?.serverPath,
             retryCount: 0,
             startTime,
             fileSize,
@@ -251,7 +261,7 @@ export function useUploadProgress() {
             opts?: {
                 status?: UploadUiStatus;
                 message?: string;
-                extras?: { mergeStartedAt?: number };
+                extras?: UploadStatusExtras;
                 debounceOverallMs?: number;
             }
         ) => {
@@ -280,9 +290,9 @@ export function useUploadProgress() {
             trackComplete: () => uploadCompletionTracker.current.complete(fileId),
             reportProgress,
             setMerging: (mergeStartedAt) => reportProgress(UPLOAD_PROGRESS_PRE_MERGE_MAX, { status: 'Merging', extras: { mergeStartedAt } }),
-            setCompleted: () => {
+            setCompleted: (serverPath) => {
                 markFileUploadComplete(fileId, 100);
-                reportProgress(100, { status: 'Completed' });
+                reportProgress(100, { status: 'Completed', extras: { serverPath } });
             },
             setFailed: (status, message) => {
                 if (status === 'Cancelled') {
@@ -339,9 +349,12 @@ export function useUploadProgress() {
                     onUiStatus: (status, progress, extras) => {
                         reportProgress(progress, { status, extras, debounceOverallMs: 50 });
                     },
-                    onCompleteSuccess: () => {
+                    onCompleteSuccess: (result) => {
                         markFileUploadComplete(fileId, 100);
-                        reportProgress(100, { status: 'Completed' });
+                        reportProgress(100, {
+                            status: 'Completed',
+                            extras: { serverPath: extractUploadedServerPath(result, file.name) },
+                        });
                     },
                     onResumeHintsRefresh: options?.onResumeHintsRefresh ?? (() => {}),
                     captureQuotaError: options?.captureQuotaError ?? captureUploadQuotaError,
@@ -409,8 +422,8 @@ export function useUploadProgress() {
             createUnitUploadCallbacks({ fileId: id, file: f, displayPath: relPath || f.name })
                 .setRetrying(attempt, maxRetries);
         },
-        onSuccess: (id, f, relPath) => {
-            createUnitUploadCallbacks({ fileId: id, file: f, displayPath: relPath || f.name }).setCompleted();
+        onSuccess: (id, f, relPath, serverPath) => {
+            createUnitUploadCallbacks({ fileId: id, file: f, displayPath: relPath || f.name }).setCompleted(serverPath);
         },
         onFailure: (id, f, lastErr, relPath) => {
             const unit = createUnitUploadCallbacks({ fileId: id, file: f, displayPath: relPath || f.name });

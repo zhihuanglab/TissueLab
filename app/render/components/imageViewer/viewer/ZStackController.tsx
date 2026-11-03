@@ -36,6 +36,12 @@ const ZStackController: React.FC<ZStackControllerProps> = ({
   const [lastParentWidth, setLastParentWidth] = useState<number>(0); // Track parent width changes
   const lastUpdateTimeRef = useRef<number>(0); // Debounce updates
   const lastDragEndTimeRef = useRef<number>(0); // Track when drag ended
+  const infoRequestRef = useRef<AbortController | null>(null);
+  const layerRequestRef = useRef<AbortController | null>(null);
+  useEffect(() => () => {
+    infoRequestRef.current?.abort();
+    layerRequestRef.current?.abort();
+  }, [sessionId]);
   const controllerRef = useRef<HTMLDivElement>(null);
   const dragSizeRef = useRef({ w: 0, h: 0 });
   const dragCaptureRef = useRef<{ el: HTMLElement; pointerId: number } | null>(null);
@@ -154,16 +160,21 @@ const ZStackController: React.FC<ZStackControllerProps> = ({
 
   // Define fetchZStackInfo before any useEffect that uses it
   const fetchZStackInfo = useCallback(async () => {
+    infoRequestRef.current?.abort();
+    const request = new AbortController();
+    infoRequestRef.current = request;
     try {
       const url = `${AI_SERVICE_API_ENDPOINT}/load/v1/zstack-info`;
       
       const urlWithParams = `${url}?session_id=${encodeURIComponent(sessionId)}`;
       const response = await apiFetch(urlWithParams, {
         method: 'GET',
+        signal: request.signal,
         returnAxiosFormat: true,
       });
       
-      const data = response.data?.data || response.data;
+      if (request.signal.aborted) return;
+      const data = response.data;
       
       if (data.zstack_info) {
         setZstackInfo(data.zstack_info);
@@ -174,6 +185,7 @@ const ZStackController: React.FC<ZStackControllerProps> = ({
         setIsVisible(false);
       }
     } catch (error) {
+      if (request.signal.aborted) return;
       console.error('[ZStack] Error fetching z-stack info:', error);
       setZstackInfo(null);
       setIsVisible(false);
@@ -302,13 +314,15 @@ const ZStackController: React.FC<ZStackControllerProps> = ({
   useEffect(() => {
     // Reset positioned state when session changes to trigger re-positioning
     setIsPositioned(false);
+    setIsVisible(false);
+    setZstackInfo(null);
     fetchZStackInfo();
   }, [sessionId, fetchZStackInfo]);
 
   // Listen for slide loaded events to refresh z-stack info
   useEffect(() => {
     const handleSlideLoaded = (event: CustomEvent) => {
-      console.log('[ZStack] Slide loaded event received, refreshing z-stack info');
+      if (event.detail?.instanceId !== sessionId) return;
       fetchZStackInfo();
     };
 
@@ -403,12 +417,16 @@ const ZStackController: React.FC<ZStackControllerProps> = ({
 
   const handleLayerChange = async (newLayer: number) => {
     if (!zstackInfo || !zstackInfo.has_zstack) return;
-
+    infoRequestRef.current?.abort();
+    layerRequestRef.current?.abort();
+    const request = new AbortController();
+    layerRequestRef.current = request;
     try {
       const url = `${AI_SERVICE_API_ENDPOINT}/load/v1/set-z-layer`;
       
-      const response = await apiFetch(url, {
+      await apiFetch(url, {
         method: 'POST',
+        signal: request.signal,
         body: JSON.stringify({
           session_id: sessionId,
           z_layer: newLayer
@@ -416,7 +434,7 @@ const ZStackController: React.FC<ZStackControllerProps> = ({
         returnAxiosFormat: true,
       });
 
-      const data = response.data?.data || response.data;
+      if (request.signal.aborted) return;
       
       setCurrentLayer(newLayer);
       
@@ -427,9 +445,10 @@ const ZStackController: React.FC<ZStackControllerProps> = ({
       
       // Trigger a custom event to notify OpenSeadragon to refresh
       window.dispatchEvent(new CustomEvent('zLayerChanged', { 
-        detail: { layer: newLayer } 
+        detail: { instanceId: sessionId, layer: newLayer }
       }));
     } catch (error) {
+      if (request.signal.aborted) return;
       console.error('[ZStack] Error setting z-layer:', error);
     }
   };

@@ -120,6 +120,11 @@ export function watchTileRevive(viewer: any): () => void {
     // OSD fires this for every try, and starts a retry after a delay during
     // which the tile sits in neither of its queues. Only its last try is ours.
     state.retryPending = (event.tries ?? 0) < 1 + (viewer.tileRetryMax ?? 0);
+    // Cancelled as off-screen by tileDemand: not a failure, and not ours to revive.
+    if (tile.__demandCancelled) {
+      waiting.delete(tile);
+      return;
+    }
     if (isPermanentTileFailure(event.tileRequest)) {
       state.blocked = true;
       waiting.delete(tile);

@@ -16,6 +16,23 @@ export interface ListingQuery {
   showNonImage: boolean;
 }
 
+/**
+ * Rows a listing loads before the user scrolls. Lists grow by scrolling, not
+ * paging, so this is only the first screenful plus some runway.
+ */
+export const LISTING_BATCH_SIZE = 50;
+
+/**
+ * Row count to request once the user scrolls to the bottom.
+ *
+ * A grown listing is re-requested from offset 0, which keeps every existing
+ * staleness / cache / refresh rule unchanged. Growing by half again (never less
+ * than a batch) keeps the rows re-sent across all those requests to a small
+ * multiple of what ends up on screen.
+ */
+export const nextListingLimit = (limit: number): number =>
+  limit + Math.max(LISTING_BATCH_SIZE, Math.floor(limit / 2));
+
 /** Trailing slashes and Windows separators must not read as a different folder. */
 export const normalizeNavigationPath = (path: string): string =>
   (path || '').trim().replace(/\\/g, '/').replace(/\/+$/g, '');

@@ -61,6 +61,58 @@ def overlay_available(wsi_path: str) -> Dict[str, bool]:
     return {"cell": bool(cell), "patch": bool(patch)}
 
 
+# Preview types that are classification overlays, and the overlay each draws.
+PREVIEW_TYPE_TO_OVERLAY_KIND = {"cell_overlay": "cell", "patch_overlay": "patch"}
+
+# What each overlay is drawn from (see _bake_cell / _bake_patch): the
+# coordinates array, class_indices, the legacy ``classes`` colors, and the
+# classification group's own metadata, which holds ``class_colors``. Other
+# arrays in the groups (probabilities, embeddings) are large and never drawn.
+_OVERLAY_SOURCES = {
+    "cell": {
+        "walk": (("Cell-Segmentation", "centroids"), ("Cell-Classification", "class_indices"),
+                 ("Cell-Classification", "classes")),
+        "group": ("Cell-Classification",),
+    },
+    "patch": {
+        "walk": (("Patch-Segmentation", "coordinates"), ("Patch-Classification", "class_indices"),
+                 ("Patch-Classification", "classes")),
+        "group": ("Patch-Classification",),
+    },
+}
+_GROUP_METADATA = ("zarr.json", ".zgroup", ".zattrs")
+
+
+def overlay_signature(wsi_path: str, kind: str) -> str:
+    """Changes whenever a file the ``kind`` overlay is drawn from changes.
+
+    Cached overlay thumbnails are keyed by it. The slide file's own mtime, which
+    keys the plain thumbnail, does not move when a classification is re-run, so
+    an overlay keyed by it alone kept its old colors until the cache aged out.
+    Chunks can be rewritten in place without touching any ``zarr.json``, so this
+    takes the newest mtime over every file of the sources, and the count, so a
+    deleted file changes it too. A few ms on a 215k-cell store.
+    """
+    sources = _OVERLAY_SOURCES.get(kind)
+    if not sources:
+        return ""
+    zpath = _zarr_path_for(wsi_path)
+    files = []
+    for parts in sources["walk"]:
+        for root, _dirs, names in os.walk(os.path.join(zpath, *parts)):
+            files.extend(os.path.join(root, name) for name in names)
+    for group in sources["group"]:
+        files.extend(os.path.join(zpath, group, meta) for meta in _GROUP_METADATA)
+    newest, count = 0, 0
+    for path in files:
+        try:
+            newest = max(newest, os.stat(path).st_mtime_ns)
+            count += 1
+        except OSError:
+            continue
+    return f"{newest}-{count}"
+
+
 def _hex_to_rgb(h: str) -> Tuple[int, int, int]:
     h = str(h).lstrip("#")
     if len(h) != 6:

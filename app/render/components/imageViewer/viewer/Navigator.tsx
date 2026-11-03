@@ -85,6 +85,10 @@ const Navigator: React.FC<NavigatorProps> = ({ navigatorId }) => {
         // would otherwise fire its whole tile grid at once and crowd out the
         // main viewer's tiles on the backend read pool.
         imageLoaderLimit: 2,
+        // Same tile timeout and retry policy as OpenSeadragonContainer; see there.
+        timeout: 60000,
+        tileRetryMax: 3,
+        tileRetryDelay: 1000,
         ajaxHeaders: { ...(viewerInstance as any).ajaxHeaders }
       } as any);
 

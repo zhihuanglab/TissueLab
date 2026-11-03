@@ -366,6 +366,12 @@ function directModelPredecessors(
     .filter((n): n is GraphNode => Boolean(n && n.kind === "model" && n.modelId))
 }
 
+const multiStageNodesOf = (graphNodes: GraphNode[]) =>
+  graphNodes.filter(
+    (n): n is GraphNode & { modelId: string } =>
+      n.kind === "model" && !!n.modelId && RUNTIME_SUBSTAGE_FROM_TEMPLATE_IDS.has(n.modelId)
+  )
+
 const zeroRuntimeTemplateSubStagesForNodes = (graphNodes: GraphNode[]) => {
   const next: Record<string, SubStage[]> = {}
   for (const node of graphNodes) {
@@ -677,6 +683,18 @@ export const WorkflowGraph: React.FC = () => {
     return toLocalWorkflowZarrPath(currentPath)
   }, [currentPath])
 
+  // Dragging a node rewrites activeWf.nodes every animation frame, so the refresh
+  // below keys on which multi-stage nodes exist rather than on the array —
+  // otherwise each frame re-posts workflow_stage_status.
+  const activeNodesRef = useRef(activeWf.nodes)
+  useEffect(() => {
+    activeNodesRef.current = activeWf.nodes
+  }, [activeWf.nodes])
+  const multiStageNodesKey = useMemo(
+    () => multiStageNodesOf(activeWf.nodes).map((n) => `${n.id}:${n.modelId}`).join("|"),
+    [activeWf.nodes]
+  )
+
   /**
    * Idle-only: fill `preProcessed` substages from backend stage_progress so an
    * already-processed slide shows prereq bars as done (same mapping as live SSE).
@@ -685,10 +703,7 @@ export const WorkflowGraph: React.FC = () => {
     if (isRunning || workflowStatus !== "idle") return
     const zarrPath = getWorkflowZarrPath()
     if (!zarrPath) return
-    const multiStageNodes = activeWf.nodes.filter(
-      (n): n is GraphNode & { modelId: string } =>
-        n.kind === "model" && !!n.modelId && RUNTIME_SUBSTAGE_FROM_TEMPLATE_IDS.has(n.modelId)
-    )
+    const multiStageNodes = multiStageNodesOf(activeNodesRef.current)
     if (multiStageNodes.length === 0) return
     try {
       const result = await fetchWorkflowStageStatus(
@@ -764,7 +779,6 @@ export const WorkflowGraph: React.FC = () => {
       // best effort
     }
   }, [
-    activeWf.nodes,
     dispatch,
     fetchWorkflowStageStatus,
     getWorkflowZarrPath,
@@ -774,7 +788,7 @@ export const WorkflowGraph: React.FC = () => {
 
   useEffect(() => {
     void refreshPreProcessedSubstages()
-  }, [refreshPreProcessedSubstages])
+  }, [refreshPreProcessedSubstages, multiStageNodesKey])
 
   // Switching slides must drop sticky local bars AND Redux stage/progress from the
   // previous zarr. Same-slide re-runs (Update / Run) keep Done bars until the next
@@ -1972,6 +1986,64 @@ export const WorkflowGraph: React.FC = () => {
           if (nextStages.length > 0 && nextStages.every((s) => s.progress >= 100)) {
             doneIds.add(node.id)
           }
+          nextRuntimeSubStagesById[node.id] = nextStages
+          continue
+        }
+
+        // Patch classification (MUSK / H-optimus-0 / Virchow): bar0 embedding is a
+        // DIFFERENT backend node (the embedding node, usually synthesized by "Run
+        // all" and not drawn on canvas), so it never shows up under this node's
+        // own SSE keys. Read it the way the VISTA branch does, or the bar sits at
+        // 0 for the whole embedding step and then the classification stream lands
+        // on it.
+        if (
+          isTissueClassifyModelId(node.modelId) &&
+          nextStages.length >= 2 &&
+          nextStages[0]?.key === "embedding" &&
+          CHILD_TO_PARENT[node.modelId]?.parentType
+        ) {
+          const embKeys = runtimeKeyCandidates(CHILD_TO_PARENT[node.modelId].parentType)
+          const embStatus = firstNumericRuntimeValue(embKeys.map((k) => statusMap?.[k]))
+          const embProgress = firstNumericRuntimeValue(embKeys.map((k) => progressMap?.[k]))
+          const embBreakdown = stageBreakdownForKeys(embKeys)
+          // Once this node itself has started, its embedding prerequisite is done
+          // (a skipped / already-computed prereq never streams SSE).
+          const clsStarted =
+            status === 1 || status === 2 || (typeof progress === "number" && progress > 0)
+          const embBar =
+            clsStarted || embStatus === 2
+              ? 100
+              : embStatus === 1 && typeof embProgress === "number"
+                ? clampProgress(embProgress)
+                : Math.max(
+                    clampProgress(embBreakdown?.embedding),
+                    clampProgress(stageBreakdown?.embedding)
+                  )
+          nextStages[0] = { ...nextStages[0], progress: embBar }
+
+          const prevCls = runtimeNodeSubStagesByIdRef.current[node.id]?.[1]?.progress ?? 0
+          const clsLive = resolveLiveOrStickyProgress({
+            status,
+            runtimeIsActive,
+            liveProgress: typeof progress === "number" ? clampProgress(progress) : 0,
+            previousProgress: prevCls,
+          })
+          // Not part of this run (status/progress absent, e.g. an embedding-only
+          // Re-run): keep the classification bar it already shows, as the
+          // cell-seg branch does, instead of dropping a finished bar to 0.
+          const notInRun = status === undefined && typeof progress !== "number"
+          nextStages[1] = {
+            ...nextStages[1],
+            progress:
+              status === 1 || status === 2
+                ? clsLive
+                : runtimeIsActive
+                  ? notInRun
+                    ? prevCls
+                    : 0
+                  : Math.max(prevCls, nextStages[1].progress, clsLive),
+          }
+          if (nextStages.every((s) => s.progress >= 100)) doneIds.add(node.id)
           nextRuntimeSubStagesById[node.id] = nextStages
           continue
         }

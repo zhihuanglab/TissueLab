@@ -2009,6 +2009,38 @@ def get_file_structure(file_path: str, path: Optional[str] = None,
 
 
 
+# Analysis result → the child that proves it was written. Group presence alone
+# is not enough: ``write_node_userdata`` creates empty groups holding only
+# userData. The file-list badges are drawn from this table.
+ANALYSIS_GROUP_REQUIRED = {
+    "Cell-Segmentation": "centroids",
+    "Cell-Classification": "class_indices",
+    "Patch-Segmentation": "embeddings",
+    "Patch-Classification": "class_indices",
+    "Tissue-Segmentation": "masks",
+}
+
+_NODE_METADATA = ("zarr.json", ".zgroup", ".zarray")   # v3, v2 group, v2 array
+
+
+def get_analysis_groups(file_path: str) -> List[str]:
+    """Analysis groups in ``ANALYSIS_GROUP_REQUIRED`` whose required child exists.
+
+    Checks node metadata files instead of walking the store: a depth-2
+    structure read opens every array under every group (annotation stores hold
+    dozens), which cost 7-40 ms per store locally and most of the ~70 ms the
+    badge reads took in prod, to answer ten yes/no questions.
+    """
+    def is_node(*parts: str) -> bool:
+        node = os.path.join(file_path, *parts)
+        return any(os.path.exists(os.path.join(node, meta)) for meta in _NODE_METADATA)
+
+    return [
+        group for group, child in ANALYSIS_GROUP_REQUIRED.items()
+        if is_node(group) and is_node(group, child)
+    ]
+
+
 def get_group_info(file_path: str, group_path: str, include_arrays: bool = True,
                   include_subgroups: bool = True) -> Optional[Dict[str, Any]]:
     """Get group information"""
@@ -2432,8 +2464,32 @@ def export_zarr_structure_service(file_path: str, export_path: str, format: str 
         raise ValueError(f"Export failed: {str(e)}")
 
 
-def validate_file_path_and_security(file_path: str) -> None:
-    """Validate file path and perform security checks"""
+def _root_is_group(store_path: str) -> bool:
+    """True if the store root holds readable v3 or v2 group metadata."""
+    for meta, is_group in (
+        ("zarr.json", lambda doc: doc.get("zarr_format") == 3 and doc.get("node_type") == "group"),
+        (".zgroup", lambda doc: doc.get("zarr_format") == 2),
+    ):
+        try:
+            with open(os.path.join(store_path, meta), "r", encoding="utf-8") as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(doc, dict) and is_group(doc):
+            return True
+    return False
+
+
+def validate_file_path_and_security(file_path: str, open_store: bool = True) -> None:
+    """Validate file path and perform security checks.
+
+    ``open_store=False`` skips opening a store whose root metadata parses as a
+    group. Opening goes through zarr's single event-loop thread, so it caps
+    every thread of the service at ~2000 opens/s together — the batch badge
+    read, which needs only metadata files, would queue on it. Anything else
+    (no root metadata, unreadable or array metadata) is still opened, and
+    legacy dotfiles repaired, as usual.
+    """
     if not file_path:
         raise ValueError("No file path provided")
 
@@ -2448,6 +2504,9 @@ def validate_file_path_and_security(file_path: str) -> None:
 
     if not is_zarr_store_path(real_file_path):
         raise ValueError("Zarr file not found")
+
+    if not open_store and _root_is_group(real_file_path):
+        return
 
     if not validate_zarr_file(real_file_path):
         raise ValueError("Invalid Zarr file")

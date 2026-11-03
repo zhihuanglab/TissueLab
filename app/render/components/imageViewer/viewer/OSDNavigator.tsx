@@ -1,8 +1,22 @@
 "use client";
 import React, { useEffect, useRef, useCallback, useState } from 'react';
 import OpenSeadragon from 'openseadragon';
-import { startTileAuth } from '@/hooks/viewer/useTileAuth';
 import { useAnnotatorInstance } from '@/contexts/AnnotatorContext';
+import { startTileAuth } from '@/hooks/viewer/useTileAuth';
+import { installTileDemand } from '@/utils/viewer/tileDemand';
+
+// OSD resolves tile sources asynchronously, even when the source is already
+// ready. Stop a disposed navigator before OSD constructs a TiledImage with its
+// destroyed drawer (StrictMode cleanup and rapid slide changes can race here).
+class CancellableNavigator extends OpenSeadragon.Navigator {
+  async instantiateTileSourceClass(options: OpenSeadragon.TileSourceSpecifier) {
+    const result = await super.instantiateTileSourceClass(options);
+    if (this.isDestroyed()) {
+      throw { message: 'Navigator was disposed before its tile source was ready.' };
+    }
+    return result;
+  }
+}
 
 interface OSDNavigatorProps {
   navigatorSizeRatio?: number;
@@ -15,9 +29,9 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
 }) => {
   const { viewerInstance } = useAnnotatorInstance();
   const navigatorRef = useRef<any>(null);
-  const stopTileAuthRef = useRef<(() => void) | null>(null);
   const navRotateHandlerRef = useRef<any>(null);
   const navScrollHandlerRef = useRef<any>(null);
+  const stopTileAuthRef = useRef<(() => void) | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const autoHideTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [isVisible, setIsVisible] = useState(true);
@@ -81,8 +95,9 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
           }
         }
         stopTileAuthRef.current?.();
-      stopTileAuthRef.current = null;
-      navigatorRef.current.destroy();
+        stopTileAuthRef.current = null;
+        navigatorRef.current._disposeTileDemand?.();
+        navigatorRef.current.destroy();
       } catch (error) {
         console.warn('Error during navigator cleanup:', error);
       } finally {
@@ -190,16 +205,30 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
   }, [autoHideDelay]);
 
   useEffect(() => {
-  const createNavigator = () => {
-    if (!viewerInstance || !containerRef.current || !viewerInstance.world) return;
+    let disposed = false;
+    let originalTiledImage: any = null;
+    let layoutTimeout: ReturnType<typeof setTimeout> | null = null;
 
-    // Clear existing content
-    containerRef.current.innerHTML = '';
+    const createNavigator = () => {
+      if (disposed || !viewerInstance?.drawer || !containerRef.current || !viewerInstance.world) return;
 
-    // Get the tiled image from viewer (get the last item which is usually the newest)
-    const itemCount = viewerInstance.world.getItemCount();
-    const tiledImage = itemCount > 0 ? viewerInstance.world.getItemAt(itemCount - 1) : null;
-    if (!tiledImage) return;
+      // Follow the displayed image. A pending Z layer is added at index 1 with opacity 0.
+      const itemCount = viewerInstance.world.getItemCount();
+      const tiledImage = itemCount > 0 ? viewerInstance.world.getItemAt(0) : null;
+      if (!tiledImage) {
+        if (layoutTimeout !== null) clearTimeout(layoutTimeout);
+        cleanupNavigator();
+        originalTiledImage = null;
+        return;
+      }
+      // add-item and open commonly announce the same image in succession.
+      if (navigatorRef.current && originalTiledImage === tiledImage) return;
+
+      if (layoutTimeout !== null) clearTimeout(layoutTimeout);
+      cleanupNavigator();
+      originalTiledImage = tiledImage;
+      containerRef.current.innerHTML = '';
+      const prevNavRotateEvent = (viewerInstance as any).events['rotate']?.slice() || [];
 
       // Create navigator container
       const navContainer = document.createElement('div');
@@ -209,7 +238,7 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
       containerRef.current.appendChild(navContainer);
 
       // Create OpenSeadragon Navigator
-      navigatorRef.current = new OpenSeadragon.Navigator({
+      const navigator = new CancellableNavigator({
         element: navContainer,
         viewer: viewerInstance,
         navigatorSizeRatio: navigatorSizeRatio,
@@ -224,19 +253,35 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
         loadTilesWithAjax: true,
         // OSD defaults this to 0 — unlimited. The navigator draws the whole
         // slide at once, so it would fire its entire tile grid concurrently
-        // while the main viewer politely holds itself to 6, and the overflow
+        // while the main viewer politely holds itself to 12, and the overflow
         // queues on the backend's shared read pool ahead of the tiles the user
         // is actually looking at.
         imageLoaderLimit: 2,
-        ajaxHeaders: { ...(viewerInstance as any).ajaxHeaders }
+        // Same tile timeout and retry policy as OpenSeadragonContainer; see there.
+        timeout: 60000,
+        tileRetryMax: 3,
+        tileRetryDelay: 1000,
+        // The main viewer's headers carry its current token (its own
+        // useTileAuth keeps them fresh); startTileAuth below keeps ours.
+        ajaxHeaders: { ...(viewerInstance as any).ajaxHeaders },
       } as any);
+      navigatorRef.current = navigator;
+      // Its own OSD viewer: its tile failures never reach the main viewer's
+      // watcher, so it refreshes its own header.
+      stopTileAuthRef.current = startTileAuth(navigator);
+      (navigator as any)._tileBackground = true;
+      (navigator as any)._disposeTileDemand = installTileDemand(navigator);
 
-      stopTileAuthRef.current = startTileAuth(navigatorRef.current);
-      navigatorRef.current.addTiledImage({
+      const currentNavRotateEvent = (viewerInstance as any).events['rotate']?.slice() || [];
+      const navRotateEvent = currentNavRotateEvent.find((item: any) => !prevNavRotateEvent.includes(item));
+      navRotateHandlerRef.current = navRotateEvent?.handler ?? null;
+
+      const navigatorImage = {
         tileSource: tiledImage.source,
         originalTiledImage: tiledImage,
         crossOriginPolicy: 'Anonymous'
-      });
+      };
+      navigator.addTiledImage(navigatorImage);
 
       navigatorRef.current.addHandler('tile-loaded', updateNavigator);
 
@@ -262,47 +307,29 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
       updateViewerSize();
       
       // Force a redraw after a short delay to ensure initialization finishes after DOM layout
-      setTimeout(() => {
-        if (navigatorRef.current && viewerInstance.viewport) {
+      layoutTimeout = setTimeout(() => {
+        if (!disposed && navigatorRef.current === navigator && viewerInstance.viewport) {
           try {
-            navigatorRef.current.updateSize();
-            navigatorRef.current.update(viewerInstance.viewport);
+            navigator.updateSize();
+            navigator.update(viewerInstance.viewport);
           } catch (e) {}
         }
       }, 500);
     };
 
-    const initNavigator = async () => {
-      if (viewerInstance) {
-        cleanupNavigator();
-        // Get rotate event before create navigator
-        const prevNavRotateEvent = (viewerInstance as any).events['rotate']?.slice() || [];
-        // Create navigator
-        createNavigator();
-        // Get rotate event after create navigator
-        const currentNavRotateEvent = (viewerInstance as any).events['rotate']?.slice() || [];
-        // Extract the handler from the event
-        const navRotateEvent = currentNavRotateEvent.filter((item: any) => !prevNavRotateEvent.includes(item))[0];
-        if (navRotateEvent) {
-          const navRotateHandler = navRotateEvent.handler;
-          navRotateHandlerRef.current = navRotateHandler;
-        }
-      }
-    };
-
     // Initialize the navigator
-    initNavigator();
+    createNavigator();
 
     // Listen for image open/ready events
     const handleOpen = () => {
       console.log('[OSDNavigator] Image opened, initializing navigator');
-      initNavigator();
+      createNavigator();
       showNavigator(); // Reset auto-hide timer to give user time to see it
     };
 
     const handleAddItem = () => {
       console.log('[OSDNavigator] World item added, initializing navigator');
-      initNavigator();
+      createNavigator();
       showNavigator(); // Reset auto-hide timer
     };
 
@@ -313,39 +340,22 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
       }
     }
 
-    // Listen for z-layer changes to recreate navigator
-    const handleZLayerChange = () => {
-      // Wait a bit for the new tiled image to be added
-      setTimeout(() => {
-        initNavigator();
-      }, 300);
-    };
-
-    window.addEventListener('zLayerChanged', handleZLayerChange);
+    // A successful layer swap removes the old item only after revealing the new one.
+    viewerInstance?.world?.addHandler('remove-item', handleAddItem);
 
     return () => {
+      disposed = true;
+      if (layoutTimeout !== null) clearTimeout(layoutTimeout);
       cleanupNavigator();
       if (viewerInstance) {
         viewerInstance.removeHandler('open', handleOpen);
         if (viewerInstance.world) {
           viewerInstance.world.removeHandler('add-item', handleAddItem);
+          viewerInstance.world.removeHandler('remove-item', handleAddItem);
         }
       }
-      window.removeEventListener('zLayerChanged', handleZLayerChange);
     };
   }, [viewerInstance, navigatorSizeRatio, updateNavigator, isMacOS, cleanupNavigator]);
-
-  // Cleanup effect for fast reload
-  useEffect(() => {
-    return () => {
-      if (navigatorRef.current) {
-        stopTileAuthRef.current?.();
-      stopTileAuthRef.current = null;
-      navigatorRef.current.destroy();
-        navigatorRef.current = null;
-      }
-    };
-  }, []);
 
   // Auto-hide effect
   useEffect(() => {

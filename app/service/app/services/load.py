@@ -3,8 +3,8 @@ import asyncio
 import logging
 import math
 import numpy as np
-from PIL import Image, ImageDraw
-from functools import lru_cache
+from PIL import Image
+from functools import wraps
 from typing import Tuple, List, Dict, Optional
 from io import BytesIO
 import time
@@ -24,7 +24,10 @@ from tissuelab_sdk.wrapper import (TiffSlideWrapper, TiffFileWrapper,
                     NiftiImageWrapper)
 
 from app.wrapper import PyvipsSlideWrapper
-from app.core.executors import tile_executor
+from app.wrapper.shared_slide_wrapper import SharedSlideWrapper
+from app.wrapper.isolated_slide_wrapper import NativeDecodeTimeout
+from app.wrapper.tile_encoding import _resize_vips_tile_to_exact, _encode_tile_vips
+from app.core.tile_scheduler import get_tile_scheduler, StaleTile, TileQueueFull
 
 import tiffslide
 try:
@@ -84,7 +87,7 @@ _session_last_access: Dict[str, float] = {}
 # straight in. A fixed pool has neither problem; two sessions occasionally share
 # a stripe, which costs one of them a wait it would have had anyway.
 _REOPEN_LOCK_STRIPES = 32
-_reopen_locks = [threading.Lock() for _ in range(_REOPEN_LOCK_STRIPES)]
+_reopen_locks = [threading.RLock() for _ in range(_REOPEN_LOCK_STRIPES)]
 
 
 def _reopen_lock_for(session_id: str) -> threading.Lock:
@@ -97,6 +100,11 @@ IDLE_SLIDE_TTL_SEC = 30 * 60
 
 def _touch_session_unlocked(session_id: str) -> None:
     _session_last_access[session_id] = time.monotonic()
+
+
+# Tile URLs carry the epoch and browsers keep tiles for a day, so an epoch must
+# never name different pixels: start each process past any earlier run's.
+_TILE_EPOCH_BASE = int(time.time())
 
 
 def _new_session_data() -> Dict:
@@ -116,10 +124,12 @@ def _new_session_data() -> Dict:
         # True only while the idle sweeper is holding this session's slide
         # closed; see release_idle_slides / ensure_session_slide.
         'slide_released': False,
-        # Bumped whenever this session switches to a different slide. Tile jobs
+        'slide_loading': False,
+        # Bumped on a slide switch or reader replacement. Tile jobs
         # capture it before they are queued and drop out if it moved on — see
         # set_session_file_path.
-        'tile_epoch': 0,
+        'tile_epoch': _TILE_EPOCH_BASE,
+        'file_identity': None,
     }
 
 
@@ -141,16 +151,25 @@ def set_session_file_path(session_id: str, file_path: Optional[str]) -> int:
     ahead of anything the new slide needs. The epoch lets queued-but-not-started
     jobs notice they are obsolete and return immediately.
 
-    Only a genuine path change bumps: reloading the same slide (force reload,
+    Only a genuine change bumps: another path, or the same path rewritten on
+    disk (new file identity). Reloading an unchanged slide (force reload,
     channel change) must not invalidate tiles that are legitimately in flight.
+    The epoch is also in every tile URL, which browsers cache, so any change of
+    pixels behind a path has to change it.
     """
+    identity = None
+    if file_path:
+        from app.utils.cache.tile import get_tile_cache
+        identity = get_tile_cache().register_file(file_path)
     with session_lock:
         if session_id not in sessions:
             sessions[session_id] = _new_session_data()
         session_data = sessions[session_id]
-        if session_data.get('current_file_path') != file_path:
-            session_data['tile_epoch'] = session_data.get('tile_epoch', 0) + 1
+        if (session_data.get('current_file_path') != file_path
+                or session_data.get('file_identity') != identity):
+            session_data['tile_epoch'] = session_data.get('tile_epoch', _TILE_EPOCH_BASE) + 1
         session_data['current_file_path'] = file_path
+        session_data['file_identity'] = identity
         _touch_session_unlocked(session_id)
         return session_data['tile_epoch']
 
@@ -256,11 +275,14 @@ def clear_session(session_id: str):
     # other file is one of the things that then never completes.
     # release_idle_slides() already splits it this way; so does this.
     slide_obj = None
-    with session_lock:
-        session_data = sessions.pop(session_id, None)
-        if session_data is not None:
-            slide_obj = session_data.get('slide')
-        _session_last_access.pop(session_id, None)
+    # A load owns this lock until its replacement reader has been published.
+    # Removing the session halfway through would orphan that reader.
+    with _reopen_lock_for(session_id):
+        with session_lock:
+            session_data = sessions.pop(session_id, None)
+            if session_data is not None:
+                slide_obj = session_data.get('slide')
+            _session_last_access.pop(session_id, None)
 
     if slide_obj is not None:
         try:
@@ -282,17 +304,21 @@ def clear_session(session_id: str):
         thumbnail_generator.forget_session(session_id)
     except Exception as e:
         logger.warning(f"Failed to drop thumbnail session state for {session_id}: {e}")
-
-    # Prompt reclaim after large slide / handler teardown.
-    try:
-        import gc
-        gc.collect()
-    except Exception:
-        pass
+    # No gc.collect() here: reference counting already frees the slide and
+    # handlers, and a full collection holds the GIL (43-75 ms under tile load),
+    # stalling the event loop on every session close.
 
 
-def create_instance_from_path(file_path: str, uid: Optional[str] = None) -> Dict:
-    """Create a new instance/session from a file path."""
+def create_instance_from_path(file_path: str, uid: Optional[str] = None,
+                              instance_id: Optional[str] = None) -> Dict:
+    """Create a new instance/session from a file path.
+
+    With ``instance_id`` this restores an open viewer's session instead: after a
+    service restart the viewer still holds its id, but the session behind it is
+    gone and every tile is refused. Only an absent session is recreated; one the
+    caller already owns on the same file is returned as is (its current epoch
+    answers a viewer whose tile URLs fell behind), and anyone else's is refused.
+    """
     if not file_path:
         return {"status": "error", "message": "file_path is required"}
 
@@ -304,11 +330,42 @@ def create_instance_from_path(file_path: str, uid: Optional[str] = None) -> Dict
         absolute_file_path = authorize_storage_read_path(resolved_file_path, uid or "")
     except PermissionError:
         return {"status": "error", "message": "Path access denied"}
-    instance_id = str(uuid.uuid4())
+    if instance_id is not None:
+        try:
+            instance_id = str(uuid.UUID(instance_id))
+        except (ValueError, TypeError, AttributeError):
+            return {"status": "error", "message": "Invalid instance_id", "http_status": 400}
+        # Serialize with loads of this session: a burst of refused tiles from
+        # two viewers of one instance must not open the slide twice.
+        with _reopen_lock_for(instance_id):
+            with session_lock:
+                existing = sessions.get(instance_id)
+                if existing is not None:
+                    if existing.get("owner_uid") != uid:
+                        return {"status": "error", "message": "Instance access denied", "http_status": 403}
+                    if existing.get("current_file_path") != absolute_file_path:
+                        return {"status": "error", "message": "Instance holds another slide", "http_status": 409}
+                    _touch_session_unlocked(instance_id)
+                    return {
+                        "status": "success",
+                        "instanceId": instance_id,
+                        "tile_epoch": existing.get("tile_epoch", 0),
+                        "message": "Instance already loaded",
+                        "restored": False,
+                    }
+            result = _create_instance(instance_id, absolute_file_path, resolved_file_path, uid)
+        if result["status"] == "success":
+            result["restored"] = True
+        return result
+    return _create_instance(str(uuid.uuid4()), absolute_file_path, resolved_file_path, uid)
+
+
+def _create_instance(instance_id: str, absolute_file_path: str, resolved_file_path: str,
+                     uid: Optional[str]) -> Dict:
     try:
         bind_session_owner(instance_id, uid or "", create=True)
     except PermissionError:
-        return {"status": "error", "message": "Instance access denied"}
+        return {"status": "error", "message": "Instance access denied", "http_status": 403}
 
     logger.info(
         "Creating instance %s for file path %s -> %s",
@@ -325,6 +382,7 @@ def create_instance_from_path(file_path: str, uid: Optional[str] = None) -> Dict
     return {
         "status": "success",
         "instanceId": instance_id,
+        "tile_epoch": get_tile_epoch(instance_id),
         "message": "Instance created successfully",
         "file_format": result["file_format"],
         "dimensions": result["dimensions"],
@@ -354,7 +412,7 @@ def release_idle_slides(ttl_sec: float = IDLE_SLIDE_TTL_SEC) -> int:
     to_close = []
     with session_lock:
         for session_id, session_data in list(sessions.items()):
-            if session_data.get('slide') is None:
+            if session_data.get('slide') is None or session_data.get('slide_loading', False):
                 continue
             last = _session_last_access.get(session_id)
             if last is None:
@@ -381,12 +439,7 @@ def release_idle_slides(ttl_sec: float = IDLE_SLIDE_TTL_SEC) -> int:
                 slide_obj.close()
         except Exception as e:
             logger.warning("Failed to close idle slide for session %s: %s", session_id, e)
-    if to_close:
-        try:
-            import gc
-            gc.collect()
-        except Exception:
-            pass
+    # No gc.collect(): see clear_session.
     return len(to_close)
 
 
@@ -424,8 +477,16 @@ def ensure_session_slide(session_id: str) -> bool:
             if session_data.get('slide') is not None:
                 _touch_session_unlocked(session_id)
                 return True
+            # A slide switch or teardown may have won while we waited for the
+            # reopen lock. Use only the current released session's path.
+            if not session_data.get('slide_released'):
+                return False
+            file_path = session_data.get('current_file_path')
+            if not file_path:
+                return False
+            z_layer = session_data.get('current_z_layer', 0)
         logger.info("Reopening released slide for session %s: %s", session_id, file_path)
-        result = load_slide_from_file_with_session(file_path, session_id)
+        result = load_slide_from_file_with_session(file_path, session_id, keep_epoch=True)
         if result.get("status") != "success":
             logger.warning(
                 "Failed to reopen slide for session %s: %s",
@@ -436,6 +497,8 @@ def ensure_session_slide(session_id: str) -> bool:
             session_data = sessions.get(session_id)
             if session_data is not None:
                 session_data['slide_released'] = False
+                if z_layer in session_data.get('zstack_info', {}).get('layer_indices', [0]):
+                    session_data['current_z_layer'] = z_layer
                 _touch_session_unlocked(session_id)
         return True
 
@@ -689,20 +752,25 @@ def get_folder_structure_for_api(folder_path: Optional[str]) -> Dict:
 def get_loaded_slide_info(session_id: str = "default") -> Dict:
     """Return the currently loaded slide metadata for a session."""
     session_data = get_session_data(session_id)
-    session_slide = session_data["slide"]
-    session_current_file_format = session_data["current_file_format"]
+    with session_lock:
+        if session_data.get("slide_loading", False):
+            return {"status": "error", "message": "Slide is still loading"}
+        snapshot = dict(session_data)
+    session_slide = snapshot["slide"]
+    session_current_file_format = snapshot["current_file_format"]
 
     if session_slide is None:
-        if session_data.get("skip_parsing", False) and session_current_file_format in ["nii", "nii.gz"]:
-            dimensions = _normalize_dimensions(session_data.get("dimensions", [512, 512]))
-            return {
+        if snapshot.get("skip_parsing", False) and session_current_file_format in ["nii", "nii.gz"]:
+            dimensions = _normalize_dimensions(snapshot.get("dimensions", [512, 512]))
+            result = {
                 "status": "success",
                 "message": "Slide loaded successfully",
+                "tile_epoch": snapshot.get("tile_epoch", 0),
                 "slideInfo": {
                     "fileFormat": session_current_file_format,
                     "dimensions": dimensions,
-                    "levelCount": session_data.get("level_count", 1),
-                    "totalTiles": session_data.get("total_tiles", 1),
+                    "levelCount": snapshot.get("level_count", 1),
+                    "totalTiles": snapshot.get("total_tiles", 1),
                     "mpp": None,
                     "magnification": None,
                     "pyramidInfo": [{
@@ -712,19 +780,30 @@ def get_loaded_slide_info(session_id: str = "default") -> Dict:
                     }],
                 },
             }
-        return {"status": "error", "message": f"No slide loaded for session {session_id}"}
+        else:
+            return {"status": "error", "message": f"No slide loaded for session {session_id}"}
 
-    return {
-        "status": "success",
-        "message": "Slide loaded successfully",
-        "slideInfo": {
-            "fileFormat": session_current_file_format,
-            "dimensions": session_slide.dimensions,
-            "levelCount": len(session_slide.level_dimensions) if hasattr(session_slide, "level_dimensions") else 0,
-            "totalTiles": calculate_total_tiles(session_slide),
-            "pyramidInfo": get_pyramid_info(session_slide),
-        },
-    }
+    else:
+        result = {
+            "status": "success",
+            "message": "Slide loaded successfully",
+            "tile_epoch": snapshot.get("tile_epoch", 0),
+            "slideInfo": {
+                "fileFormat": session_current_file_format,
+                "dimensions": session_slide.dimensions,
+                "levelCount": len(session_slide.level_dimensions) if hasattr(session_slide, "level_dimensions") else 0,
+                "totalTiles": calculate_total_tiles(session_slide),
+                "pyramidInfo": get_pyramid_info(session_slide),
+            },
+        }
+
+    with session_lock:
+        if (sessions.get(session_id) is not session_data
+                or session_data.get("slide_loading", False)
+                or session_data.get("slide") is not session_slide
+                or session_data.get("tile_epoch", 0) != snapshot.get("tile_epoch", 0)):
+            return {"status": "error", "message": "Slide changed while reading metadata"}
+    return result
 
 
 def get_session_pyramid_info(session_id: str = "default") -> Dict:
@@ -792,6 +871,7 @@ def get_session_properties_response(session_id: str = "default") -> Dict:
         result["dimensions"] = session_slide.dimensions
 
     result["level_count"] = len(session_slide.level_dimensions)
+    result["tile_epoch"] = session_data.get("tile_epoch", 0)
     result["mpp"] = result.get("mpp", 0.25)
     result["magnification"] = result.get("magnification", "20x")
 
@@ -859,52 +939,154 @@ def _parse_tile_request_inputs(col_row: str, query_params=None) -> Dict:
 
 
 async def get_tile_for_api(
-    level: int,
-    col_row: str,
-    scale_factor: float = 1.0,
-    color_mode: Optional[str] = None,
-    query_params=None,
-    session_id: str = "default",
+    level: int, col_row: str, scale_factor: float = 1.0,
+    color_mode: Optional[str] = None, query_params=None,
+    session_id: str = "default", disconnected=None, if_none_match: Optional[str] = None,
+    tile_priority: Optional[str] = None, tile_distance: Optional[str] = None,
 ) -> Dict:
-    """Resolve a tile request into JPEG bytes and metadata."""
-    parse_result = _parse_tile_request_inputs(col_row, query_params)
-    if parse_result["status"] == "error":
-        return parse_result
+    """Check RAM before admission, then share and fairly schedule cache misses.
 
-    col = parse_result["col"]
-    row = parse_result["row"]
-    channels_list = parse_result["channels"]
-    colors_list = parse_result["colors"]
+    Success results carry an ``etag``: the tile cache key, which covers the file
+    identity and every display parameter. A request whose ``If-None-Match``
+    holds it gets ``not_modified`` without queueing or decoding.
 
-    session_data = get_session_data(session_id)
+    ``tile_priority``/``tile_distance`` come from request headers: they only
+    order the queue, never change pixels, so they stay out of the URL, where a
+    per-request distance made every URL unique and defeated the browser cache.
+    """
+    parsed = _parse_tile_request_inputs(col_row, query_params)
+    if parsed['status'] == 'error':
+        return parsed
+    params = query_params or {}
+    try:
+        z_layer = int(params.get('z_layer', get_session_data(session_id).get('current_z_layer', 0)))
+        priority = int(tile_priority or 1)
+        distance = float(tile_distance or 0)
+        prefer_overview = params.get('overview') == '1'
+        content_epoch = int(params['content_epoch']) if 'content_epoch' in params else None
+        cache_mode = f'{color_mode}:overview' if prefer_overview else color_mode
+        if prefer_overview and (level != 0 or parsed['col'] != 0 or parsed['row'] != 0):
+            raise ValueError('Overview must be the whole lowest level')
+        if priority not in (0, 1, 2) or not math.isfinite(distance) or distance < 0:
+            raise ValueError('Invalid tile priority')
+        # Only the actual lowest tile may use overview admission/eviction.
+        if priority == 0 and (level != 0 or parsed['col'] != 0 or parsed['row'] != 0):
+            priority = 1
+        if z_layer < 0 or level < 0 or parsed['col'] < 0 or parsed['row'] < 0 or not math.isfinite(scale_factor) or scale_factor <= 0:
+            raise ValueError('Invalid tile parameters')
+    except (ValueError, TypeError):
+        return {'status': 'error', 'message': 'Invalid tile parameters', 'http_status': 400}
+    session = get_session_data(session_id)
+    if session.get('slide_loading', False):
+        # Usually an idle reopen of this same slide: worth retrying, unlike a
+        # stale 409 which the viewer treats as permanent.
+        return {'status': 'error', 'message': 'Slide is loading; retry shortly', 'http_status': 503}
+    slide = session.get('slide')
+    layers = session.get('zstack_info', {}).get('layer_indices', [0])
+    if z_layer not in layers:
+        return {'status': 'error', 'message': 'Invalid z-layer', 'http_status': 400}
+    if slide is not None:
+        max_level = max(0, math.ceil(math.log2(max(slide.level_dimensions[0]) / TILE_SIZE)))
+        if level > max_level:
+            return {'status': 'error', 'message': 'Invalid tile level', 'http_status': 400}
+    epoch = session.get('tile_epoch', 0)
+    if content_epoch is not None and content_epoch != epoch:
+        return {'status': 'stale', 'message': 'Tile belongs to a different slide version'}
+    path = session.get('current_file_path')
+    from app.utils.cache.tile import get_tile_cache
+    cache = get_tile_cache()
+    namespace = path + (f'_z{z_layer}' if z_layer > 0 else '') if path else None
+    if namespace and namespace != path:
+        cache.register_alias(namespace, path)
+    identity = cache.identity(namespace) if namespace else None
+    if namespace:
+        identity_current, lookup, etag = cache.bind_tile_lookup(
+            namespace, level, parsed['col'], parsed['row'], scale_factor,
+            cache_mode, parsed['channels'], parsed['colors'], expected_identity=identity)
+        etag = f'"{etag}"'
+    else:
+        identity_current, lookup, etag = lambda: True, lambda: None, None
+    def same_content():
+        # Do not recreate a deleted session merely to validate old queued work.
+        with session_lock:
+            current = sessions.get(session_id)
+            return (current is session
+                    and current.get('tile_epoch', 0) == epoch
+                    and current.get('current_file_path') == path
+                    and identity_current())
+    def valid():
+        return same_content() and not session.get('slide_loading', False)
+    scheduler = get_tile_scheduler()
+    try:
+        if disconnected is not None and await disconnected():
+            raise StaleTile('Tile client disconnected')
+        if not valid():
+            raise StaleTile('Slide changed')
+        if etag and if_none_match and etag in (tag.strip() for tag in if_none_match.split(',')):
+            return {'status': 'not_modified', 'etag': etag}
+        if namespace:
+            data = lookup()
+            if data:
+                return dict(status='success', image_data=data, format='JPEG', etag=etag)
+        missed_revision = -1
+        def cached():
+            nonlocal missed_revision
+            revision = cache.revision
+            if missed_revision == revision:
+                return None
+            if not namespace:
+                return None
+            data = lookup()
+            if not data:
+                missed_revision = revision
+            return dict(status='success', image_data=data, format='JPEG') if data else None
 
-    # Snapshot the epoch on the event loop, before queuing. Everything queued
-    # behind a slide switch then fails this check on the worker thread and
-    # returns without touching the slide — which is the only cancellation
-    # available here, since a running executor job cannot be interrupted and an
-    # aborted client XHR does not reach the server.
-    expected_epoch = session_data.get('tile_epoch', 0)
-
-    # Own pool, not the default one. `asyncio.to_thread` shares the default
-    # executor, so a slide open — one queued job per visible tile, each holding
-    # its thread for a whole libvips pipeline — filled it and left every other
-    # to_thread hop waiting, auth.verify_id_token in the HTTP middleware
-    # included. That is what put 3-4s on endpoints that return an empty list.
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        tile_executor,
-        lambda: get_tile(
-            level=level,
-            col=col,
-            row=row,
-            scale_factor=scale_factor,
-            color_mode=color_mode,
-            channels=channels_list,
-            colors=colors_list,
-            session_id=session_id,
-            expected_epoch=expected_epoch,
-        ),
-    )
+        slide = session.get('slide')
+        shared = isinstance(slide, SharedSlideWrapper) and z_layer == 0
+        artifact = (namespace, identity, level, parsed['col'], parsed['row'], scale_factor,
+                    cache_mode, tuple(parsed['channels']), tuple(parsed['colors']),
+                    session.get('current_file_format'))
+        # Special/SDK readers retain their session-scoped behavior. Only the
+        # file-shared WSI reader can safely outlive its originating session.
+        key = ('file', *artifact) if shared else ('session', session_id, epoch, *artifact)
+        def work():
+            return get_tile(level, parsed['col'], parsed['row'], scale_factor,
+                            color_mode, parsed['channels'], parsed['colors'],
+                            session_id, z_layer, epoch, identity, prefer_overview)
+        def prepare():
+            # Called on the service loop only when a native slot is available.
+            # No opening/stat/RPC occurs here, and the worker owns the release.
+            if not valid():
+                raise StaleTile('Slide changed before admission')
+            try:
+                retained = slide.retain()
+            except RuntimeError as error:
+                raise StaleTile('Slide reader was closed before admission') from error
+            snapshot = dict(session, slide=retained, slide_released=False)
+            def decode():
+                return get_tile(level, parsed['col'], parsed['row'], scale_factor,
+                                color_mode, parsed['channels'], parsed['colors'],
+                                session_id, z_layer, None, identity, prefer_overview,
+                                _session_snapshot=snapshot)
+            return decode, retained.close
+        result = await scheduler.request(
+            key, session_id, work, valid,
+            disconnected=disconnected, priority=(priority, min(distance, 1e6)),
+            cached=cached, prepare=prepare if shared else None,
+            resource=slide.tile_resource if shared else None,
+            resource_limit=slide.tile_capacity if shared else 1,
+        )
+        if result.get('status') == 'stale' and same_content():
+            return {'status': 'error', 'message': 'Slide reader is recovering; retry shortly', 'http_status': 503}
+        if result.get('status') == 'success' and etag:
+            result = dict(result, etag=etag)   # shared by every waiter: copy, never mutate
+        return result
+    except StaleTile as error:
+        if same_content() and not (disconnected is not None and await disconnected()):
+            return {'status': 'error', 'message': 'Slide reader is recovering; retry shortly', 'http_status': 503}
+        return {'status': 'stale', 'message': str(error)}
+    except TileQueueFull as error:
+        return {'status': 'error', 'message': str(error), 'http_status': 503}
 
 
 def get_overlay_tile_for_api(level: int, col_row: str, overlay_kind: str, session_id: str = "default", dot_radius: int = 1) -> Dict:
@@ -951,6 +1133,19 @@ def get_overlay_tile_for_api(level: int, col_row: str, overlay_kind: str, sessio
     tile_cache = get_tile_cache()
     # Cell dot radius is part of the cache identity (different sizes → different tiles).
     cache_mode = f"overlay_{overlay_kind}" if overlay_kind != "cell" else f"overlay_cell_r{int(dot_radius)}"
+    if file_path:
+        # Overlay pixels come from the sidecar zarr, not the slide file whose
+        # identity the cache tracks. Version them by the store's root markers;
+        # an in-place rewrite of a nested array still waits for cache expiry.
+        from app.services.thumbnail.overlay import _zarr_path_for
+        zpath = _zarr_path_for(file_path)
+        version = 0
+        for marker in ('', 'zarr.json', '.zgroup', '.zattrs'):
+            try:
+                version = max(version, os.stat(os.path.join(zpath, marker)).st_mtime_ns)
+            except OSError:
+                pass
+        cache_mode = f"{cache_mode}@{version}"
     png = None
     if file_path:
         png = tile_cache.get_cached_tile(file_path, level, col, row, 1.0, cache_mode, None, None)
@@ -1320,7 +1515,7 @@ def smart_load_ndpi_wrapper(file_path: str):
     
     Uses tifffile to read metadata first:
     - If file has z-stack (multi-layer): use TiffFileWrapper (supports z_layer)
-    - If file is single-layer: use TiffSlideWrapper (faster performance)
+    - If file is single-layer: use isolated fastslide (bounded region decoding)
     
     Args:
         file_path: Path to NDPI file
@@ -1338,7 +1533,7 @@ def smart_load_ndpi_wrapper(file_path: str):
                         is_zstack = True
                         logger.info(f"[NDPI Smart Load] Detected z-stack (4D shape), using TiffFileWrapper")
     except Exception as e:
-        logger.warning(f"[NDPI Smart Load] Failed to check metadata: {e}, defaulting to TiffSlideWrapper")
+        logger.warning(f"[NDPI Smart Load] Failed to check metadata: {e}, defaulting to isolated fastslide")
     
     # Choose wrapper based on file structure
     if is_zstack:
@@ -1347,9 +1542,9 @@ def smart_load_ndpi_wrapper(file_path: str):
         logger.info(f"[NDPI Smart Load] Using TiffFileWrapper for z-stack file: {file_path}")
         return wrapper, True
     else:
-        # Standard NDPI: use TiffSlideWrapper
-        wrapper = TiffSlideWrapper(file_path)
-        logger.info(f"[NDPI Smart Load] Using TiffSlideWrapper for standard file: {file_path}")
+        # Avoid the giant-strip TIFF allocation for standard NDPI.
+        wrapper = SharedSlideWrapper(file_path)
+        logger.info(f"[NDPI Smart Load] Using isolated fastslide reader: {file_path}")
         return wrapper, False
 
 def allowed_file(filename: str) -> bool:
@@ -1518,7 +1713,6 @@ def get_slide_properties(slide_obj) -> Dict:
     local_dict['zoom_ratios'] = zoom_ratios
     return local_dict
 
-@lru_cache(maxsize=2000)
 def process_tile_with_colors(img_np_bytes: bytes, shape: Tuple, channel_indices: Tuple, colors: Tuple) -> np.ndarray:
     """Process tile with colors using vectorised numpy (no thread pool overhead)."""
     try:
@@ -1543,6 +1737,68 @@ def load_slide_from_file(filename: str) -> Dict:
     """Load slide from file (legacy version)"""
     return load_slide_from_file_with_session(filename, session_id="default")
 
+def _serialized_slide_load(function):
+    """Reader replacement is a generation change, including reopening the same path.
+
+    Keep tile requests away from partially updated metadata. The per-session
+    reopen lock is reentrant because the idle-reopen path also uses it.
+    ``keep_epoch`` is for that idle reopen: the viewer still holds the epoch it
+    loaded with, and the released reader has no tiles left to invalidate.
+    """
+    @wraps(function)
+    def load(*args, keep_epoch=False, **kwargs):
+        session_id = kwargs.get("session_id", args[1] if len(args) > 1 else "default")
+        with _reopen_lock_for(session_id):
+            session = get_session_data(session_id)
+            from app.utils.cache.tile import get_tile_cache
+            cache = get_tile_cache()
+            old_path = session.get('current_file_path')
+            old_identity = cache.identity(old_path) if old_path else None
+            old_slide = session.get('slide')
+            with session_lock:
+                previous = dict(session)
+                previous['zstack_info'] = dict(session.get('zstack_info', {}))
+                if not keep_epoch:
+                    session['tile_epoch'] = session.get('tile_epoch', 0) + 1
+                session['slide_loading'] = True
+            succeeded = False
+            try:
+                result = function(*args, **kwargs)
+                succeeded = result.get('status') == 'success'
+                return result
+            finally:
+                with session_lock:
+                    new_slide = session.get('slide')
+                    if not succeeded:
+                        # The previous slide is back, so its viewer's epoch is valid again.
+                        owner = session.get('owner_uid')
+                        session.update(previous)
+                        session['owner_uid'] = owner
+                        if old_path and cache.identity(old_path) != old_identity:
+                            # Reopening failed after on-disk mutation. Do not
+                            # serve old reader pixels with the new file identity.
+                            session['slide'] = None
+                            session['slide_released'] = True
+                    session['slide_loading'] = False
+                # Only the shared reader is refcounted against admitted tile
+                # reads. Others may be mid-read on a tile thread; drop them and
+                # let the last reference finalize them, as before.
+                retiring = old_slide if succeeded else new_slide
+                if isinstance(retiring, SharedSlideWrapper) and retiring is not session.get('slide'):
+                    try:
+                        retiring.close()
+                    except Exception:
+                        pass
+                if (not succeeded and isinstance(old_slide, SharedSlideWrapper)
+                        and session.get('slide') is None and retiring is not old_slide):
+                    try:
+                        old_slide.close()
+                    except Exception:
+                        pass
+    return load
+
+
+@_serialized_slide_load
 def load_slide_from_file_with_session(filename: str, session_id: str = "default") -> Dict:
     """Load slide from file with session support"""
     # Get session data
@@ -1562,7 +1818,7 @@ def load_slide_from_file_with_session(filename: str, session_id: str = "default"
             # pyvips-native path for all TIFF/SVS variants.
             # PyvipsSlideWrapper uses tifffile series[0].levels to correctly identify
             # pyramid pages, filtering out SVS associated images (thumbnail/label/macro).
-            session_data['slide'] = PyvipsSlideWrapper(filename)
+            session_data['slide'] = SharedSlideWrapper(filename)
             session_data['current_file_format'] = file_ext
             session_data['tiff_slide_wrapper'] = True
         elif file_ext in ['qptiff']:
@@ -1710,35 +1966,6 @@ def load_slide_from_file_with_session(filename: str, session_id: str = "default"
         return {"status": "error", "message": f"Error loading slide: {str(e)}"}
 
 
-def _resize_vips_tile_to_exact(img: pyvips.Image, out_w: int, out_h: int) -> pyvips.Image:
-    """Scale to exact (out_w, out_h) so JPEG size matches OSD-reported tile geometry.
-
-    Uses independent horizontal/vertical scale so read_region rounding cannot leave a
-    height/width mismatch vs independently ceiled out_w/out_h (edge tiles).
-    """
-    if img.width == out_w and img.height == out_h:
-        return img
-    sx = out_w / img.width
-    sy = out_h / img.height
-    out = img.resize(sx, vscale=sy)
-    if out.width > out_w:
-        out = out.crop(0, 0, out_w, out.height)
-    if out.height > out_h:
-        out = out.crop(0, 0, out.width, out_h)
-    if out.width < out_w or out.height < out_h:
-        out = out.embed(0, 0, out_w, out_h, extend="background", background=[255, 255, 255])
-    return out
-
-
-def _encode_tile_vips(img: pyvips.Image, quality: int = 85) -> bytes:
-    """Encode a pyvips image to JPEG bytes for tile serving."""
-    if img.bands == 4:
-        img = img.extract_band(0, n=3)
-    elif img.bands == 1:
-        img = img.colourspace("srgb")
-    return img.jpegsave_buffer(Q=quality, keep="none")
-
-
 def _slide_gone_during_read(session_id: str, session_data: Dict, slide, epoch: int) -> bool:
     """Return whether a tile read started on a closed or replaced slide."""
     with session_lock:
@@ -1753,7 +1980,10 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
              color_mode: str = None, channels: List[int] = None,
              colors: List[List[int]] = None, session_id: str = "default",
              z_layer: Optional[int] = None,
-             expected_epoch: Optional[int] = None) -> Dict:
+             expected_epoch: Optional[int] = None,
+             expected_identity: Optional[str] = None,
+             prefer_overview: bool = False,
+             _session_snapshot: Optional[Dict] = None) -> Dict:
     """
     Get tile from slide
 
@@ -1762,8 +1992,19 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
     obsolete and returns immediately instead of occupying a pool thread with a
     read nobody will draw.
     """
-    # Get session data
-    session_data = get_session_data(session_id)
+    # Do not recreate a deleted viewer while finishing an admitted tile job.
+    if _session_snapshot is not None:
+        session_data = _session_snapshot
+    elif expected_epoch is not None:
+        with session_lock:
+            session_data = sessions.get(session_id)
+        if session_data is None:
+            return {"status": "stale", "message": "Viewer was closed"}
+    else:
+        session_data = get_session_data(session_id)
+
+    if session_data.get('slide_loading', False):
+        return {"status": "stale", "message": "Slide reader is being replaced"}
 
     # First thing on the worker thread, before any slide or cache access.
     if expected_epoch is not None and session_data.get('tile_epoch', 0) != expected_epoch:
@@ -1774,6 +2015,8 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
     # on the client recovers from.
     if session_data.get('slide') is None and session_data.get('slide_released'):
         ensure_session_slide(session_id)
+        if expected_epoch is not None and session_data.get('tile_epoch', 0) != expected_epoch:
+            return {"status": "stale", "message": "Slide reader was reopened"}
 
     session_slide = session_data['slide']
     read_epoch = session_data.get('tile_epoch', 0)
@@ -1786,6 +2029,15 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
     if z_layer is None:
         z_layer = session_data.get('current_z_layer', 0)
 
+    from app.utils.cache.tile import get_tile_cache
+    tile_cache = get_tile_cache()
+    namespace = session_current_file_path + (f"_z{z_layer}" if z_layer > 0 else "") if session_current_file_path else None
+    if namespace and namespace != session_current_file_path:
+        tile_cache.register_alias(namespace, session_current_file_path)
+    identity = tile_cache.identity(namespace) if namespace else None
+    if expected_identity is not None and identity != expected_identity:
+        return {'status': 'stale', 'message': 'Slide file changed'}
+
     # Match get_cached_tile: only non-zero z layers need a distinct cache namespace
     cache_key_suffix = f"_z{z_layer}" if z_layer > 0 else ""
 
@@ -1796,6 +2048,10 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
                 return {"status": "error", "message": "NII file parsing is skipped - use direct loading instead"}
             return {"status": "error", "message": f"No slide is loaded for session {session_id}"}
 
+        # A display thumbnail has its own cache namespace and must never replace
+        # the accurately sampled lowest pyramid tile used by other clients.
+        if prefer_overview:
+            color_mode = f'{color_mode}:overview'
         # Check cache first
         from app.utils.cache.tile import get_tile_cache
         tile_cache = get_tile_cache()
@@ -1867,21 +2123,27 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
         read_h = max(1, int(round(h / actual_svs_downsample)))
 
         # --- Fast path: pure pyvips pipeline (no PIL/numpy) ---
-        if isinstance(session_slide, PyvipsSlideWrapper):
+        if isinstance(session_slide, (PyvipsSlideWrapper, SharedSlideWrapper)):
             sx = int(x1 / actual_svs_downsample)
             sy = int(y1 / actual_svs_downsample)
-            region = session_slide.read_region_vips(svs_level, sx, sy, read_w, read_h)
-
-            if region.width > 0 and (region.width != out_w or region.height != out_h):
-                region = _resize_vips_tile_to_exact(region, out_w, out_h)
-
             vips_quality = 75 if session_current_file_format == 'btf' else 85
-            jpeg_data = _encode_tile_vips(region, vips_quality)
+            if isinstance(session_slide, SharedSlideWrapper):
+                if prefer_overview and hasattr(session_slide, 'render_overview'):
+                    jpeg_data = session_slide.render_overview(out_w, out_h, vips_quality)
+                else:
+                    jpeg_data = session_slide.render_tile(svs_level, sx, sy, read_w, read_h, out_w, out_h, vips_quality)
+            else:
+                region = session_slide.read_region_vips(svs_level, sx, sy, read_w, read_h)
+                region = _resize_vips_tile_to_exact(region, out_w, out_h)
+                jpeg_data = _encode_tile_vips(region, vips_quality)
+            if ((expected_epoch is not None and session_data.get('tile_epoch', 0) != expected_epoch)
+                    or (namespace and tile_cache.identity(namespace) != identity)):
+                return {'status': 'stale', 'message': 'Slide changed during decoding'}
 
             if session_current_file_path:
                 tile_cache.cache_tile(
                     session_current_file_path + cache_key_suffix, level, col, row,
-                    scale_factor, color_mode, channels, colors, jpeg_data
+                    scale_factor, color_mode, channels, colors, jpeg_data, expected_identity=identity
                 )
             return {
                 "status": "success",
@@ -2013,11 +2275,15 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
         quality = 75 if is_btf_file else 85
         jpeg_data = _encode_tile_vips(vips_img, quality)
         
+        if expected_epoch is not None and session_data.get('tile_epoch', 0) != expected_epoch:
+            return {'status': 'stale', 'message': 'Slide changed during decoding'}
+        if namespace and tile_cache.identity(namespace) != identity:
+            return {'status': 'stale', 'message': 'Slide file changed during decoding'}
         # Cache the tile if file path is available
         if session_current_file_path:
             tile_cache.cache_tile(
                 session_current_file_path + cache_key_suffix, level, col, row,
-                scale_factor, color_mode, channels, colors, jpeg_data
+                scale_factor, color_mode, channels, colors, jpeg_data, expected_identity=identity
             )
 
         return {
@@ -2028,6 +2294,8 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
             "height": out_h
         }
     except Exception as e:
+        if expected_epoch is not None and session_data.get('tile_epoch', 0) != expected_epoch:
+            return {"status": "stale", "message": "Slide changed during decoding"}
         if session_slide is not None and _slide_gone_during_read(
             session_id, session_data, session_slide, read_epoch
         ):
@@ -2040,23 +2308,15 @@ def get_tile(level: int, col: int, row: int, scale_factor: float = 1.0,
                 "message": f"Slide for session {session_id} was closed during the read",
             }
         traceback.print_exc()
-        # Swallowed here (we return a debug tile), so report explicitly — fingerprint
-        # dedups the flood when one slide fails every tile.
+        # Report the failure once via ticket fingerprinting; return a real HTTP
+        # failure so OSD can retry instead of accepting an error image.
         try:
             logger.error(f"Tile render failed: {e}", exc_info=True)
         except Exception:
             pass
 
-        # create a debug tile
-        try:
-            tile = generate_debug_tile(TILE_SIZE, TILE_SIZE, level, col, row, str(e))
-            img = Image.fromarray(tile)
-            buffer = BytesIO()
-            img.save(buffer, format="JPEG", quality=70)
-            return {"status": "success", "image_data": buffer.getvalue(), "format": "JPEG", 
-                   "width": TILE_SIZE, "height": TILE_SIZE}
-        except:
-            return {"status": "error", "message": f"Error processing tile: {str(e)}"}
+        return {"status": "error", "message": f"Error processing tile: {e}",
+                "http_status": 504 if isinstance(e, NativeDecodeTimeout) else 500}
 
 def _ensure_sidecar_zarr_v3(slide_file_path: str) -> None:
     """If the slide's sidecar ``<slide>.zarr`` store is a legacy zarr v2 store
@@ -2086,6 +2346,7 @@ def _ensure_sidecar_zarr_v3(slide_file_path: str) -> None:
         logger.warning("Sidecar zarr v2->v3 conversion skipped for %s: %s", slide_file_path, e)
 
 
+@_serialized_slide_load
 def upload_file_path(file_path: str, session_id: str = "default") -> Dict:
     """Upload file from file path"""
     
@@ -2171,12 +2432,12 @@ def upload_file_path(file_path: str, session_id: str = "default") -> Dict:
                 total_channels = 3
         elif session_data['current_file_format'] in ['tif', 'tiff', 'btf', 'svs']:
             # pyvips-native path for all TIFF/SVS/BTF variants
-            session_data['slide'] = PyvipsSlideWrapper(file_path)
+            session_data['slide'] = SharedSlideWrapper(file_path)
             total_channels = int(session_data['slide'].properties.get('channels', 3))
             session_data['tiff_slide_wrapper'] = True
         else:
             print(f"Debug - Unknown format falling through: {session_data['current_file_format']}")
-            session_data['slide'] = PyvipsSlideWrapper(file_path)
+            session_data['slide'] = SharedSlideWrapper(file_path)
             total_channels = int(session_data['slide'].properties.get('channels', 3))
             session_data['tiff_slide_wrapper'] = True
 
@@ -2359,65 +2620,6 @@ def upload_file_path(file_path: str, session_id: str = "default") -> Dict:
         print(f"Debug - Error loading slide: {str(e)}")
         traceback.print_exc()
         return {"status": "error", "message": f"Error loading slide: {str(e)}"}
-
-def generate_debug_tile(width: int, height: int, level: int, col: int, row: int, error_message: str = None) -> np.ndarray:
-    """Generate a debug tile with grid and debug information"""
-    # create a tile with a white background
-    tile = np.ones((height, width, 3), dtype=np.uint8) * 240
-    
-    # add grid lines
-    for i in range(0, height, 32):
-        tile[i:i+1, :, :] = [200, 200, 200]
-    for i in range(0, width, 32):
-        tile[:, i:i+1, :] = [200, 200, 200]
-    
-    # draw the border
-    border_width = 2
-    tile[0:border_width, :, :] = [100, 100, 100]
-    tile[-border_width:, :, :] = [100, 100, 100]
-    tile[:, 0:border_width, :] = [100, 100, 100]
-    tile[:, -border_width:, :] = [100, 100, 100]
-    
-    # add color blocks in the center of the tile
-    center_w, center_h = width // 3, height // 3
-    start_x, start_y = width // 3, height // 3
-    
-    # red block
-    tile[start_y:start_y+center_h//2, start_x:start_x+center_w//2, 0] = 200
-    tile[start_y:start_y+center_h//2, start_x:start_x+center_w//2, 1:3] = 50
-    
-    # green block
-    tile[start_y:start_y+center_h//2, start_x+center_w//2:start_x+center_w, 1] = 200
-    tile[start_y:start_y+center_h//2, start_x+center_w//2:start_x+center_w, [0,2]] = 50
-    
-    # blue block
-    tile[start_y+center_h//2:start_y+center_h, start_x:start_x+center_w//2, 2] = 200
-    tile[start_y+center_h//2:start_y+center_h, start_x:start_x+center_w//2, 0:2] = 50
-    
-    # yellow block
-    tile[start_y+center_h//2:start_y+center_h, start_x+center_w//2:start_x+center_w, 0:2] = 200
-    tile[start_y+center_h//2:start_y+center_h, start_x+center_w//2:start_x+center_w, 2] = 50
-    
-    # try to add text using PIL
-    try:
-        img = Image.fromarray(tile)
-        draw = ImageDraw.Draw(img)
-        
-        # add debug information
-        text_color = (0, 0, 0)
-        info_text = f"Level: {level}, Col: {col}, Row: {row}"
-        draw.text((10, 10), info_text, fill=text_color)
-        
-        if error_message:
-            error_text = f"Error: {error_message[:40]}..."
-            draw.text((10, 30), error_text, fill=(200, 30, 30))
-        
-        # convert back to numpy array
-        tile = np.array(img)
-    except Exception as e:
-        print(f"Debug - Error adding text to debug tile: {str(e)}")
-    
-    return tile
 
 # Thumbnail Service
 def _resize_image_if_needed(img, max_size):

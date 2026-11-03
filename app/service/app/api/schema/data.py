@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -30,5 +30,12 @@ class H5ToZarrConversionRequest(BaseModel):
     )
 
 
-__all__ = ["H5ToZarrConversionRequest"]
+class AnalysisGroupsBatchRequest(BaseModel):
+    file_paths: List[str] = Field(
+        ..., min_length=1, max_length=50,
+        description="Slide or .zarr paths, as the structure route takes them",
+    )
+
+
+__all__ = ["H5ToZarrConversionRequest", "AnalysisGroupsBatchRequest"]
 

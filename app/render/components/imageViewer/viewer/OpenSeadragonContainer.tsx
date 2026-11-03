@@ -21,6 +21,9 @@ import ReactDOM from "react-dom";
 
 // redux
 import { RootState, store } from "@/store";
+import { resolveInstanceFilePath } from "@/store/slices/wsiSlice";
+import { restoreInstance } from "@/services/file.service";
+import { watchTileSession } from "@/utils/viewer/tileSession";
 import {
   setPendingGraphOverlayRestore,
   type GraphWorkflowOverlaySnapshot,
@@ -79,7 +82,6 @@ import ZStackController from "@/components/imageViewer/viewer/ZStackController";
 import { useWs } from "@/contexts/WsProvider";
 import { useAnnotationHandlers } from "@/hooks/viewer/useAnnotationHandlers";
 import { useRefreshGtHighlightIndices } from "@/hooks/viewer/useRefreshGtHighlightIndices";
-import { useChannelUpdates } from "@/hooks/viewer/useChannelUpdates";
 import { useFileChangeHandler } from "@/hooks/viewer/useFileChangeHandler";
 import { useManualAnnotationHydration } from "@/hooks/viewer/useManualAnnotationHydration";
 import { useKeyboardHandlers } from "@/hooks/viewer/useKeyboardHandlers";
@@ -95,8 +97,8 @@ import { tileAjaxHeaders } from "@/utils/viewer/tileAuth";
 import { useTileAuth } from "@/hooks/viewer/useTileAuth";
 import {
   createTileSource,
+  preloadTileLayer,
   createTileUrlGenerator,
-  createTileUrlGeneratorForLayer,
   getLargestTiledImage,
 } from "@/utils/viewer/viewerHelpers";
 import { formatPath } from "@/utils/common/path.utils";
@@ -115,6 +117,7 @@ import { getMaskOptions, type MaskOption } from "@/services/data.service";
 import { setSelectedMaskKey } from "@/store/slices/viewer/viewerSettingsSlice";
 import { reconcileMaskKey } from "@/utils/viewer/maskBitmap";
 import OpenSeadragon from "openseadragon";
+import { installTileDemand } from "@/utils/viewer/tileDemand";
 import "@annotorious/react/annotorious-react.css";
 import { toast } from "sonner";
 import { Loader2 } from "lucide-react";
@@ -163,7 +166,6 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
   instanceId,
 }) => {
   const [tileSource, setTileSource] = useState<any>(null);
-  const [options, setOptions] = useState<any>(null);
   const [tileAuthToken, setTileAuthToken] = useState<string | null>(null);
   const [headerHeight, setHeaderHeight] = useState(104);
   const selectedIdsRef = useRef<Set<string>>(new Set());
@@ -2280,26 +2282,14 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
   }, [visibleChannels, channels]);
 
   // Track current z-layer for tile URL generation
-  const [currentZLayer, setCurrentZLayer] = useState<number>(0);
+  const [zLayerSelection, setZLayerSelection] = useState({ instanceId: currentInstanceId, layer: 0 });
+  const currentZLayer = zLayerSelection.instanceId === currentInstanceId ? zLayerSelection.layer : 0;
+  const setCurrentZLayer = (layer: number) => setZLayerSelection({ instanceId: currentInstanceId, layer });
 
-  // Listen for z-layer changes
   useEffect(() => {
-    const handleZLayerChange = (event: CustomEvent) => {
-      const { layer } = event.detail;
-      setCurrentZLayer(layer);
-    };
-
-    window.addEventListener(
-      "zLayerChanged",
-      handleZLayerChange as EventListener,
-    );
-    return () => {
-      window.removeEventListener(
-        "zLayerChanged",
-        handleZLayerChange as EventListener,
-      );
-    };
-  }, []);
+    if (!viewerInstance) return;
+    return installTileDemand(viewerInstance);
+  }, [viewerInstance]);
 
   // Use helper function to create tile URL generator
   const getTileUrl = useMemo(
@@ -2320,153 +2310,33 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
     ],
   );
 
-  // Listen for Z-Stack layer changes and refresh viewer
+  // One pending layer transition per viewer; cleanup cancels late completions.
   useEffect(() => {
+    let cancelLayer: (() => void) | undefined;
     const handleZLayerChange = (event: CustomEvent) => {
-      const { layer } = event.detail;
-
-      if (viewerInstance && tileSource && currentWSIInfo && tileAuthToken) {
-        try {
-          // Get current dimensions
-          let level_0_width = 50000;
-          let level_0_height = 50000;
-          if (Array.isArray(currentWSIInfo.dimensions)) {
-            if (
-              currentWSIInfo.dimensions.length > 0 &&
-              Array.isArray(currentWSIInfo.dimensions[0])
-            ) {
-              [level_0_width, level_0_height] = currentWSIInfo.dimensions[0];
-            }
-          } else {
-            [level_0_width, level_0_height] = currentWSIInfo.dimensions;
-          }
-
-          // Use helper functions to create tile URL generator and tile source
-          const getTileUrlForLayer = createTileUrlGeneratorForLayer(
-            visibleChannels,
-            channels,
-            currentInstanceId,
-            channelSignature,
-            layer,
-          );
-
-          const newTileSource = createTileSource(
-            { width: level_0_width, height: level_0_height },
-            getTileUrlForLayer,
-            currentInstanceId,
-            currentWSIFileInfo,
-            { zLayer: layer },
-          );
-
-          // Save current viewport state
-          const currentBounds = viewerInstance.viewport.getBounds();
-          const currentZoom = viewerInstance.viewport.getZoom();
-          const currentRotation = viewerInstance.viewport.getRotation();
-
-          const world = viewerInstance.world;
-          const oldItem = world.getItemCount() > 0 ? world.getItemAt(0) : null;
-
-          // Strategy: Preload new tiles first, then seamlessly switch
-          // 1. Add new TiledImage with opacity=0 (invisible)
-          // 2. Wait for visible viewport tiles to load
-          // 3. Fade in new image and remove old one
-
-          viewerInstance.addTiledImage({
-            tileSource: newTileSource,
-            index: 1, // Add on top of old image
-            opacity: 0, // Start invisible
-            success: (event: any) => {
-              const newItem = event.item;
-
-              // Restore viewport to trigger tile loading
-              viewerInstance.viewport.fitBounds(currentBounds, true);
-              viewerInstance.viewport.zoomTo(currentZoom, undefined, true);
-              if (currentRotation !== 0) {
-                viewerInstance.viewport.setRotation(currentRotation);
-              }
-
-              // Wait for tiles to load, then switch
-              let switchTimeout: NodeJS.Timeout;
-              let tilesLoadedCount = 0;
-
-              const performSwitch = () => {
-                // Fade in new image
-                newItem.setOpacity(1);
-
-                // Remove old image after a brief delay
-                setTimeout(() => {
-                  if (oldItem) {
-                    world.removeItem(oldItem);
-                  }
-                }, 100);
-
-                // Clear timeout
-                if (switchTimeout) {
-                  clearTimeout(switchTimeout);
-                }
-
-                // Remove event listener
-                newItem.removeHandler("tile-loaded", handleTileLoaded);
-              };
-
-              const handleTileLoaded = () => {
-                tilesLoadedCount++;
-
-                // Switch after first few tiles are loaded
-                if (tilesLoadedCount >= 3) {
-                  performSwitch();
-                }
-              };
-
-              // Listen for tile loading
-              newItem.addHandler("tile-loaded", handleTileLoaded);
-
-              // Fallback: switch after 200ms even if tiles still loading
-              switchTimeout = setTimeout(() => {
-                performSwitch();
-              }, 200);
-
-              // If tiles already loaded, switch immediately
-              setTimeout(() => {
-                if (newItem._tilesLoading === 0) {
-                  performSwitch();
-                }
-              }, 50);
-            },
-          });
-        } catch (error) {
-          console.error(
-            "[OpenSeadragon] Error reloading tiles for z-layer change:",
-            error,
-          );
-        }
-      }
-    };
-
-    window.addEventListener(
-      "zLayerChanged",
-      handleZLayerChange as EventListener,
-    );
-
-    return () => {
-      window.removeEventListener(
-        "zLayerChanged",
-        handleZLayerChange as EventListener,
+      if (event.detail?.instanceId !== currentInstanceId) return;
+      const layer = event.detail.layer;
+      setCurrentZLayer(layer);
+      if (!viewerInstance || !tileSource || !tileAuthToken) return;
+      cancelLayer?.();
+      const layerUrl = createTileUrlGenerator(visibleChannels, channels,
+        currentInstanceId, channelSignature, layer);
+      const source = createTileSource(
+        { width: tileSource.width, height: tileSource.height }, layerUrl,
+        currentInstanceId, currentWSIFileInfo,
+        { zLayer: layer, epoch: currentWSIInfo?.tile_epoch },
       );
+      cancelLayer = preloadTileLayer(viewerInstance, source);
     };
-  }, [
-    viewerInstance,
-    tileSource,
-    getTileUrl,
-    currentWSIInfo,
-    currentWSIFileInfo,
-    currentInstanceId,
-    channelSignature,
-    channels,
-    visibleChannels,
-    tileAuthToken,
-  ]);
+    window.addEventListener('zLayerChanged', handleZLayerChange as EventListener);
+    return () => {
+      window.removeEventListener('zLayerChanged', handleZLayerChange as EventListener);
+      cancelLayer?.();
+    };
+  }, [viewerInstance, tileSource, currentInstanceId, currentWSIFileInfo,
+    currentWSIInfo, tileAuthToken, visibleChannels, channels, channelSignature]);
 
+  const initializedSourceRef = useRef<string>("");
   const initViewer = useCallback(async () => {
     if (!currentInstanceId || !tileAuthToken) {
       console.warn("Cannot initialize viewer: instanceId or auth token is not available");
@@ -2509,13 +2379,20 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
       console.error("Error initializing viewer:", error);
     }
 
+    // Layer changes use the preloaded swap below, never a second ordinary refresh.
+    const sourceKey = JSON.stringify([currentInstanceId, currentWSIFileInfo?.filePath,
+      level_0_width, level_0_height, channelSignature, currentWSIInfo?.tile_epoch, tileAuthToken]);
+    if (initializedSourceRef.current === sourceKey) return;
+    initializedSourceRef.current = sourceKey;
+    setAllTilesLoaded(false);
+
     // Use helper function to create tile source
     const newTileSource = createTileSource(
       { width: level_0_width, height: level_0_height },
       getTileUrl,
       currentInstanceId,
       currentWSIFileInfo,
-      { channelSignature },
+      { channelSignature, epoch: currentWSIInfo?.tile_epoch },
     );
 
     // Add levelCount property (not in helper function)
@@ -2566,7 +2443,7 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
     }
   }, [currentTool, viewerInstance, isThisInstanceActive]);
 
-  useEffect(() => {
+  const options = useMemo(() => {
     if (tileSource && tileAuthToken) {
       // Create completely independent configuration for each instance
       const instanceOptions = {
@@ -2578,11 +2455,12 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
         showRotationControl: true,
         showZoomControl: true,
         loadTilesWithAjax: true,
-        imageLoaderLimit: 6, // Limit concurrent requests to allow effective cancellation
+        // Keep waiting work in OSD, where current viewport demand is evaluated.
+        // The overview shares this budget; the navigator has its own smaller limit.
+        imageLoaderLimit: 6,
         ajaxHeaders: tileAjaxHeaders(tileAuthTokenRef.current ?? tileAuthToken),
         tileSources: {
           ...tileSource,
-          getTileUrl: getTileUrl,
         },
         gestureSettingsMouse: {
           flickEnabled: false, // Disable default flick gesture
@@ -2600,7 +2478,14 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
         },
         animationTime: 0.3, // Increase animation time to make gestures smoother
         springStiffness: 6.5, // Decrease spring stiffness to make gestures more natural
-        timeout: 1000000,
+        // A hung tile request holds an imageLoaderLimit slot until this fires;
+        // with every slot held, no finer level loads and the slide stays blurry.
+        // 60s rather than OSD's 30s default, so slow remote backends still fit.
+        timeout: 60000,
+        // OSD marks a failed tile as missing and never requests it again, so
+        // that region would stay on the coarser level for the whole session.
+        tileRetryMax: 3,
+        tileRetryDelay: 1000,
         // macOS map style gesture settings
         immediateRender: false, // Delay rendering, improve performance
         blendTime: 0.1, // Blend time, make transition smoother
@@ -2608,15 +2493,12 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
         // Zoom level constraints
         minZoomLevel: 0.1,
         maxZoomLevel: 2000,
-        // Add instance specific configuration
-        _instanceId: currentInstanceId,
-        _tileSourceKey: tileSource._key,
-        _dimensions: tileSource._dimensions,
       };
 
-      setOptions(instanceOptions);
+      return instanceOptions;
     }
-  }, [tileSource, visibleChannels, getTileUrl, currentInstanceId, tileAuthToken]);
+    return null;
+  }, [tileSource, currentInstanceId, tileAuthToken]);
 
   // tool
   const handleToolbarClick = useCallback((tool: string | undefined) => {
@@ -2926,20 +2808,6 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
     annotatorInstance,
   });
 
-  // Channel updates handling
-  useChannelUpdates({
-    viewerInstance,
-    tileSource,
-    visibleChannels,
-    channels,
-    channelSignature,
-    currentWSIInfo,
-    currentWSIFileInfo,
-    currentInstanceId,
-    getTileUrl,
-    setAllTilesLoaded,
-  });
-
   const isRequestingClassification = useSelector(
     (state: RootState) => state.annotations.isRequestingClassification,
   );
@@ -3013,6 +2881,28 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
   }, []);
   useTileAuth(annotatorInstance?.viewer, rememberTileToken);
 
+  // A restarted service drops this viewer's session, and every tile is then
+  // refused. Restore it under the same instance id, in place: a new tile source
+  // would rebuild the viewer and send it home.
+  const tileSessionRef = useRef({ instanceId: currentInstanceId, fileInfo: currentWSIFileInfo });
+  tileSessionRef.current = { instanceId: currentInstanceId, fileInfo: currentWSIFileInfo };
+  useEffect(() => {
+    const viewer = annotatorInstance?.viewer;
+    if (!viewer) return;
+    return watchTileSession(viewer, {
+      owns: (source) => !!source?._instanceId && source._instanceId === tileSessionRef.current.instanceId,
+      restore: () => {
+        // fileInfo holds the path the slide was opened with; create_instance
+        // authorizes and resolves it the same way upload_path did.
+        const { instanceId: id, fileInfo } = tileSessionRef.current;
+        const path = resolveInstanceFilePath(fileInfo);
+        if (!id || !path) return Promise.reject(new Error("No slide path to restore the instance from"));
+        return restoreInstance(id, path);
+      },
+      onGiveUp: () => toast.error("Lost the connection to this slide. Reopen the file to keep viewing it."),
+    });
+  }, [annotatorInstance?.viewer]);
+
   // Use annotation handlers hook
   const {
     handleCanvasDoubleClick,
@@ -3077,6 +2967,9 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
       {/*@ts-ignore*/}
       <OpenSeadragonAnnotator
         autoSave
+        // useAnnotatorInitialization owns Cmd/Ctrl+Z (it keeps disk in sync). Annotorious' own
+        // listener on the viewer element would also undo the canvas while typing in a popup input.
+        disableUndoRedoKeys
         drawingEnabled={dynamicDrawingEnabled}
         tool={currentTool === 'move' || currentTool === 'lasso' ? undefined : currentTool === 'filter' ? 'rectangle' : currentTool}
         userSelectAction={

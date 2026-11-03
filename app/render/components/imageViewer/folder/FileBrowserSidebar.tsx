@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import Image from 'next/image';
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Progress } from "@/components/ui/progress";
@@ -26,16 +25,16 @@ import {
   setCurrentImagePath,
 } from '@/store/slices/fileManagerSlice';
 import { useRouter } from 'next/router';
-import { uploadFilePath, loadFileData, createInstance, getPreviewAsync } from '@/services/file.service';
+import { uploadFilePath, loadFileData, createInstance } from '@/services/file.service';
+import ImagePreviewCell from '@/components/dashboard/FileManager/ImagePreviewCell';
 import { useAnnotatorInstance } from '@/contexts/AnnotatorContext';
 import { listFiles, getConfig } from '@/services/fileManager.service';
 import { getErrorMessage } from '@/utils/common/apiResponse';
 import { isZarr } from '@/utils/dashboard/fileType.utils';
-import { shortHashFromString } from '@/utils/common/string.utils';
 import { useUserInfo } from '@/contexts/UserInfoProvider';
 import { selectSelectedModelForPath, setAvailableModelsForPath, setSelectedModelForPath, validateAllSelections } from '@/store/slices/chat/modelSelectionSlice';
 import type { FileTaskState, FileTaskStatus } from '@/types/fileTask.types';
-import { PaginationState } from '@/components/dashboard/FileManager/FileManagerPagination';
+import type { PaginationState } from '@/store/slices/fileManagerSlice';
 import { sortFileTreeData } from '@/utils/dashboard/fileManager.utils';
 import type { FileTreeNode } from '@/types/fileManager.types';
 
@@ -63,209 +62,6 @@ const TASK_STATUS_LABELS: Record<FileTaskStatus, string> = {
   error: 'Failed',
 };
 
-const ImagePreviewCellComponent: React.FC<{ 
-  fileName: string; 
-  fullPath: string; 
-  imageType: 'thumbnail' | 'label' | 'macro' 
-}> = ({
-  fileName,
-  fullPath,
-  imageType
-}) => {
-  const [previewData, setPreviewData] = useState<{
-    thumbnail: string | null;
-    macro: string | null;
-    label: string | null;
-    filename: string;
-    available: string[];
-    source_file?: string;
-  } | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const loadingRef = useRef(false);
-
-  const loadPreviewData = useCallback(async () => {
-    if (previewData || isLoading || loadingRef.current) return;
-
-    // Check cache first
-    const cacheKey = fullPath;
-    const cachedData = previewCache.get(cacheKey);
-    
-    if (cachedData) {
-      // Update timestamp for recently accessed items
-      cachedData.timestamp = Date.now();
-      previewCache.set(cacheKey, cachedData);
-      
-      // Remove timestamp before setting to component state
-      const { timestamp, ...dataWithoutTimestamp } = cachedData;
-      setPreviewData(dataWithoutTimestamp);
-      return;
-    }
-
-    // Check if this file is already being loaded by another component
-    const existingPromise = loadingFiles.get(cacheKey);
-    if (existingPromise) {
-      // Wait for the existing request to complete
-      try {
-        const data = await existingPromise;
-        setPreviewData(data);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to load preview');
-        setPreviewData({
-          thumbnail: null,
-          macro: null,
-          label: null,
-          filename: fileName,
-          available: [],
-          source_file: fullPath
-        });
-      }
-      return;
-    }
-
-    loadingRef.current = true;
-    setIsLoading(true);
-    setError(null);
-
-    // Create a promise for this request and store it globally
-    const loadPromise = (async () => {
-      try {
-        // Generate a unique request ID
-        const timestamp = Date.now();
-        const randomId = Math.random().toString(36).substr(2, 9);
-        const pathHash = shortHashFromString(fullPath, 8);
-        const requestId = `preview_${pathHash}_${timestamp}_${randomId}`;
-        
-        // Fetch all preview types - we need all types to display different previews
-        const data = await getPreviewAsync(fullPath, 'all', 100, requestId);
-        
-        // Store in cache with timestamp
-        const cacheData = { ...data, timestamp: Date.now() };
-        previewCache.set(cacheKey, cacheData);
-        cleanupCache(); // Clean up old entries if needed
-        
-        return data;
-      } catch (err) {
-        const fallbackData = {
-          thumbnail: null,
-          macro: null,
-          label: null,
-          filename: fileName,
-          available: [],
-          source_file: fullPath,
-          timestamp: Date.now()
-        };
-        
-        // Cache the fallback data to avoid repeated failed requests
-        previewCache.set(cacheKey, fallbackData);
-        cleanupCache(); // Clean up old entries if needed
-        
-        throw err;
-      } finally {
-        // Remove from loading tracker
-        loadingFiles.delete(cacheKey);
-      }
-    })();
-
-    // Store the promise so other components can wait for it
-    loadingFiles.set(cacheKey, loadPromise);
-
-    try {
-      const data = await loadPromise;
-      setPreviewData(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load preview');
-      setPreviewData({
-        thumbnail: null,
-        macro: null,
-        label: null,
-        filename: fileName,
-        available: [],
-        source_file: fullPath
-      });
-    } finally {
-      setIsLoading(false);
-      loadingRef.current = false;
-    }
-  }, [fileName, fullPath, isLoading, previewData]);
-
-  const [elementRef, setElementRef] = useState<HTMLDivElement | null>(null);
-  
-  // Memoize the intersection observer to avoid recreating it
-  const observer = useMemo(() => new IntersectionObserver(
-    (entries) => {
-      entries.forEach((entry) => {
-        if (entry.isIntersecting && !previewData && !isLoading && !loadingRef.current) {
-          const delay = Math.random() * 200 + 50;
-          setTimeout(() => {
-            if (!loadingRef.current && !previewData) {
-              loadPreviewData();
-            }
-          }, delay);
-        }
-      });
-    },
-    { threshold: 0.1, rootMargin: '20px' }
-  ), [loadPreviewData, previewData, isLoading]);
-
-  useEffect(() => {
-    if (!elementRef || !observer) return;
-
-    observer.observe(elementRef);
-    return () => observer.unobserve(elementRef);
-  }, [elementRef, observer]);
-
-  useEffect(() => {
-    setPreviewData(null);
-    setError(null);
-    loadingRef.current = false;
-  }, [fullPath]);
-
-  const currentImage = previewData?.[imageType] || null;
-
-  if (isLoading) {
-    return (
-      <div 
-        ref={setElementRef}
-        className="w-full h-full bg-muted rounded flex items-center justify-center"
-      >
-        <InlineSpinner size={12} color="var(--primary)" />
-      </div>
-    );
-  }
-
-  return (
-    <div 
-      ref={setElementRef}
-      className="w-full h-full flex items-center justify-center"
-    >
-      {currentImage ? (
-        <div className="relative w-full h-full">
-          <Image
-            src={currentImage}
-            alt={`${fileName} ${imageType}`}
-            fill
-            className="object-contain rounded"
-            onError={(e) => {
-              e.currentTarget.style.display = 'none';
-            }}
-          />
-        </div>
-      ) : (
-        <div className="w-full h-full bg-muted rounded flex items-center justify-center">
-          <ImageIcon className="h-3 w-3 text-muted-foreground" />
-        </div>
-      )}
-    </div>
-  );
-};
-
-// Memoized version to prevent unnecessary re-renders
-const ImagePreviewCell = React.memo(ImagePreviewCellComponent, (prevProps, nextProps) => {
-  return prevProps.fileName === nextProps.fileName && 
-         prevProps.fullPath === nextProps.fullPath && 
-         prevProps.imageType === nextProps.imageType;
-});
 
 interface FileItem {
   name: string;
@@ -278,41 +74,6 @@ interface FileItem {
 const isWSI = (fileName: string) => {
     const supportedExtensions = ['.svs', '.qptiff', '.tif', '.ndpi', '.tiff', '.jpeg', '.png', '.jpg', '.dcm', '.bmp', '.czi', '.nii', '.nii.gz', '.btf', '.isyntax'];
     return supportedExtensions.some(ext => fileName.toLowerCase().endsWith(ext));
-};
-
-// Global cache for preview data to avoid re-fetching
-const previewCache = new Map<string, {
-  thumbnail: string | null;
-  macro: string | null;
-  label: string | null;
-  filename: string;
-  available: string[];
-  source_file?: string;
-  timestamp: number; // Add timestamp for cache cleanup
-}>();
-
-// Global loading tracker to prevent duplicate requests for the same file
-const loadingFiles = new Map<string, Promise<{
-  thumbnail: string | null;
-  macro: string | null;
-  label: string | null;
-  filename: string;
-  available: string[];
-  source_file?: string;
-}>>();
-
-// Cache management
-const MAX_CACHE_SIZE = 100;
-const cleanupCache = () => {
-  if (previewCache.size > MAX_CACHE_SIZE) {
-    // Convert to array and sort by timestamp
-    const entries = Array.from(previewCache.entries())
-      .sort((a, b) => a[1].timestamp - b[1].timestamp);
-    
-    // Remove oldest half of entries
-    const entriesToRemove = entries.slice(0, Math.floor(entries.length / 2));
-    entriesToRemove.forEach(([key]) => previewCache.delete(key));
-  }
 };
 
 // Helper function to find tlcls files in the current directory
@@ -600,7 +361,7 @@ const FileBrowserSidebar: React.FC = () => {
     try {
       const uploadData = await uploadFilePath(absolutePath);
       const instanceData = await createInstance(uploadData.filePath ?? uploadData.fileName);
-      const loadData = await loadFileData(uploadData.fileName);
+      const loadData = await loadFileData(uploadData.fileName, instanceData);
       
       dispatch(updateInstanceWSIInfo(loadData));
       dispatch(setOutputPath(absolutePath ? absolutePath + '.zarr' : ''));
@@ -613,10 +374,7 @@ const FileBrowserSidebar: React.FC = () => {
 
       dispatch(replaceCurrentInstance({
         instanceId: instanceData.instanceId,
-        wsiInfo: {
-          ...loadData,
-          instanceId: instanceData.instanceId
-        },
+        wsiInfo: loadData,
         fileInfo: {
           fileName: absolutePath.split(/[\\/]/).pop() || '',
           filePath: absolutePath,
@@ -1190,6 +948,7 @@ const FileBrowserSidebar: React.FC = () => {
                                 fileName={file.name} 
                                 fullPath={file.path}
                                 imageType="label"
+                                compact
                               />
                             </div>
                           </div>
@@ -1201,6 +960,7 @@ const FileBrowserSidebar: React.FC = () => {
                                 fileName={file.name} 
                                 fullPath={file.path}
                                 imageType="thumbnail"
+                                compact
                               />
                             </div>
                           </div>

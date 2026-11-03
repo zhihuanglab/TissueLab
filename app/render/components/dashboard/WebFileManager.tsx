@@ -112,6 +112,7 @@ import {
   sortFileTreeData,
   truncateFileName
 } from '@/utils/dashboard/fileManager.utils';
+import eventBus from '@/utils/common/eventBus';
 import { getBackendDefinedErrorMessage, getErrorMessage } from '@/utils/common/apiResponse';
 import { getWSIBaseName, isH5Convertible, isWSI, isZarr, isZarrDir, isZarrZip } from '@/utils/dashboard/fileType.utils';
 import { isPublicReadOnlyPath, isWriteBlockedPath } from '@/utils/common/pathAccess.utils';
@@ -131,6 +132,7 @@ import {
   FolderInput,
   Image as ImageIcon, Info,
   Link2,
+  ListChecks,
   MoreVertical,
   Shapes,
   Trash2,
@@ -143,19 +145,21 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useDispatch, useSelector, useStore } from "react-redux";
 import { toast } from 'sonner';
 import {
+  LISTING_BATCH_SIZE,
   listingQueryKeyOf,
   listingRefetchTarget,
+  nextListingLimit,
   normalizeNavigationPath,
   shouldApplyListingResponse,
 } from '@/utils/dashboard/listingRequest';
 import { recentListings, RecentListing } from '@/utils/dashboard/recentListings';
 import Breadcrumbs from './Breadcrumbs';
 import { FileHeader } from "./FileManager/FileHeader";
-import { FileManagerPagination } from './FileManager/FileManagerPagination';
+import { InfiniteScrollSentinel } from './FileManager/InfiniteScrollSentinel';
+import { VirtualRows, renderBlockSpacer, renderTableSpacer, useIsDesktopLayout } from './FileManager/VirtualRows';
 import ImagePreviewCell from './FileManager/ImagePreviewCell';
-import ZarrBadgesCell from './FileManager/ZarrBadgesCell';
+import ZarrBadgesCell, { revalidateBadges } from './FileManager/ZarrBadgesCell';
 import { UploadDialog } from './UploadDialog';
-import { SelectCircleIcon } from '@/components/assets/SelectCircleIcon';
 import {
   Tooltip,
   TooltipContent,
@@ -305,6 +309,10 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
   // Read inside `fetchFiles`, whose closure can predate the latest rows.
   const allFetchedFilesRef = useRef<FileTreeNode[]>([]);
   allFetchedFilesRef.current = allFetchedFiles;
+  // The list's scroll container — the infinite-scroll sentinel observes
+  // against it, and a new folder / sort starts back at its top.
+  const listScrollRef = useRef<HTMLDivElement>(null);
+  const isDesktopLayout = useIsDesktopLayout();
 
   // Track the file-table container width so we can drop the least-important
   // columns first when the panel gets narrow. Actions always stays; mtime
@@ -712,6 +720,8 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
 
   useEffect(() => {
     currentDirectoryRef.current = currentDirectory;
+    // A scrolled-down list would otherwise open the next folder mid-way.
+    listScrollRef.current?.scrollTo({ top: 0 });
   }, [currentDirectory]);
 
 
@@ -900,10 +910,9 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     });
   }, [showNonImageFiles]);
 
-  // Client-paged listings only (search results).
-  // Filtering + sorting run over the WHOLE set, so memoize them: paging and
-  // page-size changes then only re-slice instead of redoing the work. A
-  // server-paged directory skips this entirely — the rows already are the page.
+  // Client listings only (search results, the Shared-with-me root): filter and
+  // sort the WHOLE set here. A server-paged directory skips this entirely — the
+  // server already did it.
   const { parentLinks, sortedFiles } = React.useMemo(() => {
     const links = allFetchedFiles.filter(file => (file as any).isParentLink);
     if (listingMode === 'server') {
@@ -914,10 +923,8 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     }
     const navigableFiles = allFetchedFiles.filter(file => !(file as any).isParentLink);
     // Filter the actual directory contents based on showNonImageFiles.
-    // Keep the synthetic parent link out of totals and pagination.
+    // Keep the synthetic parent link out of the total.
     const filteredFiles = filterVisibleFiles(navigableFiles);
-    // Sort the full filtered set before slicing so switching pages keeps the
-    // global ordering (previously sort ran only on the current page rows).
     return { parentLinks: links, sortedFiles: sortFileTreeData(filteredFiles, sortConfig) };
   }, [allFetchedFiles, filterVisibleFiles, sortConfig, listingMode]);
 
@@ -978,57 +985,13 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     return () => { cancelled = true; };
   }, [dialog]);
 
-  // Client-paged: apply pagination to the memoized set and update fileTree
+  // Client listings: every row is already here, and the virtualized list only
+  // renders the ones on screen, so show them all — nothing left to load.
   useEffect(() => {
     if (listingMode === 'server') return;
-    if (allFetchedFiles.length === 0) {
-      dispatch(setFileTree([]));
-      dispatch(setPagination({
-        offset: 0,
-        limit: paginationState.limit,
-        total: 0,
-        hasMore: false,
-      }));
-      return;
-    }
-
-    const filteredTotal = sortedFiles.length;
-
-    // Get current pagination state
-    const currentPaginationState = store.getState().fileManager.pagination;
-    const offset = currentPaginationState.offset;
-    const limit = currentPaginationState.limit;
-
-    if (limit === null) {
-      // Show all filtered files if limit is null, plus the synthetic parent link.
-      dispatch(setFileTree([...parentLinks, ...sortedFiles]));
-      dispatch(setPagination({
-        offset: 0,
-        limit: null,
-        total: filteredTotal,
-        hasMore: false,
-      }));
-    } else {
-      // Apply pagination to filtered files
-      // Bugfix: clamp offset when the filtered total shrinks (e.g. search/filter/delete)
-      // so we don't render an empty page.
-      const maxOffset = filteredTotal > 0 ? Math.floor((filteredTotal - 1) / limit) * limit : 0;
-      const safeOffset = Math.min(Math.max(0, offset), maxOffset);
-
-      const startIndex = safeOffset;
-      const endIndex = Math.min(sortedFiles.length, safeOffset + limit);
-      const paginatedFiles = sortedFiles.slice(startIndex, endIndex);
-      dispatch(setFileTree([...parentLinks, ...paginatedFiles]));
-
-      // Update pagination metadata based on filtered files
-      dispatch(setPagination({
-        offset: safeOffset,
-        limit,
-        total: filteredTotal,
-        hasMore: endIndex < sortedFiles.length,
-      }));
-    }
-  }, [listingMode, allFetchedFiles, parentLinks, sortedFiles, dispatch, store, paginationState.offset, paginationState.limit]);
+    dispatch(setFileTree([...parentLinks, ...sortedFiles]));
+    dispatch(setPagination({ offset: 0, total: sortedFiles.length, hasMore: false }));
+  }, [listingMode, parentLinks, sortedFiles, dispatch]);
 
   // Helper function to recursively find and update a node in the tree
   const requestSort = (key: 'name' | 'mtime' | 'size' | 'type') => {
@@ -1037,8 +1000,8 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
       direction = 'desc';
     }
     dispatch(setSortConfig({ key, direction } as SortConfig));
-    // Keep page 1 so a new global order is visible from the start.
-    dispatch(setPagination({ offset: 0 }));
+    // Show the new global order from the start.
+    restartListing();
   };
 
 
@@ -1101,15 +1064,27 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
       void fetchFiles(dir);
       triggerStorageRefresh();
     };
+    // A workflow run in the Image Viewer, whose sidebar list stays mounted
+    // through it. Its first run on a slide creates the companion store, and
+    // only a fresh listing gives that row the store its badges are read from.
+    const onWorkflowRunFinished = () => {
+      const dir = currentDirectoryRef.current;
+      if (!dir) return;
+      recentListings.clear();
+      void fetchFiles(dir);
+      triggerStorageRefresh();
+    };
     if (typeof window !== 'undefined') {
       window.addEventListener('tissuelab:cloudUploadCompleted', onUploadCompleted);
       window.addEventListener('tissuelab:preRunCompleted', onPreRunCompleted);
     }
+    eventBus.on('workflow-graph-run-finished', onWorkflowRunFinished);
     return () => {
       if (typeof window !== 'undefined') {
         window.removeEventListener('tissuelab:cloudUploadCompleted', onUploadCompleted);
         window.removeEventListener('tissuelab:preRunCompleted', onPreRunCompleted);
       }
+      eventBus.off('workflow-graph-run-finished', onWorkflowRunFinished);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [triggerStorageRefresh, fetchFiles]);
@@ -1466,7 +1441,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
       console.log('FileManager: instanceData:', instanceData);
       
       // Step 3: Load file data
-      const loadData = await loadFileData(uploadData.fileName);
+      const loadData = await loadFileData(uploadData.fileName, instanceData);
       console.log('FileManager: loadData:', loadData);
       
       // Step 4: Set slide metadata in Redux (path lives on the WSI instance)
@@ -1486,10 +1461,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
       // Step 5: Replace current instance with new WSI data (overwrite current window)
       dispatch(replaceCurrentInstance({
         instanceId: instanceData.instanceId,
-        wsiInfo: {
-          ...loadData,
-          instanceId: instanceData.instanceId
-        },
+        wsiInfo: loadData,
         fileInfo: {
           fileName: relativePath.split(/[\\/]/).pop() || '',
           filePath: relativePath,
@@ -1596,7 +1568,8 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
 
         {/* Table Body */}
         <div className="divide-y divide-border">
-          {imageFiles
+          <VirtualRows
+            rows={imageFiles
             .sort((a, b) => {
               if (sortConfig.key === 'name') {
                 return sortConfig.direction === 'asc' 
@@ -1781,6 +1754,10 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
                 </div>
               </div>
             ))}
+            scrollRef={listScrollRef}
+            estimateSize={146}
+            renderSpacer={renderBlockSpacer}
+          />
         </div>
       </div>
     );
@@ -2182,11 +2159,26 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
       }
 
       // "Pre-run analysis" checkbox: enqueue CellCast (global service survives page nav).
+      // Paths must mirror where the server put each file. Prefer the
+      // storage-relative path the server reported on completion: it may have
+      // renamed the file on save (sanitize "A1-1 PAP.ndpi" -> "A1-1_PAP.ndpi",
+      // uniquify "x.svs" -> "x(1).svs"), and queueing the browser-side name
+      // would make the pre-run fail with "file not found". Fall back to
+      // <target>/<displayPath> only when the server gave no path. Only units
+      // that actually completed are queued.
       if (preRunAnalysis && uploadResults.successful > 0) {
         const folder = uploadTargetPath.replace(/\/+$/, '');
-        const wsiPaths = validFiles
-          .filter((f) => isWSI(f.name))
-          .map((f) => `${folder}/${f.name}`.replace(/\/{2,}/g, '/'));
+        const wsiPaths = uploadUnits
+          .filter((u) => u.kind !== 'zarr')
+          .filter((u) => {
+            const st = uploadStatusRef.current.get(u.fileId);
+            return st?.status === 'Completed' || st?.progress === 100;
+          })
+          .map((u) => {
+            const serverPath = uploadStatusRef.current.get(u.fileId)?.serverPath;
+            return serverPath || `${folder}/${u.displayPath}`.replace(/\/{2,}/g, '/');
+          })
+          .filter((p) => isWSI(p.split('/').pop() || p));
         if (wsiPaths.length > 0) {
           enqueuePreRunBatch(wsiPaths);
         }
@@ -2554,35 +2546,35 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
 
 
 
-  // Pagination handlers
-  const handlePreviousPage = useCallback(async () => {
-    if (paginationState.offset > 0) {
-      const newOffset = Math.max(0, paginationState.offset - (paginationState.limit || 50));
-      dispatch(setPagination({ offset: newOffset }));
-      // The listing-query effect issues the refetch for the new page.
-    }
-  }, [paginationState.offset, paginationState.limit, dispatch]);
+  // Infinite scroll: reaching the bottom grows the listing instead of paging it.
+  // The listing-query effect refetches with the new limit and keeps the current
+  // rows on screen meanwhile. The sentinel asks once per batch of rows.
+  const handleLoadMore = useCallback((): boolean => {
+    const { hasMore, limit } = store.getState().fileManager.pagination;
+    if (!hasMore || limit === null) return false;
+    // A fetch already in flight (a navigation, a refresh) would make this one
+    // queue behind it and the same rows get requested twice. Decline, and the
+    // sentinel asks again once that fetch has landed.
+    if (isFetchingRef.current) return false;
+    dispatch(setPagination({ limit: nextListingLimit(limit) }));
+    return true;
+  }, [dispatch, store]);
 
-  const handleNextPage = useCallback(async () => {
-    if (paginationState.hasMore) {
-      const newOffset = paginationState.offset + (paginationState.limit || 50);
-      dispatch(setPagination({ offset: newOffset }));
-      // The listing-query effect issues the refetch for the new page.
-    }
-  }, [paginationState.offset, paginationState.limit, paginationState.hasMore, dispatch]);
-
-  const handlePageSizeChange = useCallback(async (newLimit: number | null) => {
-    dispatch(setPagination({ limit: newLimit, offset: 0 }));
-    // The listing-query effect issues the refetch for the new page.
+  /** Back to the first batch at the top — for changes that reorder or refilter. */
+  const restartListing = useCallback(() => {
+    dispatch(setPagination({ offset: 0, limit: LISTING_BATCH_SIZE }));
+    listScrollRef.current?.scrollTo({ top: 0 });
   }, [dispatch]);
 
-  const handlePageClick = useCallback(async (page: number) => {
-    if (paginationState.limit !== null) {
-      const newOffset = (page - 1) * paginationState.limit;
-      dispatch(setPagination({ offset: newOffset }));
-      // The listing-query effect issues the refetch for the new page.
-    }
-  }, [paginationState.limit, dispatch]);
+  const listSentinel = (
+    <InfiniteScrollSentinel
+      scrollRoot={listScrollRef}
+      hasMore={paginationState.hasMore}
+      isLoading={isLoading}
+      onLoadMore={handleLoadMore}
+      loadedCount={filesToRender.length}
+    />
+  );
 
   // const renderToolbar = () => {};
   // toolbar actions handled by FileHeader
@@ -3272,14 +3264,28 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
               </TableRow>
             </TableHeader>
             <TableBody>
-              {renderFileTableRows(filesToRender, 0, false)}
+              {isDesktopLayout && (
+                <VirtualRows
+                  rows={renderFileTableRows(filesToRender, 0, false) as React.ReactElement[]}
+                  scrollRef={listScrollRef}
+                  estimateSize={29}
+                  renderSpacer={renderTableSpacer}
+                />
+              )}
             </TableBody>
           </Table>
         </div>
-        
+
         {/* Mobile cards */}
         <div className="md:hidden min-h-[120px] px-2" onClick={handleListBackgroundClick}>
-          {renderFileCards(filesToRender, 0, false)}
+          {!isDesktopLayout && (
+            <VirtualRows
+              rows={renderFileCards(filesToRender, 0, false) as React.ReactElement[]}
+              scrollRef={listScrollRef}
+              estimateSize={92}
+              renderSpacer={renderBlockSpacer}
+            />
+          )}
         </div>
       </div>
     );
@@ -3595,12 +3601,12 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
             showNonImageFiles={showNonImageFiles}
             setShowNonImageFiles={(value) => {
               dispatch(setShowNonImageFiles(value));
-              // The filter changes the row count, so page 1 is the only page
-              // guaranteed to exist afterwards.
-              dispatch(setPagination({ offset: 0 }));
+              // The filter changes which rows exist, so start over from the top.
+              restartListing();
             }}
             onRefresh={() => {
               void fetchFiles(currentDirectory);
+              revalidateBadges();
               triggerStorageRefresh();
             }}
             disableRefresh={isLoading}
@@ -3622,24 +3628,27 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
-                      variant="ghost"
-                      size="icon"
+                      variant={isMultiSelectMode ? 'secondary' : 'ghost'}
+                      size="sm"
                       onClick={() => {
                         if (isMultiSelectMode) exitMultiSelectMode();
                         else setIsMultiSelectMode(true);
                       }}
-                      aria-label={isMultiSelectMode ? 'Done selecting' : 'Select'}
-                      className="h-7 w-7 rounded-[6px] text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
+                      aria-label={isMultiSelectMode ? 'Exit selection mode' : 'Select multiple files'}
+                      className="h-7 gap-1.5 rounded-[6px] px-2 text-xs text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
                     >
                       {isMultiSelectMode ? (
                         <X className="h-3.5 w-3.5" strokeWidth={2} />
                       ) : (
-                        <SelectCircleIcon className="h-3.5 w-3.5" />
+                        <ListChecks className="h-3.5 w-3.5" />
                       )}
+                      {isMultiSelectMode ? 'Done' : 'Select'}
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent side="bottom">
-                    {isMultiSelectMode ? 'Done' : 'Select'}
+                  <TooltipContent side="bottom" className="max-w-[260px]">
+                    {isMultiSelectMode
+                      ? 'Exit selection mode. Click rows to toggle, Shift-click for a range.'
+                      : 'Select multiple files to move, delete, or run cell segmentation on them'}
                   </TooltipContent>
                 </Tooltip>
               ) : null
@@ -3672,7 +3681,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
           )}
         </CardHeader>
         <CardContent className="flex min-h-0 flex-1 flex-col overflow-hidden p-0">
-          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+          <div ref={listScrollRef} className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
             {/* Nothing to show yet: hold the list's shape rather than folding
                 it to one line and pushing it open again. */}
             {isLoading && !error && filesToRender.length === 0 && <ListingSkeleton />}
@@ -3708,10 +3717,12 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
                   {tableViewMode === 'table' ? (
                     <div className="p-2">
                       {renderImageTable()}
+                      {listSentinel}
                     </div>
                   ) : (
                     <>
                       {renderFileTable()}
+                      {listSentinel}
                       {/* Empty drop zone for better UX */}
                       <div 
                         className="w-full min-h-[80px]"
@@ -3728,16 +3739,6 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
                   )}
                 </div>
             )}
-          </div>
-          <div className="shrink-0 border-t border-border/50">
-            <FileManagerPagination
-              pagination={paginationState}
-              isLoading={isLoading}
-              onPrevious={handlePreviousPage}
-              onNext={handleNextPage}
-              onPageSizeChange={handlePageSizeChange}
-              onPageClick={handlePageClick}
-            />
           </div>
         </CardContent>
       </Card>

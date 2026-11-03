@@ -8,6 +8,8 @@ import { forceRefreshAuthToken, getAuthToken } from "../utils/common/authToken";
 export const MAX_RECONNECT_ATTEMPTS = 10;
 export const RECONNECT_DELAY_MS = 5000;
 export const CONNECT_TIMEOUT_MS = 15000;
+export const HEARTBEAT_INTERVAL_MS = 30_000;
+export const PONG_TIMEOUT_MS = 15_000;
 /** Backoff ceiling. Ten attempts reach ~7 minutes of coverage instead of 50s. */
 export const MAX_RECONNECT_DELAY_MS = 60_000;
 
@@ -134,6 +136,8 @@ export const WsProvider: React.FC<WsProviderProps> = ({ children }) => {
   /** When the last connection attempt was made, for rate-limiting retryNow. */
   const lastAttemptAt = useRef(0);
   const pingInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const stopHeartbeat = useRef<(() => void) | null>(null);
+  const probeSocket = useRef<() => void>(() => {});
   const socketRef = useRef<WebSocket | null>(null);
   /** Invalidates in-flight onclose after teardown / replace. */
   const connectGenRef = useRef(0);
@@ -146,6 +150,9 @@ export const WsProvider: React.FC<WsProviderProps> = ({ children }) => {
   const clearSocket = useCallback(() => {
     connectGenRef.current += 1;
     isConnecting.current = false;
+    stopHeartbeat.current?.();
+    stopHeartbeat.current = null;
+    probeSocket.current = () => {};
     if (pingInterval.current) {
       clearInterval(pingInterval.current);
       pingInterval.current = null;
@@ -204,9 +211,18 @@ export const WsProvider: React.FC<WsProviderProps> = ({ children }) => {
    * rather than connecting directly: by then the socket may have come back on
    * its own, and connectWebSocket clears an existing socket before it dials, so
    * connecting unconditionally would tear down a healthy connection. The
-   * self-call is safe because useCallback([]) hands back one stable function.
+   * self-call is safe because its dependencies are stable.
    */
   const retryNow = useCallback(() => {
+    // TCP can remain OPEN locally after sleep even though the server/proxy
+    // dropped it. Check for a pong instead of trusting readyState forever.
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      probeSocket.current();
+      return;
+    }
+    if (socketRef.current && socketRef.current.readyState !== WebSocket.CONNECTING) {
+      clearSocket();
+    }
     const decision = planRetryNow({
       hasUrl: Boolean(wsUrlRef.current),
       hasSocket: Boolean(socketRef.current),
@@ -233,7 +249,7 @@ export const WsProvider: React.FC<WsProviderProps> = ({ children }) => {
     }
     toast.dismiss("reconnect-failed");
     connectRef.current(false);
-  }, []);
+  }, [clearSocket]);
 
   const connectWebSocket = useCallback(
     async (isFirstAttempt = false) => {
@@ -326,10 +342,40 @@ export const WsProvider: React.FC<WsProviderProps> = ({ children }) => {
           clearTimeout(reconnectTimer.current);
           reconnectTimer.current = null;
         }
-        if (pingInterval.current) clearInterval(pingInterval.current);
-        pingInterval.current = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) ws.send("ping");
-        }, 30000);
+        stopHeartbeat.current?.();
+        let pongTimeout: ReturnType<typeof setTimeout> | null = null;
+        const onPong = (event: MessageEvent) => {
+          if (gen !== connectGenRef.current || event.data !== "pong") return;
+          if (pongTimeout !== null) clearTimeout(pongTimeout);
+          pongTimeout = null;
+        };
+        const probe = () => {
+          if (gen !== connectGenRef.current || ws.readyState !== WebSocket.OPEN || pongTimeout !== null) return;
+          const recover = () => {
+            if (gen !== connectGenRef.current) return;
+            console.warn("[WebSocket] Heartbeat failed; reconnecting");
+            clearSocket();
+            attemptReconnect();
+          };
+          pongTimeout = setTimeout(recover, PONG_TIMEOUT_MS);
+          // Plain "ping": the server answers it with "pong" and keeps alive the
+          // instances bound on this connection.
+          try {
+            ws.send("ping");
+          } catch {
+            recover();
+          }
+        };
+        ws.addEventListener("message", onPong);
+        probeSocket.current = probe;
+        pingInterval.current = setInterval(probe, HEARTBEAT_INTERVAL_MS);
+        stopHeartbeat.current = () => {
+          ws.removeEventListener("message", onPong);
+          if (pongTimeout !== null) clearTimeout(pongTimeout);
+          pongTimeout = null;
+          if (pingInterval.current) clearInterval(pingInterval.current);
+          pingInterval.current = null;
+        };
       };
 
       ws.onerror = () => {
@@ -342,6 +388,8 @@ export const WsProvider: React.FC<WsProviderProps> = ({ children }) => {
       };
 
       ws.onclose = async (event) => {
+        // An old socket must not clear the new socket's heartbeat/deadline.
+        if (!shouldReconnectOnClose(gen, connectGenRef.current)) return;
         // Who closed it, and why. Three parties can: this client (1000
         // client_clear / 4000 connect_timeout), the backend's stale-connection
         // sweeper (1001), and auth (1008). Without the code, a disconnect that
@@ -352,6 +400,9 @@ export const WsProvider: React.FC<WsProviderProps> = ({ children }) => {
           );
         }
         if (socketRef.current === ws) socketRef.current = null;
+        stopHeartbeat.current?.();
+        stopHeartbeat.current = null;
+        probeSocket.current = () => {};
         if (pingInterval.current) {
           clearInterval(pingInterval.current);
           pingInterval.current = null;
@@ -396,9 +447,13 @@ export const WsProvider: React.FC<WsProviderProps> = ({ children }) => {
       if (document.visibilityState === "visible") retryNow();
     };
     window.addEventListener("online", retryNow);
+    window.addEventListener("pageshow", retryNow);
+    document.addEventListener("resume", retryNow);
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       window.removeEventListener("online", retryNow);
+      window.removeEventListener("pageshow", retryNow);
+      document.removeEventListener("resume", retryNow);
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [retryNow]);

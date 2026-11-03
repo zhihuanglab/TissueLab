@@ -1,3 +1,5 @@
+import os
+import re
 import threading
 import numpy as np
 from PIL import Image
@@ -9,6 +11,47 @@ except Exception:
     _tifffile = None
 
 
+_APERIO_JP2K = (33003, 33005)
+
+
+def _is_aperio_jp2k(page) -> bool:
+    try:
+        return int(page.compression) in _APERIO_JP2K
+    except Exception:
+        return False
+
+
+def _reduced_ifd_pyramid(pages):
+    """The pyramid as the top-level IFDs lay it out: the tiled base page plus each
+    tiled reduced-resolution page (NewSubfileType bit 0) of the same aspect, each
+    smaller than the last.
+
+    tifffile's series detection misses it when every IFD repeats the base page's
+    "shaped" description (HistAI exports): it then reports too few levels or
+    fails with "incompatible keyframe", and the slide opened as one 3-gigapixel
+    level. Associated images (label, macro) differ in aspect or are not tiled.
+    """
+    def reduced(page):
+        return int(page.tags.valueof(254, 0) or 0) & 1  # NewSubfileType
+
+    def tiled(page):
+        return page.tags.valueof(322) is not None  # raw tag, not NDPI virtual tiles
+
+    pages = list(pages)
+    if not pages or reduced(pages[0]) or not tiled(pages[0]):
+        return []
+    base = pages[0]
+    aspect = base.imagewidth / base.imagelength
+    levels = [base]
+    for page in pages[1:]:
+        if (reduced(page) and tiled(page)
+                and page.samplesperpixel == base.samplesperpixel
+                and abs(page.imagewidth / page.imagelength - aspect) <= 0.01 * aspect
+                and page.imagewidth < levels[-1].imagewidth):
+            levels.append(page)
+    return levels
+
+
 class PyvipsSlideWrapper:
     """pyvips-native wrapper for TIFF/SVS/BTF slides.
 
@@ -17,11 +60,13 @@ class PyvipsSlideWrapper:
     For the raw TIFF loader, each logical level (after sorting largest-first)
     is mapped to the IFD index reported by tifffile (``TiffPage.index``) so
     ``pyvips`` opens the correct page when pyramid IFDs are not contiguous
-    or not in coarse-to-fine file order. OpenSlide-backed files still use
-    ``level=`` indices from the loader.
+    or not in coarse-to-fine file order. The TIFF loader is explicit;
+    automatic OpenSlide selection is never used.
     """
 
-    def __init__(self, file_path):
+    def __init__(self, file_path, reject_sequential=False):
+        if os.path.splitext(file_path)[1].lower() == '.ndpi':
+            raise ValueError('NDPI requires fastslide for bounded region decoding')
         self.path = file_path
         self._lock = threading.Lock()
 
@@ -32,6 +77,8 @@ class PyvipsSlideWrapper:
         # SubIFDs of the base page (OME-TIFF / Bio-Formats pyramids); None when
         # the level is a top-level IFD opened by page= alone.
         self._tif_subifd_indices = []
+        self._thumbnail_page = None
+        self._overview_image = None
 
         if _tifffile is not None:
             try:
@@ -39,60 +86,110 @@ class PyvipsSlideWrapper:
                     # series[0].levels gives only the real pyramid levels —
                     # tifffile already filters out SVS associated images
                     # (thumbnail, label, macro) which live in series[1+].
+                    # Read the IFDs before series: a failed series detection
+                    # leaves tf.pages raising "incompatible keyframe" on access.
+                    pages = list(tf.pages)
+                    for page in pages:
+                        # Raw tags, not tifffile's virtual NDPI tiles.
+                        rows = page.tags.valueof(278, page.imagelength)
+                        tiled = page.tags.valueof(322) is not None
+                        if not tiled and int(page.compression) == 7 and page.imagewidth * rows * page.samplesperpixel > 64 * 1024 * 1024:
+                            raise ValueError('Large JPEG strip requires fastslide')
                     entries = []
-                    if tf.series:
-                        for lvl in tf.series[0].levels:
-                            if not lvl.pages:
-                                continue
-                            p = lvl.pages[0]
+                    try:
+                        series_levels = [lvl for lvl in tf.series[0].levels if lvl.pages] if tf.series else None
+                    except Exception:
+                        # Detection itself failed; the IFD scan below still finds the pyramid.
+                        series_levels = []
+                    level_pages = []
+                    if series_levels is not None:
+                        level_pages = [lvl.pages[0] for lvl in series_levels]
+                        ifd_levels = _reduced_ifd_pyramid(pages)
+                        if len(ifd_levels) > len(level_pages):
+                            # Only levels libvips can open (a header read, no pixels).
+                            for depth, page in enumerate(ifd_levels):
+                                try:
+                                    pyvips.Image.tiffload(file_path, page=int(page.index), access="random")
+                                except pyvips.Error:
+                                    ifd_levels = ifd_levels[:depth]
+                                    break
+                            if len(ifd_levels) > len(level_pages):
+                                level_pages = ifd_levels
+                        for p in level_pages:
                             try:
-                                h, w = p.shape[0], p.shape[1]
+                                h, w = int(p.imagelength), int(p.imagewidth)
                                 pi, si = self._page_subifd_for(p)
                                 entries.append((w, h, pi, si))
                             except Exception:
                                 continue
                     else:
-                        for page in tf.pages:
+                        for page in pages:
                             try:
-                                h, w = page.shape[0], page.shape[1]
+                                h, w = int(page.imagelength), int(page.imagewidth)
                                 pi, si = self._page_subifd_for(page)
                                 entries.append((w, h, pi, si))
                             except Exception:
                                 continue
+                    if any(_is_aperio_jp2k(p) for p in level_pages):
+                        # Aperio JPEG 2000: fastslide decodes 33003 ~2x faster than
+                        # libvips' TIFF loader, which also renders 33005 (RGB) as
+                        # YCbCr (magenta tiles). JPEG SVS stays here: fastslide is
+                        # slower on it. The isolated reader falls back to fastslide
+                        # when this constructor raises.
+                        raise ValueError('Aperio JPEG 2000 requires fastslide')
                     entries.sort(key=lambda e: e[0], reverse=True)
+                    if (reject_sequential and entries and entries[0][3] is None
+                            and pages[entries[0][2]].tags.valueof(322) is not None):
+                        # libvips reads some tiled pages only sequentially (JPEG
+                        # YCbCr 2:1, e.g. Ventana BIF). A random read then decodes
+                        # the whole level first: 11-14 s and a multi-GB temp file
+                        # that a reader killed on timeout leaves behind (seen on
+                        # macOS). A header read; fastslide reads by tile. Opt-in:
+                        # only the isolated reader has fastslide to fall back to.
+                        try:
+                            _, loaded = pyvips.Image.tiffload(file_path, page=entries[0][2], access="random", flags=True)
+                            sequential = not int(loaded['flags']) & 1   # VIPS_FOREIGN_PARTIAL
+                        except pyvips.Error:
+                            sequential = False
+                        if sequential:
+                            raise ValueError('Sequential-only tiled TIFF requires fastslide')
                     self.level_dimensions = [(w, h) for w, h, _, _ in entries]
                     self._tif_page_indices = [pi for _, _, pi, _ in entries]
+                    if entries:
+                        base_w, base_h = entries[0][0], entries[0][1]
+                        for page in pages:
+                            if int(page.index) in self._tif_page_indices:
+                                continue
+                            # Aperio's thumbnail names the exact scanned region;
+                            # labels/macros don't. Keep it outside the pyramid.
+                            marker = f'{base_w}x{base_h} -> {page.imagewidth}x{page.imagelength}'
+                            if (page.samplesperpixel == 3 and page.imagewidth * page.imagelength <= 4_000_000
+                                    and marker in (page.description or '')
+                                    and abs(page.imagewidth / page.imagelength - base_w / base_h) < .005):
+                                self._thumbnail_page = int(page.index)
+                                break
                     self._tif_subifd_indices = [si for _, _, _, si in entries]
+            except ValueError:
+                raise
             except Exception:
                 pass
 
         # Fallback: open with pyvips if tifffile failed or found nothing
         if not self.level_dimensions:
-            base = pyvips.Image.new_from_file(file_path)
-            n_pages = base.get('n-pages') if base.get_typeof('n-pages') else 1
-            base_w, base_h = base.width, base.height
-            entries = []
-            for i in range(n_pages):
-                scale = 2 ** i
-                entries.append((
-                    max(1, base_w // scale),
-                    max(1, base_h // scale),
-                    i,
-                    None,
-                ))
-            entries.sort(key=lambda e: e[0], reverse=True)
-            self.level_dimensions = [(w, h) for w, h, _, _ in entries]
-            self._tif_page_indices = [pi for _, _, pi, _ in entries]
-            self._tif_subifd_indices = [si for _, _, _, si in entries]
+            base = pyvips.Image.tiffload(file_path, access="random")
+            # Do not invent a pyramid from page count (associated images may exist).
+            self.level_dimensions = [(base.width, base.height)]
+            self._tif_page_indices = [0]
+            self._tif_subifd_indices = [None]
 
         self.dimensions = self.level_dimensions[0]
         self.level_count = len(self.level_dimensions)
         base_w = self.dimensions[0]
         self.level_downsamples = [base_w / w for w, h in self.level_dimensions]
 
-        # Detect which loader pyvips chose — OpenSlide uses `level=N`, TIFF uses `page=N`
-        _probe = pyvips.Image.new_from_file(file_path)
-        self._is_openslide = 'openslide.level-count' in _probe.get_fields()
+        # Explicit TIFF loader: never select OpenSlide implicitly.
+        _probe = pyvips.Image.tiffload(file_path, access="random")
+        self._is_openslide = False
         bands = _probe.bands
 
         # Copy loader metadata into properties so upload_file_path can resolve MPP /
@@ -133,6 +230,17 @@ class PyvipsSlideWrapper:
                     continue
                 loader_metadata[name] = s
 
+        if _tifffile is not None:
+            with _tifffile.TiffFile(file_path) as tf:
+                page = tf.pages[0]
+                description = page.description or ''
+                match = re.search(r'(?:^|[|\s])MPP\s*=\s*([\d.]+)', description)
+                if match:
+                    loader_metadata['openslide.mpp-x'] = match.group(1)
+                    loader_metadata['openslide.mpp-y'] = match.group(1)
+                match = re.search(r'(?:^|[|\s])AppMag\s*=\s*([\d.]+)', description)
+                if match:
+                    loader_metadata['openslide.objective-power'] = match.group(1)
         del _probe
 
         self.properties = {
@@ -155,14 +263,17 @@ class PyvipsSlideWrapper:
         SubIFDs of the base page rather than as separate top-level IFDs. pyvips's
         ``page=`` only addresses top-level IFDs, so those levels must be opened
         with ``page=<base>, subifd=<n>``. ``TiffPage.treeindex`` is ``(page,)``
-        for a top-level IFD and ``(page, k)`` for its k-th child SubIFD (k is
-        1-based in tifffile), which maps to pyvips ``subifd = k - 1``. Falls back
-        to ``page.index`` with no subifd when treeindex is unavailable (older
+        for a top-level IFD and ``(page, k)`` for a child SubIFD, but tifffile
+        numbers k from 1 for OME series and from 0 for generic ones (libvips
+        ``subifd=True`` output). pyvips ``subifd`` is the position in the base
+        page's SubIFDs tag, so resolve it by offset. Falls back to
+        ``page.index`` with no subifd when treeindex is unavailable (older
         tifffile) — preserving the previous page-based behavior.
         """
         ti = getattr(p, "treeindex", None)
         if isinstance(ti, tuple) and len(ti) >= 2:
-            return int(ti[0]), int(ti[1]) - 1
+            base = p.parent.pages[int(ti[0])]
+            return int(ti[0]), list(base.subifds or ()).index(p.offset)
         if isinstance(ti, tuple) and len(ti) == 1:
             return int(ti[0]), None
         return int(p.index), None
@@ -170,10 +281,7 @@ class PyvipsSlideWrapper:
     def _get_level_image(self, level: int):
         """Return cached pyvips Image for the given pyramid level (lazy load).
 
-        pyvips routes options to the correct loader internally:
-        - SVS via OpenSlide loader → ``level=N`` (OpenSlide pyramid index)
-        - TIFF/BTF via TIFF loader → ``page=`` uses the IFD index from
-          tifffile (``_tif_page_indices``), not the logical pyramid level.
+        The explicit TIFF loader uses the physical IFD/SubIFD mappings.
         """
         # Fetch by value, not `in` then `[...]`: close() clears this dict, so a
         # membership test followed by an unlocked subscript can raise KeyError
@@ -186,31 +294,15 @@ class PyvipsSlideWrapper:
         with self._lock:
             cached = self._level_images.get(level)
             if cached is None:
-                if self._is_openslide:
-                    self._level_images[level] = pyvips.Image.new_from_file(
-                        self.path, level=level, access="random"
-                    )
-                else:
-                    page = (
-                        self._tif_page_indices[level]
-                        if level < len(self._tif_page_indices)
-                        else level
-                    )
-                    subifd = (
-                        self._tif_subifd_indices[level]
-                        if level < len(self._tif_subifd_indices)
-                        else None
-                    )
-                    if subifd is not None:
-                        # Sub-resolution level stored as a SubIFD of the base
-                        # page (OME-TIFF) — page= alone can't reach it.
-                        self._level_images[level] = pyvips.Image.new_from_file(
-                            self.path, page=page, subifd=subifd, access="random"
-                        )
-                    else:
-                        self._level_images[level] = pyvips.Image.new_from_file(
-                            self.path, page=page, access="random"
-                        )
+                page = self._tif_page_indices[level]
+                subifd = self._tif_subifd_indices[level]
+                options = dict(page=page, access="random")
+                if subifd is not None:
+                    options['subifd'] = subifd
+                image = pyvips.Image.tiffload(self.path, **options)
+                if (image.width, image.height) != tuple(self.level_dimensions[level]):
+                    raise ValueError('TIFF pyramid page dimensions do not match metadata')
+                self._level_images[level] = image
             return self._level_images[level]
 
     def read_region(self, location, level, size, as_array=False, **kwargs):
@@ -286,6 +378,20 @@ class PyvipsSlideWrapper:
                 best = i
         return best
 
+    def read_overview_vips(self):
+        """Display fallback only; an associated thumbnail is not a pyramid level."""
+        if self._thumbnail_page is not None:
+            # TIFF strips may be sequential even with access='random'. Decode
+            # the metadata-validated small thumbnail once into reusable pixels.
+            with self._lock:
+                if self._overview_image is None:
+                    self._overview_image = pyvips.Image.tiffload(
+                        self.path, page=self._thumbnail_page, access='random'
+                    ).copy_memory()
+                return self._overview_image
+        level = len(self.level_dimensions) - 1
+        return self.read_region_vips(level, 0, 0, *self.level_dimensions[level])
+
     def close(self):
         """Release pyvips resources for this slide.
 
@@ -299,6 +405,7 @@ class PyvipsSlideWrapper:
         """
         with self._lock:
             self._level_images.clear()
+            self._overview_image = None
 
     def __del__(self):
         try:
