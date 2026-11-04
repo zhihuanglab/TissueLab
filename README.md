@@ -306,6 +306,53 @@ Install them from the **Models** page in the app (pre-built bundles for Windows 
 register a custom node pointing at a conda environment), or follow the
 [Tissuelab-Model-Zoo](https://github.com/zhihuanglab/Tissuelab-Model-Zoo).
 
+### Activating a Model Zoo node (example: TotalSegmentator)
+
+Nodes that have no pre-built bundle, such as radiology organ segmentation with
+TotalSegmentator, are already listed on the **Models** page and are activated once
+against a local checkout of the Model Zoo:
+
+1. Clone the Model Zoo on the machine that runs the TissueLab service and build the
+   node's environment (a GPU is recommended):
+   ```bash
+   git clone https://github.com/zhihuanglab/Tissuelab-Model-Zoo.git
+   conda create -n totalseg python=3.11 -y
+   conda activate totalseg
+   pip install -r Tissuelab-Model-Zoo/tissue_segmentation/TotalSegmentator/requirements.txt
+   ```
+2. In TissueLab open **Models**, find **TotalSegmentator Segmentation** and click
+   **Activate**. Set *Service Path* to
+   `<zoo>/tissue_segmentation/TotalSegmentator/totalsegmentator_tasknode.py` and pick the
+   `totalseg` environment. The activation is remembered for later launches. Model weights
+   are downloaded automatically on the node's first run.
+   (**Models → Create custom node** does the same and also creates the environment; then
+   the node name must be `TotalSegmentatorSegmentation`, factory `TissueSeg`, with the
+   zoo `requirements.txt` as *Dependency Path*.)
+3. Open a CT volume (NIfTI file or DICOM folder) and ask your question in the chat; the
+   **web search** toggle next to the input makes both the planner and the Coding Agent
+   look up published criteria for the task. The planner fills the node's organ list
+   (e.g. `Liver, Spleen`), the node writes `Tissue-Segmentation/masks/<organ>/mask` plus
+   the HU volume `Tissue-Segmentation/image`, and the Coding Agent computes the answer
+   from them.
+
+### Chest X-ray nodes (Ark+ and CheXzero)
+
+Both chest X-ray classifiers are listed on the **Models** page under *Task Specific* and are
+activated the same way (environment from the node's `requirements.txt`, then **Activate** with
+the node's `*_tasknode.py` as *Service Path*). Their weights are not bundled:
+
+- **Ark** (`task_specific/Ark_Plus`): place `Ark6_swinLarge768_ep50.pth.tar` in the node's
+  `checkpoints/` folder (request the Ark+ weights from its authors; see the node README).
+  Returns probabilities for fixed label sets (ChestX-ray14, CheXpert, MIMIC-CXR, ...).
+- **CheXzero** (`task_specific/CheXzero`): download the public checkpoints into the node's
+  `checkpoints/chexzero_weights/` folder (see the node README). Scores any finding written in
+  words, so the planner passes the findings the question asks about.
+
+Open a chest X-ray (PNG / JPEG / DICOM) and ask, for example, whether it suggests a given
+finding; the planner picks one of the two nodes, the node writes the probabilities to the
+zarr (`<node>/predictions`, `<node>/disease_list`, `<node>/scores_json`) and the Coding Agent
+reports the probability and its decision.
+
 ## 🧬 Reproducing the Co-evolution Experiments
 
 TissueLab adapts at three levels (paper: *Model-level*, *Strategy-level* and *Slide-level

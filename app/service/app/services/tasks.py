@@ -232,8 +232,14 @@ async def _generate_script_output(
     zarr_path: str,
     auth_header: str | None = None,
     uid: str | None = None,
+    web_search_enabled: bool = False,
 ) -> dict:
-    """Generate the analysis script with the in-process coding agent (streamed when uid is set)."""
+    """Generate the analysis script with the in-process coding agent (streamed when uid is set).
+
+    ``web_search_enabled`` is the chat's web-search toggle: when set, the coding
+    agent fetches published guidelines/criteria for the task (same lookup the
+    planner does) before writing the script.
+    """
     if not zarr_path:
         error_msg = "Zarr file path is required"
         logger.error(f"[CodingAgent] {error_msg}")
@@ -291,7 +297,7 @@ async def _generate_script_output(
                 script_task=combined_prompt,
                 zarr_structure=structure_json,
                 original_question=combined_prompt,
-                web_search_enabled=False,
+                web_search_enabled=web_search_enabled,
             )
             stream_result = await _stream_script_generation(system_prompt, user_prompt, uid)
             if isinstance(stream_result, dict) and "generated_script" in stream_result:
@@ -310,7 +316,7 @@ async def _generate_script_output(
             script_task=combined_prompt,
             zarr_structure=structure_json,
             original_question=combined_prompt,
-            web_search_enabled=False,
+            web_search_enabled=web_search_enabled,
         )
         return {"generated_script": script or ""}
     except asyncio.CancelledError:

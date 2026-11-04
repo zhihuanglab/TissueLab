@@ -1070,6 +1070,10 @@ Return only JSON, no other text. If is_correction is false, other fields can be 
         if search_enabled:
             frontend_requested = web_search_enabled
             fetched = await asyncio.to_thread(self._fetch_guidelines, combined_for_search, always_search=frontend_requested)
+            try:
+                print(f"[coding.web_search_response] {fetched}")
+            except Exception:
+                pass
         else:
             fetched = ""
 

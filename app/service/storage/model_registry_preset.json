@@ -30,7 +30,8 @@
     ],
     "TaskSpecific": [
       "Ark",
-      "CardiacMRSegmentation"
+      "CardiacMRSegmentation",
+      "CheXzero"
     ],
     "CodingAgent": [
       "GPT-4o Agent"
@@ -63,21 +64,30 @@
     },
     "TotalSegmentatorSegmentation": {
       "displayName": "TotalSegmentator Segmentation",
-      "description": "Organ segmentation for radiology images. When segmenting brain, brain structure, liver, spleen, prioritize this node over BiomedParse.",
+      "description": "Organ and lesion segmentation for radiology (CT/MRI) volumes with TotalSegmentator. Prioritize this node over BiomedParse for CT organs (brain, liver, spleen, kidneys, lungs, heart, vertebrae, ...) and for intracerebral hemorrhage, which uses TotalSegmentator's dedicated cerebral_bleed model. Writes one 3D mask per requested class plus the CT intensity volume on the same voxel grid, so a CodingAgent step can compute volumes and intensity statistics.",
       "icon": "/images/icons/totalsegmentator.png",
       "factory": "TissueSeg",
       "schema": null,
       "version": null,
       "source": "builtin",
-      "zarr_group": null,
-      "inputs": "Radiology images (CT/MRI)",
-      "outputs": "Organ masks (brain, brain structure, liver, spleen)",
+      "zarr_group": "Tissue-Segmentation",
+      "inputs": "Radiology image path (NIfTI file or DICOM folder); tissue_classes=<comma-separated organ names to segment, e.g. \"Kidney, Pancreas\"> (empty = all organs)",
+      "outputs": "Tissue-Segmentation/masks/<class>/mask (3D bool, one per requested class: organs such as liver, spleen, brain, or lesions such as intracerebral hemorrhage), classes/{name,color}, and Tissue-Segmentation/image (int16 Hounsfield-unit CT volume on the same voxel grid; attrs affine, voxel_spacing_mm)",
       "modality": "radiology",
       "supported_organs": [
         "brain",
         "brain structure",
         "liver",
         "spleen"
+      ],
+      "panel": [
+        {
+          "key": "tissue_classes",
+          "type": "input",
+          "value": "",
+          "label": "Organs to segment",
+          "placeholder": "e.g. Kidney, Pancreas (empty = all organs)"
+        }
       ]
     },
     "TotalSegmentatorClassification": {
@@ -235,15 +245,15 @@
     },
     "Ark": {
       "displayName": "Ark",
-      "description": "Task-specific model for specifically ONLY chest X-ray analysis with direct prediction scores; standalone model that does not require other nodes.",
+      "description": "Task-specific zero-shot chest X-ray classifier (Ark+, Swin-L 768px). Standalone: takes the X-ray image directly, no segmentation or other nodes needed. Returns a probability per finding for several label sets (MIMIC-CXR, CheXpert, ChestX-ray14, RSNA Pneumonia, VinDr-CXR, Shenzhen TB); a CodingAgent step turns the probabilities into the answer.",
       "icon": "/images/icons/ark.png",
       "factory": "TaskSpecific",
       "schema": null,
       "version": null,
       "source": "builtin",
-      "zarr_group": null,
-      "inputs": "Chest X-ray images",
-      "outputs": "Prediction scores"
+      "zarr_group": "Ark",
+      "inputs": "Chest X-ray image path (PNG/JPEG/DICOM); no other parameters",
+      "outputs": "Ark/predictions (52 sigmoid probabilities) aligned with Ark/disease_list; Ark/scores_json groups the same values per head (ChestX-ray14 head: Atelectasis, Cardiomegaly, Effusion, Infiltration, Mass, Nodule, Pneumonia, Pneumothorax, Consolidation, Edema, Emphysema, Fibrosis, Pleural_Thickening, Hernia; CheXpert/MIMIC heads: No Finding, Enlarged Cardiomediastinum, Cardiomegaly, Lung Opacity, Lung Lesion, Edema, Consolidation, Pneumonia, Atelectasis, Pneumothorax, Pleural Effusion, Pleural Other, Fracture, Support Devices)"
     },
     "CardiacMRSegmentation": {
       "displayName": "Cardiac MR Segmentation",
@@ -316,6 +326,18 @@
       "version": null,
       "factory": "TissueClassify",
       "zarr_group": null
+    },
+    "CheXzero": {
+      "displayName": "CheXzero",
+      "description": "Task-specific zero-shot chest X-ray classifier (CheXzero: CLIP ViT-B/32 trained on MIMIC-CXR, checkpoint ensemble). Standalone: takes the X-ray image directly, no other nodes needed. Scores ANY finding written in words (softmax of '<finding>' vs 'no <finding>'), so pass the findings the question asks about as tissue_classes; a default list of common findings is always scored too. A CodingAgent step turns the probabilities into the answer.",
+      "icon": "/images/icons/ark.png",
+      "factory": "TaskSpecific",
+      "schema": null,
+      "version": null,
+      "source": "builtin",
+      "zarr_group": "CheXzero",
+      "inputs": "Chest X-ray image path (PNG/JPEG/DICOM); tissue_classes=<comma-separated findings to score, e.g. \"Nodule, Mass\"> (optional)",
+      "outputs": "CheXzero/predictions (ensemble probabilities) aligned with CheXzero/disease_list; CheXzero/scores_json with ensemble and per-checkpoint values"
     }
   },
   "category_display_names": {

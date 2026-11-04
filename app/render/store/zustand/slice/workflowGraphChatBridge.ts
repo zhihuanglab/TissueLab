@@ -10,6 +10,7 @@ export type PendingWorkflowGraphApply = {
     prompt?: string;
     type?: string;
     ui?: Record<string, unknown> | null;
+    web_search_enabled?: boolean;
   }>;
   formattedPath: string;
 };

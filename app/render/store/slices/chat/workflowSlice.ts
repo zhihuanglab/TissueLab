@@ -77,7 +77,10 @@ export const generatePanelsFromWorkflow = (workflow: any[]): WorkflowPanel[] => 
       progress: 0,
       content: panelConfig.defaultContent.map((contentItem) => ({
         ...contentItem,
-        value: joinedValue,
+        // The web-search flag is a boolean from the chat toggle, never the step text.
+        value: contentItem.key === "web_search_enabled"
+          ? (step.web_search_enabled === true ? "1" : "")
+          : joinedValue,
       })),
       ui: (step?.ui && typeof step.ui === 'object') ? step.ui : null,
       stepName: step.model, // Save step name (e.g., "NucleiSeg") for factory matching
