@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 import traceback
 
 from .generator import ThumbnailGenerator
+from app.wrapper.isolated_slide_wrapper import PreviewSlide
 from app.utils.cache.thumbnail import thumbnail_cache_service
 from app.core import logger
 from app.core.background import track_background_task
@@ -201,10 +202,6 @@ class ThumbnailWorker:
             from tissuelab_sdk.wrapper import ISyntaxImageWrapper
         except:
             ISyntaxImageWrapper = None
-        try:
-            from tissuelab_sdk.wrapper import CziImageWrapper
-        except:
-            CziImageWrapper = None
 
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File {file_path} not found")
@@ -212,6 +209,15 @@ class ThumbnailWorker:
         # Import the file extension detection function
         from app.services.load import get_file_extension
         file_ext = get_file_extension(file_path)
+
+        # Prefer the tile readers' decoders (pyvips, then fastslide) for the
+        # formats the viewer opens with them: they see SVS label and macro
+        # photos, which TiffFileWrapper does not.
+        if file_ext in ['tif', 'tiff', 'btf', 'svs']:
+            try:
+                return PreviewSlide(file_path)
+            except Exception as e:
+                logger.info(f"Preview falls back to the SDK reader for {file_path}: {e}")
 
         if file_ext in ['tif', 'tiff', 'btf']:
             slide_obj = TiffFileWrapper(file_path)
@@ -226,7 +232,7 @@ class ThumbnailWorker:
         elif file_ext in ['isyntax']:
             slide_obj = ISyntaxImageWrapper(file_path)
         elif file_ext in ['czi']:
-            slide_obj = CziImageWrapper(file_path)
+            slide_obj = PreviewSlide(file_path)
         elif file_ext in ['dcm']:
             slide_obj = DicomImageWrapper(file_path)
         elif file_ext in ['nii', 'nii.gz']:

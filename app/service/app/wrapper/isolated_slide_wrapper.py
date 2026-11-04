@@ -15,6 +15,13 @@ import threading
 import time
 import types
 import weakref
+from collections.abc import Mapping
+
+import numpy as np
+from PIL import Image
+
+# pyvips and fastslide are imported inside functions on purpose: a reader child
+# must set VIPS_CONCURRENCY and the fastslide cache before either is loaded.
 from app.tile_resources import (
     available_cpu_count, default_native_concurrency, default_reader_budget_mb,
     default_readers_per_slide, default_tile_workers, total_memory_bytes, integer_setting,
@@ -93,6 +100,11 @@ def _overview_source(slide):
     return slide.read_region_vips(level, 0, 0, *slide.level_dimensions[level])
 
 
+# fastslide keeps vendor names for associated images; CZI calls the slide photo
+# "SlidePreview".
+_ASSOCIATED_ALIASES = {'slidepreview': 'macro'}
+
+
 class _FastSlideReader:
     def __init__(self, path):
         import fastslide
@@ -121,7 +133,13 @@ class _FastSlideReader:
         if 'levels' in self.properties:
             self.properties['levels'] = len(self._levels)
         # Label/macro photos (NDPI, SVS); not pyramid levels.
-        self.associated_names = list(self._slide.associated_images.keys())
+        # Report vendor names (CZI's "Label", "SlidePreview") the way the rest of
+        # the service looks them up: lower case, with the slide photo as "macro".
+        self._associated_keys = {}
+        for key in self._slide.associated_images.keys():
+            name = _ASSOCIATED_ALIASES.get(key.lower(), key.lower())
+            self._associated_keys.setdefault(name, key)
+        self.associated_names = list(self._associated_keys)
         self._overview_image = None
 
     def read_overview_vips(self):
@@ -139,12 +157,17 @@ class _FastSlideReader:
 
     def read_associated_vips(self, name):
         import pyvips
-        array = self._slide.associated_images[name].numpy()
+        array = self._slide.associated_images[self._associated_keys.get(name, name)].numpy()
+        if array.dtype == np.uint16:
+            # CZI's SlidePreview is 16 bits per sample; scale as the tile path does.
+            array = (array >> 8).astype(np.uint8)
+        if array.ndim == 2:
+            array = array[..., None]
+        array = np.ascontiguousarray(array)
         return pyvips.Image.new_from_memory(array.tobytes(), array.shape[1], array.shape[0], array.shape[2], 'uchar')
 
     def read_region_vips(self, level, x, y, w, h):
         import pyvips
-        import numpy as np
         if w * h * 4 > 128 * 1024 * 1024:
             raise ValueError('Fastslide region too large; use a coarser pyramid level')
         array = self._slide.read_region((x, y), level=self._levels[level], size=(w, h)).numpy()
@@ -207,7 +230,10 @@ def _worker_main(connection, path, backend, concurrency):
                     if not 0 <= level < len(slide.level_dimensions):
                         raise ValueError(f'Pyramid level {level} does not exist')
                     def render(reader):
-                        region = reader.read_region_vips(level, x, y, w, h)
+                        coarse = getattr(reader, 'read_coarse_region_vips', None)
+                        region = coarse(level, x, y, w, h, out_w, out_h) if coarse else None
+                        if region is None:
+                            region = reader.read_region_vips(level, x, y, w, h)
                         region = _resize_vips_tile_to_exact(region, out_w, out_h)
                         return _encode_tile_vips(region, quality)
                     try:
@@ -260,7 +286,6 @@ def _worker_main(connection, path, backend, concurrency):
 
 
 def _array(width, height, bands, dtype, data):
-    import numpy as np
     types = {'uchar': np.uint8, 'char': np.int8, 'ushort': np.uint16,
              'short': np.int16, 'uint': np.uint32, 'int': np.int32,
              'float': np.float32, 'double': np.float64}
@@ -268,9 +293,93 @@ def _array(width, height, bands, dtype, data):
 
 
 def _pil(width, height, bands, dtype, data):
-    from PIL import Image
     array = _array(width, height, bands, dtype, data)
     return Image.fromarray(array[..., 0] if bands == 1 else array[..., :3])
+
+
+def _vips_pil(image):
+    # Scale deeper samples to 8 bits as the tile path does; a plain cast clips
+    # a 16-bit image to white.
+    if image.format == 'ushort':
+        image = (image >> 8).cast('uchar')
+    elif image.format != 'uchar':
+        peak = image.max()
+        image = (image * (255.0 / peak) if peak > 0 else image).cast('uchar')
+    return _pil(*_raw(image))
+
+
+class _PreviewAssociated(Mapping):
+    def __init__(self, reader):
+        self._reader = reader
+
+    def __getitem__(self, name):
+        if name not in self._reader.associated_names:
+            raise KeyError(name)
+        return _vips_pil(self._reader.read_associated_vips(name))
+
+    def __contains__(self, name):
+        return name in self._reader.associated_names
+
+    def __iter__(self):
+        return iter(self._reader.associated_names)
+
+    def __len__(self):
+        return len(self._reader.associated_names)
+
+
+class PreviewSlide:
+    """In-process slide for file-list previews (thumbnail, label, macro).
+
+    Opens with the tile readers' decoders, in the same order, so previews come
+    from the decoder that serves the slide's tiles and see its label and macro
+    photos. Previews read only the coarsest level and the associated images,
+    so they run in-process rather than in a reader process.
+    """
+    def __init__(self, path):
+        from app.wrapper.pyvips_slide_wrapper import PyvipsSlideWrapper
+        sequential = False
+        try:
+            self._reader = PyvipsSlideWrapper(path, reject_sequential=True)
+        except Exception as error:
+            sequential = 'Sequential-only' in str(error)
+            try:
+                self._reader = _FastSlideReader(path)
+            except Exception:
+                if not sequential:
+                    raise
+                self._reader = PyvipsSlideWrapper(path)
+        self.dimensions = tuple(self._reader.dimensions)
+        self.level_dimensions = [tuple(d) for d in self._reader.level_dimensions]
+        self.level_downsamples = list(self._reader.level_downsamples)
+        self.properties = dict(self._reader.properties)
+        self.associated_images = _PreviewAssociated(self._reader)
+
+    @property
+    def associated_names(self):
+        return list(getattr(self._reader, 'associated_names', ()))
+
+    def read_associated_vips(self, name):
+        return self._reader.read_associated_vips(name)
+
+    def coarse_preview(self, size):
+        """The whole slide fitted to ``size`` px from the reader's coarse copy of a
+        large single-level slide (see PyvipsSlideWrapper.coarse_overview); None
+        for slides whose coarsest level is already small enough to read."""
+        coarse = getattr(self._reader, 'coarse_overview', lambda: None)()
+        if coarse is None:
+            return None
+        width, height = self.level_dimensions[0]
+        scale = min(size / width, size / height)
+        target = (max(1, int(width * scale)), max(1, int(height * scale)))
+        return _vips_pil(coarse).resize(target, Image.Resampling.LANCZOS)
+
+    def read_region(self, location, level, size, **kwargs):
+        scale = self.level_downsamples[level]
+        x, y = int(location[0] / scale), int(location[1] / scale)
+        return _vips_pil(self._reader.read_region_vips(level, x, y, *size))
+
+    def close(self):
+        self._reader.close()
 
 
 _readers = weakref.WeakSet()
@@ -583,8 +692,6 @@ class IsolatedSlideWrapper:
         return _pil(*self._rpc('associated', (name,)))
 
     def read_region(self, location, level, size, as_array=False, **kwargs):
-        import numpy as np
-        from PIL import Image
         scale = self.level_downsamples[level]
         x, y = int(location[0] / scale), int(location[1] / scale)
         image = self.read_region_vips(level, x, y, *size)
