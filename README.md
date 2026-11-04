@@ -350,7 +350,7 @@ the node's `*_tasknode.py` as *Service Path*). Their weights are not bundled:
 
 Open a chest X-ray (PNG / JPEG / DICOM) and ask, for example, whether it suggests a given
 finding; the planner picks one of the two nodes, the node writes the probabilities to the
-zarr (`<node>/predictions`, `<node>/disease_list`, `<node>/scores_json`) and the Coding Agent
+zarr (`Image-Classification/predictions`, `disease_list`, `scores_json`) and the Coding Agent
 reports the probability and its decision.
 
 ## 🧬 Reproducing the Co-evolution Experiments
