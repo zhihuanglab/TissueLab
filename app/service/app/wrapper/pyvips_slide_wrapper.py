@@ -1,5 +1,6 @@
 import os
 import re
+import tempfile
 import threading
 import numpy as np
 from PIL import Image
@@ -12,6 +13,15 @@ except Exception:
 
 
 _APERIO_JP2K = (33003, 33005)
+
+# A single-level slide has no coarse level: every zoomed-out tile, the overview
+# and the preview would decode a large share of the base image. Above this size,
+# decode a COARSE_FACTOR-downscaled copy once and serve coarse reads from it.
+COARSE_MIN_PIXELS = 64 * 1024 * 1024
+COARSE_FACTOR = 16
+_COARSE_CACHE_DIR = os.path.join(
+    os.environ.get('TL_COARSE_CACHE_DIR') or tempfile.gettempdir(), 'tissuelab-coarse')
+_COARSE_CACHE_DAYS = 14
 
 
 def _is_aperio_jp2k(page) -> bool:
@@ -81,6 +91,9 @@ class PyvipsSlideWrapper:
         self._overview_image = None
         # Label/macro/thumbnail photos (SVS series[1+]): name -> TIFF IFD index.
         self._associated_pages = {}
+        # Downscaled copy of a large single-level slide (see COARSE_FACTOR).
+        self._coarse = None
+        self._coarse_lock = threading.Lock()
 
         if _tifffile is not None:
             try:
@@ -407,8 +420,147 @@ class PyvipsSlideWrapper:
         array = np.ascontiguousarray(array[..., :3].astype(np.uint8, copy=False))
         return pyvips.Image.new_from_memory(array.tobytes(), array.shape[1], array.shape[0], 3, 'uchar')
 
+    def coarse_overview(self):
+        """The COARSE_FACTOR-downscaled base of a large single-level slide, else None."""
+        width, height = self.level_dimensions[0]
+        if len(self.level_dimensions) != 1 or width * height < COARSE_MIN_PIXELS:
+            return None
+        if self._coarse is None:
+            with self._coarse_lock:
+                if self._coarse is None:
+                    self._coarse = self._load_coarse()
+        return self._coarse
+
+    def read_coarse_region_vips(self, level, x, y, w, h, out_w, out_h):
+        """A level-0 region read for a tile at least COARSE_FACTOR smaller, from the
+        coarse copy; None when the tile needs base pixels."""
+        # Edge tiles round their output size up, so allow one pixel of slack.
+        if level != 0 or w < COARSE_FACTOR * (out_w - 1) or h < COARSE_FACTOR * (out_h - 1):
+            return None
+        coarse = self.coarse_overview()
+        if coarse is None:
+            return None
+        cx = min(coarse.width - 1, x // COARSE_FACTOR)
+        cy = min(coarse.height - 1, y // COARSE_FACTOR)
+        cw = max(1, min(coarse.width - cx, round(w / COARSE_FACTOR)))
+        ch = max(1, min(coarse.height - cy, round(h / COARSE_FACTOR)))
+        return coarse.crop(cx, cy, cw, ch)
+
+    def _coarse_cache_path(self):
+        import hashlib
+        stat = os.stat(self.path)
+        key = f'{os.path.realpath(self.path)}|{stat.st_mtime_ns}|{stat.st_size}|{COARSE_FACTOR}'
+        return os.path.join(_COARSE_CACHE_DIR, hashlib.sha1(key.encode()).hexdigest() + '.npy')
+
+    def _load_coarse(self):
+        # Shared on disk: each reader process of a slide, and the preview worker,
+        # would otherwise decode the whole base image again.
+        try:
+            cache = self._coarse_cache_path()
+        except OSError:
+            cache = None
+        array = None
+        if cache and os.path.exists(cache):
+            try:
+                array = np.load(cache)
+            except Exception:
+                array = None
+        if array is None:
+            array = self._decode_coarse()
+            if cache:
+                self._store_coarse(cache, array)
+        array = np.ascontiguousarray(array)
+        return pyvips.Image.new_from_memory(
+            array.tobytes(), array.shape[1], array.shape[0], array.shape[2], 'uchar')
+
+    @staticmethod
+    def _store_coarse(cache, array):
+        import time
+        try:
+            os.makedirs(_COARSE_CACHE_DIR, exist_ok=True)
+            tmp = f'{cache}.{os.getpid()}.tmp'
+            with open(tmp, 'wb') as handle:
+                np.save(handle, array)
+            os.replace(tmp, cache)
+            cutoff = time.time() - _COARSE_CACHE_DAYS * 86400
+            for name in os.listdir(_COARSE_CACHE_DIR):
+                entry = os.path.join(_COARSE_CACHE_DIR, name)
+                if os.path.getmtime(entry) < cutoff:
+                    os.remove(entry)
+        except OSError:
+            pass
+
+    def _decode_coarse(self):
+        array = self._decode_coarse_jpeg_tiles()
+        if array is None:
+            image = pyvips.Image.tiffload(self.path, page=self._tif_page_indices[0], access='sequential')
+            if image.bands == 4:
+                image = image.extract_band(0, n=3)
+            elif image.bands == 1:
+                image = image.colourspace('srgb')
+            if image.format == 'ushort':
+                image = image >> 8
+            image = image.shrink(COARSE_FACTOR, COARSE_FACTOR).cast('uchar')
+            array = np.ndarray(buffer=image.write_to_memory(), dtype=np.uint8,
+                               shape=(image.height, image.width, image.bands))
+        return array
+
+    def _decode_coarse_jpeg_tiles(self):
+        """Decode YCbCr JPEG tiles at 1/8 scale (the codec's DCT scaling), then
+        halve: ~1/64 of the decode work of the full image. None when the base page
+        is not tiled 8-bit YCbCr JPEG."""
+        if _tifffile is None:
+            return None
+        import io
+        from concurrent.futures import ThreadPoolExecutor
+        with _tifffile.TiffFile(self.path) as tf:
+            page = tf.pages[self._tif_page_indices[0]]
+            if not (page.is_tiled and int(page.compression) == 7 and int(page.photometric) == 6
+                    and page.samplesperpixel == 3 and page.bitspersample == 8 and int(page.planarconfig) == 1):
+                return None
+            tables = page.jpegtables
+            offsets, counts = page.dataoffsets, page.databytecounts
+            tile_w, tile_h = page.tilewidth, page.tilelength
+            width, height = page.imagewidth, page.imagelength
+        if tile_w % 8 or tile_h % 8:
+            return None
+        cols = -(-width // tile_w)
+        sw, sh = tile_w // 8, tile_h // 8
+        mosaic = np.full((-(-height // tile_h) * sh, cols * sw, 3), 255, np.uint8)
+
+        def decode(index):
+            if not counts[index]:
+                return
+            with open(self.path, 'rb') as handle:
+                handle.seek(offsets[index])
+                data = handle.read(counts[index])
+            if tables:
+                data = tables[:-2] + data[2:]
+            tile = Image.open(io.BytesIO(data))
+            tile.draft('RGB', (sw, sh))
+            pixels = np.asarray(tile.convert('RGB'))
+            if pixels.shape[:2] != (sh, sw):
+                raise ValueError('JPEG tile did not decode at 1/8 scale')
+            row, col = divmod(index, cols)
+            mosaic[row * sh:(row + 1) * sh, col * sw:(col + 1) * sw] = pixels
+
+        try:
+            with ThreadPoolExecutor(max(1, min(8, os.cpu_count() or 1))) as pool:
+                list(pool.map(decode, range(len(offsets))))
+        except Exception:
+            return None
+        eighth = pyvips.Image.new_from_memory(
+            mosaic[:-(-height // 8), :-(-width // 8)].copy().tobytes(),
+            -(-width // 8), -(-height // 8), 3, 'uchar')
+        half = eighth.shrink(COARSE_FACTOR // 8, COARSE_FACTOR // 8).cast('uchar')
+        return np.ndarray(buffer=half.write_to_memory(), dtype=np.uint8,
+                          shape=(half.height, half.width, 3))
+
     def read_overview_vips(self):
         """Display fallback only; an associated thumbnail is not a pyramid level."""
+        coarse = self.coarse_overview()
+        if coarse is not None:
+            return coarse
         if self._thumbnail_page is not None:
             # TIFF strips may be sequential even with access='random'. Decode
             # the metadata-validated small thumbnail once into reusable pixels.
@@ -435,6 +587,7 @@ class PyvipsSlideWrapper:
         with self._lock:
             self._level_images.clear()
             self._overview_image = None
+        self._coarse = None
 
     def __del__(self):
         try:

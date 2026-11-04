@@ -39,10 +39,6 @@ try:
 except:
     ISyntaxImageWrapper = None
 
-try:
-    from tissuelab_sdk.wrapper import CziImageWrapper
-except:
-    CziImageWrapper = None
 from app.utils import resolve_path
 from app.config.path_config import authorize_storage_read_path, resolve_virtual_path, STORAGE_ROOT
 
@@ -1844,9 +1840,10 @@ def load_slide_from_file_with_session(filename: str, session_id: str = "default"
             session_data['current_file_format'] = 'isyntax'
             session_data['tiff_slide_wrapper'] = False
         elif file_ext in ['czi']:
-            session_data['slide'] = CziImageWrapper(filename)
+            # fastslide, through the tile readers, on every platform.
+            session_data['slide'] = SharedSlideWrapper(filename)
             session_data['current_file_format'] = 'czi'
-            session_data['tiff_slide_wrapper'] = False
+            session_data['tiff_slide_wrapper'] = True
         elif file_ext in ['dcm']:
             session_data['slide'] = DicomImageWrapper(filename)
             session_data['current_file_format'] = 'dcm'
@@ -2402,9 +2399,10 @@ def upload_file_path(file_path: str, session_id: str = "default") -> Dict:
             total_channels = 3  # RGB images always have 3 channels
             session_data['tiff_slide_wrapper'] = False
         elif session_data['current_file_format'] in ['czi']:
-            session_data['slide'] = CziImageWrapper(file_path)
+            # fastslide, through the tile readers (see load_slide_from_file_with_session)
+            session_data['slide'] = SharedSlideWrapper(file_path)
             total_channels = 3  # RGB images always have 3 channels
-            session_data['tiff_slide_wrapper'] = False
+            session_data['tiff_slide_wrapper'] = True
         elif session_data['current_file_format'] in ['isyntax']:
             session_data['slide'] = ISyntaxImageWrapper(file_path)
             total_channels = 3  # RGB images always have 3 channels
@@ -2660,6 +2658,10 @@ def get_slide_thumbnail(slide_obj, size=200):
     Generate thumbnail image from slide
     """
     try:
+        # A large single-level slide: its only level is the whole base image.
+        coarse = slide_obj.coarse_preview(size) if hasattr(slide_obj, 'coarse_preview') else None
+        if coarse is not None:
+            return coarse
         thumbnail_level = len(slide_obj.level_dimensions) - 1
         level_width, level_height = slide_obj.level_dimensions[thumbnail_level]
         
@@ -2691,6 +2693,8 @@ def get_slide_macro(slide_obj, size=200):
             macro_img = slide_obj.associated_images['macro']
         elif hasattr(slide_obj, 'associated_images') and 'overview' in slide_obj.associated_images:
             macro_img = slide_obj.associated_images['overview']
+        elif hasattr(slide_obj, 'coarse_preview') and (coarse := slide_obj.coarse_preview(size)) is not None:
+            macro_img = coarse
         else:
             # use lower resolution level as macro image
             levels = slide_obj.level_dimensions
