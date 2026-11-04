@@ -77,14 +77,13 @@ Pattern:
   4. Handle zero denominator: if duct_cells == 0, report "undefined"
   5. Report ratio, raw counts, and total cells
 
-Radiology - Organ HU Analysis:
-Task: "Does this CT suggest fatty liver?" (using HU threshold)
+Radiology - Organ Volume / Intensity Statistics:
+Task: "What is the volume of the left kidney, and what is its mean attenuation?"
 Pattern:
-  1. Load the liver (and spleen, if present) masks from Tissue-Segmentation/masks/<organ>/mask
-  2. Load the HU volume Tissue-Segmentation/image (same voxel grid) and take image[liver_mask]
-  3. Compute mean HU: mean_HU = np.mean(liver_voxels); also the liver − spleen mean HU difference when a spleen mask exists
-  4. Apply threshold: fatty_liver = mean_HU < 40 HU
-  5. Report mean HU (liver, spleen, difference), voxel counts, threshold, and interpretation
+  1. Load the organ mask from Tissue-Segmentation/masks/<organ>/mask (3D bool)
+  2. Volume: voxel_count * prod(voxel_spacing_mm) / 1000 → ml (read voxel_spacing_mm from the group attrs; or use the mask group's volume_ml attr)
+  3. Intensity: load Tissue-Segmentation/image (same voxel grid) and take image[mask]; report mean / median / std in HU
+  4. Report volume, intensity statistics, voxel count, and any assumptions (spacing source, mask cleaning)
 
 Radiology - Detection/Overlap:
 Task: "Does this brain show intracranial hemorrhage?"

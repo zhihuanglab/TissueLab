@@ -55,11 +55,11 @@
     },
     "TotalSegmentatorSegmentation": {
       "displayName": "TotalSegmentator Segmentation",
-      "description": "Organ segmentation for radiology (CT/MRI) volumes with TotalSegmentator. When segmenting brain, brain structure, liver, spleen or other organs, prioritize this node over BiomedParse. Writes one 3D mask per organ plus the HU volume on the same grid, so a CodingAgent step can measure organ intensities (e.g. mean liver HU).",
+      "description": "Organ segmentation for radiology (CT/MRI) volumes with TotalSegmentator. When segmenting brain, brain structure, liver, spleen or other organs, prioritize this node over BiomedParse. Writes one 3D mask per organ plus the CT intensity volume on the same voxel grid, so a CodingAgent step can compute organ-level volume and intensity statistics.",
       "icon": "/images/icons/totalsegmentator.png",
       "factory": "TissueSeg",
       "source": "builtin",
-      "inputs": "Radiology image path (NIfTI file or DICOM folder); tissue_classes=<comma-separated organ names to segment, e.g. \"Liver, Spleen\"> (empty = all organs)",
+      "inputs": "Radiology image path (NIfTI file or DICOM folder); tissue_classes=<comma-separated organ names to segment, e.g. \"Kidney, Pancreas\"> (empty = all organs)",
       "outputs": "Tissue-Segmentation/masks/<organ>/mask (3D bool, one per organ), classes/{name,color}, and Tissue-Segmentation/image (int16 Hounsfield-unit CT volume on the same voxel grid; attrs affine, voxel_spacing_mm)",
       "panel": [
         {
