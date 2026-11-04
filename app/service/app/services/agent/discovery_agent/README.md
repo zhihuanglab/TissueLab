@@ -58,8 +58,10 @@ TRAIN=/data/tubule/train                   # the bundle's training folder
 cp "<TissueLab-Experiment>/Tubule Score/agent/problem.md" "$TRAIN"/
 cp "<TissueLab-Experiment>/Tubule Score/agent/human_insights.md" "$TRAIN"/   # omit for the no-insights ablation
 # ANTHROPIC_API_KEY in the environment or in app/service/.env.local
-python -m app.services.agent.discovery_agent --training-dir "$TRAIN" --name agent_6 --auto 20
+python -m app.services.agent.discovery_agent --training-dir "$TRAIN" --name my_run --auto 20
 ```
+`--name` is any name for this run; the five published runs are `agent_1 … agent_5` in
+TissueLab-Experiment.
 Each round the planner proposes a workflow, the coder writes `rounds/roundN.py`, the script runs on
 the training folder and reports in-sample and leave-one-out metrics, and the analyzer records what
 was learned; every 10 rounds the log is distilled into `prompts/knowledge_base.md`, which is
