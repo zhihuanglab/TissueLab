@@ -258,13 +258,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
     {
       text: [
         "Does this time-series 3D cardiac scan indicate myocardial hypertrophy?",
-        "Measure it on the short-axis cine segmentation (labels: 1 = LV blood pool, 2 = LV myocardium, 3 = RV blood pool; the mask's first axis is slice-major, reshape with the n_slices / n_frames attrs):",
-        "- End-diastolic frame = the frame with the maximal LV blood pool area.",
-        "- For every slice of that frame: endocardial contour = boundary of the LV blood pool mask; epicardial contour = boundary of (LV blood pool OR LV myocardium).",
-        "- For each endocardial contour point, cast a ray along the outward normal and take its first intersection with the epicardial contour; local thickness = the distance between the two points in mm (pixel spacing).",
-        "- Maximal end-diastolic wall thickness = the maximum of these local thicknesses over all points and all slices.",
-        "- Decide hypertrophy by applying the current clinical guideline criterion for maximal end-diastolic LV wall thickness.",
-        "Return the hypertrophy label, the criterion and threshold you applied with its source, the maximal thickness, and the slice and frame where it occurs.",
+        "Use the short-axis cine segmentation (LV blood pool, LV myocardium, RV blood pool) to measure the maximal left-ventricular wall thickness at end-diastole, apply the clinical guideline criterion, and report the thickness, the criterion with its source, and your conclusion.",
       ].join("\n"),
       enableWebSearch: true,
     }
