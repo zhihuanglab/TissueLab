@@ -263,8 +263,8 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
         "- For every slice of that frame: endocardial contour = boundary of the LV blood pool mask; epicardial contour = boundary of (LV blood pool OR LV myocardium).",
         "- For each endocardial contour point, cast a ray along the outward normal and take its first intersection with the epicardial contour; local thickness = the distance between the two points in mm (pixel spacing).",
         "- Maximal end-diastolic wall thickness = the maximum of these local thicknesses over all points and all slices.",
-        "- Hypertrophy if the maximal end-diastolic wall thickness >= 15 mm (ACC/AHA HCM guideline), otherwise no hypertrophy.",
-        "Return the hypertrophy label, the maximal thickness, and the slice and frame where it occurs.",
+        "- Decide hypertrophy by applying the current clinical guideline criterion for maximal end-diastolic LV wall thickness.",
+        "Return the hypertrophy label, the criterion and threshold you applied with its source, the maximal thickness, and the slice and frame where it occurs.",
       ].join("\n"),
       enableWebSearch: true,
     }
