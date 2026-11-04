@@ -1,6 +1,6 @@
 import type React from "react"
 import { useState, useRef, useEffect, useCallback } from "react"
-import { Send, Search, ExternalLink, Globe, Brain, Zap, Bot, Plus } from "lucide-react"
+import { Send, Search, ExternalLink, Globe, Brain, Zap, Bot, Plus, ThumbsUp, ThumbsDown } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { cn } from "@/utils/common/twMerge"
@@ -24,6 +24,7 @@ import { CodePreview } from "@/components/imageViewer/sidebar/agent/chat/CodePre
 import { ReasoningWidget } from "@/components/imageViewer/sidebar/agent/chat/ReasoningWidget";
 import { AI_SERVICE_API_ENDPOINT, CTRL_SERVICE_API_ENDPOINT } from '@/config/api.config';
 import { apiFetch } from '@/utils/common/apiFetch';
+import { toast } from "sonner";
 import eventBus from "@/utils/common/eventBus";
 import {addMessage, setIsGenerating, clearMessages} from "@/store/slices/chat/chatSlice"
 import { setSelectedAgent, type AgentName } from "@/store/slices/chat/agentSlice"
@@ -198,6 +199,28 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
   const [mode] = useState<"qa" | "workflow">("workflow")
   const [answerReceived, setAnswerReceived] = useState<boolean>(false);
   const [webSearchEnabled, setWebSearchEnabled] = useState<boolean>(false);
+  // Clinician feedback on a planned workflow (strategy-level co-evolution): a thumbs
+  // up/down on the card is recorded per (category, model) and re-ranks the candidate
+  // pool for later plans of the same kind. Keyed by chat message id.
+  const [workflowRatings, setWorkflowRatings] = useState<Record<number, "up" | "down">>({});
+  const rateWorkflowCard = useCallback(async (message: { id: number; content: unknown }, rating: "up" | "down") => {
+    const payload = message.content as WorkflowPreviewMessage;
+    const nodes = (payload?.steps ?? [])
+      .filter((s) => s.impl && String(s.model) !== "CodingAgent")
+      .map((s) => ({ model: String(s.model), impl: String(s.impl) }));
+    if (nodes.length === 0) return;
+    try {
+      await apiFetch(`${AI_SERVICE_API_ENDPOINT}/feedback/v1/rate`, {
+        method: "POST",
+        body: JSON.stringify({ nodes, rating, zarr_path: workflowOutputPath || formatPath(currentPath ?? "") }),
+        returnAxiosFormat: true,
+      });
+      setWorkflowRatings((prev) => ({ ...prev, [message.id]: rating }));
+      toast.success(rating === "up" ? "Thanks, this model choice will be preferred." : "Noted, other candidate models will be tried for this kind of task.");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Failed to record feedback");
+    }
+  }, [workflowOutputPath, currentPath]);
   // Push freshly-planned steps into the WorkflowGraph via the zustand bridge.
   const queueWorkflowFromChatCard = useRootStore((s) => s.queueWorkflowFromChatCard)
   const [isInputFocused, setIsInputFocused] = useState<boolean>(false);
@@ -850,6 +873,23 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
                       >
                         <div className="px-3 py-2 bg-muted border-b border-border flex items-center justify-between">
                           <h3 className="text-sm font-semibold mb-0">Workflow</h3>
+                          <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            className={cn("hover:text-primary", workflowRatings[message.id] === "up" ? "text-primary" : "text-muted-foreground")}
+                            title="Good model choice: prefer these models for this kind of task"
+                            onClick={() => void rateWorkflowCard(message, "up")}
+                          >
+                            <ThumbsUp size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            className={cn("hover:text-destructive", workflowRatings[message.id] === "down" ? "text-destructive" : "text-muted-foreground")}
+                            title="Wrong model choice: try other candidates for this kind of task next time"
+                            onClick={() => void rateWorkflowCard(message, "down")}
+                          >
+                            <ThumbsDown size={14} />
+                          </button>
                           {message.id === lastWorkflowId ? (
                             <button
                               className="text-primary hover:text-primary/80"
@@ -878,6 +918,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
                           ) : (
                             <span className="text-xs text-muted-foreground">Expired</span>
                           )}
+                          </div>
                         </div>
                         <div className="px-3 pt-[10px] pb-[12px] flex flex-col gap-2 relative">
                           {/* Vertical timeline line */}

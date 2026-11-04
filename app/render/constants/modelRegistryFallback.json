@@ -187,7 +187,7 @@
       "factory": "TaskSpecific",
       "source": "builtin",
       "inputs": "Chest X-ray image path (PNG/JPEG/DICOM); no other parameters",
-      "outputs": "Ark/predictions (52 sigmoid probabilities) aligned with Ark/disease_list; Ark/scores_json groups the same values per head (ChestX-ray14 head: Atelectasis, Cardiomegaly, Effusion, Infiltration, Mass, Nodule, Pneumonia, Pneumothorax, Consolidation, Edema, Emphysema, Fibrosis, Pleural_Thickening, Hernia; CheXpert/MIMIC heads: No Finding, Enlarged Cardiomediastinum, Cardiomegaly, Lung Opacity, Lung Lesion, Edema, Consolidation, Pneumonia, Atelectasis, Pneumothorax, Pleural Effusion, Pleural Other, Fracture, Support Devices)"
+      "outputs": "Image-Classification/predictions (52 sigmoid probabilities) aligned with Image-Classification/disease_list; Image-Classification/scores_json groups the same values per head (ChestX-ray14 head: Atelectasis, Cardiomegaly, Effusion, Infiltration, Mass, Nodule, Pneumonia, Pneumothorax, Consolidation, Edema, Emphysema, Fibrosis, Pleural_Thickening, Hernia; CheXpert/MIMIC heads: No Finding, Enlarged Cardiomediastinum, Cardiomegaly, Lung Opacity, Lung Lesion, Edema, Consolidation, Pneumonia, Atelectasis, Pneumothorax, Pleural Effusion, Pleural Other, Fracture, Support Devices)"
     },
     "CardiacMRSegmentation": {
       "displayName": "Cardiac MR Segmentation",
@@ -242,7 +242,7 @@
       "factory": "TaskSpecific",
       "source": "builtin",
       "inputs": "Chest X-ray image path (PNG/JPEG/DICOM); tissue_classes=<comma-separated findings to score, e.g. \"Nodule, Mass\"> (optional)",
-      "outputs": "CheXzero/predictions (ensemble probabilities) aligned with CheXzero/disease_list; CheXzero/scores_json with ensemble and per-checkpoint values"
+      "outputs": "Image-Classification/predictions (ensemble probabilities) aligned with Image-Classification/disease_list; Image-Classification/scores_json with ensemble and per-checkpoint values"
     }
   },
   "category_display_names": {

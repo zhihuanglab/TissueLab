@@ -239,6 +239,13 @@ async def start_workflow_from_frontend(frontend_data: dict, uid: str = None, aut
             # not a 500 bug, so it isn't auto-reported as a server-error ticket.
             return _fail({"success": False, "error": f"Node '{actual_node_name_for_zarr}' not found in tasks_svc.manager. Make sure it's already created & running.", "code": 409})
 
+        if actual_node_name_for_zarr in node_names:
+            # The planner sometimes emits the same node twice in one plan (e.g. two
+            # identical TaskSpecific steps). A node runs once per workflow, so keep
+            # the first step; the linear task_dependencies the frontend builds would
+            # otherwise make the node depend on itself and the start would fail.
+            tasks_svc.logger.warning(f"[start_workflow] duplicate step for node '{actual_node_name_for_zarr}' ignored")
+            continue
         node_names.append(actual_node_name_for_zarr) # Use the actual name for dependency chain
         node_inputs[actual_node_name_for_zarr] = userInput # Use actual name as key for Zarr writing
 
@@ -253,6 +260,7 @@ async def start_workflow_from_frontend(frontend_data: dict, uid: str = None, aut
             for target, deps in explicit_task_deps.items():
                 if target not in node_names:
                     return _fail({"success": False, "error": f"task_dependencies key '{target}' is not in workflow nodes {node_names}"})
+                deps = [d for d in deps if d != target]  # self-dependency from a duplicated step
                 for d in deps:
                     if d not in node_names:
                         return _fail({"success": False, "error": f"task_dependencies['{target}'] references unknown node '{d}'"})
