@@ -258,13 +258,13 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
     {
       text: [
         "Does this time-series 3D cardiac scan indicate myocardial hypertrophy?",
-        "Measure it on the short-axis cine segmentation (labels: 1 = LV cavity, 2 = myocardium, 3 = RV cavity; the mask's first axis is slice-major, reshape with the n_slices / n_frames attrs):",
-        "- End-diastole = the frame whose total LV cavity area over all slices is largest.",
-        "- Use only slices where, at end-diastole, the LV cavity is present and the myocardium forms a closed ring around it; skip apical or basal slices without a cavity or with an open ring.",
-        "- Endocardial boundary = myocardium pixels touching the LV cavity; epicardial boundary = myocardium pixels touching anything that is neither cavity nor myocardium (the outer contour of the ring).",
-        "- Wall thickness in a slice = for each endocardial boundary pixel, the Euclidean distance to the nearest epicardial boundary pixel (e.g. scipy.ndimage.distance_transform_edt on the inverted epicardial-boundary mask, or a KD-tree), converted to mm with the pixel spacing; take the 95th percentile of these distances as that slice's thickness, and the maximum over slices as the maximal end-diastolic wall thickness.",
-        "- Criterion (ESC 2014 / ACC-AHA 2020 HCM guidelines): maximal end-diastolic LV wall thickness >= 15 mm = hypertrophy; 13-14 mm = borderline; otherwise normal.",
-        "Return the maximal thickness, the slice and frame it occurs in, the per-slice values, and the conclusion.",
+        "Measure it on the short-axis cine segmentation (labels: 1 = LV blood pool, 2 = LV myocardium, 3 = RV blood pool; the mask's first axis is slice-major, reshape with the n_slices / n_frames attrs):",
+        "- End-diastolic frame = the frame with the maximal LV blood pool area.",
+        "- For every slice of that frame: endocardial contour = boundary of the LV blood pool mask; epicardial contour = boundary of (LV blood pool OR LV myocardium).",
+        "- For each endocardial contour point, cast a ray along the outward normal and take its first intersection with the epicardial contour; local thickness = the distance between the two points in mm (pixel spacing).",
+        "- Maximal end-diastolic wall thickness = the maximum of these local thicknesses over all points and all slices.",
+        "- Hypertrophy if the maximal end-diastolic wall thickness >= 15 mm (ACC/AHA HCM guideline), otherwise no hypertrophy.",
+        "Return the hypertrophy label, the maximal thickness, and the slice and frame where it occurs.",
       ].join("\n"),
       enableWebSearch: true,
     }
