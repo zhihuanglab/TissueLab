@@ -352,9 +352,23 @@ python -m app.services.agent.reflector_agent evaluate   --training-dir /data/ln_
 # write that script from problem.md first with `bootstrap`), then score the result
 python -m app.services.agent.reflector_agent learn      --training-dir /data/ln --analysis $S/analysis_base.py --name relearn --rounds 5
 python -m app.services.agent.reflector_agent evaluate   --training-dir /data/ln --analysis /data/ln/relearn/analysis_current.py
-# slide-level: 20 rounds of workflow refinement on a training folder
-python -m app.services.agent.discovery_agent --training-dir /data/tubule --name agent_1 --auto 20
+# slide-level: 20 rounds of workflow refinement on the tubule training folder
+# (task files problem.md / human_insights.md come from TissueLab-Experiment, "Tubule Score/agent/")
+pip install anthropic
+cp "<TissueLab-Experiment>/Tubule Score/agent/"{problem.md,human_insights.md} /data/tubule/train/
+python -m app.services.agent.discovery_agent --training-dir /data/tubule/train --name agent_6 --auto 20
+# the round-N workflow is /data/tubule/train/agent_6/rounds/roundN.py; the trajectory is experiment_log.txt
 ```
+
+**Preprocessed inputs.** Both experiments start from the app's per-slide outputs (patch
+embeddings and classifications, nuclei segmentation, region masks), and producing those for a whole
+cohort is the expensive step. The
+[TissueLab-Experiment](https://github.com/zhihuanglab/TissueLab-Experiment) repository therefore
+links reproducibility bundles (Google Drive) with these intermediate results for the lymph node
+metastasis (LNCO2) and tubule score (TCGA-BRCA) experiments, together with the task files and the
+per-round results of the published runs, so the command-line part can be run and compared without
+re-processing the slides. Rebuilding the inputs from the slides in the app is documented in each
+module's README and gives results close to, not identical with, the published ones.
 
 The reflector module uses the OpenAI-compatible connection of the service (`OPENAI_API_KEY`,
 default model `gpt-5.4`); the discovery agent uses `claude-opus-4-6` through the `anthropic` SDK

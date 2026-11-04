@@ -112,8 +112,10 @@ The experiment folder is built from the app's per-slide output; nothing in it is
 
 The folder is then ready for every command below. Contours traced from the masks are not
 guaranteed to match the published run vertex by vertex, so a folder rebuilt from the slides gives
-results close to, not identical with, the published ones; the published folder itself is available
-on request / with the data release.
+results close to, not identical with, the published ones. The published folder itself (case JSONs,
+crops, GT.csv) is distributed as a reproducibility bundle linked from the
+[TissueLab-Experiment](https://github.com/zhihuanglab/TissueLab-Experiment) README (Google Drive);
+with it, the commands below reproduce the published numbers exactly.
 
 ## Reproducing the lymph node metastasis experiment (paper Section 2.6)
 
