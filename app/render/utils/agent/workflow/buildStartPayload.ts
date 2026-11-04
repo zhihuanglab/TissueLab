@@ -24,6 +24,25 @@ export type BuildWorkflowPayloadContext = {
   afterAnnotation?: boolean;
 };
 
+/** Organ/class list typed into a panel field ("Liver, Spleen", a JSON list, or an array) → trimmed names. */
+function parseClassList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((v) => String(v ?? "").trim()).filter(Boolean);
+  }
+  if (typeof value !== "string") return [];
+  let text = value.trim();
+  if (text.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) return parseClassList(parsed);
+    } catch {
+      /* fall through to the comma-separated form */
+    }
+  }
+  text = text.replace(/^["'`](.*)["'`]$/, "$1");
+  return text.split(/[,;]/).map((v) => v.trim()).filter(Boolean);
+}
+
 /** Panel `organ` wins if non-empty; else global (Redux) organ; else "" — matches legacy classification workflow. */
 function resolveNucleiClassificationOrgan(
   panel: WorkflowPanel,
@@ -145,11 +164,18 @@ export function buildStartWorkflowPayload(
     }
 
     if (panel.title === "Tissue Segmentation") {
-      // VISTA reuses the patch classification panel and shares its class+color config.
-      // Send the same tissue_classes/tissue_colors (colors land in
-      // Tissue-Segmentation/classes/color and drive the overlay); VISTA ignores the
-      // classification-only params it doesn't read.
-      if (reduxPatchClassificationData) {
+      // Radiology segmentation nodes (TotalSegmentator) declare their own
+      // `tissue_classes` panel field holding the organ list ("Liver, Spleen").
+      // When it is filled, send it as a list and leave the WSI patch-class
+      // config alone: that state belongs to the slide, not to this CT.
+      const ownClasses = parseClassList(inputObject.tissue_classes);
+      if (ownClasses.length > 0) {
+        inputObject.tissue_classes = ownClasses;
+      } else if (reduxPatchClassificationData) {
+        // VISTA reuses the patch classification panel and shares its class+color config.
+        // Send the same tissue_classes/tissue_colors (colors land in
+        // Tissue-Segmentation/classes/color and drive the overlay); VISTA ignores the
+        // classification-only params it doesn't read.
         inputObject.tissue_classes = reduxPatchClassificationData.class_name;
         inputObject.tissue_colors = reduxPatchClassificationData.class_hex_color;
       }

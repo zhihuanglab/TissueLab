@@ -14,7 +14,28 @@ from app.utils import resolve_path
 
 class RadiologyMaskFinder:
     """Service for finding and loading segmentation masks from Zarr files for NII volumes"""
-    
+
+    # Two mask layouts are recognised:
+    #   <prefix>/voxel_mask/<name>              legacy radiology nodes (one array per label)
+    #   <group>/masks/<organ>/mask (3D bool)    VISTA-style layout written by radiology
+    #                                           segmentation task nodes such as
+    #                                           TotalSegmentator (Tissue-Segmentation group,
+    #                                           next to classes/{name,color} and an HU "image")
+    VOXEL_MASK_KEY = 'voxel_mask'
+    TISSUE_MASKS_KEY = 'masks'
+    MASK_ARRAY_KEY = 'mask'
+
+    @classmethod
+    def dataset_display_name(cls, dataset_path: str) -> str:
+        """Label for a mask dataset path: the array name, or the parent group for
+        ``.../masks/<organ>/mask`` where every array is called ``mask``."""
+        parts = [p for p in str(dataset_path).split('/') if p]
+        if not parts:
+            return str(dataset_path)
+        if parts[-1] == cls.MASK_ARRAY_KEY and len(parts) >= 2:
+            return parts[-2]
+        return parts[-1]
+
     def find_zarr_files(self, base_path: str) -> List[str]:
         """Find potential Zarr files based on base path"""
         base_path = Path(base_path)
@@ -35,64 +56,95 @@ class RadiologyMaskFinder:
         return results
     
     def find_datasets(self, zarr_file_path: str) -> List[Dict[str, Any]]:
-        """Find all datasets under any prefix/voxel_mask in Zarr file"""
+        """Find all mask datasets in a Zarr file.
+
+        Searches every group for a ``voxel_mask`` subgroup (legacy layout) and for a
+        ``masks`` subgroup holding ``<organ>/mask`` 3D arrays (VISTA-style layout).
+        2D ``masks/*/mask`` rasters belong to pathology slides and are skipped.
+        """
         datasets = []
-        
+
+        def _entry(full_path: str, name: str, arr: zarr.Array, prefix: str) -> Dict[str, Any]:
+            return {
+                'path': full_path,
+                'name': name,
+                'shape': arr.shape,
+                'dtype': str(arr.dtype),
+                'size': arr.size,
+                'nbytes': arr.nbytes,
+                'prefix': prefix,
+            }
+
         try:
             with open_zarr_cm(zarr_file_path, 'r') as f:
-                
-                # Search for any group that has voxel_mask as a subdirectory (recursively)
-                def find_voxel_mask_groups(name, obj):
-                    if isinstance(obj, zarr.Group):
-                        # Check if this group has a voxel_mask subdirectory
-                        if 'voxel_mask' in obj:
-                            voxel_mask_group = obj['voxel_mask']
-                            
-                            def visit_func(dataset_name, dataset_obj):
-                                if isinstance(dataset_obj, zarr.Array):
-                                    # Create full path for the dataset
-                                    full_path = f"{name}/voxel_mask/{dataset_name}"
-                                    datasets.append({
-                                        'path': full_path,
-                                        'name': Path(dataset_name).name,
-                                        'shape': dataset_obj.shape,
-                                        'dtype': str(dataset_obj.dtype),
-                                        'size': dataset_obj.size,
-                                        'nbytes': dataset_obj.nbytes,
-                                        'prefix': name.split('/')[-1] if '/' in name else name
-                                    })
 
-                            # zarr v3 removed Group.visititems(); walk descendants
-                            # manually, passing each node's path relative to the
-                            # group (matching the old visititems contract).
-                            def _walk(group, prefix=""):
-                                for key in group.keys():
-                                    child = group[key]
-                                    child_path = f"{prefix}/{key}" if prefix else key
-                                    visit_func(child_path, child)
-                                    if isinstance(child, zarr.Group):
-                                        _walk(child, child_path)
+                def collect_voxel_masks(name, voxel_mask_group):
+                    prefix = name.split('/')[-1] if '/' in name else name
 
-                            _walk(voxel_mask_group)
-                        else:
-                            # Recursively search in subdirectories
-                            for key in obj.keys():
-                                child = obj[key]
-                                if isinstance(child, zarr.Group):
-                                    # Recursively search in this subdirectory
-                                    find_voxel_mask_groups(f"{name}/{key}" if name != '/' else f"/{key}", child)
-                
+                    # zarr v3 removed Group.visititems(); walk descendants
+                    # manually, passing each node's path relative to the
+                    # group (matching the old visititems contract).
+                    def _walk(group, rel_prefix=""):
+                        for key in group.keys():
+                            child = group[key]
+                            child_path = f"{rel_prefix}/{key}" if rel_prefix else key
+                            if isinstance(child, zarr.Array):
+                                full_path = f"{name}/{self.VOXEL_MASK_KEY}/{child_path}"
+                                datasets.append(_entry(full_path, Path(child_path).name, child, prefix))
+                            elif isinstance(child, zarr.Group):
+                                _walk(child, child_path)
+
+                    _walk(voxel_mask_group)
+
+                def collect_tissue_masks(name, masks_group) -> bool:
+                    """``masks/<organ>/mask`` 3D arrays; returns True if any were found."""
+                    prefix = name.split('/')[-1] if '/' in name else name
+                    found = False
+                    for organ in masks_group.keys():
+                        organ_group = masks_group[organ]
+                        if not isinstance(organ_group, zarr.Group) or self.MASK_ARRAY_KEY not in organ_group:
+                            continue
+                        arr = organ_group[self.MASK_ARRAY_KEY]
+                        if not isinstance(arr, zarr.Array) or arr.ndim != 3:
+                            continue
+                        full_path = f"{name}/{self.TISSUE_MASKS_KEY}/{organ}/{self.MASK_ARRAY_KEY}"
+                        entry = _entry(full_path, organ, arr, prefix)
+                        try:
+                            entry['organ_name'] = organ_group.attrs.get('organ_name', organ)
+                        except Exception:
+                            entry['organ_name'] = organ
+                        datasets.append(entry)
+                        found = True
+                    return found
+
+                # Search for any group that carries masks (recursively)
+                def find_mask_groups(name, obj):
+                    if not isinstance(obj, zarr.Group):
+                        return
+                    handled = False
+                    if self.VOXEL_MASK_KEY in obj and isinstance(obj[self.VOXEL_MASK_KEY], zarr.Group):
+                        collect_voxel_masks(name, obj[self.VOXEL_MASK_KEY])
+                        handled = True
+                    if self.TISSUE_MASKS_KEY in obj and isinstance(obj[self.TISSUE_MASKS_KEY], zarr.Group):
+                        handled = collect_tissue_masks(name, obj[self.TISSUE_MASKS_KEY]) or handled
+                    if handled:
+                        return
+                    # Recursively search in subdirectories
+                    for key in obj.keys():
+                        child = obj[key]
+                        if isinstance(child, zarr.Group):
+                            find_mask_groups(f"{name}/{key}" if name != '/' else f"/{key}", child)
+
                 # Start the search from the root
-                find_voxel_mask_groups('/', f)
-                
-                
+                find_mask_groups('/', f)
+
         except Exception as e:
             print(f"Error reading Zarr file {zarr_file_path}: {str(e)}")
             return []
-        
+
         return datasets
-    
-    
+
+
     def find_radiology_mask(self, base_path: str) -> Optional[Dict[str, Any]]:
         """Find radiology mask(s) for a given base path, automatically merge if multiple datasets found"""
         # Find potential Zarr files
@@ -280,7 +332,7 @@ class RadiologyMaskFinder:
                     class_info.append({
                         'class_id': class_label,
                         'dataset_path': dataset_path,
-                        'dataset_name': Path(dataset_path).name,
+                        'dataset_name': self.dataset_display_name(dataset_path),
                         'nonzero_count': nonzero_count
                     })
                 
@@ -346,7 +398,7 @@ def find_radiology_mask_service(base_path: str) -> Dict[str, Any]:
     else:
         return {
             'found': False,
-            'message': 'No radiology mask found in any prefix/voxel_mask'
+            'message': 'No radiology mask found (looked for <prefix>/voxel_mask/* and <group>/masks/<organ>/mask)'
         }
 
 
@@ -387,7 +439,7 @@ def load_radiology_mask_data_service(zarr_file_path: str, dataset_path_or_info) 
 
 def search_radiology_mask_datasets_service(zarr_file_path: str, query: str = "", 
                                    include_segmentation: bool = True) -> Dict[str, Any]:
-    """Search for radiology mask datasets in Zarr file under any prefix/voxel_mask"""
+    """Search for radiology mask datasets in Zarr file (voxel_mask/* or masks/<organ>/mask)"""
     zarr_file_path = resolve_path(zarr_file_path)
     finder = RadiologyMaskFinder()
     datasets = finder.find_datasets(zarr_file_path)
