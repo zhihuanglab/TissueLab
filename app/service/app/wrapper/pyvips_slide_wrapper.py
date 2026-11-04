@@ -1,7 +1,11 @@
+import hashlib
+import io
 import os
 import re
 import tempfile
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image
 import pyvips
@@ -410,7 +414,6 @@ class PyvipsSlideWrapper:
             raise KeyError(name)
         # Small strip images that libvips' random-access loader rejects as an
         # out-of-order read, so decode them with tifffile instead.
-        import numpy as np
         with _tifffile.TiffFile(self.path) as tf:
             array = tf.pages[self._associated_pages[name]].asarray()
         if array.ndim == 2:
@@ -447,7 +450,6 @@ class PyvipsSlideWrapper:
         return coarse.crop(cx, cy, cw, ch)
 
     def _coarse_cache_path(self):
-        import hashlib
         stat = os.stat(self.path)
         key = f'{os.path.realpath(self.path)}|{stat.st_mtime_ns}|{stat.st_size}|{COARSE_FACTOR}'
         return os.path.join(_COARSE_CACHE_DIR, hashlib.sha1(key.encode()).hexdigest() + '.npy')
@@ -475,7 +477,6 @@ class PyvipsSlideWrapper:
 
     @staticmethod
     def _store_coarse(cache, array):
-        import time
         try:
             os.makedirs(_COARSE_CACHE_DIR, exist_ok=True)
             tmp = f'{cache}.{os.getpid()}.tmp'
@@ -511,8 +512,6 @@ class PyvipsSlideWrapper:
         is not tiled 8-bit YCbCr JPEG."""
         if _tifffile is None:
             return None
-        import io
-        from concurrent.futures import ThreadPoolExecutor
         with _tifffile.TiffFile(self.path) as tf:
             page = tf.pages[self._tif_page_indices[0]]
             if not (page.is_tiled and int(page.compression) == 7 and int(page.photometric) == 6

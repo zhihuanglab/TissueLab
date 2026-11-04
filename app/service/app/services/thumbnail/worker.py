@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 import traceback
 
 from .generator import ThumbnailGenerator
+from app.wrapper.isolated_slide_wrapper import PreviewSlide
 from app.utils.cache.thumbnail import thumbnail_cache_service
 from app.core import logger
 from app.core.background import track_background_task
@@ -213,7 +214,6 @@ class ThumbnailWorker:
         # formats the viewer opens with them: they see SVS label and macro
         # photos, which TiffFileWrapper does not.
         if file_ext in ['tif', 'tiff', 'btf', 'svs']:
-            from app.wrapper.isolated_slide_wrapper import PreviewSlide
             try:
                 return PreviewSlide(file_path)
             except Exception as e:
@@ -232,7 +232,6 @@ class ThumbnailWorker:
         elif file_ext in ['isyntax']:
             slide_obj = ISyntaxImageWrapper(file_path)
         elif file_ext in ['czi']:
-            from app.wrapper.isolated_slide_wrapper import PreviewSlide
             slide_obj = PreviewSlide(file_path)
         elif file_ext in ['dcm']:
             slide_obj = DicomImageWrapper(file_path)

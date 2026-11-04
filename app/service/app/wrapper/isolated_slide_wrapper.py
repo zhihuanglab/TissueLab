@@ -16,6 +16,12 @@ import time
 import types
 import weakref
 from collections.abc import Mapping
+
+import numpy as np
+from PIL import Image
+
+# pyvips and fastslide are imported inside functions on purpose: a reader child
+# must set VIPS_CONCURRENCY and the fastslide cache before either is loaded.
 from app.tile_resources import (
     available_cpu_count, default_native_concurrency, default_reader_budget_mb,
     default_readers_per_slide, default_tile_workers, total_memory_bytes, integer_setting,
@@ -151,7 +157,6 @@ class _FastSlideReader:
 
     def read_associated_vips(self, name):
         import pyvips
-        import numpy as np
         array = self._slide.associated_images[self._associated_keys.get(name, name)].numpy()
         if array.dtype == np.uint16:
             # CZI's SlidePreview is 16 bits per sample; scale as the tile path does.
@@ -163,7 +168,6 @@ class _FastSlideReader:
 
     def read_region_vips(self, level, x, y, w, h):
         import pyvips
-        import numpy as np
         if w * h * 4 > 128 * 1024 * 1024:
             raise ValueError('Fastslide region too large; use a coarser pyramid level')
         array = self._slide.read_region((x, y), level=self._levels[level], size=(w, h)).numpy()
@@ -282,7 +286,6 @@ def _worker_main(connection, path, backend, concurrency):
 
 
 def _array(width, height, bands, dtype, data):
-    import numpy as np
     types = {'uchar': np.uint8, 'char': np.int8, 'ushort': np.uint16,
              'short': np.int16, 'uint': np.uint32, 'int': np.int32,
              'float': np.float32, 'double': np.float64}
@@ -290,7 +293,6 @@ def _array(width, height, bands, dtype, data):
 
 
 def _pil(width, height, bands, dtype, data):
-    from PIL import Image
     array = _array(width, height, bands, dtype, data)
     return Image.fromarray(array[..., 0] if bands == 1 else array[..., :3])
 
@@ -363,7 +365,6 @@ class PreviewSlide:
         """The whole slide fitted to ``size`` px from the reader's coarse copy of a
         large single-level slide (see PyvipsSlideWrapper.coarse_overview); None
         for slides whose coarsest level is already small enough to read."""
-        from PIL import Image
         coarse = getattr(self._reader, 'coarse_overview', lambda: None)()
         if coarse is None:
             return None
@@ -691,8 +692,6 @@ class IsolatedSlideWrapper:
         return _pil(*self._rpc('associated', (name,)))
 
     def read_region(self, location, level, size, as_array=False, **kwargs):
-        import numpy as np
-        from PIL import Image
         scale = self.level_downsamples[level]
         x, y = int(location[0] / scale), int(location[1] / scale)
         image = self.read_region_vips(level, x, y, *size)
