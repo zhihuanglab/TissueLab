@@ -335,6 +335,24 @@ against a local checkout of the Model Zoo:
    the HU volume `Tissue-Segmentation/image`, and the Coding Agent computes the answer
    from them.
 
+### Chest X-ray nodes (Ark+ and CheXzero)
+
+Both chest X-ray classifiers are listed on the **Models** page under *Task Specific* and are
+activated the same way (environment from the node's `requirements.txt`, then **Activate** with
+the node's `*_tasknode.py` as *Service Path*). Their weights are not bundled:
+
+- **Ark** (`task_specific/Ark_Plus`): place `Ark6_swinLarge768_ep50.pth.tar` in the node's
+  `checkpoints/` folder (request the Ark+ weights from its authors; see the node README).
+  Returns probabilities for fixed label sets (ChestX-ray14, CheXpert, MIMIC-CXR, ...).
+- **CheXzero** (`task_specific/CheXzero`): download the public checkpoints into the node's
+  `checkpoints/chexzero_weights/` folder (see the node README). Scores any finding written in
+  words, so the planner passes the findings the question asks about.
+
+Open a chest X-ray (PNG / JPEG / DICOM) and ask, for example, whether it suggests a given
+finding; the planner picks one of the two nodes, the node writes the probabilities to the
+zarr (`<node>/predictions`, `<node>/disease_list`, `<node>/scores_json`) and the Coding Agent
+reports the probability and its decision.
+
 ## 🧬 Reproducing the Co-evolution Experiments
 
 TissueLab adapts at three levels (paper: *Model-level*, *Strategy-level* and *Slide-level
