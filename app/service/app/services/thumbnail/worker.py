@@ -201,10 +201,6 @@ class ThumbnailWorker:
             from tissuelab_sdk.wrapper import ISyntaxImageWrapper
         except:
             ISyntaxImageWrapper = None
-        try:
-            from tissuelab_sdk.wrapper import CziImageWrapper
-        except:
-            CziImageWrapper = None
 
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File {file_path} not found")
@@ -236,12 +232,8 @@ class ThumbnailWorker:
         elif file_ext in ['isyntax']:
             slide_obj = ISyntaxImageWrapper(file_path)
         elif file_ext in ['czi']:
-            if CziImageWrapper is not None:
-                slide_obj = CziImageWrapper(file_path)
-            else:
-                # The SDK reads CZI only on Windows; fastslide reads it elsewhere.
-                from app.wrapper.isolated_slide_wrapper import PreviewSlide
-                slide_obj = PreviewSlide(file_path)
+            from app.wrapper.isolated_slide_wrapper import PreviewSlide
+            slide_obj = PreviewSlide(file_path)
         elif file_ext in ['dcm']:
             slide_obj = DicomImageWrapper(file_path)
         elif file_ext in ['nii', 'nii.gz']:
