@@ -1844,9 +1844,15 @@ def load_slide_from_file_with_session(filename: str, session_id: str = "default"
             session_data['current_file_format'] = 'isyntax'
             session_data['tiff_slide_wrapper'] = False
         elif file_ext in ['czi']:
-            session_data['slide'] = CziImageWrapper(filename)
             session_data['current_file_format'] = 'czi'
-            session_data['tiff_slide_wrapper'] = False
+            if CziImageWrapper is not None:
+                session_data['slide'] = CziImageWrapper(filename)
+                session_data['tiff_slide_wrapper'] = False
+            else:
+                # The SDK reads CZI only on Windows (pylibCZIrw); elsewhere the
+                # tile readers open it with fastslide.
+                session_data['slide'] = SharedSlideWrapper(filename)
+                session_data['tiff_slide_wrapper'] = True
         elif file_ext in ['dcm']:
             session_data['slide'] = DicomImageWrapper(filename)
             session_data['current_file_format'] = 'dcm'
@@ -2402,9 +2408,14 @@ def upload_file_path(file_path: str, session_id: str = "default") -> Dict:
             total_channels = 3  # RGB images always have 3 channels
             session_data['tiff_slide_wrapper'] = False
         elif session_data['current_file_format'] in ['czi']:
-            session_data['slide'] = CziImageWrapper(file_path)
+            if CziImageWrapper is not None:
+                session_data['slide'] = CziImageWrapper(file_path)
+                session_data['tiff_slide_wrapper'] = False
+            else:
+                # fastslide through the tile readers (see load_slide_from_file_with_session)
+                session_data['slide'] = SharedSlideWrapper(file_path)
+                session_data['tiff_slide_wrapper'] = True
             total_channels = 3  # RGB images always have 3 channels
-            session_data['tiff_slide_wrapper'] = False
         elif session_data['current_file_format'] in ['isyntax']:
             session_data['slide'] = ISyntaxImageWrapper(file_path)
             total_channels = 3  # RGB images always have 3 channels

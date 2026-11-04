@@ -2626,7 +2626,12 @@ def _create_isolated_slide_object(file_path: str):
     elif file_ext in ['isyntax']:
         slide_obj = ISyntaxImageWrapper(file_path)
     elif file_ext in ['czi']:
-        slide_obj = CziImageWrapper(file_path)
+        if CziImageWrapper is not None:
+            slide_obj = CziImageWrapper(file_path)
+        else:
+            # The SDK reads CZI only on Windows; fastslide reads it elsewhere.
+            from app.wrapper.isolated_slide_wrapper import PreviewSlide
+            slide_obj = PreviewSlide(file_path)
     elif file_ext in ['dcm']:
         slide_obj = DicomImageWrapper(file_path)
     elif file_ext in ['nii', 'nii.gz']:
