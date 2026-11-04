@@ -77,7 +77,20 @@ export const buildGeneratedPanel = (
     content.push({ key: "path", type: "input", value: formattedPath ?? "" })
   }
 
-  const mergedContent = mergeModelPanelDefaults(content, modelId)
+  // Registry-declared panel fields (e.g. TotalSegmentator `tissue_classes`) are appended
+  // by mergeModelPanelDefaults AFTER the factory fields were filled above, so a plan's
+  // `tissue_classes=Liver, Spleen` would never reach them. Fill them here; the organ
+  // list also accepts the spellings the planner uses for it.
+  const PLAN_KEY_ALIASES: Record<string, string[]> = {
+    tissue_classes: ["targets", "organs", "classes", "roi_subset"],
+  }
+  const factoryKeys = new Set(content.map((item: any) => item.key))
+  const mergedContent = mergeModelPanelDefaults(content, modelId).map((item) => {
+    if (factoryKeys.has(item.key)) return item
+    const planKeys = [item.key, ...(PLAN_KEY_ALIASES[item.key] ?? [])]
+    const hit = planKeys.find((k) => Object.prototype.hasOwnProperty.call(parsedInput, k))
+    return hit === undefined ? item : { ...item, value: parsedInput[hit] }
+  })
 
   // Do not inject persistCodingAgentGeneratedScript here: stale zarr-key cache must not pre-fill
   // generated_script before a Run workflow has produced code (auto_bypass runs only after final apply).

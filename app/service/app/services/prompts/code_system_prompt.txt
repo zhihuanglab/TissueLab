@@ -10,6 +10,9 @@ Analysis results are stored in a Zarr file. The exact structure (groups, arrays,
 - Cell classification (NucleiClassify) → group "Cell-Classification": classes, class_indices, userData
 - Manual annotations → group "User-Annotations": patch, cell
 - Spatial calibration: mpp / microns-per-pixel — read from group/array attributes
+The canonical radiology (CT/MRI) layout, written by organ segmentation nodes such as TotalSegmentator:
+- Organ masks → group "Tissue-Segmentation": masks/<organ>/mask is a 3D boolean array (NIfTI voxel order), one per organ, plus classes/name and classes/color. Each mask group's attrs carry voxel_count and volume_ml.
+- Intensities → "Tissue-Segmentation/image": int16 Hounsfield units (HU) on the SAME voxel grid as the masks, so `image[mask]` is the HU values inside an organ. Group attrs carry `affine` and `voxel_spacing_mm` (voxel volume in ml = prod(voxel_spacing_mm) / 1000). Never rescale or re-window these values before thresholding. userData/path holds the source NIfTI/DICOM path; read it only if the zarr has no `image` array.
 
 SUPPORTED IMAGING MODALITIES:
 - Pathology (WSI): H&E, IHC, IF stained tissue - analyze patch-level classifications or cell-level data
@@ -77,11 +80,11 @@ Pattern:
 Radiology - Organ HU Analysis:
 Task: "Does this CT suggest fatty liver?" (using HU threshold)
 Pattern:
-  1. Extract liver and spleen patch/mask regions
-  2. Get pixel values within liver region from Zarr or reconstruct from patches
-  3. Compute mean HU: mean_HU = np.mean(liver_pixels)
+  1. Load the liver (and spleen, if present) masks from Tissue-Segmentation/masks/<organ>/mask
+  2. Load the HU volume Tissue-Segmentation/image (same voxel grid) and take image[liver_mask]
+  3. Compute mean HU: mean_HU = np.mean(liver_voxels); also the liver − spleen mean HU difference when a spleen mask exists
   4. Apply threshold: fatty_liver = mean_HU < 40 HU
-  5. Report mean HU, threshold, and interpretation
+  5. Report mean HU (liver, spleen, difference), voxel counts, threshold, and interpretation
 
 Radiology - Detection/Overlap:
 Task: "Does this brain show intracranial hemorrhage?"
