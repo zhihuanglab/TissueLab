@@ -255,7 +255,18 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
     { text: "Does this CT scan suggest fatty liver?", enableWebSearch: true },
     { text: "Does this brain image show any evidence of intracerebral hemorrhage?", enableWebSearch: true },
     { text: "Does this X-ray suggest any Nodule?", enableWebSearch: false },
-    { text: "Does this time-series 3D cardiac scan indicate myocardial hypertrophy?", enableWebSearch: true }
+    {
+      text: [
+        "Does this time-series 3D cardiac scan indicate myocardial hypertrophy?",
+        "Measure it on the short-axis cine segmentation (labels: 1 = LV cavity, 2 = myocardium, 3 = RV cavity; the mask's first axis is slice-major, reshape with the n_slices / n_frames attrs):",
+        "- End-diastole = the frame whose total LV cavity area over all slices is largest.",
+        "- Use only slices where, at end-diastole, the LV cavity is present and the myocardium forms a closed ring around it; skip apical or basal slices without a cavity or with an open ring.",
+        "- Wall thickness in a slice = for each endocardial boundary pixel, the shortest distance to the epicardial boundary, in mm via the pixel spacing; take the 95th percentile within the slice as that slice's thickness, and the maximum over slices as the maximal end-diastolic wall thickness.",
+        "- Criterion (ESC 2014 / ACC-AHA 2020 HCM guidelines): maximal end-diastolic LV wall thickness >= 15 mm = hypertrophy; 13-14 mm = borderline; otherwise normal.",
+        "Return the maximal thickness, the slice and frame it occurs in, the per-slice values, and the conclusion.",
+      ].join("\n"),
+      enableWebSearch: true,
+    }
   ];
   const welcomeTimerRef = useRef<number | null>(null);
   const thinkingTimerRef = useRef<number | null>(null);
