@@ -18,11 +18,7 @@ plus an analysis script defining `analyze_medical_image(json_path) -> dict` that
 under `--label-key` (default `diagnosis`). Labels are compared ignoring case, spaces and underscores.
 
 To make a case folder from a slide's patch classification in the app (contours JSON, overview and
-per-region crops for the reflector):
-```bash
-python -m app.services.patch_regions --zarr slide.svs.zarr --slide slide.svs --out-dir cases/<case> \
-    --classes "lymphnode_contours=Lymph node,tumor_contours=Tumor" --crop lymphnode_contours
-```
+per-region crops for the reflector), see *From slides to the experiment folder* below.
 
 ## Commands
 
@@ -75,12 +71,56 @@ decision and reply, `decisions.jsonl` and `run_meta.json`; `GT.csv` and `problem
 skipped, so an interrupted run is continued by running the same command again. `--model` and
 `--reasoning-effort` (default `high`) select the reflector backbone.
 
+## From slides to the experiment folder
+
+The experiment folder is built from the app's per-slide output; nothing in it is hand-made.
+
+1. **Classify the slides in the app.** Open each slide, run MUSK embedding and patch classification
+   with the lymph node and tumour classifiers (ask the question in the Agent chat and the planner
+   assembles exactly these steps, or add them in the Workflow graph; the classifiers come from active
+   learning on a few annotated patches, or load the trained `.tlcls` files). The app writes the
+   predictions into the slide's companion zarr store, `<slide>.ndpi.zarr` next to the slide, under
+   `Tissue-Segmentation/masks/<class>/mask`, one mask per class as named in the classifier.
+
+2. **Export one case folder per slide** with `patch_regions`. `--classes` maps the JSON keys the
+   analysis code reads to the class names used in the app; `--crop` names the keys whose regions
+   the reflector will look at (one crop per polygon, at `<subdir>/<i>/image.png`, `subdir` = key
+   without `_contours`, which is what `reflector_prompt.json` expects: `crops_subdir: lymphnode`):
+   ```bash
+   cd app/service
+   for slide in /data/LNCO2/*.ndpi; do
+       case=$(basename "$slide" .ndpi)
+       python -m app.services.patch_regions --zarr "$slide.zarr" --slide "$slide" --name "$case" \
+           --out-dir /data/ln/cases/$case \
+           --classes "lymphnode_contours=Lymph node,tumor_contours=Tumor" --crop lymphnode_contours
+   done
+   ```
+   Each call writes `cases/<case>/<case>.json` (`slide_name`, `mpp`, `lymphnode_contours`,
+   `tumor_contours`, `_meta`), `overview.png`, and `lymphnode/<i>/image.png`. Without `--slide`
+   only the JSON is written (enough for `evaluate`/`learn`, not for the reflector).
+   `--connect-patches` (default 3) is the patch kernel of the close/open step before contour tracing.
+
+3. **Add the ground truth and the problem definition:**
+   ```bash
+   cp app/services/agent/reflector_agent/skills/lymph_node_metastasis/problem.md /data/ln/
+   # GT.csv: header + one line per slide, first column = case folder name, second = label
+   printf 'slide_name,ground_truth\nAI-LNCO2-0004_G_HE,negative\nAI-LNCO2-0049_N_HE,macro_metastasis\n' > /data/ln/GT.csv
+   ```
+   Labels are `negative`, `isolated_tumor_cells`, `micro_metastasis`, `macro_metastasis` (case,
+   spaces and underscores are ignored). Cases listed in `GT.csv` without a folder are skipped with a
+   notice; folders without a GT line are ignored.
+
+The folder is then ready for every command below. Contours traced from the masks are not
+guaranteed to match the published run vertex by vertex, so a folder rebuilt from the slides gives
+results close to, not identical with, the published ones; the published folder itself is available
+on request / with the data release.
+
 ## Reproducing the lymph node metastasis experiment (paper Section 2.6)
 
 The published run is: analysis code with Skills 1+2 on the upstream predictions, then the same code
 after the VLM reflector has removed predicted lymph node regions that are not lymph node. With the
-experiment folder laid out as above (one `cases/<case>/<case>.json` per slide holding
-`lymphnode_contours`, `tumor_contours`, `mpp`, plus the per-region crops):
+experiment folder built as in the previous section (one `cases/<case>/<case>.json` per slide holding
+`lymphnode_contours`, `tumor_contours`, `mpp`, plus the per-region crops), the whole chain is:
 
 ```bash
 cd app/service
