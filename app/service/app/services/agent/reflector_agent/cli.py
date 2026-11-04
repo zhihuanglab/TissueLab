@@ -1,9 +1,12 @@
 """Command line for the reflector agent.
 
-    python -m app.services.agent.reflector_agent learn  --training-dir <dir> --analysis base.py --name r1 --rounds 5
+    python -m app.services.agent.reflector_agent bootstrap --training-dir <dir> --out <dir>/analysis_base.py
+    python -m app.services.agent.reflector_agent learn  --training-dir <dir> --analysis <dir>/analysis_base.py --name r1 --rounds 5
     python -m app.services.agent.reflector_agent learn  --training-dir <dir> --seed-knowledge skills/lymph_node_metastasis
     python -m app.services.agent.reflector_agent filter --case-json c.json --crops-dir <case>/ \
         --prompt skills/lymph_node_metastasis/reflector_prompt.json --out filtered.json
+    python -m app.services.agent.reflector_agent filter-all --training-dir <dir> --out <dir>_filtered \
+        --prompt skills/lymph_node_metastasis/reflector_prompt.json [--crops-root <dir with crops>]
     python -m app.services.agent.reflector_agent evaluate --training-dir <dir> --analysis code.py
 """
 import argparse
@@ -16,6 +19,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="python -m app.services.agent.reflector_agent",
                                  description="Strategy-level co-evolution: learn corrective skills from errors; VLM reflector filter")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("bootstrap", help="write the initial (skill-free) analysis script from problem.md with the LLM")
+    p.add_argument("--training-dir", required=True)
+    p.add_argument("--out", required=True, help="where to put the script that runs on every case")
+    p.add_argument("--attempts", type=int, default=3, help="regenerate after a crash or timeout, up to this many times")
+    p.add_argument("--label-key", default="diagnosis")
+    p.add_argument("--model", default="")
+    p.add_argument("--timeout", type=int, default=1800, help="seconds allowed for one evaluation of the training set")
 
     p = sub.add_parser("learn", help="evaluate -> reflect -> distil -> verify -> record, for N rounds")
     p.add_argument("--training-dir", required=True)
@@ -45,11 +56,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--history", default="")
     p.add_argument("--model", default="")
     p.add_argument("--reasoning-effort", default="high")
+
+    p = sub.add_parser("filter-all", help="VLM reflector over every case of an experiment folder -> filtered copy of the folder")
+    p.add_argument("--training-dir", required=True, help="experiment folder (GT.csv, problem.md, cases/<case>/<case>.json)")
+    p.add_argument("--out", required=True, help="the filtered copy; evaluate/learn can run on it directly")
+    p.add_argument("--prompt", required=True, help="reflector prompt JSON")
+    p.add_argument("--crops-root", default="", help="<root>/<case>/<crops_subdir>/<i>/image.png (default: <training-dir>/cases)")
+    p.add_argument("--contours-key", default="")
+    p.add_argument("--context", default=None)
+    p.add_argument("--cases", default="", help="comma-separated subset")
+    p.add_argument("--workers", type=int, default=4, help="parallel API calls")
+    p.add_argument("--model", default="")
+    p.add_argument("--reasoning-effort", default="high")
     return ap
 
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.cmd == "bootstrap":
+        from .bootstrap import bootstrap_analysis
+        rec = bootstrap_analysis(args.training_dir, args.out, args.model or None, args.attempts, args.label_key, args.timeout)
+        print(json.dumps(rec, indent=1, default=str))
+        return 0 if rec["accepted"] else 1
     if args.cmd == "learn":
         from .learn import learn_skills
         res = learn_skills(args.training_dir, args.name, args.analysis or None, args.seed_knowledge or None,
@@ -88,6 +116,16 @@ def main(argv=None) -> int:
         s = filter_case(llm, args.case_json, crops, args.out, prompt, key, args.context, args.history or None)
         print(f"{s['total']} regions, excluded {len(s['excluded'])}: {s['excluded']} -> {args.out}")
         return 0
+    if args.cmd == "filter-all":
+        from .llm import LLM
+        from .vlm_filter import filter_training_dir, load_prompt
+        prompt = load_prompt(args.prompt)
+        meta = filter_training_dir(lambda: LLM(args.model or None, reasoning_effort=args.reasoning_effort),
+                                   args.training_dir, args.out, prompt, args.crops_root or None,
+                                   args.contours_key or None, args.context, args.workers,
+                                   args.cases.split(",") if args.cases else None)
+        print(json.dumps({k: v for k, v in meta.items() if k != "prompt"}, indent=1))
+        return 1 if meta["errors"] else 0
     return 2
 
 

@@ -273,6 +273,8 @@ TissueLab/
 │       │                    #         activation, feedback, history, agent, file_manager, users
 │       ├── app/services/    # slide I/O, segmentation, workflow runtime, code sandbox,
 │       │                    #         agent/, file_manager/, users
+│       │   └── agent/       # workflow + verification agents, discovery/ (Research panel),
+│       │                    # discovery_agent/ and reflector_agent/ (co-evolution experiments, CLI)
 │       ├── app/core/        # settings, identity, access guards, response envelope
 │       ├── app/config/      # path_config (storage roots + ACL), zarr layout
 │       └── scripts/         # maintenance scripts
@@ -332,6 +334,78 @@ against a local checkout of the Model Zoo:
    (e.g. `Liver, Spleen`), the node writes `Tissue-Segmentation/masks/<organ>/mask` plus
    the HU volume `Tissue-Segmentation/image`, and the Coding Agent computes the answer
    from them.
+
+## 🧬 Reproducing the Co-evolution Experiments
+
+TissueLab adapts at three levels (paper: *Model-level*, *Strategy-level* and *Slide-level
+co-evolution*; Methods, *Multi-level co-evolution mechanism*). Everything that improves a single
+analysis — fine-tuning the recognition models and improving the agent's ability on your own slides —
+is done in the app. The two cohort-scale co-evolution experiments of the paper, which iterate over a
+whole training set against ground truth, ship as command-line modules so they can be re-run exactly.
+
+### In the app
+
+| Level | What you do | Where |
+|---|---|---|
+| **Model-level** (Fig. 5, Supplementary Fig. 5) | Run a segmentation / classification task node, correct the wrong patches or cells with the annotation tools, retrain. Only a lightweight head on the frozen model is updated, so the corrected prediction appears on the same slide within the session; the classifier is saved and reused on later slides. | Image viewer → Review / Workflow graph (active learning); `tutorials/Tool-level co-evolving demo_v2.mp4` |
+| **Strategy-level, model selection** | Ask the question in the chat, judge the result; the agent's model choice and its learned corrections follow your feedback and are kept under `app/service/storage/users/local/`. | Image viewer → Agent |
+| **Slide-level discovery** (SEA-AD biomarker search) | Open a workspace with slides and a cohort CSV, click **Start Research**; each round proposes, runs and judges candidate measurements in a sandbox. | Research panel (needs Docker, see above); `tutorials/TissueLab_Research_Demo_v2.mp4` |
+
+### From the command line
+
+Both modules live in `app/service/app/services/agent/`, read their API key from
+`app/service/.env.local`, and take an *experiment folder* (`GT.csv`, `problem.md`, per-case data).
+The per-case data is the app's own output for each slide (for the lymph node experiment,
+`python -m app.services.patch_regions` turns a classified slide's zarr store into a case folder).
+The exact layout, every option and the run-directory contents are in each module's README.
+
+| Experiment | Module | Command |
+|---|---|---|
+| **Strategy-level**: corrective skills + VLM reflector, lymph node metastasis (Section 2.6) | [`reflector_agent/`](app/service/app/services/agent/reflector_agent/README.md) | `python -m app.services.agent.reflector_agent bootstrap` / `learn` / `filter-all` / `evaluate` |
+| **Slide-level**: workflow co-evolution against ground truth, tubule formation scoring (Section 2.7) | [`discovery_agent/`](app/service/app/services/agent/discovery_agent/README.md) | `python -m app.services.agent.discovery_agent --training-dir <dir> --name agent_1 --auto 20` |
+
+```bash
+cd app/service
+# strategy-level, step 0: one case folder per slide from the app's patch classification
+# (slide + its companion zarr store -> contours JSON, overview, per-region crops), plus GT.csv and problem.md
+python -m app.services.patch_regions --zarr /data/LNCO2/<slide>.ndpi.zarr --slide /data/LNCO2/<slide>.ndpi \
+        --name <slide> --out-dir /data/ln/cases/<slide> \
+        --classes "lymphnode_contours=Lymph node,tumor_contours=Tumor" --crop lymphnode_contours
+# strategy-level: score the shipped skills, run the reflector over the cohort, score again
+S=app/services/agent/reflector_agent/skills/lymph_node_metastasis
+python -m app.services.agent.reflector_agent evaluate   --training-dir /data/ln --analysis $S/analysis_with_skills_2.py
+python -m app.services.agent.reflector_agent filter-all --training-dir /data/ln --out /data/ln_filtered --prompt $S/reflector_prompt.json
+python -m app.services.agent.reflector_agent evaluate   --training-dir /data/ln_filtered --analysis $S/analysis_with_skills_2.py
+# strategy-level from scratch: learn the skills again from the skill-free base script (or let the LLM
+# write that script from problem.md first with `bootstrap`), then score the result
+python -m app.services.agent.reflector_agent learn      --training-dir /data/ln --analysis $S/analysis_base.py --name relearn --rounds 5
+python -m app.services.agent.reflector_agent evaluate   --training-dir /data/ln --analysis /data/ln/relearn/analysis_current.py
+# slide-level: 20 rounds of workflow refinement on the tubule training folder
+# (task files problem.md / human_insights.md come from TissueLab-Experiment, "Tubule Score/agent/")
+pip install anthropic
+cp "<TissueLab-Experiment>/Tubule Score/agent/"{problem.md,human_insights.md} /data/tubule/train/
+python -m app.services.agent.discovery_agent --training-dir /data/tubule/train --name my_run --auto 20
+# --name is the run folder: the round-N workflow is /data/tubule/train/my_run/rounds/roundN.py, the trajectory experiment_log.txt
+```
+
+**Preprocessed inputs.** Both experiments start from the app's per-slide outputs (patch
+embeddings and classifications, nuclei segmentation, region masks), and producing those for a whole
+cohort is the expensive step. The
+[TissueLab-Experiment](https://github.com/zhihuanglab/TissueLab-Experiment) repository therefore
+links reproducibility bundles (Google Drive) with these intermediate results for the lymph node
+metastasis (LNCO2) and tubule score (TCGA-BRCA) experiments, together with the task files and the
+per-round results of the published runs, so the command-line part can be run and compared without
+re-processing the slides.
+
+The reflector module uses the OpenAI-compatible connection of the service (`OPENAI_API_KEY`,
+default model `gpt-5.4`); the discovery agent uses `claude-opus-4-6` through the `anthropic` SDK
+(`ANTHROPIC_API_KEY`), as in the paper. `reflector_agent/skills/lymph_node_metastasis/` ships the
+knowledge base learned in the published run (Skills 1 and 2, the analysis code and the reflector
+prompt), so the paper's final configuration can be scored without any LLM call, and the skill-free
+base script the learning started from, so the skills can be learned again from scratch: each round
+reflects on the misclassified slides with their thumbnails, proposes one rule, and keeps it only if it
+fixes at least one slide and breaks none. `learn` writes the accepted rules, their rationale, evidence
+and code to `<training-dir>/<name>/knowledge_base/knowledge.md`.
 
 ## 🔧 Integrate Your Own Model
 
