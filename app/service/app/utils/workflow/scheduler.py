@@ -815,6 +815,7 @@ class TaskScheduler:
                     execution.zarr_path,
                     auth_header=execution.auth_header,
                     uid=uid,
+                    web_search_enabled=execution.web_search_enabled,
                 )
             finally:
                 # Cancel progress animation when script generation completes

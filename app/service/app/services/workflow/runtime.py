@@ -51,6 +51,8 @@ class WorkflowExecution:
     failed_tasks: Set[str] = field(default_factory=set)
     status: str = "queued"  # queued | running | cancelling | completed | error | cancelled
     script_prompt: Optional[str] = None
+    # Coding Agent guideline web search, as set by the chat's web-search toggle.
+    web_search_enabled: bool = False
     script_task_started: bool = False
     created_at: float = field(default_factory=time.time)
     # Stamped by purge_finished_executions, not at the status assignment sites.

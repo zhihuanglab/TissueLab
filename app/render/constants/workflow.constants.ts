@@ -33,6 +33,9 @@ export const panelMap: Record<string, PanelConfig> = {
       title: "Coding Agent",
       defaultContent: [
         { key: "prompt", type: "input", value: "" },
+        // "1" when the chat's web-search toggle was on for this plan; sent to the
+        // backend so script generation fetches the same guidelines the planner saw.
+        { key: "web_search_enabled", type: "input", value: "" },
         { key: "script_run_policy", type: "input", value: "auto_bypass" },
         { key: "script_last_run_digest", type: "input", value: "" },
         { key: "script_last_run_raw", type: "input", value: "" },

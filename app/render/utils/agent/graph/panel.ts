@@ -63,6 +63,9 @@ export const buildGeneratedPanel = (
   const content = cfg.defaultContent.map((contentItem: any) => {
     // Coding Agent: only `prompt` gets the chat step text — never overwrite script_run_policy /
     // digest fields (that broke policy detection and triggered spurious auto-runs).
+    if (isCodingAgent && contentItem.key === "web_search_enabled") {
+      return { ...contentItem, value: step.web_search_enabled === true ? "1" : "" }
+    }
     if (isCodingAgent && contentItem.key !== "prompt") return { ...contentItem }
     // `prompt` always carries the joined chat step text (calculation text / classes / etc.).
     if (contentItem.key === "prompt") return { ...contentItem, value: joinedValue }

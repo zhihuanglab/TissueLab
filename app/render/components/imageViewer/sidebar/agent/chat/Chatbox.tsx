@@ -38,6 +38,8 @@ type WorkflowPreviewStep = {
   prompt?: string
   type?: string
   ui?: Record<string, unknown> | null
+  /** Chat web-search toggle at planning time; the Coding Agent step forwards it to the backend. */
+  web_search_enabled?: boolean
 }
 
 export type GeneratedWorkflowStep = WorkflowPreviewStep
@@ -640,10 +642,11 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
           return {
             ...item,
             prompt: typeof item.input === "string" ? item.input : "",
-            impl: item.impl || undefined
+            impl: item.impl || undefined,
+            web_search_enabled: webSearchEnabled,
           };
         }
-        return item;
+        return { ...item, web_search_enabled: webSearchEnabled };
       });
 
       const formattedPath = formatPath(currentPath ?? "");
@@ -665,6 +668,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
           impl: s.impl ?? null,
           input: s.input,
           prompt: typeof s.input === 'string' ? s.input : undefined,
+          web_search_enabled: webSearchEnabled,
         })),
         formattedPath,
       });
@@ -674,6 +678,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
         model: step.model,
         impl: step.impl ?? null,
         input: step.input ?? null,
+        web_search_enabled: webSearchEnabled,
       }));
 
       // First, send the introduction message
@@ -856,6 +861,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
                                   impl: s.impl ?? null,
                                   input: s.input,
                                   prompt: typeof s.input === 'string' ? s.input : undefined,
+                                  web_search_enabled: s.web_search_enabled === true,
                                 }))
                                 if (steps.length > 0) {
                                   queueWorkflowFromChatCard({
