@@ -230,6 +230,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
       enableWebSearch: false,
     },
     { text: "Does this CT scan suggest fatty liver?", enableWebSearch: true },
+    { text: "Does this brain image show any evidence of intracerebral hemorrhage?", enableWebSearch: true },
     { text: "Does this X-ray suggest any Nodule?", enableWebSearch: false },
     { text: "Does this time-series 3D cardiac scan indicate myocardial hypertrophy?", enableWebSearch: true }
   ];
