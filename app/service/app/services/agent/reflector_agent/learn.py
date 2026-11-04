@@ -48,8 +48,8 @@ def setup_run(training_dir: str, name: str, initial_analysis: Optional[str] = No
             KnowledgeBase(kb_dir)
     if not os.path.exists(current):
         if not initial_analysis:
-            raise SystemExit("ERROR: an initial analysis script is required (--analysis), "
-                             "or seed a knowledge base that carries one (--seed-knowledge)")
+            raise SystemExit("ERROR: an initial analysis script is required (--analysis; write one with the "
+                             "`bootstrap` command), or seed a knowledge base that carries one (--seed-knowledge)")
         shutil.copy2(initial_analysis, current)
         shutil.copy2(initial_analysis, os.path.join(run_dir, "analysis_initial.py"))
     return {"run_dir": run_dir, "prompts_dir": prompts_dir, "kb_dir": kb_dir, "current_code": current,
