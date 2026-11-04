@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2500 620" width="2500" height="620">
+<rect x="120.0" y="120.0" width="112.2" height="112.2" fill="#46464e"/><rect x="253.9" y="120.0" width="112.2" height="112.2" fill="#46464e"/><rect x="387.7" y="120.0" width="112.2" height="112.2" fill="#46464e"/><rect x="253.9" y="253.9" width="112.2" height="112.2" fill="#46464e"/><rect x="120.0" y="253.9" width="112.2" height="112.2" fill="#6352a2"/><rect x="120.0" y="387.7" width="112.2" height="112.2" fill="#6352a2"/><rect x="253.9" y="387.7" width="112.2" height="112.2" fill="#6352a2"/><rect x="387.7" y="387.7" width="112.2" height="112.2" fill="#6352a2"/>
+<text x="610" y="320" font-family="Helvetica, Arial, sans-serif" font-weight="700" font-size="250" letter-spacing="-2"><tspan fill="#ebebee">Tissue</tspan><tspan fill="#6352a2">Lab</tspan></text>
+<text x="616" y="482" font-family="Helvetica, Arial, sans-serif" font-size="66" fill="#cdcdd2">A co-evolving agentic AI system for medical image analysis</text>
+</svg>
