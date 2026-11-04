@@ -2587,10 +2587,6 @@ def _create_isolated_slide_object(file_path: str):
         from tissuelab_sdk.wrapper import ISyntaxImageWrapper
     except:
         ISyntaxImageWrapper = None
-    try:
-        from tissuelab_sdk.wrapper import CziImageWrapper
-    except:
-        CziImageWrapper = None
 
     from app.wrapper import PyvipsSlideWrapper
 
@@ -2626,7 +2622,8 @@ def _create_isolated_slide_object(file_path: str):
     elif file_ext in ['isyntax']:
         slide_obj = ISyntaxImageWrapper(file_path)
     elif file_ext in ['czi']:
-        slide_obj = CziImageWrapper(file_path)
+        from app.wrapper.isolated_slide_wrapper import PreviewSlide
+        slide_obj = PreviewSlide(file_path)
     elif file_ext in ['dcm']:
         slide_obj = DicomImageWrapper(file_path)
     elif file_ext in ['nii', 'nii.gz']:

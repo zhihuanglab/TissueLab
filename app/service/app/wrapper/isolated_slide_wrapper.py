@@ -94,6 +94,11 @@ def _overview_source(slide):
     return slide.read_region_vips(level, 0, 0, *slide.level_dimensions[level])
 
 
+# fastslide keeps vendor names for associated images; CZI calls the slide photo
+# "SlidePreview".
+_ASSOCIATED_ALIASES = {'slidepreview': 'macro'}
+
+
 class _FastSlideReader:
     def __init__(self, path):
         import fastslide
@@ -122,7 +127,13 @@ class _FastSlideReader:
         if 'levels' in self.properties:
             self.properties['levels'] = len(self._levels)
         # Label/macro photos (NDPI, SVS); not pyramid levels.
-        self.associated_names = list(self._slide.associated_images.keys())
+        # Report vendor names (CZI's "Label", "SlidePreview") the way the rest of
+        # the service looks them up: lower case, with the slide photo as "macro".
+        self._associated_keys = {}
+        for key in self._slide.associated_images.keys():
+            name = _ASSOCIATED_ALIASES.get(key.lower(), key.lower())
+            self._associated_keys.setdefault(name, key)
+        self.associated_names = list(self._associated_keys)
         self._overview_image = None
 
     def read_overview_vips(self):
@@ -140,7 +151,14 @@ class _FastSlideReader:
 
     def read_associated_vips(self, name):
         import pyvips
-        array = self._slide.associated_images[name].numpy()
+        import numpy as np
+        array = self._slide.associated_images[self._associated_keys.get(name, name)].numpy()
+        if array.dtype == np.uint16:
+            # CZI's SlidePreview is 16 bits per sample; scale as the tile path does.
+            array = (array >> 8).astype(np.uint8)
+        if array.ndim == 2:
+            array = array[..., None]
+        array = np.ascontiguousarray(array)
         return pyvips.Image.new_from_memory(array.tobytes(), array.shape[1], array.shape[0], array.shape[2], 'uchar')
 
     def read_region_vips(self, level, x, y, w, h):
