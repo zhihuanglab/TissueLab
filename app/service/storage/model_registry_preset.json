@@ -265,7 +265,7 @@
       "source": "builtin",
       "zarr_group": null,
       "inputs": "Cardiac MRI: a NIfTI volume or a DICOM folder of one series (e.g. the short-axis cine stack); optional view=LVSA|4CH|VLA|LVOT (default LVSA, the short-axis view used for LV mass and wall thickness)",
-      "outputs": "<node>/voxel_mask/<view>: uint8 label map on the input image grid (LVSA: 0 background, 1 LV cavity, 2 myocardium, 3 RV cavity; other views: 0 background, 1 myocardium), with class_names and pixel spacing in the dataset attrs; for a cine DICOM series the first axis stacks slices x time frames",
+      "outputs": "<node>/voxel_mask/<view>: uint8 label map on the input image grid (LVSA: 0 background, 1 LV cavity, 2 myocardium, 3 RV cavity; other views: 0 background, 1 myocardium), with class_names and pixel spacing in the dataset attrs; for a cine DICOM series the first axis is slice-major (attrs n_slices, n_frames, slice_location_mm, trigger_time_ms; voxel_mask/slice_index and frame_index arrays)",
       "modality": "radiology",
       "supported_structures": [
         "myocardium",
