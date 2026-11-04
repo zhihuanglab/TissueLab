@@ -85,7 +85,7 @@
           "type": "input",
           "value": "",
           "label": "Organs to segment",
-          "placeholder": "e.g. Liver, Spleen (empty = all organs)"
+          "placeholder": "e.g. Kidney, Pancreas (empty = all organs)"
         }
       ]
     },
