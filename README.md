@@ -325,8 +325,11 @@ whole training set against ground truth, ship as command-line modules so they ca
 ### From the command line
 
 Both modules live in `app/service/app/services/agent/`, read their API key from
-`app/service/.env.local`, and take an *experiment folder* (`GT.csv`, `problem.md`, per-case data);
-the exact layout, every option and the run-directory contents are in each module's README.
+`app/service/.env.local`, and take an *experiment folder* (`GT.csv`, `problem.md`, per-case data).
+The per-case data is exported from the app's own output: after the slides have been classified in the
+app, `python -m app.services.patch_regions` turns each slide's zarr store into a case folder, so the
+command-line part starts exactly where the app leaves off. The exact layout, every option and the
+run-directory contents are in each module's README.
 
 | Experiment | Module | Command |
 |---|---|---|
@@ -335,6 +338,11 @@ the exact layout, every option and the run-directory contents are in each module
 
 ```bash
 cd app/service
+# strategy-level, step 0: one case folder per slide from the app's patch classification
+# (slide + its companion zarr store -> contours JSON, overview, per-region crops), plus GT.csv and problem.md
+python -m app.services.patch_regions --zarr /data/LNCO2/<slide>.ndpi.zarr --slide /data/LNCO2/<slide>.ndpi \
+        --name <slide> --out-dir /data/ln/cases/<slide> \
+        --classes "lymphnode_contours=Lymph node,tumor_contours=Tumor" --crop lymphnode_contours
 # strategy-level: score the shipped skills, run the reflector over the cohort, score again
 S=app/services/agent/reflector_agent/skills/lymph_node_metastasis
 python -m app.services.agent.reflector_agent evaluate   --training-dir /data/ln --analysis $S/analysis_with_skills_2.py
