@@ -1,9 +1,8 @@
 <div align="center">
-
-# TissueLab
-
-**A Co-evolving Agentic AI System for Medical Imaging Analysis**
-
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="app/render/public/brand/TissueLab_banner_dark.png">
+    <img src="app/render/public/brand/TissueLab_banner_light.png" width="100%" alt="TissueLab: a co-evolving agentic AI system for medical image analysis">
+  </picture>
 </div>
 
 <div align="center">
@@ -15,13 +14,6 @@
 
 </div>
 
-<br>
-
-<div align="center">
-  <img src="app/render/public/brand/TissueLab_logo.png" width="150px" />
-</div>
-
-<br>
 
 ## 🖥️ Demonstration Videos
 - [TissueLab Demonstrations](https://www.youtube.com/watch?v=rssWT4Mehqw) — experimental results and visualizations
