@@ -55,12 +55,12 @@
     },
     "TotalSegmentatorSegmentation": {
       "displayName": "TotalSegmentator Segmentation",
-      "description": "Organ segmentation for radiology (CT/MRI) volumes with TotalSegmentator. When segmenting brain, brain structure, liver, spleen or other organs, prioritize this node over BiomedParse. Writes one 3D mask per organ plus the CT intensity volume on the same voxel grid, so a CodingAgent step can compute organ-level volume and intensity statistics.",
+      "description": "Organ and lesion segmentation for radiology (CT/MRI) volumes with TotalSegmentator. Prioritize this node over BiomedParse for CT organs (brain, liver, spleen, kidneys, lungs, heart, vertebrae, ...) and for intracerebral hemorrhage, which uses TotalSegmentator's dedicated cerebral_bleed model. Writes one 3D mask per requested class plus the CT intensity volume on the same voxel grid, so a CodingAgent step can compute volumes and intensity statistics.",
       "icon": "/images/icons/totalsegmentator.png",
       "factory": "TissueSeg",
       "source": "builtin",
       "inputs": "Radiology image path (NIfTI file or DICOM folder); tissue_classes=<comma-separated organ names to segment, e.g. \"Kidney, Pancreas\"> (empty = all organs)",
-      "outputs": "Tissue-Segmentation/masks/<organ>/mask (3D bool, one per organ), classes/{name,color}, and Tissue-Segmentation/image (int16 Hounsfield-unit CT volume on the same voxel grid; attrs affine, voxel_spacing_mm)",
+      "outputs": "Tissue-Segmentation/masks/<class>/mask (3D bool, one per requested class: organs such as liver, spleen, brain, or lesions such as intracerebral hemorrhage), classes/{name,color}, and Tissue-Segmentation/image (int16 Hounsfield-unit CT volume on the same voxel grid; attrs affine, voxel_spacing_mm)",
       "panel": [
         {
           "key": "tissue_classes",

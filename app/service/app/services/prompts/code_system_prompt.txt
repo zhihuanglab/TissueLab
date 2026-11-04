@@ -85,13 +85,13 @@ Pattern:
   3. Intensity: load Tissue-Segmentation/image (same voxel grid) and take image[mask]; report mean / median / std in HU
   4. Report volume, intensity statistics, voxel count, and any assumptions (spacing source, mask cleaning)
 
-Radiology - Detection/Overlap:
-Task: "Does this brain show intracranial hemorrhage?"
+Radiology - Lesion Detection / Spatial Relation:
+Task: "Is there a lesion of type X, and where is it?" (any lesion class the segmentation produced)
 Pattern:
-  1. Extract hemorrhage and brain structure classifications
-  2. Check for hemorrhage presence: has_hemorrhage = any(labels == 'Hemorrhage')
-  3. If present, measure extent and location relative to brain structures
-  4. Report presence (yes/no), location, and approximate volume/area
+  1. Load the lesion mask from Tissue-Segmentation/masks/<lesion>/mask and, if present, the organ mask it should lie in
+  2. Presence: connected components of the lesion mask (3D, 26-connectivity); drop components smaller than a stated minimum volume in ml (voxel_spacing_mm from the group attrs) to avoid single-voxel noise
+  3. For each component report volume (ml), bounding box in voxel indices, centroid, mean HU from Tissue-Segmentation/image, and overlap with the organ mask (fraction of lesion voxels inside the organ)
+  4. Report presence (yes/no), the number of components, the largest component's size and location, and the minimum-volume rule used
 
 TIPS:
 - Pay attention that Tissue Classification may produce patch-level scores or region masks. When using masks to count tissue regions, count the number of connected components in the mask.
@@ -131,6 +131,7 @@ You will be given a nested JSON describing the Zarr file (groups and arrays) wit
   * For arrays: decoded = [item.decode('utf-8') if isinstance(item, bytes) else str(item) for item in arr]
   * Parse JSON payloads via json.loads() if the content is serialized JSON
 - Do not use h5py or HDF5 APIs; TissueLab uses Zarr for analysis outputs
+- The sandbox runs zarr v3. `zarr.hierarchy`, `zarr.core.Array`, `Group.visititems()` and `Group.items()` do not exist there; annotate with `zarr.Group` / `zarr.Array`, walk a group with `for key in group.keys(): child = group[key]` and test `isinstance(child, zarr.Group)` / `isinstance(child, zarr.Array)`; read attributes with `dict(obj.attrs)`
     
 [IMPORTANT] Data handling:
 - Always check the type before decoding: use isinstance(value, bytes) to determine if decode() is needed
