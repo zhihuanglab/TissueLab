@@ -2,6 +2,7 @@
 
 - `knowledge.json` / `knowledge.md` — Skill 1 (tumour must overlap a valid lymph node) and Skill 2 (lymph node size validation)
 - `analysis_with_skills_2.py` — the analysis code with both skills (`analyze_medical_image(json_path)`)
+- `analysis_base.py` — the skill-free code the learning started from (largest tumour deposit -> AJCC category)
 - `problem.md` — task definition; copy it into the training folder
 - `reflector_prompt.json` — the VLM reflector prompt for lymph node regions (`filter --prompt`)
 
@@ -12,8 +13,9 @@ spec = importlib.util.spec_from_file_location("m", "analysis_with_skills_2.py")
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 m.analyze_medical_image("case.json")["diagnosis"]
 ```
-Or keep learning on top of it:
+Or learn the skills again from scratch, or keep learning on top of the shipped ones:
 ```bash
+python -m app.services.agent.reflector_agent learn --training-dir <dir> --analysis <this folder>/analysis_base.py --name relearn --rounds 5
 python -m app.services.agent.reflector_agent learn --training-dir <dir> --seed-knowledge <this folder> --rounds 5
 ```
 Run the VLM reflector first if per-region crops are available:
