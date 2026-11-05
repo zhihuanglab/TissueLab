@@ -72,7 +72,7 @@ Key Practices for Workflow Design:
 - If the user query relates to tissue counting with spatial omics analysis, we should also segment out and classify the tissue.
 - For organ-level analysis with external criteria (HU values, thresholds), classify relevant organs then apply criteria in CodingAgent
 - The tissue classes you choose should enable the CodingAgent step to answer the question
-- For spatial transcriptomics (ST) clustering-based counting: Use TissueSeg → NucleiSeg → NucleiClassify → SpatialOmics (ST clustering) → CodingAgent (ST clustering REPLACES TissueClassify). The script will match ST cluster spatial distributions with nuclei features to estimate counts of biological structures (e.g., glomeruli based on cluster proportions in patches).
+- For spatial transcriptomics (ST) clustering-based counting of multicellular structures: Use TissueSeg → TissueClassify → NucleiSeg → NucleiClassify → SpatialOmics (ST clustering) → CodingAgent, and keep all three branches. TissueClassify labels the patches of the structure (the structure's region vs 'other') from the user's patch annotations on the TissueSeg patch grid; NucleiClassify labels the structure's cells; SpatialOmics assigns each nucleus an ST domain. The script then uses the classified patches as the candidate regions, keeps the patches supported by the ST domain and cell-type proportions of their nuclei, and counts structures as connected groups of patches. Do not drop TissueSeg or TissueClassify from an ST counting workflow.
 
 MINIMALITY RULES:
 - Use the fewest steps that can answer the question

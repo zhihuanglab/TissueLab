@@ -173,7 +173,7 @@
     },
     "CellCharter": {
       "displayName": "CellCharter",
-      "description": "Spatial-domain clustering of nuclei from spatial transcriptomics (CellCharter: PCA of nucleus expression, Delaunay neighbourhood aggregation, Gaussian-mixture clustering). Needs the slide's nucleus segmentation (NucleiSeg) and, to name the domains, the nucleus classification (NucleiClassify); takes the per-nucleus expression .h5ad that accompanies the slide. Writes a domain label per nucleus for each requested K plus marker genes per domain, so a CodingAgent step can count structures (e.g. glomeruli) as spatial groups of nuclei in the matching domain.",
+      "description": "Spatial-domain clustering of nuclei from spatial transcriptomics (CellCharter: PCA of nucleus expression, Delaunay neighbourhood aggregation, Gaussian-mixture clustering). Needs the slide's nucleus segmentation (NucleiSeg) and, to name the domains, the nucleus classification (NucleiClassify); takes the per-nucleus expression .h5ad that accompanies the slide. Writes a domain label per nucleus for each requested K plus marker genes per domain, so a CodingAgent step can combine the domains with the patch classification (TissueClassify) and cell classification on the TissueSeg patch grid and count multicellular structures as connected groups of patches.",
       "icon": "/images/icons/cellcharter.png",
       "factory": "SpatialOmics",
       "source": "builtin",
