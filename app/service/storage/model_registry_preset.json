@@ -210,7 +210,7 @@
       "source": "builtin",
       "zarr_group": "Spatial-Omics",
       "inputs": "st_path=<per-nucleus expression .h5ad with nucleus centroids> (default: the .h5ad next to the opened slide); n_clusters=<K or list, e.g. 9 or 5,6,7,8,9,10> (default 9)",
-      "outputs": "Spatial-Omics/clusters/k<K> (int32 domain label per nucleus), Spatial-Omics/centroids (x, y per nucleus, level-0 pixels), Spatial-Omics/cluster_markers/k<K> (JSON {label: top marker genes}), Spatial-Omics/nucleus_id, Spatial-Omics/segmentation_index (row of Cell-Segmentation / Cell-Classification for each nucleus, when the .h5ad nuclei are the slide's segmented nuclei)",
+      "outputs": "Spatial-Omics/clusters/k<K> (int32 domain label per nucleus), Spatial-Omics/centroids (x, y per nucleus, level-0 pixels), Spatial-Omics/cluster_markers/k<K> (JSON {label: top marker genes}), Spatial-Omics/nucleus_id, Spatial-Omics/segmentation_index (row of Cell-Segmentation / Cell-Classification for each nucleus: by obs_names when they are those rows, else the nearest segmented nucleus within 8 px, -1 if none)",
       "panel": [
         {
           "key": "st_path",
