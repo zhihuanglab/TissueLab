@@ -255,7 +255,13 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
     { text: "Does this CT scan suggest fatty liver?", enableWebSearch: true },
     { text: "Does this brain image show any evidence of intracerebral hemorrhage?", enableWebSearch: true },
     { text: "Does this X-ray suggest any Nodule?", enableWebSearch: false },
-    { text: "Does this time-series 3D cardiac scan indicate myocardial hypertrophy?", enableWebSearch: true }
+    {
+      text: [
+        "Does this time-series 3D cardiac scan indicate myocardial hypertrophy?",
+        "Use the short-axis cine segmentation (LV blood pool, LV myocardium, RV blood pool) to measure the maximal left-ventricular wall thickness at end-diastole, apply the clinical guideline criterion, and report the thickness, the criterion with its source, and your conclusion.",
+      ].join("\n"),
+      enableWebSearch: true,
+    }
   ];
   const welcomeTimerRef = useRef<number | null>(null);
   const thinkingTimerRef = useRef<number | null>(null);
