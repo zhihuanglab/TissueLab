@@ -112,6 +112,12 @@ export function buildStartWorkflowPayload(
       }
       // Chat web-search toggle, stored as "1"/"" on the panel; the backend
       // reuses it for the coding agent's guideline lookup.
+      const mpp = Number(inputObject.slide_mpp);
+      if (Number.isFinite(mpp) && mpp > 0) {
+        inputObject.slide_mpp = mpp;
+      } else {
+        delete inputObject.slide_mpp;
+      }
       const ws = inputObject.web_search_enabled;
       inputObject.web_search_enabled =
         ws === true || ws === 1 || (typeof ws === "string" && ["1", "true", "yes", "on"].includes(ws.trim().toLowerCase()));

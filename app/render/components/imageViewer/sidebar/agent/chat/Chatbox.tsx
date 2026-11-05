@@ -41,6 +41,7 @@ type WorkflowPreviewStep = {
   ui?: Record<string, unknown> | null
   /** Chat web-search toggle at planning time; the Coding Agent step forwards it to the backend. */
   web_search_enabled?: boolean
+  slide_mpp?: number | null
 }
 
 export type GeneratedWorkflowStep = WorkflowPreviewStep
@@ -674,9 +675,10 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
             prompt: typeof item.input === "string" ? item.input : "",
             impl: item.impl || undefined,
             web_search_enabled: webSearchEnabled,
+            slide_mpp: slideInfo?.mpp ?? null,
           };
         }
-        return { ...item, web_search_enabled: webSearchEnabled };
+        return { ...item, web_search_enabled: webSearchEnabled, slide_mpp: slideInfo?.mpp ?? null };
       });
 
       const formattedPath = formatPath(currentPath ?? "");
@@ -699,6 +701,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
           input: s.input,
           prompt: typeof s.input === 'string' ? s.input : undefined,
           web_search_enabled: webSearchEnabled,
+          slide_mpp: slideInfo?.mpp ?? null,
         })),
         formattedPath,
       });

@@ -1724,6 +1724,7 @@ class GenerateScriptRequest(BaseModel):
     zarr_path: str
     prompt: str
     web_search_enabled: bool = False
+    slide_mpp: Optional[float] = None
 
 
 @tasks_router.post("/v1/generate_script")
@@ -1750,6 +1751,7 @@ async def generate_script(
         auth_header=http_request.headers.get("Authorization"),
         uid=getattr(auth_user, "uid", None),
         web_search_enabled=bool(request.web_search_enabled),
+        slide_mpp=request.slide_mpp,
     )
     if result.get("error"):
         return error_response(result["error"])

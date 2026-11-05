@@ -66,6 +66,10 @@ export const buildGeneratedPanel = (
     if (isCodingAgent && contentItem.key === "web_search_enabled") {
       return { ...contentItem, value: step.web_search_enabled === true ? "1" : "" }
     }
+    if (isCodingAgent && contentItem.key === "slide_mpp") {
+      const mpp = Number(step.slide_mpp)
+      return { ...contentItem, value: Number.isFinite(mpp) && mpp > 0 ? String(mpp) : "" }
+    }
     if (isCodingAgent && contentItem.key !== "prompt") return { ...contentItem }
     // `prompt` always carries the joined chat step text (calculation text / classes / etc.).
     if (contentItem.key === "prompt") return { ...contentItem, value: joinedValue }
