@@ -3,22 +3,16 @@
     "TissueClassify": [
       "BiomedParseClassification",
       "MuskClassification",
-      "TotalSegmentatorClassification",
-      "HOptimusClassification",
-      "VirchowClassification"
+      "TotalSegmentatorClassification"
     ],
     "TissueSeg": [
       "BiomedParseSegmentation",
       "MuskEmbedding",
       "TotalSegmentatorSegmentation",
-      "VISTA",
-      "HOptimusEmbedding",
-      "VirchowEmbedding"
+      "VISTA"
     ],
     "NucleiSeg": [
       "StarDist",
-      "InstanSegNode",
-      "CellCast",
       "Cytoformer"
     ],
     "NucleiClassify": [
@@ -142,19 +136,6 @@
       "inputs": null,
       "outputs": "Per-nucleus contours and centroids"
     },
-    "InstanSegNode": {
-      "displayName": "InstanSeg Nuclei Segmentation",
-      "description": "Fast nuclei segmentation using InstanSeg's lightweight transformer architecture. Produces per-nucleus contours, centroids, and PLIP embeddings. Alternative to StarDist with improved speed.",
-      "icon": "/images/icons/nuclei_segmentation_stardist.png",
-      "factory": "NucleiSeg",
-      "schema": null,
-      "version": null,
-      "source": "builtin",
-      "h5_group": null,
-      "inputs": "WSI path, pixel_size, model_type",
-      "outputs": "Per-nucleus contours, centroids, probability, PLIP embeddings at Cell-Segmentation/embeddings [N,768]",
-      "zarr_group": "Cell-Segmentation"
-    },
     "Cytoformer": {
       "displayName": "Cytoformer Cell Segmentation",
       "description": "Nuclei/cell instance segmentation (StarDist geometry) with fine-tuned H-optimus-0 per-cell embeddings [N,1536]; prerequisite for Cytoformer nuclei classification.",
@@ -166,18 +147,6 @@
       "zarr_group": "Cell-Segmentation",
       "inputs": "WSI path, pixel_size",
       "outputs": "Per-nucleus contours, centroids, and H-optimus-0 embeddings at Cell-Segmentation/embeddings [N,1536]"
-    },
-    "CellCast": {
-      "displayName": "CellCast Nuclei Segmentation",
-      "description": "Instance segmentation of nuclei/cells on WSI with per-nucleus polygons/centroids; prerequisite for per-cell metrics and classification.",
-      "icon": "/images/icons/nuclei_segmentation_stardist.png",
-      "factory": "NucleiSeg",
-      "schema": null,
-      "version": null,
-      "source": "builtin",
-      "zarr_group": "Cell-Segmentation",
-      "inputs": null,
-      "outputs": "Per-nucleus contours and centroids"
     },
     "VISTA": {
       "displayName": "VISTA Tissue Segmentation",
@@ -284,48 +253,6 @@
       "zarr_group": null,
       "inputs": null,
       "outputs": null
-    },
-    "HOptimusEmbedding": {
-      "displayName": "Patch Embedding (H-optimus-0)",
-      "description": "Generates 1536-d H-optimus-0 patch embeddings for pathology whole slides, used downstream by patch classification.",
-      "icon": "/images/icons/musk_embedding.svg",
-      "factory": "TissueSeg",
-      "schema": null,
-      "version": null,
-      "source": "builtin",
-      "zarr_group": "Patch-Segmentation",
-      "inputs": null,
-      "outputs": "Patch embeddings [N,1536]"
-    },
-    "VirchowEmbedding": {
-      "displayName": "Patch Embedding (Virchow)",
-      "description": "Generates 2560-d Virchow patch embeddings (class token + mean patch tokens) for pathology whole slides.",
-      "icon": "/images/icons/musk_embedding.svg",
-      "factory": "TissueSeg",
-      "schema": null,
-      "version": null,
-      "source": "builtin",
-      "zarr_group": "Patch-Segmentation",
-      "inputs": null,
-      "outputs": "Patch embeddings [N,2560]"
-    },
-    "HOptimusClassification": {
-      "displayName": "H-optimus-0 Classification",
-      "description": "Patch-based classification. Run HOptimusEmbedding first to generate patch embeddings.",
-      "icon": "/images/icons/musk_classification.svg",
-      "schema": null,
-      "version": null,
-      "factory": "TissueClassify",
-      "zarr_group": null
-    },
-    "VirchowClassification": {
-      "displayName": "Virchow Classification",
-      "description": "Patch-based classification. Run VirchowEmbedding first to generate patch embeddings.",
-      "icon": "/images/icons/musk_classification.svg",
-      "schema": null,
-      "version": null,
-      "factory": "TissueClassify",
-      "zarr_group": null
     },
     "CheXzero": {
       "displayName": "CheXzero",
