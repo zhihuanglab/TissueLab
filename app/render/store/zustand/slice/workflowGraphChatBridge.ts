@@ -11,6 +11,7 @@ export type PendingWorkflowGraphApply = {
     type?: string;
     ui?: Record<string, unknown> | null;
     web_search_enabled?: boolean;
+    slide_mpp?: number | null;
   }>;
   formattedPath: string;
 };

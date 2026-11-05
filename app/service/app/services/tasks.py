@@ -233,8 +233,12 @@ async def _generate_script_output(
     auth_header: str | None = None,
     uid: str | None = None,
     web_search_enabled: bool = False,
+    slide_mpp: float | None = None,
 ) -> dict:
     """Generate the analysis script with the in-process coding agent (streamed when uid is set).
+
+    ``slide_mpp`` is the slide's microns-per-pixel as the viewer reports it; it is
+    stated in the task text so scripts do not have to guess a calibration.
 
     ``web_search_enabled`` is the chat's web-search toggle: when set, the coding
     agent fetches published guidelines/criteria for the task (same lookup the
@@ -286,6 +290,11 @@ async def _generate_script_output(
     except Exception as struct_err:
         logger.warning(f"[CodingAgent] Failed to fetch local Zarr structure for script preview: {struct_err}")
 
+    if slide_mpp is not None:
+        prompt_text = (
+            f"{prompt_text}\n\nSlide calibration: {slide_mpp:g} microns per pixel at level 0 (from the slide "
+            "file's metadata; if this is implausible for a microscope slide, say so and derive length scales from the data)."
+        )
     combined_prompt = (
         f"{prompt_text}\n\nZarr structure:\n{structure_json}"
         if structure_json else prompt_text

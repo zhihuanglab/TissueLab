@@ -36,6 +36,9 @@ export const panelMap: Record<string, PanelConfig> = {
         // "1" when the chat's web-search toggle was on for this plan; sent to the
         // backend so script generation fetches the same guidelines the planner saw.
         { key: "web_search_enabled", type: "input", value: "" },
+        // The slide's microns per pixel (viewer slideInfo), stated to the coding agent so scripts
+        // do not guess a calibration; empty when the slide has none.
+        { key: "slide_mpp", type: "input", value: "" },
         { key: "script_run_policy", type: "input", value: "auto_bypass" },
         { key: "script_last_run_digest", type: "input", value: "" },
         { key: "script_last_run_raw", type: "input", value: "" },

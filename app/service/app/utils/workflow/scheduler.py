@@ -816,6 +816,7 @@ class TaskScheduler:
                     auth_header=execution.auth_header,
                     uid=uid,
                     web_search_enabled=execution.web_search_enabled,
+                    slide_mpp=execution.slide_mpp,
                 )
             finally:
                 # Cancel progress animation when script generation completes

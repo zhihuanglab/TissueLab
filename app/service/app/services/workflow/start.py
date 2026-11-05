@@ -197,6 +197,7 @@ async def start_workflow_from_frontend(frontend_data: dict, uid: str = None, aut
     # The chat's web-search toggle rides on the Coding Agent step so the same
     # guideline lookup the planner had also reaches script generation.
     script_web_search = False
+    script_slide_mpp = None
 
     for stepKey, stepVal in steps:
         panel_type = stepVal["nodeId"] # This is TaskNodeManager registry node id from frontend
@@ -222,6 +223,13 @@ async def start_workflow_from_frontend(frontend_data: dict, uid: str = None, aut
                 or (isinstance(raw_ws, (int, float)) and raw_ws == 1)
                 or (isinstance(raw_ws, str) and raw_ws.strip().lower() in ("1", "true", "yes", "on"))
             )
+            raw_mpp = userInput.get("slide_mpp")
+            try:
+                script_slide_mpp = float(raw_mpp) if raw_mpp not in (None, "") else None
+            except (TypeError, ValueError):
+                script_slide_mpp = None
+            if script_slide_mpp is not None and not (script_slide_mpp > 0):
+                script_slide_mpp = None
             if script_prompt is not None:
                 script_seen = True
             else:
@@ -415,6 +423,7 @@ async def start_workflow_from_frontend(frontend_data: dict, uid: str = None, aut
     provisional.failed_tasks = set()
     provisional.script_prompt = normalized_script_prompt
     provisional.web_search_enabled = bool(script_web_search)
+    provisional.slide_mpp = script_slide_mpp
     provisional.auth_header = auth_header
     provisional.zarr_path = zarr_path
 
