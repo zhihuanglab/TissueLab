@@ -3,6 +3,11 @@ import os
 from typing import Dict, Any, Optional
 from app.core import logger
 
+# Retired node ids in a saved registry -> the node that replaced them. CellCast is
+# shown as "StarDist" (the same model, accelerated).
+RETIRED_NODE_RENAMES: Dict[str, str] = {"StarDist": "CellCast"}
+
+
 class ModelStore:
     """
     Simple on-disk registry for task nodes (both built-in and custom) grouped by categories.
@@ -74,6 +79,8 @@ class ModelStore:
             self.save()
         else:
             self._data = data
+            if self._migrate_retired_nodes(self._data):
+                self.save()
 
         self._loaded = True
 
@@ -335,6 +342,38 @@ class ModelStore:
         if not isinstance(data["category_display_names"], dict):
             data["category_display_names"] = {}
         return data
+
+    def _migrate_retired_nodes(self, data: dict) -> bool:
+        """Rename retired node ids in a saved registry to the node that replaced them
+        (StarDist -> CellCast). A desktop StarDist bundle installed before the rename
+        keeps its runtime (service_path) and launches as CellCast from then on.
+        Returns True when the registry changed."""
+        nodes = data["nodes"]
+        changed = False
+        preset_nodes: Optional[Dict[str, Any]] = None
+        for old, new in RETIRED_NODE_RENAMES.items():
+            if old not in nodes:
+                continue
+            old_meta = nodes.pop(old)
+            if new not in nodes and isinstance(old_meta, dict):
+                if preset_nodes is None:
+                    try:
+                        preset_nodes = self.normalize_registry_dict(self.load_preset_registry())["nodes"]
+                    except Exception:
+                        preset_nodes = {}
+                # Shown with the new node's name/description; keeps the install's runtime.
+                nodes[new] = {**old_meta, **(preset_nodes.get(new) or {}), **(
+                    {"runtime": old_meta["runtime"]} if "runtime" in old_meta else {}
+                )}
+            for members in data["category_map"].values():
+                if isinstance(members, list) and old in members:
+                    idx = members.index(old)
+                    members[:] = [m for m in members if m != old]
+                    if new not in members:
+                        members.insert(idx, new)
+            changed = True
+            logger.info(f"[model_store] Renamed retired node {old} -> {new}")
+        return changed
 
     def is_empty_registry(self, data: dict) -> bool:
         

@@ -16,8 +16,6 @@
       "VirchowEmbedding"
     ],
     "NucleiSeg": [
-      "StarDist",
-      "InstanSegNode",
       "CellCast",
       "Cytoformer"
     ],
@@ -96,23 +94,6 @@
       "factory": "TissueClassify",
       "source": "builtin"
     },
-    "StarDist": {
-      "displayName": "Cell/Nuclei Segmentation",
-      "description": "Instance segmentation of nuclei/cells on WSI with per-nucleus polygons/centroids; prerequisite for per-cell metrics and classification.",
-      "icon": "/images/icons/nuclei_segmentation_stardist.png",
-      "factory": "NucleiSeg",
-      "source": "builtin",
-      "outputs": "Per-nucleus contours and centroids"
-    },
-    "InstanSegNode": {
-      "displayName": "InstanSeg Nuclei Segmentation",
-      "description": "Fast nuclei segmentation using InstanSeg's lightweight transformer architecture. Produces per-nucleus contours, centroids, and PLIP embeddings. Alternative to StarDist with improved speed.",
-      "icon": "/images/icons/nuclei_segmentation_stardist.png",
-      "factory": "NucleiSeg",
-      "source": "builtin",
-      "inputs": "WSI path, pixel_size, model_type",
-      "outputs": "Per-nucleus contours, centroids, probability, PLIP embeddings at Cell-Segmentation/embeddings [N,768]"
-    },
     "Cytoformer": {
       "displayName": "Cytoformer Cell Segmentation",
       "description": "Nuclei/cell instance segmentation (StarDist geometry) with fine-tuned H-optimus-0 per-cell embeddings [N,1536]; prerequisite for Cytoformer nuclei classification.",
@@ -122,12 +103,12 @@
       "outputs": "Per-nucleus contours, centroids, and H-optimus-0 embeddings at Cell-Segmentation/embeddings [N,1536]"
     },
     "CellCast": {
-      "displayName": "CellCast Nuclei Segmentation",
-      "description": "Instance segmentation of nuclei/cells on WSI with per-nucleus polygons/centroids; prerequisite for per-cell metrics and classification.",
+      "displayName": "StarDist Nuclei Segmentation",
+      "description": "StarDist nuclei/cell instance segmentation on WSI (accelerated CellCast implementation) with per-nucleus polygons/centroids and PLIP embeddings; prerequisite for NuClass classification and per-cell metrics.",
       "icon": "/images/icons/nuclei_segmentation_stardist.png",
       "factory": "NucleiSeg",
       "source": "builtin",
-      "outputs": "Per-nucleus contours and centroids"
+      "outputs": "Per-nucleus contours, centroids, probability, PLIP embeddings at Cell-Segmentation/embeddings [N,768]"
     },
     "VISTA": {
       "displayName": "VISTA Tissue Segmentation",

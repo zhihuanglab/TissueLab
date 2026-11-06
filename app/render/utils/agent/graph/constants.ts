@@ -167,8 +167,6 @@ export const MODEL_SUBSTAGES: Record<
       rerunnable: true,
     },
   ],
-  StarDist: CELL_SEG_PIPELINE_SUBSTAGES,
-  InstanSegNode: CELL_SEG_PIPELINE_SUBSTAGES,
   CellCast: CELL_SEG_PIPELINE_SUBSTAGES,
 }
 
@@ -221,8 +219,18 @@ export const registryCategoryMap = (
   modelRegistryFallback as { category_map?: Record<string, string[]> }
 ).category_map ?? {}
 
-/** True for ANY cell-segmentation node (registry factory "NucleiSeg") — StarDist,
- *  InstanSeg, CellCast, Cytoformer, and any future one. Seg-node UI/logic keys off the
+/** Retired node ids → the node that replaced them. CellCast is shown as "StarDist"
+ *  (the same model, accelerated); the old StarDist node is gone. */
+export const RETIRED_MODEL_ALIASES: Readonly<Record<string, string>> = {
+  StarDist: "CellCast",
+}
+
+/** `modelId` with a retired id mapped to the node that replaced it. */
+export const canonicalModelId = <T extends string | null | undefined>(modelId: T): T =>
+  ((modelId && RETIRED_MODEL_ALIASES[modelId]) || modelId) as T
+
+/** True for ANY cell-segmentation node (registry factory "NucleiSeg") — CellCast
+ *  (StarDist), Cytoformer, and any future one. Seg-node UI/logic keys off the
  *  FACTORY, not a hardcoded modelId list, so every cell-seg model is treated identically. */
 export const isCellSegModelId = (modelId?: string | null): boolean =>
   !!modelId && registryNodes[modelId]?.factory === "NucleiSeg"

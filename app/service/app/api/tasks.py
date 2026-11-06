@@ -296,7 +296,7 @@ def install_events(install_id: str, request: Request):
 def get_log_tail(path: Optional[str] = None, model_name: Optional[str] = None, n: int = 200):
     """
     Return the last n lines of a log file. n defaults to 200.
-    Either path (log file path under tasknode_logs) or model_name (e.g. InstanSegNode) must be provided.
+    Either path (log file path under tasknode_logs) or model_name (e.g. CellCast) must be provided.
     Frontend sends model_name; path is for direct use when log_path is known.
     For remote nodes, logs are fetched from the remote node's logs API.
     """

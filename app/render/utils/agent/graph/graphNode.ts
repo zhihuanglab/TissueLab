@@ -12,6 +12,7 @@ import {
   PROGRESS_BAR_H,
   START_NODE_ID,
   TERMINAL_SIZE,
+  canonicalModelId,
   isCellSegModelId,
   isNucleiClassifyModelId,
   isTissueClassifyModelId,
@@ -132,9 +133,12 @@ export function sseOverallToSegEmbBars(overall: number): { seg: number; emb: num
 }
 
 /** Align saved/imported graph nodes with current `MODEL_SUBSTAGES` (e.g. cell seg gained two bars). */
-export function normalizeGraphNodeSubStages(node: GraphNode): GraphNode {
-  if (node.kind !== "model" || !node.modelId) return node
-  const template = MODEL_SUBSTAGES[node.modelId]
+export function normalizeGraphNodeSubStages(saved: GraphNode): GraphNode {
+  if (saved.kind !== "model" || !saved.modelId) return saved
+  // Saved under a retired id (StarDist): load as the node that replaced it.
+  const modelId = canonicalModelId(saved.modelId)
+  const node = modelId === saved.modelId ? saved : { ...saved, modelId }
+  const template = MODEL_SUBSTAGES[modelId]
   if (!template?.length) {
     // Runtime progress is derived from SSE / zarr status; persisted graph snapshots should start pending.
     if (typeof node.progress === "number" && node.progress !== 0) {
@@ -159,7 +163,7 @@ export function normalizeGraphNodeSubStages(node: GraphNode): GraphNode {
     }
   }
   const prevByKey = new Map(existing.map((s) => [s.key, s.progress]))
-  const cellSegIds = isCellSegModelId(node.modelId)
+  const cellSegIds = isCellSegModelId(modelId)
   const legacyDone =
     cellSegIds && existing.length === 0 && (node.progress ?? 0) >= 100 ? 100 : undefined
   return {

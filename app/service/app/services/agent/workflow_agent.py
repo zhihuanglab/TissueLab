@@ -20,6 +20,23 @@ from app.services import llm_config, llm_settings
 from app.services.agent.knowledge_store import get_knowledge_store
 from app.repos.schema.knowledge import KnowledgeItem
 
+# CellCast is shown to users as "StarDist" (the same StarDist model, accelerated); the old
+# StarDist node is gone. Map that name to CellCast wherever an impl is read.
+IMPL_ALIASES: Dict[str, str] = {"StarDist": "CellCast"}
+
+
+def normalize_impl_aliases(impl: Any, candidates: Any) -> Tuple[Any, List[Any]]:
+    """The step's impl and impl_candidates with retired node names mapped to the node
+    that replaces them, candidates de-duplicated in order."""
+    impl = IMPL_ALIASES.get(impl, impl) if isinstance(impl, str) else impl
+    out: List[Any] = []
+    for c in candidates if isinstance(candidates, list) else []:
+        c = IMPL_ALIASES.get(c, c) if isinstance(c, str) else c
+        if c not in out:
+            out.append(c)
+    return impl, out
+
+
 # PROMPTS_DIR is in parent directory (app/services/prompts)
 PROMPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts")
 
@@ -484,7 +501,7 @@ Rules:
                 if category == "TissueClassify":
                     cap_lines.append("Selection Guide: Prefer MUSK for pathology questions; use BiomedParse only for radiology questions. Omit TissueClassify if no region/patch labeling is needed and the task is cell-only. ALWAYS precede TissueClassify with TissueSeg to provide required embeddings/features. Provide specific tissue class types with anatomical context when relevant to avoid ambiguous terms.")
                 if category == "NucleiSeg":
-                    cap_lines.append("Selection Guide: Required for cell-level metrics; no inputs; do not invent targets. DEFAULT IMPL: SegmentationNode (StarDist) — it is the validated, production-default choice for H&E pathology and should be the first impl_candidate. Only choose InstanSegNode when the user explicitly requests it or the slide is a non-H&E modality where StarDist is known to underperform.")
+                    cap_lines.append("Selection Guide: Required for cell-level metrics; no inputs; do not invent targets. DEFAULT IMPL: CellCast (displayName StarDist; the same StarDist model, accelerated) — it is the validated, production-default choice for H&E pathology and should be the first impl_candidate; use it whenever the user asks for StarDist, and never output impl=StarDist. Use Cytoformer when the classifier is CytoformerClassification.")
                 if category == "NucleiClassify":
                     cap_lines.append("Selection Guide: Include only minimal necessary classes (e.g., ['tumor_cell','other']).")
                 if category == "CodingAgent":

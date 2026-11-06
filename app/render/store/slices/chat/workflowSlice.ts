@@ -1,6 +1,7 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
 import type { WorkflowRuntimeStatus } from '@/utils/agent/workflow/runtimeStatus';
 import { WorkflowStatus } from '@/utils/agent/workflow/runtimeStatus';
+import { canonicalModelId } from '@/utils/agent/graph/constants';
 
 export type { WorkflowRuntimeStatus };
 
@@ -166,13 +167,19 @@ const initialState: WorkflowState = {
   pendingGraphOverlayRestore: null,
 };
 
+/** A panel saved under a retired node id (StarDist) gets the node that replaced it (CellCast). */
+const withCanonicalType = (panel: WorkflowPanel): WorkflowPanel => {
+  const type = canonicalModelId(panel.type);
+  return type === panel.type ? panel : { ...panel, type };
+};
+
 const workflowSlice = createSlice({
   name: 'workflow',
   initialState,
   reducers: {
     // Set the entire panels array
     setPanels: (state, action: PayloadAction<WorkflowPanel[]>) => {
-      state.panels = action.payload;
+      state.panels = action.payload.map(withCanonicalType);
     },
 
     // Initialize panels from workflow config
@@ -180,7 +187,7 @@ const workflowSlice = createSlice({
       const { workflow, formattedPath } = action.payload;
       if (!workflow || !workflow.length) return;
 
-      state.panels = generatePanelsFromWorkflow(workflow).map((panel: WorkflowPanel) => ({
+      state.panels = generatePanelsFromWorkflow(workflow).map(withCanonicalType).map((panel: WorkflowPanel) => ({
         ...panel,
         content: panel.type !== 'CodingAgent' && !panel.content.some((item: ContentItem) => item.key === 'path')
           ? [...panel.content, { key: 'path', type: 'input', value: formattedPath ?? "" }]

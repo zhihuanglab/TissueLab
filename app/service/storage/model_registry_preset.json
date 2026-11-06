@@ -12,7 +12,7 @@
       "VISTA"
     ],
     "NucleiSeg": [
-      "StarDist",
+      "CellCast",
       "Cytoformer"
     ],
     "NucleiClassify": [
@@ -124,9 +124,9 @@
       "factory": "TissueClassify",
       "zarr_group": null
     },
-    "StarDist": {
-      "displayName": "Cell/Nuclei Segmentation",
-      "description": "Instance segmentation of nuclei/cells on WSI with per-nucleus polygons/centroids; prerequisite for per-cell metrics and classification.",
+    "CellCast": {
+      "displayName": "StarDist Nuclei Segmentation",
+      "description": "StarDist nuclei/cell instance segmentation on WSI (accelerated CellCast implementation) with per-nucleus polygons/centroids and PLIP embeddings; prerequisite for NuClass classification and per-cell metrics.",
       "icon": "/images/icons/nuclei_segmentation_stardist.png",
       "factory": "NucleiSeg",
       "schema": null,
@@ -134,7 +134,7 @@
       "source": "builtin",
       "zarr_group": "Cell-Segmentation",
       "inputs": null,
-      "outputs": "Per-nucleus contours and centroids"
+      "outputs": "Per-nucleus contours, centroids, probability, PLIP embeddings at Cell-Segmentation/embeddings [N,768]"
     },
     "Cytoformer": {
       "displayName": "Cytoformer Cell Segmentation",

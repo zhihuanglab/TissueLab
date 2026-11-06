@@ -10,7 +10,7 @@ class NucleiSegmentation(BaseModelFactory):
             print("[NucleiSegmentation] Using user-defined segmentation class:", custom_cls)
             self._model_instance = custom_cls()
         else:
-            print("[NucleiSegmentation] Initializing InstanSeg model...")
+            print("[NucleiSegmentation] No user-defined segmentation class given")
 
     def get_model(self) -> Any:
         return self._model_instance

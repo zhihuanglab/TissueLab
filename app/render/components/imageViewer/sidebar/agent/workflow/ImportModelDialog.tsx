@@ -30,7 +30,7 @@ interface NodesExtendedPayload {
 // Pseudo-category that surfaces a curated short-list at the top of the left rail.
 const FREQUENT_CATEGORY_KEY = "__frequent__";
 const FREQUENT_CATEGORY_LABEL = "Frequently Used Models";
-const FREQUENT_NODE_IDS = ["NuClass", "MuskClassification", "VISTA"];
+const FREQUENT_NODE_IDS = ["Cytoformer", "CytoformerClassification", "NuClass", "MuskClassification", "VISTA"];
 
 // Safety-net poll behind the activation SSE stream while the dialog is open.
 // Same cadence as the Model Zoo page: every read runs the backend's remote

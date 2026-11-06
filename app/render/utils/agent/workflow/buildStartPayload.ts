@@ -1,4 +1,5 @@
 import { panelMap } from "@/constants/workflow.constants";
+import { canonicalModelId } from "@/utils/agent/graph/constants";
 import type { WorkflowPanel } from "@/store/slices/chat/workflowSlice";
 import { applyCytoformerClassificationInput } from "@/utils/agent/workflow/cytoformer";
 import { restrictClassesToAnnotated } from "@/utils/annotations/nucleiClassList";
@@ -74,7 +75,8 @@ export function buildStartWorkflowPayload(
 
   panelsToRun.forEach((panel, index) => {
     const stepKey = `step${index + 1}`;
-    const nodeId = (panel.type || "GPT-4o Agent").trim();
+    // A panel saved under a retired id (StarDist) runs as the node that replaced it.
+    const nodeId = canonicalModelId((panel.type || "GPT-4o Agent").trim());
     const inputObject: Record<string, any> = {};
     panel.content.forEach((contentItem) => {
       const k = (contentItem.key || "").trim();

@@ -1,6 +1,7 @@
 import { CHILD_TO_PARENT, panelMap } from "@/constants/workflow.constants"
 import type { WorkflowPanel } from "@/store/slices/chat/workflowSlice"
 import { getZarrStructure, type ZarrObject, type ZarrStructure } from "@/services/data.service"
+import { canonicalModelId } from "@/utils/agent/graph/constants"
 
 type PrereqNode = { modelId?: string }
 
@@ -10,7 +11,6 @@ const PREREQ_OUTPUT_GROUP: Record<string, string> = {
   VirchowEmbedding: "Patch-Segmentation",
   MuskClassification: "Patch-Classification",
   CellCast: "Cell-Segmentation",
-  StarDist: "Cell-Segmentation",
   Cytoformer: "Cell-Segmentation",
   NuClass: "Cell-Classification",
   CytoformerClassification: "Cell-Classification",
@@ -79,8 +79,8 @@ export function hasCytoformerEmbeddings(structure: ZarrStructure | undefined): b
 }
 
 /**
- * NuClass-space embeddings: the PLIP 768-d vectors StarDist / CellCast /
- * InstanSeg write (no `embedding_*` attrs). Only these make NuClass the right
+ * NuClass-space embeddings: the PLIP 768-d vectors CellCast (StarDist) and
+ * the retired StarDist node write (no `embedding_*` attrs). Only these make NuClass the right
  * classifier; anything else (no store, Cytoformer, legacy UNI2 1536-d) goes to
  * Cytoformer.
  */
@@ -118,8 +118,8 @@ export function hasPatchEmbeddingsFor(structure: ZarrStructure | undefined, embe
   return Array.isArray(shape) && shape.length === 2 && shape[0] > 0 && shape[1] === dim
 }
 
-/** StarDist / CellCast / InstanSeg all write the 768-d NuClass-space embeddings. */
-const NUCLASS_SPACE_SEG_NODES = new Set(["CellCast", "StarDist", "InstanSegNode"])
+/** Seg nodes that write the 768-d NuClass-space embeddings (retired ids map to CellCast). */
+const NUCLASS_SPACE_SEG_NODES = new Set(["CellCast"])
 
 function synthesizeDefaultPanelByKey(panelKey: string): WorkflowPanel | null {
   const cfg = panelMap[panelKey]
@@ -186,7 +186,7 @@ export async function augmentPanelsWithPrereqs(
     if (modelType === "Cytoformer") {
       return hasReusableCytoformerEmbeddings
     }
-    if (NUCLASS_SPACE_SEG_NODES.has(modelType)) {
+    if (NUCLASS_SPACE_SEG_NODES.has(canonicalModelId(modelType))) {
       return hasReusableNuClassEmbeddings
     }
     if (PATCH_EMBEDDING_DIM[modelType]) {

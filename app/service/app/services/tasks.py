@@ -3772,7 +3772,7 @@ def _compute_stage_progress_for_node(node_name: str, zf: zarr.Group) -> Dict[str
         or _dataset_exists_nonempty(zf, "nuclei_segmentation/centroids")
         or _dataset_exists_nonempty(zf, "morphology/centroids")
     )
-    # PLIP-flavoured cell embeddings (StarDist/CellPose/InstanSeg -> NuClass). The
+    # PLIP-flavoured cell embeddings (StarDist/CellPose -> NuClass). The
     # slot is shared with Cytoformer's 1536-d features, so match on the width
     # rather than mere existence; Cell-Segmentation/probabilities is segmentation
     # output and says nothing about embeddings.
@@ -3840,7 +3840,8 @@ def _compute_stage_progress_for_node(node_name: str, zf: zarr.Group) -> Dict[str
         stage["segmentation"] = 100 if has_cell_seg else 0
         stage["embedding"] = 100 if has_cytoformer_embedding else 0
         stage["classification"] = 100 if has_cytoformer_classification else 0
-    elif node_name in ("StarDist", "InstanSegNode", "CellCast") or "seg" in lower_name:
+    # StarDist: retired id that saved workflows may still send.
+    elif node_name in ("CellCast", "StarDist") or "seg" in lower_name:
         stage["segmentation"] = 100 if has_cell_seg else 0
         stage["embedding"] = 100 if has_cell_embedding else 0
     elif node_name in ("NuClass", "NucleiClassify"):
@@ -3901,8 +3902,6 @@ def get_workflow_stage_status(uid: str, zarr_path: str, steps: Optional[List[Dic
     try:
         with open_zarr_cm(resolved, mode="r") as zf:
             nodes_to_eval = requested_nodes or [
-                "StarDist",
-                "InstanSegNode",
                 "CellCast",
                 "Cytoformer",
                 "NuClass",

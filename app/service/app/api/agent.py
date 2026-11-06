@@ -24,6 +24,7 @@ from app.services.agent.workflow_agent import (
     WorkflowAgent,
     _extract_code_from_markdown,
     get_workflow_agent,
+    normalize_impl_aliases,
 )
 from app.services.agent.verification_agent import get_verification_agent
 from app.services import llm_settings
@@ -88,8 +89,8 @@ def _normalize_steps(steps_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Expecting { "steps": [ { step, model, input: [..], impl, impl_candidates }, ... ] }"""
     steps_list: List[Dict[str, Any]] = []
     for idx, item in enumerate(steps_obj.get("steps", [])):
-        impl_val = item.get("impl", "")
-        candidates_val = item.get("impl_candidates") or ([] if not impl_val else [impl_val])
+        impl_val, candidates_val = normalize_impl_aliases(item.get("impl", ""), item.get("impl_candidates"))
+        candidates_val = candidates_val or ([] if not impl_val else [impl_val])
         if impl_val and impl_val not in candidates_val:
             candidates_val = [impl_val] + [c for c in candidates_val if c != impl_val]
         steps_list.append({
