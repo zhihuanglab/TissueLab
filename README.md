@@ -5,6 +5,8 @@
   </picture>
 </div>
 
+<br>
+
 <div align="center">
 
 [![arXiv](https://img.shields.io/badge/arXiv-2509.20279-b31b1b.svg)](https://arxiv.org/abs/2509.20279)
