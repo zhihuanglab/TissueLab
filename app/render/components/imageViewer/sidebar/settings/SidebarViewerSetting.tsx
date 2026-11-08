@@ -7,6 +7,8 @@ import { findShortcutConflict, shortcutKeyFromEvent, type ShortcutActionKey } fr
 import { CheckCircle2, XCircle } from 'lucide-react';
 import React from 'react';
 
+const MODIFIER_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'CapsLock', 'OS']);
+
 const SidebarPrefs = () => {
     const {
         zoomSpeed,
@@ -183,6 +185,13 @@ const ShortcutRow: React.FC<{
                 setCapture(null);
                 return;
             }
+            // The viewer ignores Cmd/Ctrl/Alt combos (they belong to the app
+            // and OS), so a bare modifier press or such a combo would bind a
+            // key that never fires. Keep waiting for a plain key. AltGr types
+            // characters, so it is allowed.
+            if (MODIFIER_KEYS.has(e.key)) return;
+            const altGraph = typeof e.getModifierState === 'function' && e.getModifierState('AltGraph');
+            if (e.metaKey || (!altGraph && (e.ctrlKey || e.altKey))) return;
             const key = shortcutKeyFromEvent(e);
             if (RESERVED_KEYS.has(key)) {
                 setCapture({ action, refused: { reason: 'reserved', key } });

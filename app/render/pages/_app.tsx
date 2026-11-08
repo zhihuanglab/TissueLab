@@ -63,6 +63,15 @@ function App({ Component, pageProps }: AppPropsWithLayout) {
       });
     };
     bridge.on("main-process-error", onMainProcessError);
+    // A notice raised while no window was open (macOS: window closed, app in
+    // the Dock) is held by main until this listener exists; fetch it now.
+    if (typeof bridge.invoke === "function") {
+      Promise.resolve(bridge.invoke("take-pending-backend-notice"))
+        .then((notice: unknown) => {
+          if (typeof notice === "string" && notice) onMainProcessError({ kind: "Backend stopped", message: notice });
+        })
+        .catch(() => { /* older main without the handler */ });
+    }
     return () => {
       try { bridge.off?.("main-process-error", onMainProcessError); } catch { /* bridge gone */ }
     };

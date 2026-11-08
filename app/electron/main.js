@@ -260,17 +260,9 @@ function createWindow() {
   // mainWindow.loadURL('chrome://gpu');
   mainWindowEverShown = true;
   mainWindow.loadURL(`http://localhost:${getNextjsPort()}`);
-  if (pendingBackendNotice) {
-    const notice = pendingBackendNotice;
-    const win = mainWindow;
-    win.webContents.once('did-finish-load', () => {
-      if (pendingBackendNotice !== notice) return;
-      pendingBackendNotice = null;
-      try {
-        win.webContents.send('main-process-error', { kind: 'Backend stopped', message: notice });
-      } catch (e) { /* window closed again */ }
-    });
-  }
+  // A pending "backend stopped" notice is picked up by the renderer itself
+  // ('take-pending-backend-notice') once its listener exists; a push on
+  // did-finish-load could arrive before React has subscribed and be lost.
   // const GPUFeatureStatus = app.getGPUFeatureStatus()
   // console.log(GPUFeatureStatus)
   
@@ -521,6 +513,14 @@ function checkNextjsServerReady(url, callback, maxAttempts = 30) {
 
 // Global variable to track active downloads
 let activeDownloads = new Map();
+
+// The renderer asks for a backend notice it missed while no window was open
+// (macOS Dock reopen). Returned once, then cleared.
+ipcMain.handle('take-pending-backend-notice', () => {
+  const notice = pendingBackendNotice;
+  pendingBackendNotice = null;
+  return notice;
+});
 
 ipcMain.handle('open-folder-dialog', async () => {
   const result = await dialog.showOpenDialog({
@@ -1077,8 +1077,11 @@ function startBackendMonitoring() {
     }
   } catch (e) { /* splash closing */ }
 
-  backendMonitorInterval = setInterval(async () => {
+  if (backendMonitorInterval) clearInterval(backendMonitorInterval);
+  const interval = setInterval(async () => {
     const isReady = await checkBackendHealth(port);
+    // Superseded or already handled while this check was in flight.
+    if (backendMonitorInterval !== interval) return;
     if (!isReady && !mainWindow && Date.now() - startedAt >= BACKEND_WAIT_LIMIT_MS) {
       failStartup(`The TissueLab backend service did not start within ${Math.round(BACKEND_WAIT_LIMIT_MS / 60_000)} minutes.`);
       return;
@@ -1086,24 +1089,29 @@ function startBackendMonitoring() {
     if (isReady) {
       console.log(`[ELECTRON] Backend service detected on port ${port}! Opening main window...`);
       
-      if (backendMonitorInterval) {
-        clearInterval(backendMonitorInterval);
-        backendMonitorInterval = null;
-      }
-      
-      createWindow();
+      clearInterval(interval);
+      backendMonitorInterval = null;
+
+      if (!mainWindow || mainWindow.isDestroyed()) createWindow();
     }
   }, 5000);
+  backendMonitorInterval = interval;
 }
 
 function checkBackendReady(port, callback, maxAttempts = 60) {
   let attempts = 0;
-  
+  // A health check can take up to 2 s while one starts every second, so checks
+  // overlap; only the first verdict counts (callback runs exactly once).
+  let settled = false;
+
   const check = async () => {
+    if (settled) return;
     attempts++;
     const isReady = await checkBackendHealth(port);
-    
+    if (settled) return;
+
     if (isReady) {
+      settled = true;
       console.log(`[ELECTRON] Backend service is ready on port ${port}!`);
       if (backendCheckInterval) {
         clearInterval(backendCheckInterval);
@@ -1116,6 +1124,7 @@ function checkBackendReady(port, callback, maxAttempts = 60) {
     if (attempts < maxAttempts) {
       console.log(`[ELECTRON] Backend service not ready yet on port ${port}... (attempt ${attempts}/${maxAttempts})`);
     } else {
+      settled = true;
       console.error(`[ELECTRON] Backend service failed to start after ${maxAttempts} attempts`);
       if (backendCheckInterval) {
         clearInterval(backendCheckInterval);

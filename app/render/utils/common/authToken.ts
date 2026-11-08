@@ -57,6 +57,12 @@ export const notifyMissingAuth = () => {
  */
 export const waitForAuthReady = (timeoutMs = 120_000): Promise<void> => {
   if (authReadyWaiter) return authReadyWaiter;
+  // No sign-in prompt is showing (e.g. notifyMissingAuth was inside its
+  // cooldown after the user just dismissed it): nothing can complete a
+  // sign-in, so settle now instead of waiting out the timeout.
+  if (!signupModalStore.getState().isSignupModalOpen) {
+    return hasSignedInUser() ? Promise.resolve() : Promise.reject(new Error(AUTH_MISSING_ERROR));
+  }
 
   authReadyWaiter = new Promise<void>((resolve, reject) => {
     resolveAuthReady = resolve;

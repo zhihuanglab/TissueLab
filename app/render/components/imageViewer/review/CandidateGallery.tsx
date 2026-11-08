@@ -473,7 +473,13 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
   };
 
   // N shortcut: open the class picker, same as clicking this tile's No button.
+  // Only a nonce that changes while this tile is mounted counts: a tile that
+  // remounts (refetch skeleton, page change) with an old nonce must not pop
+  // the picker open by itself.
+  const handledPickerNonceRef = useRef(openPickerNonce);
   useEffect(() => {
+    if (openPickerNonce === handledPickerNonceRef.current) return;
+    handledPickerNonceRef.current = openPickerNonce;
     if (openPickerNonce === undefined || writeDisabled || label !== undefined || pendingReclassification) return;
     updateDropdownPosition();
     setShowDropdown(true);

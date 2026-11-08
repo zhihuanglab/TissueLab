@@ -269,7 +269,11 @@ export default function DistributionControl({
     const seq = ++histogramSeqRef.current
     const isStale = () => seq !== histogramSeqRef.current
     if (selectedClass.source !== "nuclei" || !shapeCoords || !currentPath || !instanceId) {
+      // Any reply still in flight is stale now and won't clear these itself.
       setProbHist([])
+      setRegionProbs([])
+      setRegionIndices([])
+      setLoading(false)
       return
     }
     setLoading(true)

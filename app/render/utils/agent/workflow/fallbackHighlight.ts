@@ -8,7 +8,7 @@
 export type FallbackHighlightClasses = { string: string; number: string; keyword: string };
 
 const TOKEN =
-  /(["'])(?:\\.|(?!\1).)*\1|\b\d+(?:\.\d+)?\b|\b(?:def|return|import|from|as|if|elif|else|for|while|with|try|except|class)\b/g;
+  /(["'])(?:\\.|(?!\1)[^\\\n])*\1|\b\d+(?:\.\d+)?\b|\b(?:def|return|import|from|as|if|elif|else|for|while|with|try|except|class)\b/g;
 
 export const escapeHtml = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");

@@ -103,6 +103,8 @@ const LocalFileManager = () => {
 
   const [conversionJobs, setConversionJobs] = useState<ConversionJobMap>({});
   const fetchSeqRef = useRef(0);
+  // Highest listing request that has finished (equal to fetchSeqRef when idle).
+  const settledSeqRef = useRef(0);
   // Status polls can overlap when a request takes longer than the 3 s interval.
   // Stamp each request so a slow, older reply is ignored, and announce each
   // job's terminal status only once.
@@ -211,14 +213,25 @@ const LocalFileManager = () => {
       // Forget the remembered root only when the root itself is gone. A
       // failing sub-folder (deleted, no permission) must not send the user
       // back to "Open Folder" on the next launch.
-      const rootMissing = path === rootFolder && /ENOENT|no such file|cannot find/i.test(String(err?.message ?? ''));
+      const rootMissing = !!rootFolder && isSamePath(path, rootFolder) && /ENOENT|no such file|cannot find/i.test(String(err?.message ?? ''));
       if (rootMissing && typeof window !== 'undefined') {
         window.localStorage.removeItem('tissuelab_local_root_folder');
       }
     } finally {
       if (isCurrent()) setIsLoading(false);
+      settledSeqRef.current = Math.max(settledSeqRef.current, seq);
     }
   }, [electron, rootFolder, currentDirectory]);
+
+  // Background refresh (e.g. a conversion finished). Skipped while a listing is
+  // in flight: that one is the user's navigation, it already brings a fresh
+  // list, and refreshing the old folder here would supersede it and undo the
+  // click.
+  const refreshInBackground = useCallback(() => {
+    if (fetchSeqRef.current !== settledSeqRef.current) return;
+    const dir = currentDirectoryRef.current;
+    if (dir) fetchFiles(dir);
+  }, [fetchFiles]);
 
   // Filter files based on showNonImageFiles setting
   const filterVisibleFiles = useCallback((files: FileTreeNode[]): FileTreeNode[] => {
@@ -296,9 +309,7 @@ const LocalFileManager = () => {
               if (updated.status === 'succeeded') {
                 if (!firstAnnouncement('succeeded')) return;
                 toast.success(`Conversion completed: ${fileName}`);
-                if (currentDirectory) {
-                  fetchFiles(currentDirectory);
-                }
+                refreshInBackground();
                 window.setTimeout(() => {
                   setConversionJobs(prev => {
                     const { [path]: _, ...rest } = prev;
@@ -354,7 +365,7 @@ const LocalFileManager = () => {
     }, 3000);
 
     return () => window.clearInterval(intervalId);
-  }, [conversionJobs, currentDirectory, fetchFiles, getConversionErrorMessage]);
+  }, [conversionJobs, refreshInBackground, getConversionErrorMessage]);
 
   useEffect(() => {
     if (dialog?.type === 'create-folder' || dialog?.type === 'rename') {

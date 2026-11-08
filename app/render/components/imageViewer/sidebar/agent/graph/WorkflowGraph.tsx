@@ -2339,6 +2339,17 @@ export const WorkflowGraph: React.FC = () => {
   // tab under its own entry's name updates that entry; any other existing name
   // is a conflict shown inline in the Save dialog (no overwrite, no prompt).
   const [libraryNameByWfId, setLibraryNameByWfId] = useState<Record<string, string>>({})
+  // A library name belongs to at most one tab: the tab that last loaded or
+  // saved it. Any other tab that still points at it loses the claim, so it
+  // can't silently overwrite that entry later.
+  const claimLibraryName = useCallback((wfId: string, name: string) => {
+    setLibraryNameByWfId((prev) => {
+      const next: Record<string, string> = {}
+      for (const [id, n] of Object.entries(prev)) if (n !== name) next[id] = n
+      next[wfId] = name
+      return next
+    })
+  }, [])
   const saveNameConflict = useMemo(() => {
     const name = saveForm.name.trim()
     if (!name || !savedList[name] || libraryNameByWfId[activeWf.id] === name) return null
@@ -2485,7 +2496,10 @@ export const WorkflowGraph: React.FC = () => {
       panelStates: mergedPanelStates as Record<string, unknown>,
       bottomMode,
       chatMessages: JSON.parse(JSON.stringify(chatMessages)) as unknown[],
-      libraryNameByWfId,
+      // Only tabs that are still open.
+      libraryNameByWfId: Object.fromEntries(
+        Object.entries(libraryNameByWfId).filter(([id]) => workflows.some((w) => w.id === id))
+      ),
     }
     if (sessionSaveTimerRef.current) clearTimeout(sessionSaveTimerRef.current)
     sessionSaveTimerRef.current = setTimeout(() => {
@@ -3220,7 +3234,7 @@ export const WorkflowGraph: React.FC = () => {
       return
     }
     setSavedList(all)
-    setLibraryNameByWfId((prev) => ({ ...prev, [activeWf.id]: name }))
+    claimLibraryName(activeWf.id, name)
     setSaveDialogOpen(false)
     notifyWorkflowLocalStorageChanged()
     toast.success(`Saved "${name}" (graph, chat, and node settings)`)
@@ -3228,7 +3242,7 @@ export const WorkflowGraph: React.FC = () => {
     if (saveForm.publish) {
       preparePublishWorkflow(name, snapshot)
     }
-  }, [saveForm, activeWf, panelStates, chatMessages, buildRuntimeContextSnapshot, preparePublishWorkflow, currentPath, libraryNameByWfId])
+  }, [saveForm, activeWf, panelStates, chatMessages, buildRuntimeContextSnapshot, preparePublishWorkflow, currentPath, libraryNameByWfId, claimLibraryName])
 
   // Submit the One-vs-rest Save dialog: for each chosen class, write a scoped
   // save_classifier_paths ({class: <folder>/<name>.tlcls}), run ONE training pass
@@ -3845,12 +3859,12 @@ export const WorkflowGraph: React.FC = () => {
       }
       setWorkflows((prev) => [...prev, loaded])
       setActiveWfId(loaded.id)
-      setLibraryNameByWfId((prev) => ({ ...prev, [loaded.id]: name }))
+      claimLibraryName(loaded.id, name)
       const resolved = await ensureCommunityClassifiersResolved(wf)
       restoreSavedWorkflowPanelsAndChat(resolved)
       toast.success(`Loaded "${name}"`)
     },
-    [restoreSavedWorkflowPanelsAndChat, ensureCommunityClassifiersResolved]
+    [restoreSavedWorkflowPanelsAndChat, ensureCommunityClassifiersResolved, claimLibraryName]
   )
 
   // Load a preset community workflow (default JSON until online DB is wired).
@@ -3886,6 +3900,12 @@ export const WorkflowGraph: React.FC = () => {
       return
     }
     setSavedList(all)
+    // The entry is gone: no tab owns that name any more.
+    setLibraryNameByWfId((prev) => {
+      const next: Record<string, string> = {}
+      for (const [id, n] of Object.entries(prev)) if (n !== name) next[id] = n
+      return next
+    })
     notifyWorkflowLocalStorageChanged()
     toast.message(`Removed "${name}"`)
   }, [])

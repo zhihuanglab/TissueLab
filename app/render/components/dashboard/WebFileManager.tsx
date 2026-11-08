@@ -499,7 +499,10 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     setChunkUploadResumeHints(listChunkUploadResumeHints());
   }, []);
 
+  // Whether the center Upload dialog is on screen (read when a batch ends).
+  const uploadDialogOpenRef = useRef(false);
   useEffect(() => {
+    uploadDialogOpenRef.current = Boolean(uploadSettings.isUploadDialogOpen);
     if (uploadSettings.isUploadDialogOpen) {
       refreshChunkUploadResumeHints();
     }
@@ -2314,7 +2317,14 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
               (s) => s.status === 'Error'
             );
             const failed = Math.max(uploadResults.failed, errorStatuses.length);
-            if (failed > 0) {
+            if (failed > 0 && !uploadDialogOpenRef.current) {
+              // The dialog was closed after the last file settled but before this
+              // summary ran: nobody would see the banner, so report the failures now.
+              toast.error(
+                `${failed} file${failed === 1 ? '' : 's'} failed to upload`,
+                uploadResults.successful > 0 ? { description: `${uploadResults.successful} uploaded.` } : undefined,
+              );
+            } else if (failed > 0) {
               setUploadResult({
                 successful: uploadResults.successful,
                 failed,
@@ -3790,6 +3800,8 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
                         if (uploadDisabled || denyWriteToast('upload files', currentDirectory)) {
                           return;
                         }
+                        // A new session starts clean; an earlier batch's summary is old news.
+                        setUploadResult(null);
                         dispatch(setUploadSettings({ isUploadDialogOpen: true }));
                       }}
                       disabled={uploadDisabled}

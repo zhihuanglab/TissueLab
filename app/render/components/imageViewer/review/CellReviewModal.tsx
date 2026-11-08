@@ -331,9 +331,23 @@ export const CellReviewModal: React.FC<CellReviewModalProps> = ({
         returnAxiosFormat: true,
       });
       if (seq !== tileRequestSeqRef.current) return;
-
+      // This request shares the tile sequence with fetchAndPositionCell and can
+      // supersede it (e.g. "Show contour" toggled while a cell tile loads), so
+      // it also ends the loading state and re-points the slider cache at
+      // this cell.
+      setIsLoadingReview(false);
 
       const d = response.data as Record<string, any>;
+      const tileBody = d?.image != null ? d : d?.data;
+      if (tileBody?.image) {
+        setCachedCellData({
+          slide: cell.slideId,
+          cellId: cell.cellId,
+          centroid: cell.centroid,
+          contour: tileBody.contour,
+          bounds: tileBody.bounds,
+        });
+      }
 
       // Classification fields may sit on unwrapped body or under .data
       let cellClassificationData: any = null;
@@ -379,6 +393,7 @@ export const CellReviewModal: React.FC<CellReviewModalProps> = ({
     } catch (error: any) {
       if (seq !== tileRequestSeqRef.current) return;
       setContourData(null);
+      setIsLoadingReview(false);
     }
   };
 

@@ -121,21 +121,32 @@ export function WorkflowBatchDialog(props: WorkflowBatchDialogProps) {
 
   // Select everything when the dialog opens (or when the first files arrive).
   // After that a refreshed list only drops paths that disappeared: resetting
-  // to "all" here made Start run files the user had unticked.
+  // to "all" here made Start run files the user had unticked. While nothing
+  // has been unticked yet (everything listed is selected, e.g. only the
+  // current-slide fallback before the folder listing arrived), files that
+  // appear are selected too.
   const seededRef = useRef(false)
+  const prevPathsRef = useRef<string[]>([])
   useEffect(() => {
     if (!open) {
       seededRef.current = false
+      prevPathsRef.current = []
       return
     }
     const paths = files.map((file) => file.path)
+    const prevPaths = prevPathsRef.current
+    prevPathsRef.current = paths
     if (!seededRef.current) {
       if (paths.length > 0) seededRef.current = true
       setSelectedPaths(new Set(paths))
       return
     }
     const present = new Set(paths)
-    setSelectedPaths((prev) => new Set([...prev].filter((p) => present.has(p))))
+    setSelectedPaths((prev) => {
+      const allWereSelected = prevPaths.length > 0 && prevPaths.every((p) => prev.has(p))
+      if (allWereSelected) return new Set(paths)
+      return new Set([...prev].filter((p) => present.has(p)))
+    })
   }, [files, open])
 
   // Reset the search when the dialog closes so the next open starts clean.
