@@ -109,6 +109,46 @@ export function getContourGeometry(contour: ContourLike | null | undefined): Con
   return geometry;
 }
 
+/** Ray cast over flat contour coords [x0, y0, x1, y1, ...]. */
+export function isPointInContour(x: number, y: number, points: PointList | null | undefined): boolean {
+  if (!points) return false;
+  const n = points.length >> 1;
+  if (n < 3) return false;
+
+  let inside = false;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
+    const xi = points[i * 2];
+    const yi = points[i * 2 + 1];
+    const xj = points[j * 2];
+    const yj = points[j * 2 + 1];
+    if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/**
+ * The first contour whose polygon contains (x, y), or null. Each contour is
+ * AABB-rejected first, so only a contour the point could be inside is ray-cast.
+ */
+export function findContourAtPoint<T extends ContourLike>(
+  contours: readonly T[],
+  x: number,
+  y: number,
+): T | null {
+  for (let i = 0; i < contours.length; i++) {
+    const contour = contours[i];
+    const points = contour?.points;
+    if (!points || points.length < 6) continue;
+    const geometry = getContourGeometry(contour);
+    if (x < geometry.minX || x > geometry.maxX) continue;
+    if (y < geometry.minY || y > geometry.maxY) continue;
+    if (isPointInContour(x, y, points)) return contour;
+  }
+  return null;
+}
+
 /**
  * Half-open overlap test, identical to the sweep it replaces: a contour whose
  * bounds only touch an edge of `aabb` does not count as inside.

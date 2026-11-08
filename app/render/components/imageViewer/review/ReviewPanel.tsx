@@ -218,7 +218,12 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
   // Batch processing: commit all staged review actions on Save —
   //   • "Yes" confirmations + "No" reclassifications → one save_annotation/batch call
   //   • Saved-view removals → delete each from user_annotation
-  const submitPendingReclassifications = useCallback(async (): Promise<ReviewSaveResult | null> => {
+  const submitPendingReclassifications = useCallback(async (
+    // Class the staged "Yes" confirmations were made for. Defaults to the
+    // current review class; the class-switch auto-save passes the previous one
+    // because reviewState.className has already moved to the new class.
+    confirmedClassName?: string,
+  ): Promise<ReviewSaveResult | null> => {
     if (!activeInstanceId || !currentPath) return null;
     if (!reviewState.slideId) return null;
     if (!assertWritable("submit review changes")) {
@@ -315,14 +320,15 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
 
       // Bump nuclei class counts for everything committed (cell only — patch
       // counts are maintained server-side in patch_class_counts):
-      //   "Yes" confirmations → the current review class
+      //   "Yes" confirmations → the class they were made for (confirmedClassName)
       //   "No" reclassifications → their chosen target class
       // A caller-scoped class list (patch panels) must not mutate the shared
       // cell-class Redux list.
       if (!isPatch && !reviewClassesProp) {
         const classChangeCounts = new Map<string, number>();
-        if (reviewState.className && confirmedCells.size > 0) {
-          classChangeCounts.set(reviewState.className, confirmedCells.size);
+        const yesClassName = confirmedClassName ?? reviewState.className;
+        if (yesClassName && confirmedCells.size > 0) {
+          classChangeCounts.set(yesClassName, confirmedCells.size);
         }
         reclassEntries.forEach(([, newClass]) => {
           classChangeCounts.set(newClass, (classChangeCounts.get(newClass) || 0) + 1);
@@ -402,18 +408,31 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
       setPendingReclassifications(new Map());
       // Clear confirmed cells
       setConfirmedCells(new Set());
+      // Staged removals hold the old slide's cell ids — keeping them would
+      // delete those ids from the new slide on the next save.
+      setPendingRemovals(new Set());
+      setReviewMode("review");
     }
   }, [currentPath, reviewState.slideId, dispatch]);
   
-  // Batch processing: Submit pending reclassifications when switching classes
+  // Batch processing: submit pending reclassifications once when the class
+  // changes. Keyed on the class name alone: depending on the submit callback
+  // re-ran this after every save (each save clears the pending sets, which
+  // recreates the callback) and re-posted save_annotation/batch in a loop.
+  const submitPendingRef = useRef(submitPendingReclassifications);
   useEffect(() => {
-    if (reviewState.className !== currentHistogramClass && currentHistogramClass !== null) {
-      // Class has been switched, submit pending reclassifications
-      submitPendingReclassifications();
+    submitPendingRef.current = submitPendingReclassifications;
+  }, [submitPendingReclassifications]);
+  const prevReviewClassRef = useRef(reviewState.className);
+  useEffect(() => {
+    const prev = prevReviewClassRef.current;
+    prevReviewClassRef.current = reviewState.className;
+    if (prev && prev !== reviewState.className) {
+      void submitPendingRef.current(prev);
       // Clear confirmed cells (because switched to new class)
       setConfirmedCells(new Set());
     }
-  }, [reviewState.className, currentHistogramClass, submitPendingReclassifications]);
+  }, [reviewState.className]);
 
   // Get target class from Redux state (set by ClassificationPanel)
   const targetClass = useMemo(() => {
@@ -722,9 +741,20 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
     }
   };
 
+  // One auto-clear timer at a time: an older click's timer must not clear a
+  // newer selection early.
+  const selectionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (selectionTimerRef.current) clearTimeout(selectionTimerRef.current);
+  }, []);
+
   //Handle candidate click
   const handleCandidateClick = useCallback((clickedCandidate: any) => {
-    
+    if (selectionTimerRef.current) {
+      clearTimeout(selectionTimerRef.current);
+      selectionTimerRef.current = null;
+    }
+
     // Toggle selection - if clicking the same candidate, deselect it
     // This prevents the "sticking" behavior mentioned in requirements
     if (selectedCandidate?.cell_id === clickedCandidate.cell_id) {
@@ -736,7 +766,8 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
     setSelectedCandidate(clickedCandidate);
     
     // Auto-clear selection after 3 seconds to prevent sticking
-    setTimeout(() => {
+    selectionTimerRef.current = setTimeout(() => {
+      selectionTimerRef.current = null;
       setSelectedCandidate(null);
     }, 3000);
     
@@ -878,7 +909,10 @@ export const ActiveLearningPanel = React.forwardRef<ActiveLearningPanelRef, Acti
                 }
                 loading={reviewMode === 'saved'
                   ? (reviewState?.loading || false)
-                  : (reviewState?.loading || thresholdLoading || (currentHistogramClass !== reviewState.className))}
+                  // A failed first load never sets currentHistogramClass; don't let the class
+                  // mismatch keep the skeleton up over the error + Retry (N-04).
+                  : (reviewState?.loading || thresholdLoading ||
+                     (!reviewState?.error && currentHistogramClass !== reviewState.className))}
                 error={reviewState?.error || null}
                 total={
                   reviewMode === 'saved'

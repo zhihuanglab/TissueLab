@@ -100,13 +100,19 @@ export const CellReviewModal: React.FC<CellReviewModalProps> = ({
   const [pendingReclassificationsCount, setPendingReclassificationsCount] = useState(0);
   const activeLearningPanelRef = useRef<ActiveLearningPanelRef>(null);
   const viewSizeDebounceRef = useRef<NodeJS.Timeout | null>(null);
+  // Latest cell_review_tile request. Replies to older requests (a previously
+  // clicked cell, an earlier zoom, a closed modal) are dropped so they cannot
+  // replace what the user is looking at now.
+  const tileRequestSeqRef = useRef(0);
 
   // Reset review state whenever the modal closes (covers X / overlay / Close
   // button / parent-controlled close).
   useEffect(() => {
     if (!open) {
+      tileRequestSeqRef.current += 1;
       setReviewData(null);
-      setShowContour(false);
+      // Back to the initial default (on), so every open starts the same way.
+      setShowContour(true);
       setReviewError(null);
       setIsLoadingReview(false);
       setIsResizingView(false);
@@ -152,6 +158,7 @@ export const CellReviewModal: React.FC<CellReviewModalProps> = ({
     const currentPatchSize = customPatchSize || calculatePatchSizeFromZoom(currentZoom);
 
     setIsLoadingReview(true);
+    const seq = ++tileRequestSeqRef.current;
 
     try {
       // Call backend API to get cell patch with variable size
@@ -169,6 +176,7 @@ export const CellReviewModal: React.FC<CellReviewModalProps> = ({
         body: JSON.stringify(requestPayload),
         returnAxiosFormat: true,
       });
+      if (seq !== tileRequestSeqRef.current) return;
 
 
       // Handle API response format (cell patch data)
@@ -228,6 +236,7 @@ export const CellReviewModal: React.FC<CellReviewModalProps> = ({
       setIsLoadingReview(false);
 
     } catch (error: any) {
+      if (seq !== tileRequestSeqRef.current) return;
       setReviewError(getErrorMessage(error, 'Failed to fetch and position cell'));
       setIsLoadingReview(false);
     }
@@ -287,6 +296,7 @@ export const CellReviewModal: React.FC<CellReviewModalProps> = ({
     if (!cell) return;
 
     const currentMagnification = magnification ?? 40;
+    const seq = ++tileRequestSeqRef.current;
 
     try {
       // Validate cell data before making request
@@ -320,6 +330,7 @@ export const CellReviewModal: React.FC<CellReviewModalProps> = ({
         body: JSON.stringify(requestPayload),
         returnAxiosFormat: true,
       });
+      if (seq !== tileRequestSeqRef.current) return;
 
 
       const d = response.data as Record<string, any>;
@@ -366,14 +377,36 @@ export const CellReviewModal: React.FC<CellReviewModalProps> = ({
       }
 
     } catch (error: any) {
+      if (seq !== tileRequestSeqRef.current) return;
       setContourData(null);
     }
+  };
+
+  // Every way of closing (Close button, Esc, X, click outside) saves the
+  // staged Yes/No actions first, so labels are never dropped silently. No
+  // "save changes?" prompt. A read-only slide can't be saved, so closing just
+  // closes it (Update is disabled there too).
+  const closingRef = useRef(false);
+  const closeWithSave = async () => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    try {
+      const panel = activeLearningPanelRef.current;
+      if (pathWritable && panel && panel.getPendingReclassificationsCount() > 0) {
+        await panel.submitPendingReclassifications();
+      }
+    } catch {
+      // Silent failure, don't disturb user
+    } finally {
+      closingRef.current = false;
+    }
+    onClose();
   };
 
   return (
     <Dialog
       open={open}
-      onOpenChange={(o) => { if (!o) onClose(); }}
+      onOpenChange={(o) => { if (!o) void closeWithSave(); }}
     >
       <DialogContent className="max-w-[1200px] w-full max-h-[90vh] overflow-hidden flex flex-col">
         <DialogHeader>
@@ -484,7 +517,7 @@ export const CellReviewModal: React.FC<CellReviewModalProps> = ({
                     </Button>
                   </div>
                 </div>
-              ) : !reviewState?.selectedClass ? (
+              ) : !(reviewState?.className || reviewState?.selectedClass) ? (
                 <div style={{
                   position: 'absolute',
                   top: 0,
@@ -730,23 +763,7 @@ export const CellReviewModal: React.FC<CellReviewModalProps> = ({
         </Button>
         <Button
           variant="secondary"
-          onClick={async () => {
-            // Auto-save all reclassifications before closing
-            try {
-              // Submit pending batch reclassifications first
-              if (activeLearningPanelRef.current) {
-                const pendingCount = activeLearningPanelRef.current.getPendingReclassificationsCount();
-                if (pendingCount > 0) {
-                  await activeLearningPanelRef.current.submitPendingReclassifications();
-                }
-              }
-
-            } catch (error) {
-              // Silent failure, don't disturb user
-            }
-
-            onClose();
-          }}
+          onClick={() => { void closeWithSave(); }}
         >
           Close
         </Button>

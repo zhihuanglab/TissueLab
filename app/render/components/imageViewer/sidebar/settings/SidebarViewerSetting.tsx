@@ -3,7 +3,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { RangeInput } from '@/components/ui/range-input';
 import { useShortcuts } from '@/hooks/viewer/useShortcuts';
 import { useViewerSettings } from '@/hooks/viewer/useViewerSettings';
-import type { ShortcutActionKey } from '@/store/slices/viewer/shortcutsSlice';
+import { findShortcutConflict, shortcutKeyFromEvent, type ShortcutActionKey } from '@/store/slices/viewer/shortcutsSlice';
 import { CheckCircle2, XCircle } from 'lucide-react';
 import React from 'react';
 
@@ -132,180 +132,124 @@ const SidebarPrefs = () => {
 
 export default SidebarPrefs;
 
-// Editable shortcuts card
+/** Same top-to-bottom order as the viewer toolbar (tools left to right, then the overlay toggles). */
+const SHORTCUT_ROWS: { label: string; action: ShortcutActionKey }[] = [
+    { label: 'Tool: Move', action: 'tool.move' },
+    { label: 'Tool: Lasso', action: 'tool.lasso' },
+    { label: 'Tool: Rectangle', action: 'tool.rectangle' },
+    { label: 'Tool: Polygon', action: 'tool.polygon' },
+    { label: 'Tool: Ruler', action: 'tool.line' },
+    { label: 'Tool: Filter', action: 'tool.filter' },
+    { label: 'Toggle Nuclei Annotations', action: 'toggleNuclei' },
+    { label: 'Toggle Patch Annotations', action: 'togglePatches' },
+    { label: 'Toggle Tissue Overlay', action: 'toggleMask' },
+];
+
+/** Keys the viewer itself owns ('f' flips the slide), so they cannot be rebound. */
+const RESERVED_KEYS = new Set(['f']);
+
+/**
+ * The row waiting for a key press, if any, and why its last key was refused.
+ * The binding only changes once an accepted key arrives, so leaving capture
+ * (Esc, click outside, focus loss) has nothing to undo.
+ */
+type ShortcutCapture = {
+    action: ShortcutActionKey;
+    refused?: { reason: 'conflict'; with: ShortcutActionKey } | { reason: 'reserved'; key: string };
+} | null;
+
+// One shortcut row. Declared at module scope: a component declared inside
+// ShortcutsCard is a new type on every render, so every row would remount.
+const ShortcutRow: React.FC<{
+    label: string;
+    action: ShortcutActionKey;
+    bindings: Record<ShortcutActionKey, string>;
+    capture: ShortcutCapture;
+    setCapture: (capture: ShortcutCapture) => void;
+    updateShortcut: (action: ShortcutActionKey, key: string) => void;
+}> = ({ label, action, bindings, capture, setCapture, updateShortcut }) => {
+    const buttonRef = React.useRef<HTMLButtonElement>(null);
+    const isWaiting = capture?.action === action;
+
+    // While this row waits: take the next key press, and leave on a click
+    // elsewhere or focus loss. Clicking another row ends this one the same way.
+    React.useEffect(() => {
+        if (!isWaiting) return;
+
+        const onKeyDown = (e: KeyboardEvent) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (e.key === 'Escape') {
+                setCapture(null);
+                return;
+            }
+            const key = shortcutKeyFromEvent(e);
+            if (RESERVED_KEYS.has(key)) {
+                setCapture({ action, refused: { reason: 'reserved', key } });
+                return;
+            }
+            const taken = findShortcutConflict(bindings, key, action);
+            if (taken) {
+                setCapture({ action, refused: { reason: 'conflict', with: taken } });
+                return;
+            }
+            updateShortcut(action, key);
+            setCapture(null);
+        };
+        const onMouseDown = (e: MouseEvent) => {
+            if (!buttonRef.current?.contains(e.target as Node)) setCapture(null);
+        };
+        const onBlur = () => setCapture(null);
+
+        const button = buttonRef.current;
+        window.addEventListener('keydown', onKeyDown, true);
+        // Deferred so the click that started capture does not end it.
+        const timeoutId = setTimeout(() => document.addEventListener('mousedown', onMouseDown), 0);
+        button?.addEventListener('blur', onBlur);
+        return () => {
+            window.removeEventListener('keydown', onKeyDown, true);
+            clearTimeout(timeoutId);
+            document.removeEventListener('mousedown', onMouseDown);
+            button?.removeEventListener('blur', onBlur);
+        };
+    }, [isWaiting, action, bindings, setCapture, updateShortcut]);
+
+    const refused = isWaiting && capture?.refused;
+
+    return (
+        <div className="grid grid-cols-[1fr_120px_24px] items-center gap-2 py-1.5 px-1 hover:bg-muted/50 rounded transition-colors">
+            <div className="text-xs font-medium text-foreground">{label}</div>
+            <button
+                ref={buttonRef}
+                onClick={() => setCapture({ action })}
+                className={`h-8 w-full rounded border border-border bg-background text-center text-xs font-medium hover:bg-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 ${
+                    isWaiting ? 'text-muted-foreground leading-tight' : 'text-foreground'
+                }`}
+            >
+                {isWaiting ? (
+                    <>
+                        Press a key<br />or Esc to cancel
+                    </>
+                ) : (
+                    bindings[action]
+                )}
+            </button>
+            <div className="flex items-center justify-center">
+                {refused ? (
+                    <XCircle className="h-4 w-4 text-destructive" />
+                ) : !isWaiting && (
+                    <CheckCircle2 className="h-4 w-4 text-green-500" />
+                )}
+            </div>
+        </div>
+    );
+};
+
+// Editable shortcuts card; a binding is changed by clicking its key badge.
 const ShortcutsCard: React.FC = () => {
     const { bindings, updateShortcut, reset } = useShortcuts();
-    const [waitingKeyFor, setWaitingKeyFor] = React.useState<string | null>(null);
-    const [conflictFor, setConflictFor] = React.useState<ShortcutActionKey | null>(null);
-    const [conflictWith, setConflictWith] = React.useState<ShortcutActionKey | null>(null);
-    const [reservedFor, setReservedFor] = React.useState<ShortcutActionKey | null>(null);
-    const [reservedKey, setReservedKey] = React.useState<string | null>(null);
-
-    const Row: React.FC<{ label: string; value: string; actionKey: ShortcutActionKey; onChange: (k: string) => void }> = ({ label, value, actionKey, onChange }) => {
-        const buttonRef = React.useRef<HTMLButtonElement>(null);
-        const keyDownHandlerRef = React.useRef<((e: KeyboardEvent) => void) | null>(null);
-        const previousValueRef = React.useRef<string>(value);
-
-        // Update previous value ref when value changes (outside waiting mode)
-        React.useEffect(() => {
-            if (waitingKeyFor !== label) {
-                previousValueRef.current = value;
-            }
-        }, [value, waitingKeyFor, label]);
-
-        // Cleanup function to exit waiting mode
-        const exitWaitingMode = React.useCallback((restoreValue = false) => {
-            if (restoreValue && previousValueRef.current !== value) {
-                // Restore previous value if it was changed
-                onChange(previousValueRef.current);
-            }
-            setWaitingKeyFor(null);
-            setConflictFor(null);
-            setConflictWith(null);
-            setReservedFor(null);
-            setReservedKey(null);
-            if (keyDownHandlerRef.current) {
-                window.removeEventListener('keydown', keyDownHandlerRef.current, true);
-                keyDownHandlerRef.current = null;
-            }
-        }, [value, onChange]);
-
-        // Handle click outside or focus loss
-        React.useEffect(() => {
-            if (waitingKeyFor !== label) return;
-
-            const handleClickOutside = (e: MouseEvent) => {
-                if (buttonRef.current && !buttonRef.current.contains(e.target as Node)) {
-                    // Exit waiting mode and restore previous value
-                    exitWaitingMode(true);
-                }
-            };
-
-            const handleFocusLoss = () => {
-                // Exit waiting mode and restore previous value
-                exitWaitingMode(true);
-            };
-
-            // Add click outside listener (use setTimeout to avoid immediate trigger)
-            const timeoutId = setTimeout(() => {
-                document.addEventListener('mousedown', handleClickOutside);
-            }, 0);
-
-            // Add blur listener to button
-            const button = buttonRef.current;
-            if (button) {
-                button.addEventListener('blur', handleFocusLoss);
-            }
-
-            return () => {
-                clearTimeout(timeoutId);
-                document.removeEventListener('mousedown', handleClickOutside);
-                if (button) {
-                    button.removeEventListener('blur', handleFocusLoss);
-                }
-            };
-        }, [waitingKeyFor, label, exitWaitingMode]);
-
-        const onBadgeClick = () => {
-            // Exit any existing waiting mode first
-            if (keyDownHandlerRef.current) {
-                window.removeEventListener('keydown', keyDownHandlerRef.current, true);
-            }
-            
-            // Save current value before entering waiting mode
-            previousValueRef.current = value;
-            
-            setWaitingKeyFor(label);
-            setConflictFor(null);
-            setConflictWith(null);
-            setReservedFor(null);
-            setReservedKey(null);
-            
-            const onKeyDown = (e: KeyboardEvent) => {
-                // Check if we're still waiting for this specific row
-                setWaitingKeyFor((current) => {
-                    if (current !== label) {
-                        window.removeEventListener('keydown', onKeyDown, true);
-                        keyDownHandlerRef.current = null;
-                        return current;
-                    }
-                    return current;
-                });
-                
-                e.preventDefault();
-                e.stopPropagation();
-                
-                if (e.key === 'Escape') {
-                    // Cancel - exit waiting mode and restore previous value
-                    exitWaitingMode(true);
-                    return;
-                }
-                
-                const key = (e.key === ' ')
-                    ? 'Space'
-                    : (e.key && e.key.length === 1 ? e.key.toLowerCase() : e.code);
-                
-                // reserved key guard (system-reserved)
-                if (key === 'f') {
-                    setReservedFor(actionKey);
-                    setReservedKey('f');
-                    // Keep listening for another key or Esc - stay in waiting mode, don't update value
-                    return;
-                }
-                
-                // conflict detection
-                const hit = Object.entries(bindings).find(([k, v]) => v === key && (k as ShortcutActionKey) !== actionKey) as [ShortcutActionKey, string] | undefined;
-                if (hit) {
-                    setConflictFor(actionKey);
-                    setConflictWith(hit[0]);
-                    // Keep listening for the next key or Esc - stay in waiting mode, don't update value
-                    return;
-                }
-                
-                // Valid key - update the binding and exit waiting mode (don't restore value)
-                onChange(key);
-                exitWaitingMode(false);
-            };
-            
-            keyDownHandlerRef.current = onKeyDown;
-            window.addEventListener('keydown', onKeyDown, true);
-        };
-
-        // Determine status
-        const isWaiting = waitingKeyFor === label;
-        const hasConflict = conflictFor === actionKey;
-        const isReserved = reservedFor === actionKey;
-        const status = isWaiting ? 'waiting' : hasConflict || isReserved ? 'conflict' : 'ok';
-
-        return (
-            <div className="grid grid-cols-[1fr_120px_24px] items-center gap-2 py-1.5 px-1 hover:bg-muted/50 rounded transition-colors">
-                <div className="text-xs font-medium text-foreground">{label}</div>
-                <button
-                    ref={buttonRef}
-                    onClick={onBadgeClick}
-                    className={`h-8 w-full rounded border border-border bg-background text-center text-xs font-medium hover:bg-muted transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-1 ${
-                        isWaiting ? 'text-muted-foreground leading-tight' : 'text-foreground'
-                    }`}
-                >
-                    {isWaiting ? (
-                        <>
-                            Press a key<br />or Esc to cancel
-                        </>
-                    ) : (
-                        value
-                    )}
-                </button>
-                <div className="flex items-center justify-center">
-                    {status === 'ok' && (
-                        <CheckCircle2 className="h-4 w-4 text-green-500" />
-                    )}
-                    {status === 'conflict' && (
-                        <XCircle className="h-4 w-4 text-destructive" />
-                    )}
-                </div>
-            </div>
-        );
-    };
+    const [capture, setCapture] = React.useState<ShortcutCapture>(null);
+    const refused = capture?.refused;
 
     return (
         <Card className="w-[280px]">
@@ -314,29 +258,32 @@ const ShortcutsCard: React.FC = () => {
                 <Button size="sm" variant="outline" className="h-7" onClick={reset}>Reset</Button>
             </CardHeader>
             <CardContent className="p-2 pt-0">
-                {conflictFor && conflictWith && (
+                {refused?.reason === 'conflict' && (
                     <div className="mb-1.5 px-2 py-1 rounded-sm text-[11px] bg-destructive/10 text-destructive border border-destructive/20 text-center">
-                        Conflict: <span className="font-medium">{conflictFor}</span> conflicts with <span className="font-medium">{conflictWith}</span>.
+                        Conflict: <span className="font-medium">{capture!.action}</span> conflicts with <span className="font-medium">{refused.with}</span>.
                         <br />
                         Press another key or Esc to cancel.
                     </div>
                 )}
-                {reservedFor && reservedKey && (
+                {refused?.reason === 'reserved' && (
                     <div className="mb-1.5 px-2 py-1 rounded-sm text-[11px] bg-muted text-foreground border border-border text-center">
-                        &quot;{reservedKey}&quot; is reserved by the OSD.flip.
+                        &quot;{refused.key}&quot; is reserved by the OSD.flip.
                         <br />
                         Press another key or Esc to cancel.
                     </div>
                 )}
                 <div className="space-y-0">
-                    <Row label="Toggle Nuclei Annotations" actionKey={'toggleNuclei'} value={bindings.toggleNuclei} onChange={(k) => updateShortcut('toggleNuclei', k)} />
-                    <Row label="Toggle Patch Annotations" actionKey={'togglePatches'} value={bindings.togglePatches} onChange={(k) => updateShortcut('togglePatches', k)} />
-                    <Row label="Toggle Tissue Overlay" actionKey={'toggleMask'} value={bindings.toggleMask} onChange={(k) => updateShortcut('toggleMask', k)} />
-                    <Row label="Tool: Move" actionKey={'tool.move'} value={bindings['tool.move']} onChange={(k) => updateShortcut('tool.move', k)} />
-                    <Row label="Tool: Polygon" actionKey={'tool.polygon'} value={bindings['tool.polygon']} onChange={(k) => updateShortcut('tool.polygon', k)} />
-                    <Row label="Tool: Rectangle" actionKey={'tool.rectangle'} value={bindings['tool.rectangle']} onChange={(k) => updateShortcut('tool.rectangle', k)} />
-                    <Row label="Tool: Ruler" actionKey={'tool.line'} value={bindings['tool.line']} onChange={(k) => updateShortcut('tool.line', k)} />
-                    <Row label="Tool: Filter" actionKey={'tool.filter'} value={bindings['tool.filter']} onChange={(k) => updateShortcut('tool.filter', k)} />
+                    {SHORTCUT_ROWS.map(({ label, action }) => (
+                        <ShortcutRow
+                            key={action}
+                            label={label}
+                            action={action}
+                            bindings={bindings}
+                            capture={capture}
+                            setCapture={setCapture}
+                            updateShortcut={updateShortcut}
+                        />
+                    ))}
                 </div>
             </CardContent>
         </Card>

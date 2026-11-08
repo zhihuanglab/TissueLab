@@ -1,5 +1,5 @@
 import { useCallback, useEffect } from 'react'
-import { useDispatch, useSelector } from 'react-redux'
+import { useDispatch, useSelector, useStore } from 'react-redux'
 import { RootState } from '@/store'
 import { DEFAULT_SHORTCUTS, resetShortcuts, setAllShortcuts, setShortcut, ShortcutActionKey } from '@/store/slices/viewer/shortcutsSlice'
 
@@ -24,6 +24,7 @@ const saveToLocalStorage = (bindings: Record<ShortcutActionKey, string>) => {
 
 export const useShortcuts = () => {
   const dispatch = useDispatch()
+  const store = useStore<RootState>()
   const bindings = useSelector((state: RootState) => state.shortcuts.bindings)
 
   useEffect(() => {
@@ -33,17 +34,18 @@ export const useShortcuts = () => {
     if (loaded) dispatch(setAllShortcuts({ ...DEFAULT_SHORTCUTS, ...loaded }))
   }, [dispatch])
 
-  useEffect(() => {
-    saveToLocalStorage(bindings)
-  }, [bindings])
-
+  // Persist only on an explicit change. Saving whatever Redux held on mount
+  // wrote the defaults over the user's bindings before they were loaded,
+  // whenever two components using this hook mounted together.
   const updateShortcut = useCallback((action: ShortcutActionKey, key: string) => {
     dispatch(setShortcut({ action: action, key }))
-  }, [dispatch])
+    saveToLocalStorage(store.getState().shortcuts.bindings)
+  }, [dispatch, store])
 
   const reset = useCallback(() => {
     dispatch(resetShortcuts())
-  }, [dispatch])
+    saveToLocalStorage(store.getState().shortcuts.bindings)
+  }, [dispatch, store])
 
   const isConflict = (key: string, self?: ShortcutActionKey) => {
     return Object.entries(bindings).some(([k, v]) => v === key && (k as ShortcutActionKey) !== self)

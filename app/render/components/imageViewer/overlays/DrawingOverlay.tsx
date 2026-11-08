@@ -1,6 +1,6 @@
 import { RootState } from "@/store";
-import { useAnnotationTypes } from '@/store/zustand/slice/annotationTypesStore';
-import { getContourGeometry } from '@/utils/viewer/contourGeometry';
+import { annotationTypeStore, useAnnotationTypes } from '@/store/zustand/slice/annotationTypesStore';
+import { findContourAtPoint, getContourGeometry } from '@/utils/viewer/contourGeometry';
 import { webglContextManager } from '@/utils/viewer/webglContextManager';
 import { mat2d } from "gl-matrix";
 import OpenSeadragon from "openseadragon";
@@ -173,27 +173,6 @@ const createCircleVertices = (segments: number) => {
   }
   return vertices;
 };
-
-// Ray casting over flat contour coords [x0, y0, x1, y1, ...].
-const isPointInPolygon = (x: number, y: number, polygonPoints: Int32Array | null): boolean => {
-  if (!polygonPoints) return false;
-  const n = polygonPoints.length >> 1;
-  if (n < 3) return false;
-
-  let inside = false;
-  for (let i = 0, j = n - 1; i < n; j = i++) {
-    const xi = polygonPoints[i * 2];
-    const yi = polygonPoints[i * 2 + 1];
-    const xj = polygonPoints[j * 2];
-    const yj = polygonPoints[j * 2 + 1];
-
-    if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
-      inside = !inside;
-    }
-  }
-
-  return inside;
-}
 
 const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
   viewer,
@@ -669,21 +648,23 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
   // Precise hit-test: the cell whose CONTOUR polygon actually contains (cx, cy).
   // AABB-reject each cell first (cheap bounds compare, memoised on the contour);
   // only the polygon the point could be inside runs the ray-cast. Returns that
-  // cell's class index, or null when the point is outside every contour.
-  const findCellClassAtPoint = useCallback((cx: number, cy: number): number | null => {
-    for (let a = 0; a < annotations.length; a++) {
-      const annotation = annotations[a];
-      const points = annotation?.points as Int32Array | undefined;
-      if (!points || points.length < 6) continue;
-      const geometry = getContourGeometry(annotation);
-      if (cx < geometry.minX || cx > geometry.maxX) continue;
-      if (cy < geometry.minY || cy > geometry.maxY) continue;
-      if (!isPointInPolygon(cx, cy, points)) continue;
-      const classId = annotation.class_id;
-      return typeof classId === "number" ? classId : -1;
-    }
-    return null;
-  }, [annotations]);
+  // cell's class (name + colour), or null when the point is outside every contour.
+  // A manual reclassification (double-click, review) lives in the override
+  // store, not in the contour's class_id, and it is what the fill shows — so it
+  // wins here too, or the popup names the old class over a recoloured cell.
+  const findCellClassAtPoint = useCallback((cx: number, cy: number): { name: string; color: string } | null => {
+    const annotation = findContourAtPoint(annotations, cx, cy);
+    if (!annotation) return null;
+    const override = annotation.id != null
+      ? annotationTypeStore.getState().annotationTypes.get(String(annotation.id))
+      : undefined;
+    if (override?.category) return { name: override.category, color: override.color || "#888888" };
+    const classId = annotation.class_id;
+    const cls = typeof classId === "number" && classId >= 0 && classId < nucleiClasses.length
+      ? nucleiClasses[classId]
+      : undefined;
+    return { name: cls?.name ?? "Unclassified", color: cls?.color ?? "#888888" };
+  }, [annotations, nucleiClasses]);
 
   // Process polygon edge data (contours) — WebGL highlight is the contour (yellow edges).
   // With selection: when filterHighlightIndices set, only show contours for highlighted (prob >= threshold); else show all in region.
@@ -1209,9 +1190,8 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
   // Read by the click handler through a ref: these change on every contour
   // repaint, and as dependencies they re-registered three OSD handlers per frame
   // during a pan.
-  const clickReadsRef = useRef({ findCellClassAtPoint, nucleiClasses, annotations });
+  const clickReadsRef = useRef({ findCellClassAtPoint, annotations });
   clickReadsRef.current.findCellClassAtPoint = findCellClassAtPoint;
-  clickReadsRef.current.nucleiClasses = nucleiClasses;
   clickReadsRef.current.annotations = annotations;
 
   useEffect(() => {
@@ -1229,18 +1209,15 @@ const DrawingOverlay: React.FC<DrawingOverlayProps> = ({
       const imgPoint = tiledImage.viewportToImageCoordinates(
         viewer.viewport.pointFromPixel(event.position),
       );
-      const classId = reads.findCellClassAtPoint(imgPoint.x, imgPoint.y);
-      if (classId === null) { setClassPopup(null); return; } // outside every contour
+      const cls = reads.findCellClassAtPoint(imgPoint.x, imgPoint.y);
+      if (cls === null) { setClassPopup(null); return; } // outside every contour
 
-      const cls = classId >= 0 && classId < reads.nucleiClasses.length
-        ? reads.nucleiClasses[classId]
-        : undefined;
       const oe = event.originalEvent as MouseEvent | undefined;
       setClassPopup({
         x: oe?.clientX ?? 0,
         y: oe?.clientY ?? 0,
-        name: cls?.name ?? "Unclassified",
-        color: cls?.color ?? "#888888",
+        name: cls.name,
+        color: cls.color,
       });
     };
     const dismiss = () => setClassPopup(null);

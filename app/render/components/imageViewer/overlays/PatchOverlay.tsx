@@ -146,6 +146,19 @@ const PatchOverlay: React.FC<PatchOverlayProps> = ({
     const scale = Math.hypot(a, b);
     const gtTissueSet = highlightGtAnnotations && gtHighlightTissueIndices.length > 0 ? new Set(gtHighlightTissueIndices) : null;
 
+    // Class ids are stable (deleting a class does not renumber the rest), so map id -> colour
+    // through class_id rather than by array position (N-09). Fall back to position only when
+    // the store carries no class_id list.
+    const classColors = reduxPatchClassificationData?.class_hex_color;
+    const classIds = reduxPatchClassificationData?.class_id;
+    const colorByClassId = new Map<number, string>();
+    if (classColors) {
+      classColors.forEach((hex, i) => {
+        const id = Array.isArray(classIds) && classIds.length === classColors.length ? Number(classIds[i]) : i;
+        if (Number.isFinite(id) && !colorByClassId.has(id)) colorByClassId.set(id, hex);
+      });
+    }
+
     patches.forEach((patch) => {
       // Extract patch data: [idx, x, y, width, height, color, class_id]
       // Handle both old format (without class_id) and new format (with class_id)
@@ -156,12 +169,10 @@ const PatchOverlay: React.FC<PatchOverlayProps> = ({
       const height = patch[4];
       const color = patch[5];
       const class_id = patch.length > 6 ? patch[6] : -1;
-      const classColors = reduxPatchClassificationData?.class_hex_color;
       const finalColor =
         patchOverrides[idx] ||
-        (classColors && class_id >= 0 && class_id < classColors.length
-          ? classColors[class_id]
-          : color);
+        (class_id >= 0 ? colorByClassId.get(Number(class_id)) : undefined) ||
+        color;
       
       // Use dynamic patch dimensions from backend (already in image-space coordinates)
       const patchImageWidth = width;

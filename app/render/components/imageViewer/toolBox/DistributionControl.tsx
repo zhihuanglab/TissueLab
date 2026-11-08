@@ -187,7 +187,11 @@ export default function DistributionControl({
   const { assertWritable, toastIfDenied, allowed: pathWritable, tooltip: writeBlockTitle } = usePathWriteAccess(currentPath)
   const { userInfo } = useUserInfo()
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const containerRef = useRef<HTMLDivElement>(null)
+  // Callback ref (state): the chart container only mounts once data arrives,
+  // so the resize observer has to start when the element appears.
+  const [containerEl, setContainerEl] = useState<HTMLDivElement | null>(null)
+  // Latest histogram request; replies for an older region/class are dropped.
+  const histogramSeqRef = useRef(0)
   const isDraggingRef = useRef(false)
   const [chartWidth, setChartWidth] = useState(260)
 
@@ -262,6 +266,8 @@ export default function DistributionControl({
   }, [isDragging, updateThresholdFromClientX])
 
   const fetchRegionProbabilityHistogram = useCallback(async () => {
+    const seq = ++histogramSeqRef.current
+    const isStale = () => seq !== histogramSeqRef.current
     if (selectedClass.source !== "nuclei" || !shapeCoords || !currentPath || !instanceId) {
       setProbHist([])
       return
@@ -280,6 +286,7 @@ export default function DistributionControl({
         `${AI_SERVICE_API_ENDPOINT}/seg/v1/region_probability_histogram?file_path=${encodeURIComponent(formattedPath)}&start_x=${start_x}&start_y=${start_y}&end_x=${end_x}&end_y=${end_y}&class_id=${class_id}`,
         { method: "GET", returnAxiosFormat: true }
       )
+      if (isStale()) return
       const data = resp?.data?.data ?? resp?.data
       if (data?.probs && Array.isArray(data.probs)) {
         const probs = data.probs as number[]
@@ -293,20 +300,25 @@ export default function DistributionControl({
         setProbHist([])
       }
     } catch (e) {
-      if (isSegmentationHandlerNotReadyError(e)) return
+      if (isStale() || isSegmentationHandlerNotReadyError(e)) return
       setError(getErrorMessage(e, "Failed to load probability distribution"))
       setRegionProbs([])
       setRegionIndices([])
       setProbHist([])
     } finally {
-      setLoading(false)
+      if (!isStale()) setLoading(false)
     }
   }, [selectedClass.source, selectedClass.index, shapeCoords, currentPath, instanceId])
+
+  // Unmount: nothing in flight may write state or highlights afterwards.
+  useEffect(() => () => { histogramSeqRef.current++ }, [])
 
   useEffect(() => {
     if (selectedClass.source === "nuclei" && shapeCoords && selectedClass.index >= -1) {
       void fetchRegionProbabilityHistogram()
     } else {
+      histogramSeqRef.current++
+      setLoading(false)
       setProbHist([])
       setRegionProbs([])
       setRegionIndices([])
@@ -400,14 +412,17 @@ export default function DistributionControl({
   ])
 
   useEffect(() => {
-    const el = containerRef.current
+    const el = containerEl
     if (!el) return
-    const update = () => setChartWidth(Math.max(200, el.offsetWidth - 16))
+    // A hidden / not-yet-laid-out container reports 0: keep the last width.
+    const update = () => {
+      if (el.offsetWidth > 0) setChartWidth(Math.max(200, el.offsetWidth - 16))
+    }
     update()
     const ro = new ResizeObserver(update)
     ro.observe(el)
     return () => ro.disconnect()
-  }, [])
+  }, [containerEl])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -461,7 +476,7 @@ export default function DistributionControl({
   }
 
   return (
-    <div ref={containerRef} className="w-full flex flex-col gap-1">
+    <div ref={setContainerEl} className="w-full flex flex-col gap-1">
       <div className="text-xs text-muted-foreground shrink-0">
         Probability distribution (in region)
       </div>

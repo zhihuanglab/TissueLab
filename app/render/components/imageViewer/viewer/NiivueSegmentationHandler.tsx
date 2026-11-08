@@ -433,7 +433,8 @@ const NiivueSegmentationHandler: React.FC<NiivueSegmentationHandlerProps> = ({
         ? 'Space'
         : (event.key && event.key.length === 1 ? event.key.toLowerCase() : event.code);
       const normalize = (k?: string) => (k ? (k.length === 1 ? k.toLowerCase() : k) : '');
-      const bindingKey = 'Space';
+      // Follow the user's "Toggle Nuclei Annotations" binding, like the WSI viewer.
+      const bindingKey = bindings.toggleNuclei || 'Space';
 
       if (eventKeyNorm === normalize(bindingKey)) {
         event.preventDefault();

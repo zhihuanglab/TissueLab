@@ -20,6 +20,17 @@ interface UseKeyboardHandlersParams {
   /** Updated synchronously on toggle so late WS frames / session ticks share one gate. */
   showBackendAnnotationsRef: React.MutableRefObject<boolean>;
   showPatchesRef: React.MutableRefObject<boolean>;
+  /** Only the active (visible) viewer reacts; hidden panes keep their listener idle. Default true. */
+  isActive?: boolean;
+}
+
+const ACTIVATABLE_CONTROL =
+  'button, a[href], summary, [role="button"], [role="checkbox"], [role="switch"], [role="menuitem"], [role="option"], [role="tab"], [role="radio"]';
+
+/** The button-like control `el` is (or sits in), if any. */
+function closestControl(el: EventTarget | null): Element | null {
+  const node = el as Element | null;
+  return node && typeof node.closest === 'function' ? node.closest(ACTIVATABLE_CONTROL) : null;
 }
 
 /**
@@ -42,7 +53,17 @@ export const useKeyboardHandlers = (params: UseKeyboardHandlersParams) => {
     mask: 0,
   });
 
+  // Button-like control the last mouse/touch press landed on; cleared by Tab,
+  // which moves focus with the keyboard.
+  const pointerControlRef = useRef<Element | null>(null);
+
   useEffect(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      pointerControlRef.current = closestControl(event.target);
+    };
+    const handleTab = (event: KeyboardEvent) => {
+      if (event.key === 'Tab') pointerControlRef.current = null;
+    };
     const handleKeyDown = (event: KeyboardEvent) => {
       const {
         socket,
@@ -58,6 +79,10 @@ export const useKeyboardHandlers = (params: UseKeyboardHandlersParams) => {
       } = paramsRef.current;
       const keys = bindingsRef.current;
 
+      // Every mounted container listens on window; let only the active one act,
+      // so one key press doesn't toggle (and request) every open slide.
+      if (paramsRef.current.isActive === false) return;
+
       const target = event.target as HTMLElement;
       const isInputElement =
         target.tagName === 'INPUT' ||
@@ -67,6 +92,18 @@ export const useKeyboardHandlers = (params: UseKeyboardHandlersParams) => {
 
       if (isInputElement) return;
       if (event.repeat) return;
+      // Bindings are single keys: Cmd/Ctrl/Alt combos (Cmd+X cut, Cmd+M
+      // minimize, Ctrl+1 ...) belong to the app and OS, not to the viewer.
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      // Space/Enter on a button-like control reached with the keyboard (Tab)
+      // activates that control; don't hijack it (and preventDefault) for an
+      // overlay shortcut. A control that only holds focus because it was just
+      // clicked (e.g. a toolbar tool) keeps the shortcut. :focus-visible can't
+      // tell these apart: Chromium sets it before keydown is dispatched.
+      if (event.key === ' ' || event.key === 'Enter') {
+        const control = closestControl(target);
+        if (control && control !== pointerControlRef.current) return;
+      }
 
       const eventKeyNorm =
         event.key === ' '
@@ -107,7 +144,9 @@ export const useKeyboardHandlers = (params: UseKeyboardHandlersParams) => {
             keydownUpdate(true, false);
             setShowBackendAnnotations(false);
           }
-        } else if (!socket || socket.readyState !== WebSocket.OPEN) {
+        } else if (newVal && (!socket || socket.readyState !== WebSocket.OPEN)) {
+          // Only turning the overlay ON needs the socket; hiding it always works,
+          // same as the toolbar button.
           toast.error(
             'Nuclei overlay requires an open WebSocket connection. Please check your connection and try again.',
           );
@@ -146,7 +185,7 @@ export const useKeyboardHandlers = (params: UseKeyboardHandlersParams) => {
             keydownUpdatePatches(true, false);
             setShowPatches(false);
           }
-        } else if (!socket || socket.readyState !== WebSocket.OPEN) {
+        } else if (newPatches && (!socket || socket.readyState !== WebSocket.OPEN)) {
           toast.error(
             'Patch overlay requires an open WebSocket connection. Please check your connection and try again.',
           );
@@ -192,7 +231,13 @@ export const useKeyboardHandlers = (params: UseKeyboardHandlersParams) => {
       }
     };
 
+    window.addEventListener('pointerdown', handlePointerDown, true);
+    window.addEventListener('keydown', handleTab, true);
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown, true);
+      window.removeEventListener('keydown', handleTab, true);
+      window.removeEventListener('keydown', handleKeyDown);
+    };
   }, [dispatch]);
 };

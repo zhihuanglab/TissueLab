@@ -9,7 +9,7 @@ import { InlineSpinner } from '@/components/assets/PageLoading';
 import { useDispatch, useSelector } from 'react-redux';
 import { useActiveSlidePath } from '@/utils/viewer/slidePath';
 import { updateInstanceWSIInfo, replaceCurrentInstance } from '@/store/slices/wsiSlice';
-import { setSlideInfo } from '@/store/slices/svsPathSlice';
+import { setSlideInfo, setTotalChannels } from '@/store/slices/svsPathSlice';
 import { setOutputPath } from '@/store/slices/chat/workflowSlice';
 import { toast } from 'sonner';
 import { setImageLoaded, setWsiOpening } from '@/store/slices/layoutSlice';
@@ -35,13 +35,15 @@ import { useUserInfo } from '@/contexts/UserInfoProvider';
 import { selectSelectedModelForPath, setAvailableModelsForPath, setSelectedModelForPath, validateAllSelections } from '@/store/slices/chat/modelSelectionSlice';
 import type { FileTaskState, FileTaskStatus } from '@/types/fileTask.types';
 import type { PaginationState } from '@/store/slices/fileManagerSlice';
-import { sortFileTreeData } from '@/utils/dashboard/fileManager.utils';
+import { getExtension, sortFileTreeData } from '@/utils/dashboard/fileManager.utils';
 import type { FileTreeNode } from '@/types/fileManager.types';
 
 const truncateFileName = (fileName: string, maxLength: number = 25) => {
   if (fileName.length <= maxLength) return fileName;
-  const extension = fileName.split('.').pop() || '';
-  const nameWithoutExt = fileName.slice(0, fileName.length - extension.length - 1);
+  // A name with no real extension (most folders) used to count as all
+  // extension, so it was never shortened (D-02).
+  const extension = getExtension(fileName);
+  const nameWithoutExt = extension ? fileName.slice(0, fileName.length - extension.length - 1) : fileName;
   if (nameWithoutExt.length <= maxLength - 5) return fileName;
   const endChars = 3;
   const truncatedLength = maxLength - extension.length - endChars - 6;
@@ -161,6 +163,9 @@ const FileBrowserSidebar: React.FC = () => {
   const clickTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastFetchedPathRef = useRef<string | null>(null);
   const inFlightPathRef = useRef<string | null>(null);
+  // Bumped by every listing that claims the in-flight slot; a reply whose
+  // number is no longer current belongs to a folder the user already left.
+  const fetchSeqRef = useRef(0);
   const suppressAutoNavigateRef = useRef<boolean>(false);
   const [fileTaskStates, setFileTaskStates] = useState<Record<string, FileTaskState>>({});
   // Tracks the path we've already snapped the page to, so subsequent manual
@@ -222,6 +227,8 @@ const FileBrowserSidebar: React.FC = () => {
     // the fetch still running, and turning the spinner off while the real
     // response was still in the air.
     let claimedPath: string | null = null;
+    let seq = 0;
+    const isStale = () => seq !== fetchSeqRef.current;
 
     try {
       let result: FileItem[] = [];
@@ -231,6 +238,7 @@ const FileBrowserSidebar: React.FC = () => {
       }
 
       claimedPath = normalizedPath;
+      seq = ++fetchSeqRef.current;
       inFlightPathRef.current = normalizedPath;
       dispatch(setIsLoading(true));
       dispatch(setError(null));
@@ -244,6 +252,9 @@ const FileBrowserSidebar: React.FC = () => {
         dispatch(setIsLoading(false));
         return;
       }
+
+      // A newer listing (another folder) was started meanwhile: drop this one.
+      if (isStale()) return;
 
       if (isWebMode && normalizedPath) {
         result = result.map((item) => normalizeChildPath(normalizedPath, item));
@@ -281,6 +292,7 @@ const FileBrowserSidebar: React.FC = () => {
       
       // Do not auto-select any model by default
     } catch (err: any) {
+      if (isStale()) return;
       const notAuth = err && (err.status === 401 || err.status === 403);
       const errorMessage = notAuth
         ? "You don't have access to this folder"
@@ -288,7 +300,7 @@ const FileBrowserSidebar: React.FC = () => {
       dispatch(setError(errorMessage));
       dispatch(setFileList([]));
     } finally {
-      if (claimedPath !== null) {
+      if (claimedPath !== null && !isStale()) {
         inFlightPathRef.current = null;
         dispatch(setIsLoading(false));
       }
@@ -370,7 +382,14 @@ const FileBrowserSidebar: React.FC = () => {
         fileSize: uploadData.fileSize ?? null,
         mpp: uploadData.slideInfo.mpp ?? null,
         magnification: uploadData.slideInfo.magnification ?? null,
+        imageType: uploadData.slideInfo.imageType
+          || ((uploadData.slideInfo.fileFormat === 'qptiff' && (uploadData.slideInfo.totalChannels ?? 0) > 3)
+            ? 'Multiplex Immunofluorescent'
+            : 'Brightfield H&E'),
       }));
+      // Reset the channel list for the new slide (as the dashboard managers do),
+      // so a previous multiplex slide's channels don't carry over into the tile URL.
+      dispatch(setTotalChannels(uploadData.slideInfo.totalChannels || 3));
 
       dispatch(replaceCurrentInstance({
         instanceId: instanceData.instanceId,
@@ -704,7 +723,9 @@ const FileBrowserSidebar: React.FC = () => {
   const folderTitle = (p: string): string => {
     const rel = (p || '').replace(/^users\/[^/]+\/?/, '');
     if (!rel) return 'Home';
-    return truncateFileName(rel.split('/').pop() || rel, 20);
+    // Local (Windows) folders use backslashes; show the last segment either way.
+    const name = rel.split(/[\\/]/).filter(Boolean).pop() || rel;
+    return truncateFileName(name, 20);
   };
 
   return (
@@ -853,7 +874,7 @@ const FileBrowserSidebar: React.FC = () => {
           {!isLoading && !error && selectedFolder && viewerVisibleFiles.length === 0 && (
             <div className="p-4 text-center text-muted-foreground text-xs">No files found</div>
           )}
-          {!isLoading && !error && selectedFolder && imageFiles.length === 0 && folderFiles.length === 0 && (
+          {!isLoading && !error && selectedFolder && viewerVisibleFiles.length > 0 && imageFiles.length === 0 && folderFiles.length === 0 && (
             <div className="p-4 text-center text-muted-foreground text-xs">No image files found in this folder</div>
           )}
 

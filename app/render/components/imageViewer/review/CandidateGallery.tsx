@@ -76,19 +76,39 @@ const CandidateGallery: React.FC<CandidateGalleryProps> = ({
   const totalPages = Math.ceil(total / pageSize);
   
 
+  // N opens the class picker on the target tile; the nonce lets repeated
+  // presses re-open it after the user closed it.
+  const [keyboardPicker, setKeyboardPicker] = useState<{ cellId: string; nonce: number } | null>(null);
+
   // Keyboard shortcuts for Y/N labeling
   const handleKeyDown = useCallback((event: KeyboardEvent) => {
     if (writeDisabled || safeCandidates.length === 0 || loading) return;
+    // Keys typed into a text field (page number, class name, search) are text,
+    // not Y/N shortcuts.
+    // Radios / checkboxes (e.g. the class list just clicked) keep the shortcuts.
+    const target = event.target as HTMLElement | null;
+    const isTextInput = target instanceof HTMLInputElement
+      && !/^(checkbox|radio|button|submit|reset|range|color|file|image)$/i.test(target.type);
+    if (target && (target.isContentEditable || isTextInput || /^(TEXTAREA|SELECT)$/.test(target.tagName))) return;
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
 
-    // Find the first unlabeled candidate
-    const unlabeledCandidate = safeCandidates.find(c => c.label === undefined);
+    // First visible candidate still awaiting a decision. One staged for
+    // reclassification (No → class) already has one, and the panel refuses
+    // Yes on it, so targeting it would make Y a no-op forever.
+    const unlabeledCandidate = safeCandidates
+      .slice(0, 12)
+      .find(c => c.label === undefined && !pendingReclassifications.has(c.cell_id));
     if (!unlabeledCandidate) return;
 
-    if (!savedMode && event.key.toLowerCase() === 'y') {
+    const key = event.key.toLowerCase();
+    if (!savedMode && key === 'y') {
       event.preventDefault();
       onLabelCandidate(unlabeledCandidate.cell_id, 1);
+    } else if (!savedMode && key === 'n') {
+      event.preventDefault();
+      setKeyboardPicker(prev => ({ cellId: unlabeledCandidate.cell_id, nonce: (prev?.nonce ?? 0) + 1 }));
     }
-  }, [safeCandidates, loading, onLabelCandidate, savedMode, writeDisabled]);
+  }, [safeCandidates, loading, onLabelCandidate, savedMode, writeDisabled, pendingReclassifications]);
 
   useEffect(() => {
     document.addEventListener('keydown', handleKeyDown);
@@ -217,6 +237,7 @@ const CandidateGallery: React.FC<CandidateGalleryProps> = ({
                 pendingReclassification={pendingReclassifications.get(candidate.cell_id)}
                 onPendingReclassification={onPendingReclassification}
                 onCancelPendingReclassification={onCancelPendingReclassification}
+                openPickerNonce={keyboardPicker?.cellId === candidate.cell_id ? keyboardPicker.nonce : undefined}
                 writeDisabled={writeDisabled}
                 writeDisabledTitle={writeDisabledTitle}
               />
@@ -314,6 +335,8 @@ interface CandidateTileProps {
   onCancelPendingReclassification?: (cellId: string) => void;
   writeDisabled?: boolean;
   writeDisabledTitle?: string;
+  // Changes each time the N shortcut targets this tile: opens the class picker.
+  openPickerNonce?: number;
 }
 
 const CandidateTile: React.FC<CandidateTileProps> = ({
@@ -334,6 +357,7 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
   onCancelPendingReclassification,
   writeDisabled = false,
   writeDisabledTitle,
+  openPickerNonce,
 }) => {
   const { cell_id, prob, crop, label } = candidate;
   const { image, bbox, bounds, contour } = crop;
@@ -447,6 +471,14 @@ const CandidateTile: React.FC<CandidateTileProps> = ({
       });
     }
   };
+
+  // N shortcut: open the class picker, same as clicking this tile's No button.
+  useEffect(() => {
+    if (openPickerNonce === undefined || writeDisabled || label !== undefined || pendingReclassification) return;
+    updateDropdownPosition();
+    setShowDropdown(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openPickerNonce]);
 
   // No longer need click outside handler - dropdown only closes via close button
 

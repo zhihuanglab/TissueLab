@@ -21,6 +21,32 @@ import { setTool } from "@/store/slices/viewer/toolSlice";
  * View-only paths still LOCAL-add; create handler stamps without disk write.
  */
 
+// Minimum average thickness (screen px, 2 * area / perimeter) of a lasso. A
+// thinner trace is a line or a slightly wobbly stroke, not a region, and would
+// save an invisible polygon.
+const MIN_LASSO_THICKNESS_PX = 2;
+
+/** Shoelace area of a closed polygon. */
+function polygonArea(pts: ReadonlyArray<readonly [number, number]>): number {
+  let twice = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const [x1, y1] = pts[i];
+    const [x2, y2] = pts[(i + 1) % pts.length];
+    twice += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(twice) / 2;
+}
+
+function polygonPerimeter(pts: ReadonlyArray<readonly [number, number]>): number {
+  let p = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const [x1, y1] = pts[i];
+    const [x2, y2] = pts[(i + 1) % pts.length];
+    p += Math.hypot(x2 - x1, y2 - y1);
+  }
+  return p;
+}
+
 interface LassoOverlayProps {
   viewer: OpenSeadragon.Viewer | null;
   annotator: any;
@@ -106,6 +132,9 @@ const LassoOverlay: React.FC<LassoOverlayProps> = ({
 
     const item = viewer?.world.getItemAt(0);
     if (!viewer || !item || !annotator || screenPts.length < 3) return;
+    // A straight or near-straight stroke encloses nothing: drop it and keep
+    // the lasso tool so the user can simply draw again.
+    if ((2 * polygonArea(screenPts)) / polygonPerimeter(screenPts) < MIN_LASSO_THICKNESS_PX) return;
 
     // screen px -> image coords, dropping consecutive duplicates
     const points: [number, number][] = [];
@@ -116,7 +145,7 @@ const LassoOverlay: React.FC<LassoOverlayProps> = ({
       const prev = points[points.length - 1];
       if (!prev || prev[0] !== xy[0] || prev[1] !== xy[1]) points.push(xy);
     }
-    if (points.length < 3) return;
+    if (points.length < 3 || polygonArea(points) === 0) return;
 
     let minX = points[0][0];
     let minY = points[0][1];

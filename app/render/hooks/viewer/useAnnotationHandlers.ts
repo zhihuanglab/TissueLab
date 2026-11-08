@@ -7,6 +7,7 @@ import { useUserInfo } from '@/contexts/UserInfoProvider';
 import { resolveAnnotatorLabel } from '@/utils/viewer/annotator';
 import { AnnotationClass } from '@/store/slices/viewer/annotationSlice';
 import { CentroidsArray } from '@/types/centroidsArray';
+import { findContourAtPoint, getContourGeometry } from '@/utils/viewer/contourGeometry';
 import { annotationTypeStore } from '@/store/zustand/slice/annotationTypesStore';
 import { toLocalWorkflowZarrPath } from '@/utils/agent/workflow/pathNorm';
 import { scheduleCoalescedClassificationAfterAnnotation } from '@/utils/agent/workflow/workflow.utils';
@@ -16,15 +17,50 @@ import { denyWriteToast } from '@/hooks/usePathWriteAccess';
 import { AI_SERVICE_API_ENDPOINT } from '@/config/api.config';
 import { isSegmentationHandlerNotReadyError, segFetch } from '@/utils/common/segFetch';
 import eventBus from '@/utils/common/eventBus';
+import { getErrorMessage } from '@/utils/common/apiResponse';
+import { toast } from 'sonner';
 
 const DOUBLE_CLICK_THRESHOLD_MS = 500; // Milliseconds
 const CLICK_RADIUS_SQUARED = 350 * 350; // Using 350px radius
 const SINGLE_CLICK_DELAY_MS = 300;
+const SAVE_FAILED_MESSAGE = 'Failed to save cell classification. Reverted to previous state.';
+
+/**
+ * Optimistically recolour one cell; returns a rollback that restores the previous
+ * entry (or removes it), unless something else has recoloured the cell since.
+ * `classIndex` (position in nucleiClasses) lets a later class recolour reach
+ * this cell (updateColorByClassIndex matches on it).
+ */
+function applyOptimisticCellClass(id: string, color: string, category: string, classIndex?: number): () => void {
+  const store = annotationTypeStore.getState();
+  const previous = store.annotationTypes.get(id);
+  store.setMany([
+    classIndex !== undefined && classIndex >= 0
+      ? { id, color, category, classIndex }
+      : { id, color, category },
+  ]);
+  return () => {
+    const state = annotationTypeStore.getState();
+    const current = state.annotationTypes.get(id);
+    if (!current || current.color !== color || current.category !== category) return;
+    if (previous) {
+      state.setMany([{ id, ...previous }]);
+    } else {
+      state.removeMany([id]);
+    }
+  };
+}
 
 interface UseAnnotationHandlersParams {
   viewerInstance: any;
   annotatorInstance: any;
   centroids: CentroidsArray;
+  /**
+   * Cell contours currently painted. Static images (and WSIs at high zoom) only
+   * ever get contours, never centroids, so double-click classification falls
+   * back to the contour under the pointer (N-20).
+   */
+  contours?: ReadonlyArray<{ id: string | number; points?: ArrayLike<number> | null }>;
   activeManualClassificationClassRef: React.MutableRefObject<any>;
   currentPath: string | null;
   currentInstanceId?: string | null;
@@ -57,6 +93,7 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
     annotatorInstance,
     onSaveAnnotationSuccess,
     centroids,
+    contours,
     activeManualClassificationClassRef,
     currentPath,
     currentInstanceId,
@@ -85,6 +122,10 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
   const lastClickedAnnotationIdRef = useRef<string | null>(null);
   const singleClickTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tooltipVisibleRef = useRef(false);
+  // Read through a ref: contours change on every pan, and as a dependency they
+  // would re-register the OSD double-click handler each repaint.
+  const contoursRef = useRef(contours);
+  contoursRef.current = contours;
 
   // Helper function to save annotation and trigger workflow
   const saveAnnotationAndTriggerWorkflow = useCallback(async (
@@ -94,8 +135,20 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
     originalY: number,
     newClassName: string,
     newClassColor: string,
-    method: string
-  ) => {
+    method: string,
+    rollback?: () => void
+  ): Promise<boolean> => {
+    // Undo the optimistic recolour and redraw so the cell doesn't look classified when it isn't.
+    const revert = () => {
+      if (!rollback) return;
+      rollback();
+      try {
+        if (viewerInstance && viewerInstance.world.getItemCount() > 0) viewerInstance.forceRedraw();
+      } catch (error) {
+        console.warn('[OSD Redraw] Failed to force redraw:', error);
+      }
+    };
+
     const payload = {
       path: zarrPath,
       region_geometry: { x1: originalX, y1: originalY, x2: originalX, y2: originalY },
@@ -111,7 +164,9 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
 
     if (!currentInstanceId) {
       console.warn('[Annotation Handler] Missing currentInstanceId; aborting save_annotation.');
-      return;
+      revert();
+      toast.error(SAVE_FAILED_MESSAGE);
+      return false;
     }
 
     try {
@@ -141,12 +196,18 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
       }
 
       setTimeout(() => handleToolbarClick('move'), 50);
+      return true;
     } catch (error) {
+      // The label was not stored: roll back the instant recolour (N-11).
+      revert();
       if (!isSegmentationHandlerNotReadyError(error)) {
         console.warn(`[Annotation Handler] Error saving annotation or triggering workflow via API:`, error);
+        toast.error(getErrorMessage(error, SAVE_FAILED_MESSAGE));
       }
+      return false;
     }
   }, [
+    viewerInstance,
     nucleiClasses,
     currentOrgan,
     currentInstanceId,
@@ -177,6 +238,8 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
       ? tiledImage.viewportToImageCoordinates(viewportPoint)
       : viewer.viewport.viewportToImageCoordinates(viewportPoint);
 
+    let target: { id: number; x: number; y: number } | null = null;
+
     let closestCentroidTuple: Int32Array | undefined = undefined;
     let minDistanceSquared = Infinity;
 
@@ -194,22 +257,37 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
     });
 
     if (closestCentroidTuple && minDistanceSquared <= CLICK_RADIUS_SQUARED) {
+      const tuple = closestCentroidTuple as Int32Array;
+      target = { id: tuple[0], x: tuple[1], y: tuple[2] };
+    } else {
+      // No centroid frame (static image, or WSI at contour zoom): use the cell
+      // whose contour contains the point. The contour id is the cell id.
+      const contour = findContourAtPoint(contoursRef.current ?? [], imagePoint.x, imagePoint.y);
+      const id = contour ? Number(contour.id) : NaN;
+      if (contour && Number.isInteger(id)) {
+        const { centerX, centerY } = getContourGeometry(contour);
+        target = { id, x: Math.round(centerX), y: Math.round(centerY) };
+      }
+    }
+
+    if (target) {
       if (denyWriteToast('annotate', currentPath)) {
         return;
       }
-      const centroidId = closestCentroidTuple[0];
-      const originalX = closestCentroidTuple[1]; // This is level0_x
-      const originalY = closestCentroidTuple[2]; // This is level0_y
+      const centroidId = target.id;
+      const originalX = target.x; // level0_x
+      const originalY = target.y; // level0_y
       const newClassName = activeClass.name;
       const newClassColor = activeClass.color;
 
-      console.log(`[handleCanvasDoubleClick] Centroid ${centroidId} double-clicked. New class: ${newClassName}`);
+      console.log(`[handleCanvasDoubleClick] Cell ${centroidId} double-clicked. New class: ${newClassName}`);
 
-      annotationTypeStore.getState().setMany([{
-        id: String(centroidId),
-        color: newClassColor,
-        category: newClassName,
-      }]);
+      const rollback = applyOptimisticCellClass(
+        String(centroidId),
+        newClassColor,
+        newClassName,
+        nucleiClasses.findIndex((c) => c.name === newClassName),
+      );
 
       // Force OSD redraw
       if (viewerInstance && viewerInstance.world.getItemCount() > 0) {
@@ -223,6 +301,7 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
       const zarrPath = toLocalWorkflowZarrPath(currentPath);
       if (!zarrPath) {
         console.error('[handleCanvasDoubleClick] Could not get Zarr path for saving annotation.');
+        rollback();
         return;
       }
 
@@ -233,7 +312,8 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
         originalY,
         newClassName,
         newClassColor,
-        'canvas double-click classification'
+        'canvas double-click classification',
+        rollback
       );
     } else {
       console.log('[handleCanvasDoubleClick] No close centroid found, or double-click intended for Annotorious.');
@@ -243,6 +323,7 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
     activeManualClassificationClassRef,
     centroids,
     currentPath,
+    nucleiClasses,
     saveAnnotationAndTriggerWorkflow,
   ]);
 
@@ -299,7 +380,12 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
 
       console.log(`[handleClickAnnotationForClassification] Double-click: Processing ${centroidId} with class ${newClassName}`);
 
-      annotationTypeStore.getState().setMany([{ id: String(centroidId), color: newClassColor, category: newClassName }]);
+      const rollback = applyOptimisticCellClass(
+        String(centroidId),
+        newClassColor,
+        newClassName,
+        nucleiClasses.findIndex((c) => c.name === newClassName),
+      );
 
       if (viewerInstance && viewerInstance.world.getItemCount() > 0) {
         try {
@@ -312,6 +398,7 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
       const zarrPath = toLocalWorkflowZarrPath(currentPath);
       if (!zarrPath) {
         console.error('[handleClickAnnotationForClassification] Double-click: Could not get Zarr path.');
+        rollback();
         lastClickTimestampRef.current = 0;
         lastClickedAnnotationIdRef.current = null;
         return;
@@ -324,7 +411,8 @@ export const useAnnotationHandlers = (params: UseAnnotationHandlersParams) => {
         originalY_level0,
         newClassName,
         newClassColor,
-        'annotation double-click classification'
+        'annotation double-click classification',
+        rollback
       ).then(() => {
         setTimeout(() => {
           handleToolbarClick('move');

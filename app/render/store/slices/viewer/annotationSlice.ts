@@ -257,6 +257,7 @@ const annotationSlice = createSlice({
         next.every((cls, i) =>
           cls.name === current[i].name &&
           cls.count === current[i].count &&
+          cls.negativeCount === current[i].negativeCount &&
           cls.color === current[i].color &&
           cls.persisted === current[i].persisted
         );

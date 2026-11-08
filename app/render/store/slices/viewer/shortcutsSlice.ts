@@ -27,6 +27,24 @@ export const DEFAULT_SHORTCUTS: Record<ShortcutActionKey, string> = {
   'tool.filter': '5',
 }
 
+/**
+ * The binding name of a key press: 'Space', a lowercased printable character,
+ * or `event.code` for anything else.
+ */
+export function shortcutKeyFromEvent(event: KeyboardEvent): string {
+  if (event.key === ' ') return 'Space'
+  return event.key && event.key.length === 1 ? event.key.toLowerCase() : event.code
+}
+
+/** The other action already bound to `key`, if any. */
+export function findShortcutConflict(
+  bindings: Record<ShortcutActionKey, string>,
+  key: string,
+  self: ShortcutActionKey,
+): ShortcutActionKey | undefined {
+  return (Object.keys(bindings) as ShortcutActionKey[]).find((k) => k !== self && bindings[k] === key)
+}
+
 const initialState: ShortcutsState = {
   bindings: { ...DEFAULT_SHORTCUTS },
 }

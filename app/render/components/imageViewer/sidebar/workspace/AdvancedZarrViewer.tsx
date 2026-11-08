@@ -49,8 +49,11 @@ import {
 export const formatBytes = (bytes: number): string => {
   if (bytes === 0) return '0 B';
   const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  const i = Math.min(
+    sizes.length - 1,
+    Math.max(0, Math.floor(Math.log(bytes) / Math.log(k)))
+  );
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 };
 
@@ -978,7 +981,8 @@ const FileInfoPanel = ({ zarrStructure, zarrFilePath, zarrFileInfo }: {
   zarrFilePath: string;
   zarrFileInfo?: any;
 }) => {
-  const fileName = zarrFilePath?.split('/').pop() || 'unknown.zarr';
+  // Local Windows slides arrive as "C:\...\x.svs.zarr"; split on both separators (V-14).
+  const fileName = zarrFilePath?.split(/[\\/]/).filter(Boolean).pop() || 'unknown.zarr';
   
   const datasets = zarrStructure?.root ? extractDatasetsAsArray(zarrStructure.root) : [];
   

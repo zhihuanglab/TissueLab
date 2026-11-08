@@ -122,6 +122,9 @@ const ZarrCard: React.FC<ZarrCardProps> = ({ currentPath }) => {
       // Validate zarr file
       try {
         const validationResult = await validateZarrFile(zarrFilePath);
+        // A late answer for a slide the user has already left must not touch
+        // the new slide's card.
+        if (!isCurrentLoad()) return;
         if (!validationResult.is_valid) {
           setZarrFileExists(false);
           setError(validationResult.error || 'File is not a valid Zarr file');
@@ -130,6 +133,7 @@ const ZarrCard: React.FC<ZarrCardProps> = ({ currentPath }) => {
         console.log('Zarr file validation successful:', validationResult);
       } catch (validationError) {
         console.log('Zarr file not found or not accessible:', validationError);
+        if (!isCurrentLoad()) return;
         setZarrFileExists(false);
         setError(getErrorMessage(validationError, 'Zarr file not found or not accessible'));
         return;

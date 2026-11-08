@@ -125,6 +125,10 @@ const ZarrReplaceDialog: React.FC<ZarrReplaceDialogProps> = ({
   const zipInputRef = useRef<HTMLInputElement>(null);
   const stagingRelRef = useRef<string | null>(null);
   stagingRelRef.current = stagingRel;
+  // The slide the current staging was uploaded/validated against, and a token
+  // that invalidates an in-flight upload/validation when the target changes.
+  const stagedForRef = useRef<string | null>(null);
+  const ingestSeqRef = useRef(0);
 
   const resetAll = useCallback(() => {
     setPicked(null);
@@ -138,10 +142,25 @@ const ZarrReplaceDialog: React.FC<ZarrReplaceDialogProps> = ({
   // Clean up any staging folder when the dialog goes away.
   useEffect(() => {
     if (!isOpen) {
+      ingestSeqRef.current++;
       if (stagingRelRef.current) deleteZarrStaging(stagingRelRef.current);
       resetAll();
     }
   }, [isOpen, resetAll]);
+
+  // The active slide changed under an open dialog: a source staged/validated for
+  // the previous slide must not be applied to this one, so start over.
+  const prevTargetRef = useRef(targetSlidePath);
+  useEffect(() => {
+    if (prevTargetRef.current === targetSlidePath) return;
+    prevTargetRef.current = targetSlidePath;
+    ingestSeqRef.current++;
+    if (stagingRelRef.current) deleteZarrStaging(stagingRelRef.current);
+    stagingRelRef.current = null;
+    stagedForRef.current = null;
+    resetAll();
+    setUploadPct(null);
+  }, [targetSlidePath, resetAll]);
 
   // Upload → stage → validate, as soon as something is picked.
   const ingest = useCallback(
@@ -164,6 +183,10 @@ const ZarrReplaceDialog: React.FC<ZarrReplaceDialogProps> = ({
       // (which exists) and put the staging subfolder in the relative-path prefix.
       const stagingSub = `.zarr_replace_staging/${uuid}`;
       const rel = `${userRoot}/${stagingSub}`;
+      const seq = ++ingestSeqRef.current;
+      // Superseded by a newer pick or a different target slide.
+      const isStale = () => seq !== ingestSeqRef.current;
+      stagedForRef.current = targetSlidePath;
       setPicked(p);
       setValidation(null);
       setError(null);
@@ -179,14 +202,21 @@ const ZarrReplaceDialog: React.FC<ZarrReplaceDialogProps> = ({
           (f) => setUploadPct(Math.round(f * 100))
         );
 
+        if (isStale()) {
+          // Its folder may have been written after the target-change cleanup ran.
+          if (stagingRelRef.current !== rel) deleteZarrStaging(rel);
+          return;
+        }
         setUploadPct(null);
         setBusy('validate');
         const v = await validateZarrReplacement(rel, targetSlidePath, slideDims?.[0], slideDims?.[1]);
+        if (isStale()) return;
         setValidation(v);
       } catch (e) {
+        if (isStale()) return;
         setError(getErrorMessage(e, 'Upload / validation failed'));
       } finally {
-        setBusy(null);
+        if (!isStale()) setBusy(null);
       }
     },
     [targetSlidePath, slideDims, pathWritable]
@@ -236,6 +266,7 @@ const ZarrReplaceDialog: React.FC<ZarrReplaceDialogProps> = ({
 
   const handleReplace = useCallback(async () => {
     if (!stagingRel || !targetSlidePath || !validation?.ok) return;
+    if (stagedForRef.current !== targetSlidePath) return;
     if (!pathWritable) return;
     setBusy('replace');
     setError(null);

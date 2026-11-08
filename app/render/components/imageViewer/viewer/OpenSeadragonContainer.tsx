@@ -162,6 +162,43 @@ const EMPTY_CENTROIDS = new CentroidsArray(new Int32Array(0), 0);
 const EMPTY_ANNOTATIONS: any[] = [];
 const EMPTY_PATCHES: PatchOverlayEntry[] = [];
 
+// One shared console.error filter for every mounted container, reference
+// counted: per-container wrap/restore re-installed a stale wrapper whenever
+// viewers unmounted in mount order rather than LIFO.
+let consoleFilterUsers = 0;
+let consoleFilterOriginal: typeof console.error | null = null;
+let consoleFilterWrapper: typeof console.error | null = null;
+function acquireOsdConsoleFilter(): () => void {
+  if (consoleFilterUsers++ === 0) {
+    const original = console.error;
+    consoleFilterOriginal = original;
+    consoleFilterWrapper = (...args: any[]) => {
+      // Filter out specific OpenSeadragon warnings from third-party libraries
+      const message = args[0]?.toString() || "";
+      if (
+        message.includes("viewportToImageCoordinates") ||
+        message.includes("viewportToImageRectangle")
+      ) {
+        return;
+      }
+      original.apply(console, args);
+    };
+    console.error = consoleFilterWrapper;
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (--consoleFilterUsers > 0) return;
+    // Leave it alone if something else has replaced console.error since.
+    if (console.error === consoleFilterWrapper && consoleFilterOriginal) {
+      console.error = consoleFilterOriginal;
+    }
+    consoleFilterOriginal = null;
+    consoleFilterWrapper = null;
+  };
+}
+
 const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
   instanceId,
 }) => {
@@ -191,27 +228,7 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
   useWebGLCleanup(instanceId || undefined);
 
   // Filter out OpenSeadragon viewport warnings from third-party libraries
-  useEffect(() => {
-    const originalError = console.error;
-
-    console.error = (...args: any[]) => {
-      // Filter out specific OpenSeadragon warnings from third-party libraries
-      const message = args[0]?.toString() || "";
-      if (
-        message.includes("viewportToImageCoordinates") ||
-        message.includes("viewportToImageRectangle")
-      ) {
-        // Silently ignore these warnings
-        return;
-      }
-      // Pass through all other errors
-      originalError.apply(console, args);
-    };
-
-    return () => {
-      console.error = originalError;
-    };
-  }, []);
+  useEffect(() => acquireOsdConsoleFilter(), []);
 
   // Load viewer settings from localStorage on component mount
   const { zoomSpeed, trackpadGesture, showNavigator, toggleShowNavigator } =
@@ -420,7 +437,11 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
   // Fetch mask options (Tissue-Segmentation/masks/<tissue>). Re-fetch on path change AND
   // after a workflow run finishes — a VISTA run produces new masks without changing the
   // path, so without the run-finished refresh the Tissue Overlay toggle would stay disabled.
+  // Replies are unordered (a run-finished refresh can answer after a later reset's),
+  // so only the latest request may apply.
+  const maskOptionsSeqRef = useRef(0);
   const refreshMaskOptions = useCallback(() => {
+    const seq = ++maskOptionsSeqRef.current;
     if (!currentPath) {
       setMaskOptions([]);
       return;
@@ -431,9 +452,12 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
       return;
     }
     getMaskOptions(zarrPath).then((res) => {
+      if (seq !== maskOptionsSeqRef.current) return;
       setMaskOptions(res.success && res.options ? res.options : []);
     });
   }, [currentPath]);
+  // Unmount / path change: a reply still in flight is for a slide no longer shown.
+  useEffect(() => () => { maskOptionsSeqRef.current++; }, [currentPath]);
 
   useEffect(() => {
     refreshMaskOptions();
@@ -2513,6 +2537,13 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
 
   // Go to recommended viewport (toolbar dropdown): ROIs → Nuclei/Tissue → class; API supports nuclei only
   const [loadingRecommendViewport, setLoadingRecommendViewport] = useState(false);
+  // A reply is dropped once the slide/viewer changed, the viewer unmounted, or a
+  // newer request was made — it would move/toast a view that is no longer shown.
+  const recommendSeqRef = useRef(0);
+  useEffect(() => () => {
+    recommendSeqRef.current++;
+    setLoadingRecommendViewport(false);
+  }, [currentPath, viewerInstance]);
   const handleGoToRecommended = useCallback(
     async (roiType: "nuclei" | "tissue", targetClass: number) => {
       if (roiType === "tissue") {
@@ -2524,12 +2555,15 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
         return;
       }
       const formattedPath = formatPath(currentPath);
+      const seq = ++recommendSeqRef.current;
+      const isStale = () => seq !== recommendSeqRef.current;
       setLoadingRecommendViewport(true);
       try {
         const resp = await apiFetch(
           `${AI_SERVICE_API_ENDPOINT}/tasks/v1/recommend_viewport?file_path=${encodeURIComponent(formattedPath)}&target_class=${targetClass}&selection_mode=high_confidence`,
           { method: "GET", returnAxiosFormat: true },
         );
+        if (isStale()) return;
         const data = resp?.data?.data ?? resp?.data;
         const bbox = data?.bbox;
         if (
@@ -2566,9 +2600,10 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
         viewerInstance.viewport.applyConstraints();
         toast.success("Moved to recommended region");
       } catch (e) {
+        if (isStale()) return;
         toast.error(getErrorMessage(e, "Failed to get recommended viewport"));
       } finally {
-        setLoadingRecommendViewport(false);
+        if (!isStale()) setLoadingRecommendViewport(false);
       }
     },
     [currentPath, viewerInstance],
@@ -2752,6 +2787,7 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
     keydownUpdatePatches,
     showBackendAnnotationsRef,
     showPatchesRef,
+    isActive: isThisInstanceActive,
   });
 
   // Viewport refresh handling
@@ -2914,6 +2950,7 @@ const OpenSeadragonContainer: React.FC<{ instanceId?: string }> = ({
     viewerInstance,
     annotatorInstance,
     centroids,
+    contours: paintAnnotations,
     activeManualClassificationClassRef,
     currentPath,
     currentInstanceId,

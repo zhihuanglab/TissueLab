@@ -4,9 +4,17 @@ import { useEffect } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 
 const STORAGE_KEY = 'tissuelab_preferences';
+// Set once the user flips the trackpad toggle. Older versions saved the then-default
+// trackpadGesture:false along with every other setting change and forced it on for Mac at
+// runtime, so a saved value without this flag is not the user's choice.
+const TRACKPAD_CHOSEN_KEY = 'trackpadGestureSetByUser';
+
+// Trackpad gestures default on for Mac, off elsewhere. This is only the default: a value the
+// user picked with the toggle always wins (see TRACKPAD_CHOSEN_KEY).
+const isMacPlatform = () => typeof navigator !== 'undefined' && navigator.userAgent.includes('Mac');
 
 export const DEFAULT_SETTINGS = {
-    trackpadGesture: false,
+    trackpadGesture: isMacPlatform(),
     zoomSpeed: 0.5,
     centroidSize: 1.5,
     overlayAlpha: 0.4,
@@ -24,13 +32,16 @@ const loadFromLocalStorage = (): typeof DEFAULT_SETTINGS => {
                 parsed.overlayAlpha = parsed.centroidAlpha;
                 delete parsed.centroidAlpha;
             }
+            if (parsed[TRACKPAD_CHOSEN_KEY] !== true) delete parsed.trackpadGesture;
             // Merge default settings and saved settings, ensure all fields exist
             return { ...DEFAULT_SETTINGS, ...parsed };
         }
     } catch (error) {
         console.error('Load settings from local storage failed:', error);
     }
-    return DEFAULT_SETTINGS;
+    // A copy: updateSetting mutates what this returns, and the shared defaults
+    // must stay intact for "Reset to Default Settings".
+    return { ...DEFAULT_SETTINGS };
 };
 
 const saveToLocalStorage = (settings: typeof DEFAULT_SETTINGS) => {
@@ -48,6 +59,9 @@ const updateSetting = <K extends keyof typeof DEFAULT_SETTINGS>(
     try {
         const currentSettings = loadFromLocalStorage();
         currentSettings[key] = value;
+        if (key === 'trackpadGesture') {
+            (currentSettings as Record<string, unknown>)[TRACKPAD_CHOSEN_KEY] = true;
+        }
         localStorage.setItem(STORAGE_KEY, JSON.stringify(currentSettings));
     } catch (error) {
         console.error('Update setting failed:', error);

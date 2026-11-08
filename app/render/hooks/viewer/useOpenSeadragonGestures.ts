@@ -71,9 +71,11 @@ export const useOpenSeadragonGestures = ({
           const minZoom = viewer.viewport.getMinZoom();
           const maxZoom = viewer.viewport.getMaxZoom();
           
-          if (expectedZoom >= minZoom && expectedZoom <= maxZoom) {
-            // Perform zoom only if it's within bounds
-            viewer.viewport.zoomBy(zoomFactor, viewportPoint);
+          // Clamp a step that would cross min/max to land exactly on the bound,
+          // instead of dropping it (which left the wheel short of full zoom).
+          const clampedZoom = Math.min(maxZoom, Math.max(minZoom, expectedZoom));
+          if (beforeZoom > 0 && clampedZoom !== beforeZoom) {
+            viewer.viewport.zoomBy(clampedZoom / beforeZoom, viewportPoint);
           }
           
           // Don't call applyConstraints() to prevent automatic reset

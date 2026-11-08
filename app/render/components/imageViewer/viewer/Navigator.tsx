@@ -13,6 +13,9 @@ const Navigator: React.FC<NavigatorProps> = ({ navigatorId }) => {
   const stopTileAuthRef = useRef<(() => void) | null>(null);
   const navRotateHandlerRef = useRef<any>(null);
   const navScrollHandlerRef = useRef<any>(null);
+  // The main-viewer tiled image the minimap was built from; when the viewer is
+  // reused for another slide (viewer.open), item 0 changes and we rebuild.
+  const builtFromRef = useRef<any>(null);
   // Brower detection for MacOS
   const isMacOS = typeof window !== 'undefined' && navigator.userAgent.includes('Mac')
 
@@ -44,6 +47,7 @@ const Navigator: React.FC<NavigatorProps> = ({ navigatorId }) => {
       stopTileAuthRef.current = null;
       navigatorRef.current.destroy();
       navigatorRef.current = null;
+      builtFromRef.current = null;
 
       if (wrapper) {
         wrapper.innerHTML = '';
@@ -56,6 +60,9 @@ const Navigator: React.FC<NavigatorProps> = ({ navigatorId }) => {
       if (!viewerInstance) return;
       // Create a new container for openSeadragon
       const tiledImage = viewerInstance.world.getItemAt(0);
+      // No image yet (still opening, or the open failed): build the minimap
+      // once one is added instead of crashing the sidebar.
+      if (!tiledImage) return;
       const container = document.createElement('div');
       container.className = 'w-full h-full';
       container.style.width = '100%';
@@ -92,6 +99,7 @@ const Navigator: React.FC<NavigatorProps> = ({ navigatorId }) => {
         ajaxHeaders: { ...(viewerInstance as any).ajaxHeaders }
       } as any);
 
+      builtFromRef.current = tiledImage;
       stopTileAuthRef.current = startTileAuth(navigatorRef.current);
       navigatorRef.current.addTiledImage({
         tileSource: tiledImage.source,
@@ -134,10 +142,21 @@ const Navigator: React.FC<NavigatorProps> = ({ navigatorId }) => {
         }
       }
     };
-    // Initialize the navigator
+    // Initialize the navigator now, or once the viewer has an image; rebuild it
+    // when the viewer is reused for another slide (its first item changes).
+    const onItemAdded = () => {
+      const first = viewerInstance?.world?.getItemAt?.(0);
+      if (!navigatorRef.current || (first && first !== builtFromRef.current)) initNavigator();
+    };
+    viewerInstance?.world?.addHandler?.('add-item', onItemAdded);
+    viewerInstance?.addHandler?.('open', onItemAdded);
     initNavigator();
 
-    return cleanupNavigator;
+    return () => {
+      viewerInstance?.world?.removeHandler?.('add-item', onItemAdded);
+      viewerInstance?.removeHandler?.('open', onItemAdded);
+      cleanupNavigator();
+    };
   }, [viewerInstance, navigatorId, cleanupNavigator, updateNavigator, isMacOS]);
 
   return (

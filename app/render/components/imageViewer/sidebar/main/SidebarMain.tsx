@@ -17,7 +17,6 @@ import {
 } from '@/store/slices/svsPathSlice';
 import throttle from 'lodash/throttle';
 import dynamic from 'next/dynamic';
-import { setTrackpadGesture } from '@/store/slices/viewer/viewerSettingsSlice';
 import { setImageSetting, resetImageSettings } from '@/store/slices/viewer/imageSettingsSlice';
 import { useAnnotatorInstance } from '@/contexts/AnnotatorContext';
 import { toast } from 'sonner';
@@ -41,14 +40,9 @@ const getRandomColor = () => {
 const MainSidebar: React.FC = () => {
   const dispatch = useDispatch();
   const { viewerInstance } = useAnnotatorInstance();
-  
-  // Hydrate trackpad gesture preference on the client
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
-      const isMacOS = navigator.userAgent.includes('Mac');
-      dispatch(setTrackpadGesture(isMacOS));
-    }
-  }, [dispatch]);
+
+  // The trackpad gesture preference is hydrated by useViewerSettings (saved value, else the
+  // platform default in DEFAULT_SETTINGS); don't override it here (V-04).
   const totalChannels = useSelector((state: RootState) => state.svsPath.totalChannels);
   const channels = useSelector((state: RootState) => state.svsPath.channels);
   const visibleChannels = useSelector((state: RootState) => state.svsPath.visibleChannels);
@@ -62,6 +56,9 @@ const MainSidebar: React.FC = () => {
 
   const [pendingChannelChanges, setPendingChannelChanges] = useState<Set<number>>(new Set());
   const batchUpdateTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  // The batch waiting on batchUpdateTimeoutRef, so an unmount (panel closed
+  // inside the 500 ms window) can still commit it instead of dropping it.
+  const pendingBatchRef = useRef<Set<number> | null>(null);
 
   useEffect(() => {
     if (totalChannels && channels.length === 0) {
@@ -157,7 +154,13 @@ const MainSidebar: React.FC = () => {
   const handleChannelToggle = (index: number) => {
     setPendingChannelChanges(prev => {
       const newChanges = new Set(prev);
-      newChanges.add(index);
+      // A second click on a channel that is already pending cancels the first,
+      // so off-then-on within the batch window leaves the channel unchanged.
+      if (newChanges.has(index)) {
+        newChanges.delete(index);
+      } else {
+        newChanges.add(index);
+      }
 
       // Clear existing timeout
       if (batchUpdateTimeoutRef.current) {
@@ -165,7 +168,10 @@ const MainSidebar: React.FC = () => {
       }
 
       // Set new timeout
+      pendingBatchRef.current = newChanges;
       batchUpdateTimeoutRef.current = setTimeout(() => {
+        batchUpdateTimeoutRef.current = null;
+        pendingBatchRef.current = null;
         console.log('Processing batch channel updates:', newChanges);
         newChanges.forEach(channelIndex => {
           dispatch(toggleChannel(channelIndex));
@@ -222,10 +228,17 @@ const MainSidebar: React.FC = () => {
     return () => {
       if (batchUpdateTimeoutRef.current) {
         clearTimeout(batchUpdateTimeoutRef.current);
+        batchUpdateTimeoutRef.current = null;
       }
-      throttledColorChange.cancel();
+      // Commit a channel batch / colour pick still in flight rather than
+      // losing what the user just did.
+      pendingBatchRef.current?.forEach(channelIndex => {
+        dispatch(toggleChannel(channelIndex));
+      });
+      pendingBatchRef.current = null;
+      throttledColorChange.flush();
     };
-  }, [throttledColorChange]);
+  }, [throttledColorChange, dispatch]);
 
   return (
     <div className="space-y-6 h-screen overflow-y-auto p-4 custom-scrollbar">
@@ -306,7 +319,7 @@ const MainSidebar: React.FC = () => {
                     <div className="flex items-center gap-2">
                       <input
                         type="checkbox"
-                        checked={isChannelVisible(index) || pendingChannelChanges.has(index)}
+                        checked={isChannelVisible(index) !== pendingChannelChanges.has(index)}
                         onChange={() => handleChannelToggle(index)}
                         className="w-3.5 h-3.5"
                         id={`channel-${index}`}

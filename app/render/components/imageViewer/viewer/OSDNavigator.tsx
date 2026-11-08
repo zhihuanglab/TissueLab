@@ -36,6 +36,9 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
   const autoHideTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [isVisible, setIsVisible] = useState(true);
   const [isHovered, setIsHovered] = useState(false);
+  // Read by long-lived OSD handlers (open/add-item), which would otherwise
+  // capture a stale isHovered and schedule a hide under the cursor.
+  const isHoveredRef = useRef(false);
   const [isAutoFading, setIsAutoFading] = useState(false);
   const [viewerSize, setViewerSize] = useState({ width: 0, height: 0 });
 
@@ -177,15 +180,18 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
       autoHideTimeoutRef.current = null;
     }
     // Set new timeout to hide navigator
-    if (!isHovered) {
+    if (!isHoveredRef.current) {
       autoHideTimeoutRef.current = setTimeout(() => {
         setIsAutoFading(true); // Set to auto-fade mode
         setIsVisible(false);
       }, autoHideDelay);
     }
-  }, [autoHideDelay, isHovered]);
+  }, [autoHideDelay]);
+  const showNavigatorRef = useRef(showNavigator);
+  showNavigatorRef.current = showNavigator;
 
   const handleMouseEnter = useCallback(() => {
+    isHoveredRef.current = true;
     setIsHovered(true);
     setIsAutoFading(false); // Immediate show on hover
     setIsVisible(true);
@@ -196,6 +202,7 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
   }, []);
 
   const handleMouseLeave = useCallback(() => {
+    isHoveredRef.current = false;
     setIsHovered(false);
     // Restart auto-hide timer
     autoHideTimeoutRef.current = setTimeout(() => {
@@ -324,13 +331,13 @@ const OSDNavigator: React.FC<OSDNavigatorProps> = ({
     const handleOpen = () => {
       console.log('[OSDNavigator] Image opened, initializing navigator');
       createNavigator();
-      showNavigator(); // Reset auto-hide timer to give user time to see it
+      showNavigatorRef.current(); // Reset auto-hide timer to give user time to see it
     };
 
     const handleAddItem = () => {
       console.log('[OSDNavigator] World item added, initializing navigator');
       createNavigator();
-      showNavigator(); // Reset auto-hide timer
+      showNavigatorRef.current(); // Reset auto-hide timer
     };
 
     if (viewerInstance) {

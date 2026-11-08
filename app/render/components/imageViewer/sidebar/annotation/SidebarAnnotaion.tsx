@@ -296,8 +296,11 @@ const SidebarAnnotation: React.FC = () => {
     {},
   );
 
-  const [aiAnnotationFilters, setAiAnnotationFilters] =
-    useState<AnnotationFilters>({});
+  // Kept per layer type: a class filter set on the cell layer must not hide
+  // rows of the patch layer (their class lists differ).
+  const [classificationFilters, setClassificationFilters] = useState<
+    Record<string, AnnotationFilters>
+  >({});
 
   const allAnnotations = useSelector(
     (state: RootState) => state.annotations.annotations,
@@ -319,6 +322,10 @@ const SidebarAnnotation: React.FC = () => {
   // REAL stored annotations rather than the in-memory annotorious shapes.
   const [savedUserAnnotations, setSavedUserAnnotations] = useState<any[]>([]);
   const savedUserFetchSeqRef = useRef(0);
+  // Latest cell / patch page request: a slower reply for a page the user has
+  // already left must not replace the rows of the current page.
+  const aiFetchSeqRef = useRef(0);
+  const aiPatchFetchSeqRef = useRef(0);
   // Per-classifier run metadata (created_at) from <X-Classification>/metadata,
   // refreshed each classification run — used for the cell/patch "most recent".
   const [classificationMeta, setClassificationMeta] = useState<{
@@ -570,6 +577,7 @@ const SidebarAnnotation: React.FC = () => {
 
   const fetchAiAnnotations = async (offset: number, limit: number) => {
     if (!currentImagePath || !activeInstanceId) return;
+    const seq = ++aiFetchSeqRef.current;
     try {
       setLoading(true);
       const response = await segFetch(activeInstanceId, `${AI_SERVICE_API_ENDPOINT}/seg/v1/annotations/?offset=${offset}&limit=${limit}`, {
@@ -577,6 +585,7 @@ const SidebarAnnotation: React.FC = () => {
           
           returnAxiosFormat: true,
         });
+      if (seq !== aiFetchSeqRef.current) return;
       const data = response.data;
       if (!data) {
         throw new Error("Unexpected response structure");
@@ -590,6 +599,7 @@ const SidebarAnnotation: React.FC = () => {
         setTotalAiAnnotations(newTotal);
       }
     } catch (error) {
+      if (seq !== aiFetchSeqRef.current) return;
       if (isSegmentationHandlerNotReadyError(error)) {
         // A slide switch tears down the old handler before the new one is
         // ready. This is an expected transient state, not a dev-runtime error.
@@ -597,7 +607,7 @@ const SidebarAnnotation: React.FC = () => {
       }
       console.warn("Error fetching AI annotations:", error);
     } finally {
-      setLoading(false);
+      if (seq === aiFetchSeqRef.current) setLoading(false);
     }
   };
 
@@ -720,6 +730,7 @@ const SidebarAnnotation: React.FC = () => {
 
   const fetchAiAnnotationsPatch = async (offset: number, limit: number) => {
     if (!currentImagePath || !activeInstanceId) return;
+    const seq = ++aiPatchFetchSeqRef.current;
     try {
       setLoading(true);
       const response = await segFetch(activeInstanceId, `${AI_SERVICE_API_ENDPOINT}/seg/v1/patches/?offset=${offset}&limit=${limit}`, {
@@ -727,6 +738,7 @@ const SidebarAnnotation: React.FC = () => {
           
           returnAxiosFormat: true,
         });
+      if (seq !== aiPatchFetchSeqRef.current) return;
       const data = response.data;
       if (!data) {
         throw new Error("Unexpected response structure");
@@ -740,12 +752,13 @@ const SidebarAnnotation: React.FC = () => {
         setTotalAiAnnotationsPatch(newTotal);
       }
     } catch (error) {
+      if (seq !== aiPatchFetchSeqRef.current) return;
       if (isSegmentationHandlerNotReadyError(error)) {
         return;
       }
       console.warn("Error fetching AI annotations patch:", error);
     } finally {
-      setLoading(false);
+      if (seq === aiPatchFetchSeqRef.current) setLoading(false);
     }
   };
 
@@ -1286,9 +1299,16 @@ const SidebarAnnotation: React.FC = () => {
       uniqueColors,
       emptyMessage,
     } = config;
+    const filterKey = layer.type;
+    const layerFilters = classificationFilters[filterKey] ?? {};
+    const updateLayerFilters = (patch: Partial<AnnotationFilters>) =>
+      setClassificationFilters((prev) => ({
+        ...prev,
+        [filterKey]: { ...(prev[filterKey] ?? {}), ...patch },
+      }));
     const filteredAnnotations = applyFilters(
       layer.annotations,
-      aiAnnotationFilters,
+      layerFilters,
     );
 
     const resolveRow = (record: AnnotationRecord) => {
@@ -1338,12 +1358,11 @@ const SidebarAnnotation: React.FC = () => {
               label: name,
               value: name,
             }))}
-            values={aiAnnotationFilters.class_name ?? []}
+            values={layerFilters.class_name ?? []}
             onChange={(values) =>
-              setAiAnnotationFilters((prev) => ({
-                ...prev,
+              updateLayerFilters({
                 class_name: values.length ? values : undefined,
-              }))
+              })
             }
           />
           <FilterDropdown
@@ -1352,12 +1371,11 @@ const SidebarAnnotation: React.FC = () => {
               label: String(id),
               value: String(id),
             }))}
-            values={aiAnnotationFilters.class_id ?? []}
+            values={layerFilters.class_id ?? []}
             onChange={(values) =>
-              setAiAnnotationFilters((prev) => ({
-                ...prev,
+              updateLayerFilters({
                 class_id: values.length ? values : undefined,
-              }))
+              })
             }
           />
           <FilterDropdown
@@ -1374,12 +1392,11 @@ const SidebarAnnotation: React.FC = () => {
               ),
               value: color,
             }))}
-            values={aiAnnotationFilters.class_hex_color ?? []}
+            values={layerFilters.class_hex_color ?? []}
             onChange={(values) =>
-              setAiAnnotationFilters((prev) => ({
-                ...prev,
+              updateLayerFilters({
                 class_hex_color: values.length ? values : undefined,
-              }))
+              })
             }
           />
         </div>
