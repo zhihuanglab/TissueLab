@@ -1,5 +1,5 @@
-import { useEffect } from 'react';
-import { useDispatch, useSelector } from 'react-redux';
+import { useEffect, useRef } from 'react';
+import { useDispatch, useSelector, useStore } from 'react-redux';
 import { RootState } from '@/store/index';
 import { 
   setCurrentDirectory, 
@@ -8,13 +8,15 @@ import {
   setSortConfig, 
   setTableViewMode, 
   setShowNonImageFiles,
-  setSearchTerm,
   addExpandedFolder,
   removeExpandedFolder
 } from '@/store/slices/fileManagerSlice';
 
 export const useFileManagerPreservation = (storageKey: string = 'fileManagerState') => {
   const dispatch = useDispatch();
+  const store = useStore<RootState>();
+  // Set once the restore effect has run; saving waits for it so defaults never overwrite saved state.
+  const restoredRef = useRef(false);
   const {
     currentDirectory,
     fileTree,
@@ -27,43 +29,13 @@ export const useFileManagerPreservation = (storageKey: string = 'fileManagerStat
     lastVisitedPath
   } = useSelector((state: RootState) => state.fileManager);
 
-  // Save state to localStorage when it changes
-  useEffect(() => {
-    // Check if we're in a browser environment
-    if (typeof window === 'undefined') {
-      return;
-    }
-    
-    const stateToSave = {
-      currentDirectory,
-      selectedFiles,
-      sortConfig,
-      tableViewMode,
-      showNonImageFiles,
-      searchTerm,
-      expandedFolders,
-      lastVisitedPath
-    };
-    
-    localStorage.setItem(storageKey, JSON.stringify(stateToSave));
-  }, [
-    storageKey,
-    currentDirectory,
-    selectedFiles,
-    sortConfig,
-    tableViewMode,
-    showNonImageFiles,
-    searchTerm,
-    expandedFolders,
-    lastVisitedPath
-  ]);
-
   // Restore state from localStorage on mount
   useEffect(() => {
     // Check if we're in a browser environment
     if (typeof window === 'undefined') {
       return;
     }
+    restoredRef.current = true;
     
     const savedState = localStorage.getItem(storageKey);
     if (savedState) {
@@ -86,9 +58,9 @@ export const useFileManagerPreservation = (storageKey: string = 'fileManagerStat
         if (parsedState.showNonImageFiles !== undefined) {
           dispatch(setShowNonImageFiles(parsedState.showNonImageFiles));
         }
-        if (parsedState.searchTerm) {
-          dispatch(setSearchTerm(parsedState.searchTerm));
-        }
+        // searchTerm is deliberately not restored: a search is transient, and
+        // restoring the term without re-running it shows an empty folder as
+        // "No files found" (R-DASH-05).
         if (parsedState.expandedFolders) {
           parsedState.expandedFolders.forEach((folder: string) => {
             dispatch(addExpandedFolder(folder));
@@ -99,6 +71,42 @@ export const useFileManagerPreservation = (storageKey: string = 'fileManagerStat
       }
     }
   }, [dispatch, storageKey]);
+
+  // Save state to localStorage when it changes. Declared after the restore
+  // effect and gated on it: on mount the restore runs first, and the values are
+  // read from the store (not this render's closure, which still holds the
+  // defaults) so the freshly restored state is what gets written back.
+  useEffect(() => {
+    // Check if we're in a browser environment
+    if (typeof window === 'undefined' || !restoredRef.current) {
+      return;
+    }
+    const latest = store.getState().fileManager;
+    
+    const stateToSave = {
+      currentDirectory: latest.currentDirectory,
+      selectedFiles: latest.selectedFiles,
+      sortConfig: latest.sortConfig,
+      tableViewMode: latest.tableViewMode,
+      showNonImageFiles: latest.showNonImageFiles,
+      searchTerm: latest.searchTerm,
+      expandedFolders: latest.expandedFolders,
+      lastVisitedPath: latest.lastVisitedPath
+    };
+    
+    localStorage.setItem(storageKey, JSON.stringify(stateToSave));
+  }, [
+    store,
+    storageKey,
+    currentDirectory,
+    selectedFiles,
+    sortConfig,
+    tableViewMode,
+    showNonImageFiles,
+    searchTerm,
+    expandedFolders,
+    lastVisitedPath
+  ]);
 
   return {
     currentDirectory,

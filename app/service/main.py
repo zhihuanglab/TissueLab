@@ -264,7 +264,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Download-Count"],  # Explicitly expose custom headers
+    expose_headers=["X-Download-Count", "X-Search-Truncated"],  # Explicitly expose custom headers
     # Let browsers reuse a preflight for an hour (as Google APIs do; Chrome caps
     # at 2h) instead of Starlette's default 600s.
     max_age=3600,

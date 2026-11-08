@@ -107,9 +107,12 @@ class AppResponse:
 
         content = json.dumps(response_data, cls=NumpyEncoder)
         _log_response_body(self.code, content, self.data)
+        # media_type: without it clients sniffing Content-Type took an error
+        # envelope for the bytes they asked for (a tile, a mask, a CSV export).
         return Response(
             content=content,
             status_code=200,  # Always return 200
+            media_type="application/json",
         )
 
 

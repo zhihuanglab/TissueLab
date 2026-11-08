@@ -115,7 +115,7 @@ import {
 import eventBus from '@/utils/common/eventBus';
 import { getBackendDefinedErrorMessage, getErrorMessage } from '@/utils/common/apiResponse';
 import { getWSIBaseName, isH5Convertible, isWSI, isZarr, isZarrDir, isZarrZip } from '@/utils/dashboard/fileType.utils';
-import { isPublicReadOnlyPath, isWriteBlockedPath } from '@/utils/common/pathAccess.utils';
+import { isPublicReadOnlyPath, isWriteBlockedPath, getRestrictedAccessMode } from '@/utils/common/pathAccess.utils';
 import { shortHashFromString, validateItemName } from '@/utils/common/string.utils';
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@radix-ui/react-hover-card";
 import {
@@ -159,7 +159,7 @@ import { InfiniteScrollSentinel } from './FileManager/InfiniteScrollSentinel';
 import { VirtualRows, renderBlockSpacer, renderTableSpacer, useIsDesktopLayout } from './FileManager/VirtualRows';
 import ImagePreviewCell from './FileManager/ImagePreviewCell';
 import ZarrBadgesCell, { revalidateBadges } from './FileManager/ZarrBadgesCell';
-import { UploadDialog } from './UploadDialog';
+import { UploadDialog, type UploadResultSummary } from './UploadDialog';
 import {
   Tooltip,
   TooltipContent,
@@ -449,6 +449,12 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
   
   // Conversion jobs state for h5 to zarr conversion
   const [conversionJobs, setConversionJobs] = useState<ConversionJobMap>({});
+  // Status polls can overlap when a request takes longer than the 3 s interval.
+  // Stamp each request so a slow, older reply is ignored, and announce each
+  // job's terminal status only once.
+  const conversionPollSeqRef = useRef(0);
+  const conversionAppliedSeqRef = useRef<Record<string, number>>({});
+  const conversionAnnouncedRef = useRef<Set<string>>(new Set());
   
   // Overwrite confirmation dialog state for compression/extraction
   const [overwriteCompressDialogOpen, setOverwriteCompressDialogOpen] = useState(false);
@@ -509,6 +515,11 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
   // visible. Drives the "Upload complete!" notice shown in the file-selection area.
   // Cleared at the start of every new upload so it only appears once per batch.
   const [uploadJustCompleted, setUploadJustCompleted] = useState(false);
+  // Same moment, but some files failed: the dialog lists the failures instead.
+  const [uploadResult, setUploadResult] = useState<UploadResultSummary | null>(null);
+  // Bumped by the toolbar Upload button while an upload runs, to bring the
+  // minimized / hidden progress view back.
+  const [revealUploadProgress, setRevealUploadProgress] = useState(0);
 
   const [dialog, setDialog] = useState<
     { type: 'create-folder' | 'rename'; path?: string; } |
@@ -1143,8 +1154,20 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     const intervalId = window.setInterval(async () => {
       await Promise.all(
         activeEntries.map(async ([path, job]) => {
+          const seq = ++conversionPollSeqRef.current;
+          const isStale = () => seq < (conversionAppliedSeqRef.current[path] ?? 0);
+          const markApplied = () => { conversionAppliedSeqRef.current[path] = seq; };
+          // True the first time this job reaches this terminal status.
+          const firstAnnouncement = (status: string) => {
+            const key = `${job.jobId}:${status}`;
+            if (conversionAnnouncedRef.current.has(key)) return false;
+            conversionAnnouncedRef.current.add(key);
+            return true;
+          };
           try {
             const updated = await getConversionJobStatus(job.jobId);
+            if (isStale()) return;
+            markApplied();
             const prevStatus = conversionJobs[path]?.status;
             const prevError = conversionJobs[path]?.error ?? null;
 
@@ -1172,6 +1195,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
             if (prevStatus !== updated.status || prevError !== (updated.error ?? null)) {
               const fileName = path.split(/[/\\]/).pop() || path;
               if (updated.status === 'succeeded') {
+                if (!firstAnnouncement('succeeded')) return;
                 toast.success(`Conversion completed: ${fileName}`);
                 if (currentDirectory) {
                   fetchFiles(currentDirectory);
@@ -1183,6 +1207,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
                   });
                 }, 10000);
               } else if (updated.status === 'failed') {
+                if (!firstAnnouncement('failed')) return;
                 toast.error(updated.error ?? 'Conversion failed');
                 window.setTimeout(() => {
                   setConversionJobs(prev => {
@@ -1193,6 +1218,8 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
               }
             }
           } catch (err) {
+            if (isStale()) return;
+            markApplied();
             const errorMessage = getConversionErrorMessage(err, 'Failed to fetch conversion status');
             const prevStatus = conversionJobs[path]?.status;
 
@@ -1211,7 +1238,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
               };
             });
 
-            if (prevStatus !== 'failed') {
+            if (prevStatus !== 'failed' && firstAnnouncement('failed')) {
               const fileName = path.split(/[/\\]/).pop() || path;
               toast.error(errorMessage);
               window.setTimeout(() => {
@@ -1342,17 +1369,32 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     return paths;
   }, [fileTree, showNonImageFiles]);
 
+  // Entering a folder leaves search mode: a kept term would filter the new
+  // folder (or show `No files found for "..."`) and be saved for next visit.
+  const enterFolder = (path: string) => {
+    if (searchTerm || searchDebounceRef.current) {
+      if (searchDebounceRef.current) {
+        clearTimeout(searchDebounceRef.current);
+        searchDebounceRef.current = null;
+      }
+      searchSeqRef.current += 1; // drop any search still in flight
+      setSearchTruncated(false);
+      dispatch(setSearchTerm(''));
+    }
+    fetchFiles(path);
+  };
+
   const openOrEnterItem = (item: FileTreeNode) => {
     // @ts-ignore
     if (item.isParentLink) {
       const target = item.path;
       if (!target) return;
-      fetchFiles(target);
+      enterFolder(target);
       return;
     }
 
     if (item.is_dir && !isZarr(item.name)) {
-      fetchFiles(item.path);
+      enterFolder(item.path);
     } else if (isWSI(item.name)) {
       handleWsiUpload(item.path);
     } else if (isZarrZip(item.name)) {
@@ -1427,7 +1469,21 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     }
   };
 
-  const handleWsiUpload = async (relativePath: string) => {
+  // One slide open at a time: a double click (or a click while the first
+  // open is still running) would otherwise create two viewer instances and
+  // push the route twice.
+  const openingSlideRef = useRef(false);
+  const handleWsiUpload = async (path: string) => {
+    if (openingSlideRef.current) return;
+    openingSlideRef.current = true;
+    try {
+      await openWsi(path);
+    } finally {
+      openingSlideRef.current = false;
+    }
+  };
+
+  const openWsi = async (relativePath: string) => {
     dispatch(setWsiOpening(true)); // full-screen loading cover until the viewer renders
     try {
       console.log('FileManager: Starting WSI upload for:', relativePath);
@@ -1452,7 +1508,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
         fileSize: uploadData.fileSize ?? null,
         mpp: uploadData.slideInfo.mpp ?? null,
         magnification: uploadData.slideInfo.magnification ?? null,
-        imageType: uploadData.slideInfo.imageType || (uploadData.slideInfo.fileFormat === 'qptiff' && uploadData.slideInfo.totalChannels && uploadData.slideInfo.totalChannels > 3) ? 'Multiplex Immunofluorescent' : 'Brightfield H&E'
+        imageType: uploadData.slideInfo.imageType || ((uploadData.slideInfo.fileFormat === 'qptiff' && (uploadData.slideInfo.totalChannels ?? 0) > 3) ? 'Multiplex Immunofluorescent' : 'Brightfield H&E')
       }));
       if (uploadData.slideInfo.totalChannels) {
         dispatch(setTotalChannels(uploadData.slideInfo.totalChannels));
@@ -1485,7 +1541,8 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     } catch(err) {
         console.error("Error processing WSI file:", err);
         dispatch(setWsiOpening(false)); // lift the cover so the error is visible
-        dispatch(setError(getErrorMessage(err, 'Failed to load WSI file.')));
+        // Toast instead of the global listing error: the folder view, New Folder and Upload stay usable.
+        toast.error(getErrorMessage(err, 'Failed to load WSI file.'));
     }
   }
 
@@ -1794,7 +1851,12 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
   const handleDragOver = (e: React.DragEvent, targetPath?: string) => {
     e.preventDefault(); // Necessary to allow dropping
     e.dataTransfer.dropEffect = 'move';
+    // The event bubbles from a folder row to the list container, which passes
+    // the current folder; the innermost (row) target wins.
+    const native = e.nativeEvent as DragEvent & { __fmDropTargetSet?: boolean };
+    if (native.__fmDropTargetSet) return;
     if (targetPath !== undefined && draggingPaths.length > 0) {
+      native.__fmDropTargetSet = true;
       setDragOverTarget(targetPath);
     }
   };
@@ -2045,6 +2107,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     try {
     // Clear the "just completed" banner whenever a new upload batch starts.
     setUploadJustCompleted(false);
+    setUploadResult(null);
     refreshChunkUploadResumeHints();
 
     uploadQuotaErrorRef.current = null;
@@ -2244,10 +2307,25 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
           if (isDialogMinimizedRef.current) {
             dispatch(setUploadSettings({ isUploadDialogOpen: false }));
             isDialogMinimizedRef.current = false; // reset for next session
-          } else if (uploadResults.successful > 0) {
-            // User was watching the center dialog and at least one file succeeded —
-            // show the "Upload complete" notice above the file-selection area.
-            setUploadJustCompleted(true);
+          } else {
+            // User was watching the center dialog: show the outcome above the
+            // file-selection area — "Upload complete", or the failures.
+            const errorStatuses = Array.from(uploadStatusRef.current.values()).filter(
+              (s) => s.status === 'Error'
+            );
+            const failed = Math.max(uploadResults.failed, errorStatuses.length);
+            if (failed > 0) {
+              setUploadResult({
+                successful: uploadResults.successful,
+                failed,
+                cancelled: uploadResults.cancelled,
+                errors: Array.from(new Set(
+                  errorStatuses.map((s) => s.error).filter((m): m is string => Boolean(m))
+                )),
+              });
+            } else if (uploadResults.successful > 0) {
+              setUploadJustCompleted(true);
+            }
           }
 
           cleanupUploadState(batchGeneration);
@@ -2582,6 +2660,19 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
   // Handle copying a Samples file or folder to the user's Personal root.
   // Supports automatic retry when backend returns 503 COPY_BUSY_RETRY.
   const COPY_MAX_RETRIES = 10;
+  // Pending 503 retries (toast key -> timer). Cleared on unmount so a file
+  // manager that is gone stops re-issuing the copy; its "Queued…" toast goes too.
+  const copyRetryTimersRef = useRef<Map<string, number>>(new Map());
+  useEffect(() => {
+    const pending = copyRetryTimersRef.current;
+    return () => {
+      pending.forEach((timer, toastKey) => {
+        window.clearTimeout(timer);
+        toast.dismiss(toastKey);
+      });
+      pending.clear();
+    };
+  }, []);
   const handleCopyToPersonal = async (item: FileTreeNode, retryCount: number = 0, link: boolean = false, includeZarr: boolean = false) => {
     const itemKey = item.path;
     const toastKey = `ctp_${itemKey}`; // Stable key so toasts update in-place
@@ -2629,7 +2720,13 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
         const retryAfter: number = (e as any).retryAfter ?? 10;
         setCopyStates(prev => ({ ...prev, [itemKey]: 'queued' }));
         toast.loading(`Queued… retrying in ${retryAfter}s`, { id: toastKey, duration: Infinity });
-        setTimeout(() => { handleCopyToPersonal(item, retryCount + 1, link, includeZarr); }, retryAfter * 1000);
+        const pending = copyRetryTimersRef.current;
+        const prevTimer = pending.get(toastKey);
+        if (prevTimer !== undefined) window.clearTimeout(prevTimer);
+        pending.set(toastKey, window.setTimeout(() => {
+          pending.delete(toastKey);
+          handleCopyToPersonal(item, retryCount + 1, link, includeZarr);
+        }, retryAfter * 1000));
         return;
       }
 
@@ -2744,53 +2841,59 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     // item.path alone is not authoritative for extract permissions.
     const itemAccessPath = isInSamplesDir ? currentDirectory : item.path;
     const itemWritable = !isWriteBlockedPath(itemAccessPath);
+    // Public Samples are read-only but downloadable; only Viewer shares block
+    // taking the bytes (matches the backend extract ACL).
+    const itemDownloadable = getRestrictedAccessMode(itemAccessPath) !== 'viewer';
     // Allow opening menu for files even in Samples to enable Download.
     // Also allow for (non-zarr) directories inside Samples so "Copy folder to Personal" is accessible.
     const isSamplesSubfolder = item.is_dir && isInSamplesDir && !isZarr(item.name);
     const triggerDisabled = disabledAll && item.is_dir && !isSamplesSubfolder;
+    // Runs a download with one toast; once the progress events report a failure
+    // the final "completed" toast is skipped so it can't overwrite the error.
+    const runDownload = async (key: string, path: string, suggestedName: string) => {
+      let failed = false;
+      toast.loading('Preparing download...', { id: key, duration: Infinity });
+      const result = await downloadFile(path, suggestedName, (progress) => {
+        if (progress.state === 'progressing' && progress.percent !== undefined) {
+          toast.loading(`Downloading ${progress.percent}%`, { id: key, duration: Infinity });
+        } else if (progress.state === 'completed') {
+          toast.success('Download completed', { id: key, duration: 2000 });
+        } else if (progress.state === 'interrupted' || progress.state === 'cancelled' || progress.state === 'failed') {
+          failed = true;
+          toast.error('Download Failed', { id: key, duration: 2000 });
+        }
+      });
+      if (failed) return;
+      if (result && result.ok === false) {
+        if (result.cancelled) toast('Download cancelled', { id: key, duration: 2000 });
+        else toast.error('Download Failed', { id: key, duration: 2000 });
+        return;
+      }
+      toast.success('Download completed', { id: key, duration: 2000 });
+    };
     const onDownload = async () => {
-      if (!itemWritable) {
+      if (!itemDownloadable) {
         denyWriteToast('download this item', itemAccessPath);
         return;
       }
       const key = `dl_${Math.random().toString(36).slice(2)}`;
       try {
-        toast.loading('Preparing download...', { id: key, duration: Infinity });
         // For zarr dirs: backend streams as zip, suggest .zip filename
         const suggestedName = isZarrDir ? `${item.name || 'download'}.zip` : (item.name || 'download');
-        await downloadFile(item.path, suggestedName, (progress) => {
-          if (progress.state === 'progressing' && progress.percent !== undefined) {
-            toast.loading(`Downloading ${progress.percent}%`, { id: key, duration: Infinity });
-          } else if (progress.state === 'completed') {
-            toast.success('Download completed', { id: key, duration: 2000 });
-          } else if (progress.state === 'interrupted' || progress.state === 'cancelled' || progress.state === 'failed') {
-            toast.error('Download Failed', { id: key, duration: 2000 });
-          }
-        });
-        
-        toast.success('Download completed', { id: key, duration: 2000 });
+        await runDownload(key, item.path, suggestedName);
       } catch (e: any) {
         toast.error(getErrorMessage(e, 'Download failed'), { id: key });
       }
     };
     const onDownloadData = async () => {
-      if (denyWriteToast('download analysis data', itemAccessPath)) {
+      if (!itemDownloadable) {
+        denyWriteToast('download analysis data', itemAccessPath);
         return;
       }
       const key = `dld_${Math.random().toString(36).slice(2)}`;
       try {
-        toast.loading('Preparing download...', { id: key, duration: Infinity });
         // Companion analysis data for this WSI lives at <wsi>.zarr; backend streams it as zip.
-        await downloadFile(`${item.path}.zarr`, `${item.name}.zarr.zip`, (progress) => {
-          if (progress.state === 'progressing' && progress.percent !== undefined) {
-            toast.loading(`Downloading ${progress.percent}%`, { id: key, duration: Infinity });
-          } else if (progress.state === 'completed') {
-            toast.success('Download completed', { id: key, duration: 2000 });
-          } else if (progress.state === 'interrupted' || progress.state === 'cancelled' || progress.state === 'failed') {
-            toast.error('Download Failed', { id: key, duration: 2000 });
-          }
-        });
-        toast.success('Download completed', { id: key, duration: 2000 });
+        await runDownload(key, `${item.path}.zarr`, `${item.name}.zarr.zip`);
       } catch (e: any) {
         toast.error(getErrorMessage(e, 'Download failed'), { id: key });
       }
@@ -2802,8 +2905,8 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     const conversionJob = isH5File ? conversionJobs[item.path] : null;
     const isConverting = conversionJob && (conversionJob.status === 'pending' || conversionJob.status === 'running');
     const handleCompress = async (overwrite: boolean = false) => {
+      const key = `cmp_${Math.random().toString(36).slice(2)}`;
       try {
-        const key = `cmp_${Math.random().toString(36).slice(2)}`;
         const statusMessages: Record<string, string> = {
           'pending': 'Starting compression...',
           'processing': 'Compressing...',
@@ -2843,15 +2946,15 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
         await fetchFiles(currentDirectory);
         toast.success('Compressed to zip', { id: key, duration: 2000 });
       } catch (e: any) {
-        toast.error(getErrorMessage(e, 'Compression failed'));
+        toast.error(getErrorMessage(e, 'Compression failed'), { id: key, duration: 4000 });
       }
     };
     const handleExtract = async (overwrite: boolean = false) => {
       if (denyWriteToast('extract this archive', itemAccessPath)) {
         return;
       }
+      const key = `ext_${Math.random().toString(36).slice(2)}`;
       try {
-        const key = `ext_${Math.random().toString(36).slice(2)}`;
         const statusMessages: Record<string, string> = {
           'pending': 'Starting extraction...',
           'processing': 'Extracting...',
@@ -2889,7 +2992,21 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
         await fetchFiles(currentDirectory);
         toast.success('Extraction completed', { id: key, duration: 2000 });
       } catch (e: any) {
-        toast.error(getErrorMessage(e, 'Extraction failed'));
+        const message = getErrorMessage(e, 'Extraction failed');
+        // The archive's entries need not be named after the zip, so the
+        // pre-check above can miss a clash the server then refuses. Offer the
+        // same overwrite choice instead of a dead-end error.
+        const conflict = !overwrite ? /File conflict: '(.+)' already exists/i.exec(message) : null;
+        if (conflict) {
+          toast.dismiss(key);
+          setOverwriteTargetPath(currentDirectory ? `${currentDirectory}/${conflict[1]}` : conflict[1]);
+          setOverwriteTargetName(conflict[1]);
+          setOverwriteAction(() => () => handleExtract(true));
+          setOverwriteCompressDialogOpen(true);
+          return;
+        }
+        // Replace the "Starting extraction..." spinner rather than leaving it up.
+        toast.error(message, { id: key, duration: 4000 });
       }
     };
     return (
@@ -2901,12 +3018,12 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
           </DropdownMenuTrigger>
           <DropdownMenuContent>
               {(!item.is_dir || isZarrDir) && (
-                <DropdownMenuItem onSelect={onDownload} disabled={!itemWritable}>
+                <DropdownMenuItem onSelect={onDownload} disabled={!itemDownloadable}>
                     <DownloadCloud className="h-4 w-4 mr-2" /> Download
                 </DropdownMenuItem>
               )}
               {isWsiFile && (
-                <DropdownMenuItem onSelect={onDownloadData} disabled={!itemWritable}>
+                <DropdownMenuItem onSelect={onDownloadData} disabled={!itemDownloadable}>
                     <DownloadCloud className="h-4 w-4 mr-2" /> Download data
                 </DropdownMenuItem>
               )}
@@ -3036,6 +3153,11 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     // disagree on string order above the BMP, and an emoji in a filename is
     // enough to trigger it.
     const sortedNodes = nodes;
+    // Folder under the cursor while rows are being dragged (not one of the dragged rows).
+    const dropTargetClass = (path: string) =>
+      draggingPaths.length > 0 && dragOverTarget === path && !draggingPaths.includes(path)
+        ? ' !bg-primary/20 ring-2 ring-inset ring-primary/60'
+        : '';
 
     sortedNodes.forEach((item, index) => {
         const globalIndex = baseIndex + index;
@@ -3049,7 +3171,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
                     onDragLeave={handleDragLeave}
                     onDrop={(e) => handleDrop(e, item)}
                     onClick={(e) => handleItemClick(item, e)}
-                    className="cursor-pointer transition-colors align-middle hover:bg-primary/10 mx-2 rounded-lg bg-card border-b border-border/30 text-[12px] [&_td]:py-0.5 [&_td]:px-2"
+                    className={`cursor-pointer transition-colors align-middle hover:bg-primary/10 mx-2 rounded-lg bg-card border-b border-border/30 text-[12px] [&_td]:py-0.5 [&_td]:px-2${dropTargetClass(item.path)}`}
                 >
                     <TableCell style={{ minWidth: COL_MIN_NAME }}>
                          <div style={{ paddingLeft: `${item.depth * 24}px` }} className="flex items-center gap-2">
@@ -3082,7 +3204,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
                 onDragLeave={item.is_dir && !isZarr(item.name) ? handleDragLeave : undefined}
                 onDrop={item.is_dir && !isZarr(item.name) ? (e) => handleDrop(e, item) : (e) => e.preventDefault()}
                 onClick={(e) => handleItemClick(item, e)}
-                className={`even:bg-muted/10 cursor-pointer transition-colors align-middle rounded-lg mx-2 hover:!bg-primary/9 ${selectedPaths.has(item.path) ? '!bg-primary/15 hover:!bg-primary/20' : ''} ${!item.is_dir && isWSI(item.name) && item.attachedZarrPath ? '' : 'border-b border-border/30'} text-[12px] [&_td]:py-0.5 [&_td]:px-2`}
+                className={`even:bg-muted/10 cursor-pointer transition-colors align-middle rounded-lg mx-2 hover:!bg-primary/9 ${selectedPaths.has(item.path) ? '!bg-primary/15 hover:!bg-primary/20' : ''} ${!item.is_dir && isWSI(item.name) && item.attachedZarrPath ? '' : 'border-b border-border/30'} text-[12px] [&_td]:py-0.5 [&_td]:px-2${item.is_dir && !isZarr(item.name) ? dropTargetClass(item.path) : ''}`}
             >
                 <TableCell className="px-3" style={{ minWidth: COL_MIN_NAME }}>
                     <div style={{ paddingLeft: `${item.depth * 24}px` }} className="flex items-center gap-3">
@@ -3432,11 +3554,10 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     currentDirectory === 'samples' ||
     (!!personalRootForUp && currentDirectory === personalRootForUp);
   const newFolderDisabled = Boolean(error) || !canCreate;
-  const uploadDisabled =
-    uploadSettings.isUploading
-    || hasActiveUploadStatuses(uploadStatus)
-    || Boolean(error)
-    || !canUpload;
+  // While an upload runs the Upload button stays usable: it brings the progress
+  // view back (after Minimize / Hide progress) instead of starting a new batch.
+  const uploadBusy = uploadSettings.isUploading || hasActiveUploadStatuses(uploadStatus);
+  const uploadDisabled = !uploadBusy && (Boolean(error) || !canUpload);
 
   // Selection actions must see every selected node, not just the ones on screen,
   // so paging mid-select doesn't drop Move / Delete / Copy from the toolbar.
@@ -3661,6 +3782,11 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
                       variant="default"
                       size="sm"
                       onClick={() => {
+                        if (uploadBusy) {
+                          dispatch(setUploadSettings({ isUploadDialogOpen: true }));
+                          setRevealUploadProgress((n) => n + 1);
+                          return;
+                        }
                         if (uploadDisabled || denyWriteToast('upload files', currentDirectory)) {
                           return;
                         }
@@ -3673,7 +3799,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
                       <Upload className="h-3.5 w-3.5" />
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent side="bottom">Upload Files</TooltipContent>
+                  <TooltipContent side="bottom">{uploadBusy ? 'Show upload progress' : 'Upload Files'}</TooltipContent>
                 </Tooltip>
               ) : null
             }
@@ -3748,6 +3874,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
         onClose={() => {
           // Google Drive style: closing the dialog does not cancel in-flight uploads.
           setUploadJustCompleted(false);
+          setUploadResult(null);
           dispatch(setUploadSettings({
             isUploadDialogOpen: false,
             isUploading: false,
@@ -3766,6 +3893,8 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
         onMinimizedChange={(minimized) => { isDialogMinimizedRef.current = minimized; }}
         uploadInterrupted={uploadInterrupted}
         uploadJustCompleted={uploadJustCompleted}
+        uploadResult={uploadResult}
+        revealProgressSignal={revealUploadProgress}
         resumeHints={chunkUploadResumeHints}
         preRunAnalysis={preRunAnalysis}
         onPreRunAnalysisChange={setPreRunAnalysis}

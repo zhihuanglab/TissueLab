@@ -1,7 +1,8 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Folder, Globe } from "lucide-react";
+import { AlertCircle, Folder, Globe } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { getConfig } from "@/services/fileManager.service";
 import { useSelector } from "react-redux";
@@ -80,6 +81,11 @@ const StorageFolderCards: React.FC = () => {
   // the highlight follows automatically.
   const [requestedNav, setRequestedNav] = useState<{ path: string; key: number } | null>(null);
   const [personalPath, setPersonalPath] = useState<string>("");
+  // Set when /fm/v1/config fails (backend down, no defaultPath). Without it a
+  // dashboard with no saved path would show the loading skeleton forever.
+  const [configError, setConfigError] = useState<string | null>(null);
+  // Bumped by Retry (and by clicking Personal while the config is missing).
+  const [configAttempt, setConfigAttempt] = useState(0);
   // Read the deep path ONCE at mount. After WebFileManager takes over it owns
   // currentDirectory; we don't want to keep recomputing initialPath as it
   // changes (that would steal navigation focus from the user).
@@ -126,17 +132,28 @@ const StorageFolderCards: React.FC = () => {
   // Fetch the local user's personal path from /v1/config.
   useEffect(() => {
     let cancelled = false;
+    setConfigError(null);
     getConfig()
       .then((cfg) => {
-        if (!cancelled && cfg?.defaultPath) {
+        if (cancelled) return;
+        if (cfg?.defaultPath) {
           setPersonalPath(cfg.defaultPath.replace(/\\/g, "/"));
+        } else {
+          setConfigError("The file service did not report your Personal folder.");
         }
       })
-      .catch(() => {});
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        console.warn("[StorageFolderCards] getConfig failed:", err);
+        const detail = err instanceof Error && err.message ? ` (${err.message})` : "";
+        setConfigError(`Could not reach the file service${detail}.`);
+      });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [configAttempt]);
+
+  const retryConfig = useCallback(() => setConfigAttempt((n) => n + 1), []);
 
   const getPathForFolder = useCallback(
     (folder: FolderCategory): string => {
@@ -200,14 +217,18 @@ const StorageFolderCards: React.FC = () => {
   const handleCardClick = useCallback(
     (folder: FolderCategory) => {
       const target = getPathForFolder(folder);
-      if (!target) return; // personalPath not loaded yet — wait for getConfig
+      if (!target) {
+        // personalPath not loaded yet: wait for getConfig, or retry it if it failed.
+        if (configError) retryConfig();
+        return;
+      }
       // Always stamp a fresh key so clicking the same card twice still
       // triggers a remount + refetch (useful when the previous fetch
       // failed and the user wants to retry).
       setRequestedNav({ path: target, key: (requestedNav?.key ?? 0) + 1 });
       initialSavedPathRef.current = null;
     },
-    [getPathForFolder, requestedNav?.key]
+    [getPathForFolder, requestedNav?.key, configError, retryConfig]
   );
 
   // Cortex "open this study" — same machinery as a card click, just with a
@@ -308,6 +329,8 @@ const StorageFolderCards: React.FC = () => {
             is barely perceptible. */}
         {ready ? (
           <WebFileManager key={requestedNav?.key ?? 0} initialPath={resolvedInitialPath} />
+        ) : configError ? (
+          <FileManagerConfigError message={configError} onRetry={retryConfig} />
         ) : (
           <FileManagerSkeleton />
         )}
@@ -315,6 +338,26 @@ const StorageFolderCards: React.FC = () => {
     </div>
   );
 };
+
+/** Shown instead of the skeleton when the landing path cannot be resolved. */
+const FileManagerConfigError: React.FC<{ message: string; onRetry: () => void }> = ({
+  message,
+  onRetry,
+}) => (
+  <div
+    role="alert"
+    className="flex h-full min-h-0 w-full flex-col items-center justify-center gap-3 p-6 text-center"
+  >
+    <AlertCircle className="h-8 w-8 text-destructive" aria-hidden />
+    <div className="space-y-1">
+      <div className="text-sm font-semibold">Failed to load your files</div>
+      <div className="text-xs text-muted-foreground">{message}</div>
+    </div>
+    <Button variant="outline" size="sm" onClick={onRetry}>
+      Retry
+    </Button>
+  </div>
+);
 
 /**
  * Lightweight skeleton shown while the dashboard is still resolving its

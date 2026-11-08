@@ -1,7 +1,13 @@
 import { COMMUNITY_API_ENDPOINT, CTRL_SERVICE_API_ENDPOINT } from '@/config/api.config';
 import { FmApiError } from '@/services/fmApiError';
 import { apiFetch } from '@/utils/common/apiFetch';
-import { getAuthToken } from '@/utils/common/authToken';
+import {
+    AUTH_MISSING_ERROR,
+    getAuthToken,
+    notifyMissingAuth,
+    resolveSessionToken,
+    waitForAuthReady,
+} from '@/utils/common/authToken';
 import { sanitizeFilename } from '@/utils/common/string.utils';
 import Cookies from 'js-cookie';
 import { getAuth } from 'firebase/auth';
@@ -294,12 +300,17 @@ export const downloadFileDirect = async (token: string): Promise<Blob> => {
     });
     
     if (!response.ok) {
+        let message = `Request failed with status ${response.status}`;
         try {
             const data = await response.json();
-            throw new Error(data.detail || data.error || `Request failed with status ${response.status}`);
+            const detail = data?.detail ?? data?.message ?? data?.error;
+            if (typeof detail === 'string' && detail.trim()) {
+                message = detail;
+            }
         } catch {
-            throw new Error(`Request failed with status ${response.status}`);
+            /* non-JSON body: keep the status message */
         }
+        throw new Error(message);
     }
     return await response.blob();
 };
@@ -665,10 +676,32 @@ export const uploadFiles = (
             }
             xhr.open('POST', `${endpoint}/fm/v1/files/upload`, true);
         };
+        // A hosted endpoint (community storage) needs a real session: the local
+        // placeholder token must never leave the machine. Prompt for sign-in,
+        // wait for it, and give up if the user dismisses the prompt — the same
+        // contract apiFetch has for hosted requests.
+        const isLocalEndpoint = endpoint.startsWith(CTRL_SERVICE_API_ENDPOINT);
+        let hostedToken: string | null = null;
+        if (!isLocalEndpoint) {
+            try {
+                hostedToken = await resolveSessionToken();
+                if (!hostedToken) {
+                    notifyMissingAuth();
+                    await waitForAuthReady();
+                    hostedToken = await resolveSessionToken();
+                }
+            } catch {
+                hostedToken = null;
+            }
+            if (!hostedToken) {
+                reject(new Error(AUTH_MISSING_ERROR));
+                return;
+            }
+        }
         try {
             const effective = await setEffectivePath();
             applyFormDataAndOpen(effective);
-            const token = await getAuthToken();
+            const token = isLocalEndpoint ? await getAuthToken() : hostedToken;
             if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
         } catch (e) {
             const effective = await setEffectivePath();
@@ -889,6 +922,7 @@ export const subscribeTaskStatus = async (
     const startTime = Date.now();
     const remainingMs = () => Math.max(0, maxWaitTime - (Date.now() - startTime));
 
+    const notFound = { done: true, missing: true, error: 'Task not found or already finished' };
     const pollOnce = async (): Promise<{ done: boolean; result?: any; error?: string; missing?: boolean }> => {
         try {
             const response = await apiFetch(
@@ -898,7 +932,7 @@ export const subscribeTaskStatus = async (
             const res = response as Response;
             if (res.status === 404) {
                 // Completed tasks are removed from memory — result may already be gone.
-                return { done: true, missing: true, error: 'Task not found or already finished' };
+                return notFound;
             }
             const data = await handleResponse(res);
             if (onStatusUpdate && data?.status) {
@@ -911,7 +945,13 @@ export const subscribeTaskStatus = async (
                 return { done: true, error: data.error || 'Task failed' };
             }
             return { done: false };
-        } catch {
+        } catch (e: any) {
+            // The service answers an unknown/reaped task with HTTP 200 + {code: 404}
+            // (AppError envelope); apiFetch raises it as ApiError.code, handleResponse
+            // as FmApiError.status. Either way the task is gone — stop waiting.
+            if (e?.code === 404 || (e instanceof FmApiError && e.status === 404)) {
+                return notFound;
+            }
             return { done: false };
         }
     };

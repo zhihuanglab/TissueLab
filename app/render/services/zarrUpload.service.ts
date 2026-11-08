@@ -379,13 +379,19 @@ export async function executeZarrBatchUpload(
 
         let batchFailed = false;
         let batchCancelled = false;
+        // Set when a batch that ran out of retries aborts the shared controller to stop
+        // its siblings; their resulting aborts are fallout of that failure, not a user cancel.
+        let abortedByBatchFailure = false;
+        const noteAborted = () => {
+            if (!abortedByBatchFailure) batchCancelled = true;
+        };
 
         if (batches.length > 0) {
             let nextIdx = 0;
 
             const uploadBatchWithRetry = async (batch: ZarrBatchFileEntry[], batchIndex: number) => {
                 if (zarrAbort.signal.aborted) {
-                    batchCancelled = true;
+                    noteAborted();
                     return;
                 }
                 if (resumedUploadedBatches.has(batchIndex)) {
@@ -395,7 +401,7 @@ export async function executeZarrBatchUpload(
                 }
                 for (let attempt = 0; attempt <= UPLOAD_MAX_RETRIES; attempt++) {
                     if (zarrAbort.signal.aborted) {
-                        batchCancelled = true;
+                        noteAborted();
                         return;
                     }
                     try {
@@ -416,18 +422,26 @@ export async function executeZarrBatchUpload(
                         return;
                     } catch (error: unknown) {
                         if (isAbortError(error) || zarrAbort.signal.aborted) {
-                            batchCancelled = true;
+                            noteAborted();
                             return;
                         }
                         const canRetry = attempt < UPLOAD_MAX_RETRIES;
                         if (!canRetry) {
                             nextIdx = batches.length;
+                            const failedAsCancel = String((error as Error)?.message ?? '').toLowerCase().includes('cancel');
+                            if (failedAsCancel) {
+                                batchCancelled = true;
+                            } else {
+                                batchFailed = true;
+                                // Only the first failure's message is reported.
+                                if (!abortedByBatchFailure) {
+                                    zarrFinalFailureMessage = (error as Error)?.message || 'Zarr batch upload failed';
+                                }
+                                abortedByBatchFailure = true;
+                            }
                             zarrAbort.abort();
                             console.error(`Zarr batch ${batchIndex} upload failed:`, error);
                             captureQuotaError(error);
-                            batchCancelled = String((error as Error)?.message ?? '').toLowerCase().includes('cancel');
-                            batchFailed = !batchCancelled;
-                            zarrFinalFailureMessage = (error as Error)?.message || 'Zarr batch upload failed';
                             return;
                         }
 
@@ -458,10 +472,10 @@ export async function executeZarrBatchUpload(
 
         if (batchFailed || batchCancelled) {
             await cleanupPartialZarr();
-            return fail(
-                batchCancelled ? 'Cancelled' : 'Error',
-                zarrFinalFailureMessage
-            );
+            // A real batch failure wins over the aborts it caused in the other batches.
+            return batchFailed
+                ? fail('Error', zarrFinalFailureMessage)
+                : fail('Cancelled', zarrFinalFailureMessage);
         }
 
         const mergeStartedAt = Date.now();

@@ -16,13 +16,26 @@ export const formatBytes = (bytes: number, decimals = 2): string => {
 };
 
 /**
+ * The trailing extension of a name ("a.svs" -> "svs"), or '' when there is no
+ * real one: no dot, a leading dot only (".bashrc"), or a "suffix" too long or
+ * containing spaces to be an extension (e.g. "Cohort v2.reviewed by team").
+ */
+const MAX_EXTENSION_LENGTH = 10;
+export const getExtension = (fileName: string): string => {
+  const lastDot = fileName.lastIndexOf('.');
+  if (lastDot <= 0 || lastDot === fileName.length - 1) return '';
+  const ext = fileName.slice(lastDot + 1);
+  if (ext.length > MAX_EXTENSION_LENGTH || /\s/.test(ext)) return '';
+  return ext;
+};
+
+/**
  * Truncate file name to specified length while preserving extension
  */
 export const truncateFileName = (fileName: string, maxLength: number = 80): string => {
   if (fileName.length <= maxLength) return fileName;
-  const extension = fileName.split('.').pop() || '';
-  const nameWithoutExt = fileName.slice(0, fileName.length - extension.length - 1);
-  if (nameWithoutExt.length <= maxLength - 5) return fileName;
+  const extension = getExtension(fileName);
+  const nameWithoutExt = extension ? fileName.slice(0, fileName.length - extension.length - 1) : fileName;
   const endChars = 5;
   const truncatedLength = maxLength - extension.length - endChars - 8;
   if (truncatedLength < 5) {
@@ -38,7 +51,7 @@ export const truncateFileName = (fileName: string, maxLength: number = 80): stri
  * Format file type for display
  */
 export const formatFileType = (fileName: string): string => {
-  const extension = fileName.split('.').pop();
+  const extension = getExtension(fileName);
   if (extension) {
     if (isWSI(fileName)) return 'WSI';
     if (isZarrZip(fileName)) return 'zip';
@@ -246,9 +259,22 @@ export const getAllImageFiles = (
   
   const extractImages = (nodes: FileTreeNode[], basePath: string = '') => {
     nodes.forEach(node => {
-      if (node.is_dir && node.children) {
+      const zarrStore = isZarrDir(node.name);
+      if (node.is_dir && zarrStore) {
+        // A .zarr store is a directory but is listed as one image; never descend into its chunks.
+        if (includeZarr) {
+          imageFiles.push({
+            name: node.name,
+            path: node.path,
+            fullPath: node.path,
+            size: node.size,
+            mtime: node.mtime,
+            isZarr: true
+          });
+        }
+      } else if (node.is_dir && node.children) {
         extractImages(node.children, basePath ? `${basePath}/${node.name}` : node.name);
-      } else if (!node.is_dir && (isWSI(node.name) || (includeZarr && isZarrDir(node.name)) || isH5Convertible(node.name))) {
+      } else if (!node.is_dir && (isWSI(node.name) || (includeZarr && zarrStore) || isH5Convertible(node.name))) {
         // Include WSI files, .zarr directories, and h5 files
         imageFiles.push({
           name: node.name,

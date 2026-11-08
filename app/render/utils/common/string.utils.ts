@@ -79,17 +79,29 @@ export const sanitizeFilename = (originalName: string): string => {
   if (!originalName) return `file_${Date.now()}`;
 
   // Normalize Unicode (NFKC to reduce compatibility issues)
-  let name = originalName.normalize("NFKC");
+  // Replace all whitespace including NBSP-like characters, and path separators,
+  // with underscores *before* splitting off the extension: a name such as
+  // "Tumor v1.2/final" has its last dot inside the text, and whatever follows
+  // that dot must not keep a space or become a sub-path.
+  const whitespaceRegex = /[\s\u00A0\u202F\u2007\u2060\uFEFF]+/g;
+  const name = originalName
+    .normalize("NFKC")
+    .replace(whitespaceRegex, "_")
+    .replace(/[\\\/]/g, "_");
 
   // Split extension (handles names beginning with a dot carefully)
   const lastDot = name.lastIndexOf(".");
   const hasExt = lastDot > 0 && lastDot !== name.length - 1;
   const base = hasExt ? name.slice(0, lastDot) : name;
-  const ext = hasExt ? name.slice(lastDot) : "";
+  const ext = hasExt
+    ? "." +
+      name
+        .slice(lastDot + 1)
+        .replace(/[\x00-\x1F\x7F]/g, "")
+        .replace(/[\:*?"<>|\'`\[\]\{\}\#\%\^~\+\=\,;!@]/g, "_")
+    : "";
 
-  // Replace all whitespace including NBSP-like characters with underscores
-  const whitespaceRegex = /[\s\u00A0\u202F\u2007\u2060\uFEFF]+/g;
-  let safeBase = base.replace(whitespaceRegex, "_");
+  let safeBase = base;
 
   // Remove/replace characters that commonly cause issues across OS/filesystems
   // Includes: path separators, quotes, control chars, and other reserved/specials
@@ -124,6 +136,10 @@ export const validateItemName = (name: string): string | null => {
   if (!name || name.trim() === '') return 'Name cannot be empty.';
   if (name.trim() !== name) return 'Name cannot start or end with spaces.';
   if (name.includes('/')) return "Names cannot contain '/'.";
+  // '\' is a path separator on Windows: "x\..\..\a.svs" would move the item
+  // out of its folder. The rest are invalid in Windows file names.
+  if (/[\\:*?"<>|]/.test(name)) return 'Names cannot contain \\ : * ? " < > |';
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(name)) return `'${name}' is a reserved name on Windows.`;
   if (name.includes('\0')) return 'Name contains invalid characters.';
   if (name === '.' || name === '..') return `'${name}' is a reserved name.`;
   if (name.startsWith('..')) return "Names cannot start with '..'.";

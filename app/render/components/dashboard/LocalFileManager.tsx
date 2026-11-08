@@ -83,6 +83,12 @@ type ConversionJobState = {
 
 type ConversionJobMap = Record<string, ConversionJobState>;
 
+/** Same folder regardless of separator style or a trailing separator ("C:\data" vs "C:/data/"). */
+function isSamePath(a: string, b: string): boolean {
+  const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '');
+  return norm(a) === norm(b);
+}
+
 function getOpenInSystemFileManagerMenuLabel(): string {
   if (typeof navigator === 'undefined') return 'Open in File Manager';
   const pf = navigator.platform || '';
@@ -96,6 +102,13 @@ const LocalFileManager = () => {
   const router = useRouter();
 
   const [conversionJobs, setConversionJobs] = useState<ConversionJobMap>({});
+  const fetchSeqRef = useRef(0);
+  // Status polls can overlap when a request takes longer than the 3 s interval.
+  // Stamp each request so a slow, older reply is ignored, and announce each
+  // job's terminal status only once.
+  const conversionPollSeqRef = useRef(0);
+  const conversionAppliedSeqRef = useRef<Record<string, number>>({});
+  const conversionAnnouncedRef = useRef<Set<string>>(new Set());
   const [rootFolder, setRootFolder] = useState<string>('');
   const [currentDirectory, setCurrentDirectory] = useState<string>('');
   const currentDirectoryRef = useRef<string>(''); // Ref to track current directory without causing re-renders
@@ -139,10 +152,15 @@ const LocalFileManager = () => {
 
   const fetchFiles = useCallback(async (path: string) => {
     if (!electron) return;
+    // Only the newest listing may write the folder/list; a slower earlier
+    // one (user clicked on before it answered) is dropped.
+    const seq = ++fetchSeqRef.current;
+    const isCurrent = () => fetchSeqRef.current === seq;
     setIsLoading(true);
     setError(null);
     try {
       const result: FileItem[] = await electron.listLocalFiles(path);
+      if (!isCurrent()) return;
       const sortedFiles = result.sort((a, b) => {
         if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
         return b.mtime - a.mtime; // Sort by last modified time in descending order
@@ -157,7 +175,7 @@ const LocalFileManager = () => {
       // Apply WSI-Zarr grouping
       treeNodes = groupWSIAndZarrFiles(treeNodes);
 
-      if (rootFolder && path && path !== rootFolder) {
+      if (rootFolder && path && !isSamePath(path, rootFolder)) {
         // Handle both Windows and Unix path separators for parent path calculation
         const normalizedPath = path.replace(/\\/g, '/');
         const lastSlashIndex = normalizedPath.lastIndexOf('/');
@@ -186,15 +204,19 @@ const LocalFileManager = () => {
       currentDirectoryRef.current = path; // Update ref synchronously
 
     } catch (err: any) {
+      if (!isCurrent()) return;
       setError(err.message);
       setFileTree([]);
       setAllFiles([]);
-      // If loading fails during initialization, clear localStorage
-      if (typeof window !== 'undefined') {
+      // Forget the remembered root only when the root itself is gone. A
+      // failing sub-folder (deleted, no permission) must not send the user
+      // back to "Open Folder" on the next launch.
+      const rootMissing = path === rootFolder && /ENOENT|no such file|cannot find/i.test(String(err?.message ?? ''));
+      if (rootMissing && typeof window !== 'undefined') {
         window.localStorage.removeItem('tissuelab_local_root_folder');
       }
     } finally {
-      setIsLoading(false);
+      if (isCurrent()) setIsLoading(false);
     }
   }, [electron, rootFolder, currentDirectory]);
 
@@ -231,8 +253,20 @@ const LocalFileManager = () => {
     const intervalId = window.setInterval(async () => {
       await Promise.all(
         activeEntries.map(async ([path, job]) => {
+          const seq = ++conversionPollSeqRef.current;
+          const isStale = () => seq < (conversionAppliedSeqRef.current[path] ?? 0);
+          const markApplied = () => { conversionAppliedSeqRef.current[path] = seq; };
+          // True the first time this job reaches this terminal status.
+          const firstAnnouncement = (status: string) => {
+            const key = `${job.jobId}:${status}`;
+            if (conversionAnnouncedRef.current.has(key)) return false;
+            conversionAnnouncedRef.current.add(key);
+            return true;
+          };
           try {
             const updated = await getConversionJobStatus(job.jobId);
+            if (isStale()) return;
+            markApplied();
             const prevStatus = conversionJobs[path]?.status;
             const prevError = conversionJobs[path]?.error ?? null;
 
@@ -260,6 +294,7 @@ const LocalFileManager = () => {
             if (prevStatus !== updated.status || prevError !== (updated.error ?? null)) {
               const fileName = path.split(/[/\\]/).pop() || path;
               if (updated.status === 'succeeded') {
+                if (!firstAnnouncement('succeeded')) return;
                 toast.success(`Conversion completed: ${fileName}`);
                 if (currentDirectory) {
                   fetchFiles(currentDirectory);
@@ -271,6 +306,7 @@ const LocalFileManager = () => {
                   });
                 }, 10000);
               } else if (updated.status === 'failed') {
+                if (!firstAnnouncement('failed')) return;
                 const errorMessage = updated.error ?? 'Conversion failed';
                 toast.error(errorMessage);
                 window.setTimeout(() => {
@@ -282,6 +318,8 @@ const LocalFileManager = () => {
               }
             }
           } catch (err) {
+            if (isStale()) return;
+            markApplied();
             const errorMessage = getConversionErrorMessage(err, 'Failed to fetch conversion status');
             const prevStatus = conversionJobs[path]?.status;
 
@@ -300,7 +338,7 @@ const LocalFileManager = () => {
               };
             });
 
-            if (prevStatus !== 'failed') {
+            if (prevStatus !== 'failed' && firstAnnouncement('failed')) {
               const fileName = path.split(/[/\\]/).pop() || path;
               toast.error(errorMessage);
               window.setTimeout(() => {
@@ -347,7 +385,21 @@ const LocalFileManager = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rootFolder]);
 
-  const handleWsiUpload = async (absolutePath: string) => {
+  // One slide open at a time: a double click (or a click while the first
+  // open is still running) would otherwise create two viewer instances and
+  // push the route twice.
+  const openingSlideRef = useRef(false);
+  const handleWsiUpload = async (path: string) => {
+    if (openingSlideRef.current) return;
+    openingSlideRef.current = true;
+    try {
+      await openWsi(path);
+    } finally {
+      openingSlideRef.current = false;
+    }
+  };
+
+  const openWsi = async (absolutePath: string) => {
     dispatch(setWsiOpening(true)); // full-screen loading cover until the viewer renders
     try {
       console.log('LocalFileManager: Starting WSI upload for:', absolutePath);
@@ -372,7 +424,7 @@ const LocalFileManager = () => {
         fileSize: uploadData.fileSize ?? null,
         mpp: uploadData.slideInfo.mpp ?? null,
         magnification: uploadData.slideInfo.magnification ?? null,
-        imageType: uploadData.slideInfo.imageType || (uploadData.slideInfo.fileFormat === 'qptiff' && uploadData.slideInfo.totalChannels && uploadData.slideInfo.totalChannels > 3) ? 'Multiplex Immunofluorescent' : 'Brightfield H&E'
+        imageType: uploadData.slideInfo.imageType || ((uploadData.slideInfo.fileFormat === 'qptiff' && (uploadData.slideInfo.totalChannels ?? 0) > 3) ? 'Multiplex Immunofluorescent' : 'Brightfield H&E')
       }));
       if (uploadData.slideInfo.totalChannels) {
         dispatch(setTotalChannels(uploadData.slideInfo.totalChannels));
@@ -405,7 +457,8 @@ const LocalFileManager = () => {
     } catch (err) {
       console.error("Error processing WSI file:", err);
       dispatch(setWsiOpening(false)); // lift the cover so the error is visible
-      setError("Failed to load WSI file.");
+      // Toast instead of the listing error: the folder view stays usable after a failed open.
+      toast.error("Failed to load WSI file.");
     }
   };
 
@@ -568,7 +621,7 @@ const LocalFileManager = () => {
     } else if (isZarr(item.name)) {
       // For .zarr directories, try to find and open the corresponding WSI file
       const zarrBaseName = getWSIBaseName(item.name);
-      const parentDir = item.path.substring(0, item.path.lastIndexOf('/'));
+      const parentDir = item.path.replace(/[\\/][^\\/]*$/, '');
       // Try to find the corresponding WSI file in the same directory
       const wsiFile = fileTree.find(file =>
         !file.is_dir &&
@@ -580,6 +633,7 @@ const LocalFileManager = () => {
         handleWsiUpload(wsiFile.path);
       } else {
         console.log("No corresponding WSI file found for Zarr file:", item.path);
+        toast.warning("No corresponding WSI file found for this Zarr file");
       }
     } else {
       console.log('Selected absolute path (non-image):', item.path);
@@ -587,7 +641,7 @@ const LocalFileManager = () => {
   };
 
   const handleGoUp = () => {
-    if (!currentDirectory || currentDirectory === rootFolder) return;
+    if (!currentDirectory || isSamePath(currentDirectory, rootFolder)) return;
 
     // Handle both Windows and Unix path separators
     const normalizedPath = currentDirectory.replace(/\\/g, '/');
@@ -970,7 +1024,7 @@ const LocalFileManager = () => {
     if (!dialog) return null;
     if (dialog.type === 'create-folder' || dialog.type === 'rename') {
       const isRename = dialog.type === 'rename';
-      const defaultValue = isRename ? dialog.path?.split('/').pop() : '';
+      const defaultValue = isRename ? dialog.path?.split(/[\\/]/).pop() : '';
       return (
         <Dialog open onOpenChange={() => setDialog(null)}>
           <DialogContent className="bg-background text-foreground">
@@ -1027,8 +1081,8 @@ const LocalFileManager = () => {
           {rootFolder ? rootFolder : 'Local Root'}
         </span>
       </span>
-      {currentDirectory && currentDirectory !== rootFolder && <ChevronRight className="h-3 w-3 sm:h-4 sm:w-4 mx-0.5 sm:mx-1 shrink-0" />}
-      {currentDirectory && currentDirectory !== rootFolder && (() => {
+      {currentDirectory && !isSamePath(currentDirectory, rootFolder) && <ChevronRight className="h-3 w-3 sm:h-4 sm:w-4 mx-0.5 sm:mx-1 shrink-0" />}
+      {currentDirectory && !isSamePath(currentDirectory, rootFolder) && (() => {
         // Normalize paths for consistent handling
         const normalizedCurrent = currentDirectory.replace(/\\/g, '/');
         const normalizedRoot = rootFolder.replace(/\\/g, '/');
@@ -1044,7 +1098,8 @@ const LocalFileManager = () => {
                   className="cursor-pointer hover:underline p-1 rounded truncate max-w-[100px] sm:max-w-[150px] md:max-w-none shrink-0"
                   title={part}
                   onClick={() => {
-                    fetchFiles(pathUntilThisPart);
+                    // Navigate with the root's own separators (backslashes on Windows).
+                    fetchFiles(convertToSystemPath(pathUntilThisPart));
                   }}
                 >
                   {part}
@@ -1075,7 +1130,7 @@ const LocalFileManager = () => {
               onNewFolder={() => setDialog({ type: "create-folder" })}
               onOpenFolder={handleOpenRootFolder}
               onGoUp={handleGoUp}
-              canGoUp={!!currentDirectory && currentDirectory !== rootFolder}
+              canGoUp={!!currentDirectory && !isSamePath(currentDirectory, rootFolder)}
               breadcrumb={renderBreadcrumbs()}
             />
         </CardHeader>

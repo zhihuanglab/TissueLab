@@ -1,10 +1,17 @@
 "use client";
 
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Database, PlayCircle } from "lucide-react";
-import React from "react";
+import React, { useState } from "react";
 
 const DatasetsPage: React.FC = () => {
+  const [showTutorial, setShowTutorial] = useState(false);
 
   return (
     <div className="box-border h-full w-full flex flex-col overflow-hidden font-sans">
@@ -14,6 +21,7 @@ const DatasetsPage: React.FC = () => {
           <h1 className="text-2xl font-bold">Datasets</h1>
           <button
             className="inline-flex items-center gap-1.5 text-muted-foreground hover:text-foreground transition-colors"
+            onClick={() => setShowTutorial(true)}
           >
             <PlayCircle className="h-4 w-4 text-red-500" />
             <span className="text-xs">Watch Tutorial</span>
@@ -38,6 +46,21 @@ const DatasetsPage: React.FC = () => {
           </Card>
         </div>
       </div>
+
+      {/* Tutorial video dialog (same placeholder as /dashboard) */}
+      <Dialog open={showTutorial} onOpenChange={setShowTutorial}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>How to use this page</DialogTitle>
+          </DialogHeader>
+          <div className="flex aspect-video w-full items-center justify-center rounded-lg bg-muted">
+            <div className="flex flex-col items-center gap-2 text-muted-foreground">
+              <PlayCircle className="h-12 w-12" />
+              <p className="text-sm">Tutorial video placeholder</p>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };

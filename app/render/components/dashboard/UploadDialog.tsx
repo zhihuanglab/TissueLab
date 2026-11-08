@@ -32,6 +32,21 @@ export interface FileWithPath extends File {
   _relativePath?: string;
 }
 
+export interface UploadResultSummary {
+  successful: number;
+  failed: number;
+  cancelled: number;
+  /** Distinct error messages of the failed files. */
+  errors?: string[];
+}
+
+/** "Upload failed" / "3 uploaded, 1 failed" — null when nothing failed. */
+export const describeUploadFailures = (successful: number, failed: number): string | null => {
+  if (failed <= 0) return null;
+  if (successful > 0) return `${successful} uploaded, ${failed} failed`;
+  return failed === 1 ? 'Upload failed' : `Upload failed: ${failed} files`;
+};
+
 // Upload dialog props
 interface UploadDialogProps {
   isOpen: boolean;
@@ -47,6 +62,10 @@ interface UploadDialogProps {
   onMinimizedChange?: (isMinimized: boolean) => void;
   /** When true, show a brief "upload complete" notice above the file-selection area. */
   uploadJustCompleted?: boolean;
+  /** Outcome of the batch that just ended while the dialog was visible; failures are listed above the file-selection area. */
+  uploadResult?: UploadResultSummary | null;
+  /** Bumped by the parent (e.g. the toolbar Upload button) to bring a minimized or hidden progress view back. */
+  revealProgressSignal?: number;
   /** Unfinished chunked uploads saved in localStorage — prompt user to re-select same file. */
   resumeHints?: ChunkUploadResumeHint[];
   /** "Pre-run CellCast after upload" checkbox state. */
@@ -66,6 +85,8 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
   uploadInterrupted,
   onMinimizedChange,
   uploadJustCompleted,
+  uploadResult,
+  revealProgressSignal = 0,
   resumeHints = [],
   preRunAnalysis = false,
   onPreRunAnalysisChange,
@@ -74,6 +95,8 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
   const [isMinimized, setIsMinimized] = useState(false);
   const [isWidgetDismissed, setIsWidgetDismissed] = useState(false);
   const [isProcessingDrop, setIsProcessingDrop] = useState(false);
+  // Folders from the last drop that could not be read (shown under the drop zone).
+  const [dropError, setDropError] = useState<string | null>(null);
 
   const hasActiveUpload = isUploading || Boolean(
     uploadStatus && Array.from(uploadStatus.values()).some(
@@ -101,6 +124,17 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
       onMinimizedChange?.(false);
     }
   }, [isOpen]);
+
+  // The parent asks to see the progress again (toolbar Upload while an upload
+  // runs): undo "minimize" and "hide progress".
+  const lastRevealSignalRef = React.useRef(revealProgressSignal);
+  React.useEffect(() => {
+    if (revealProgressSignal === lastRevealSignalRef.current) return;
+    lastRevealSignalRef.current = revealProgressSignal;
+    setIsWidgetDismissed(false);
+    setIsMinimized(false);
+    onMinimizedChange?.(false);
+  }, [revealProgressSignal]);
 
   // Recursively read all files from a dropped directory entry
   const readDirectoryEntries = useCallback(async (
@@ -162,6 +196,7 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
   // File selection handlers
   const handleFileSelect = (files: FileList | null, relativePaths?: string[]) => {
     if (!files || files.length === 0) return;
+    setDropError(null);
     onUpload(files, relativePaths);
     // Reset input so the same files can be re-selected
     const input = document.getElementById('file-upload-input') as HTMLInputElement;
@@ -171,6 +206,7 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
   // Handle folder selection via webkitdirectory input
   const handleFolderSelect = (files: FileList | null) => {
     if (!files || files.length === 0) return;
+    setDropError(null);
     const relativePaths: string[] = [];
     for (let i = 0; i < files.length; i++) {
       // webkitRelativePath gives us the path like "folderName/sub/file.txt"
@@ -203,10 +239,14 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
     e.preventDefault();
     e.stopPropagation();
     setIsDragging(false);
+    setDropError(null);
 
+    // Browsers empty the DataTransfer once the drop event returns, so take the
+    // file list now — the fallback below runs after several awaits.
+    const droppedFiles = e.dataTransfer.files;
     const items = e.dataTransfer.items;
     if (!items || items.length === 0) {
-      handleFileSelect(e.dataTransfer.files);
+      handleFileSelect(droppedFiles);
       return;
     }
 
@@ -223,28 +263,38 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
 
     if (!hasDirectory) {
       // No directories — use simple file upload
-      handleFileSelect(e.dataTransfer.files);
+      handleFileSelect(droppedFiles);
       return;
     }
 
-    // Has directories — recursively enumerate all files
+    // Has directories — recursively enumerate all files. An unreadable entry
+    // is reported and skipped; everything that could be read is still uploaded.
     setIsProcessingDrop(true);
+    const unreadable: string[] = [];
     try {
       const allFiles: { file: File; relativePath: string }[] = [];
       for (const entry of entries) {
-        if (entry.isFile) {
-          const fileEntry = entry as FileSystemFileEntry;
-          const file = await new Promise<File>((resolve, reject) =>
-            fileEntry.file(resolve, reject)
-          );
-          allFiles.push({ file, relativePath: file.name });
-        } else if (entry.isDirectory) {
-          const dirFiles = await readDirectoryEntries(
-            entry as FileSystemDirectoryEntry,
-            entry.name
-          );
-          allFiles.push(...dirFiles);
+        try {
+          if (entry.isFile) {
+            const fileEntry = entry as FileSystemFileEntry;
+            const file = await new Promise<File>((resolve, reject) =>
+              fileEntry.file(resolve, reject)
+            );
+            allFiles.push({ file, relativePath: file.name });
+          } else if (entry.isDirectory) {
+            const dirFiles = await readDirectoryEntries(
+              entry as FileSystemDirectoryEntry,
+              entry.name
+            );
+            allFiles.push(...dirFiles);
+          }
+        } catch (entryErr) {
+          console.error(`Error reading dropped entry "${entry.name}":`, entryErr);
+          unreadable.push(entry.name);
         }
+      }
+      if (unreadable.length > 0) {
+        setDropError(`Could not read ${unreadable.map((n) => `"${n}"`).join(', ')}`);
       }
 
       if (allFiles.length === 0) return;
@@ -264,8 +314,12 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
       }
     } catch (err) {
       console.error('Error processing dropped folder:', err);
-      // Fallback to simple file upload
-      handleFileSelect(e.dataTransfer.files);
+      // Fallback to simple file upload with the list captured at drop time.
+      if (droppedFiles && droppedFiles.length > 0) {
+        onUpload(droppedFiles);
+      } else {
+        setDropError('Could not read the dropped folder. Try "Select folder" instead.');
+      }
     } finally {
       setIsProcessingDrop(false);
     }
@@ -317,6 +371,19 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
       ? Array.from(uploadStatus.values()).filter((s) => s.status === 'Merging').length
       : 0;
     const isMerging = mergingCount > 0;
+    const liveStatuses = uploadStatus
+      ? Array.from(uploadStatus.values()).filter((s) => s.status !== 'Cancelled')
+      : [];
+    const stillRunning = liveStatuses.some(
+      (s) => s.status === 'Uploading' || s.status === 'Merging' || s.status === 'Pending'
+    );
+    const failedCount = liveStatuses.filter((s) => s.status === 'Error').length;
+    const completedCount = liveStatuses.filter((s) => s.status === 'Completed').length;
+    // Every file is done and some failed: say so instead of "in progress".
+    const failureSummary = !stillRunning ? describeUploadFailures(completedCount, failedCount) : null;
+    const firstError = failureSummary
+      ? liveStatuses.find((s) => s.status === 'Error' && s.error)?.error
+      : undefined;
 
     return (
       <div className="fixed bottom-4 right-4 z-[60] bg-card border border-border rounded-lg shadow-xl p-4 min-w-[320px] backdrop-blur-sm bg-card/95">
@@ -345,13 +412,19 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
           </div>
         </div>
         
-        {uploadProgress === 100 && !isMerging ? (
+        {failureSummary ? (
+          <div className="flex items-start gap-2 text-destructive bg-destructive/10 p-2 rounded">
+            <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <p className="text-xs font-medium">{failureSummary}</p>
+              {firstError && (
+                <p className="text-xs break-words [overflow-wrap:anywhere]">{firstError}</p>
+              )}
+            </div>
+          </div>
+        ) : uploadProgress === 100 && !isMerging ? (
           (() => {
-            const hasIncompleteUploads = uploadStatus && Array.from(uploadStatus.values()).some(
-              status => status.status === 'Uploading' || status.status === 'Merging' || status.status === 'Error'
-            );
-            
-            if (hasIncompleteUploads) {
+            if (stillRunning) {
               return (
                 <div className="flex items-center gap-2 text-foreground bg-muted p-2 rounded">
                   <AlertTriangle className="h-4 w-4" />
@@ -525,11 +598,28 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
   const renderFileSelection = () => {
     if (hasActiveUpload && hasActiveItems) return null;
 
+    const resultFailure = uploadResult
+      ? describeUploadFailures(uploadResult.successful, uploadResult.failed)
+      : null;
+
     return (
       <>
         {renderResumeBanner()}
-        {/* Completion notice — only shown right after an upload finishes */}
-        {uploadJustCompleted && (
+        {/* Result of the batch that just ended: failures win over "complete" */}
+        {resultFailure ? (
+          <div
+            role="alert"
+            className="mb-4 flex items-start gap-2 px-4 py-3 rounded-lg bg-destructive/10 border border-destructive/40 text-destructive text-sm"
+          >
+            <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+            <div className="min-w-0 space-y-1">
+              <p className="font-medium">{resultFailure}</p>
+              {(uploadResult?.errors ?? []).slice(0, 3).map((msg) => (
+                <p key={msg} className="text-xs break-words [overflow-wrap:anywhere]">{msg}</p>
+              ))}
+            </div>
+          </div>
+        ) : uploadJustCompleted && (
           <div className="mb-4 flex items-center gap-2 px-4 py-3 rounded-lg bg-muted border border-border text-foreground text-sm">
             <CheckCircle2 className="h-4 w-4 shrink-0 text-primary" />
             <span>Upload complete</span>
@@ -599,6 +689,12 @@ export const UploadDialog: React.FC<UploadDialogProps> = ({
           </Button>
         </div>
       </div>
+      {dropError && (
+        <p role="alert" className="mt-3 flex items-center gap-2 px-1 text-sm text-destructive">
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          <span>{dropError}</span>
+        </p>
+      )}
       {onPreRunAnalysisChange && (
         <label className="mt-4 flex items-center gap-2 px-1 text-sm text-muted-foreground cursor-pointer select-none">
           <Checkbox
