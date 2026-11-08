@@ -84,7 +84,8 @@ export function useModelUpload(userInfo?: any) {
   const handleUploadModel = async (
     onSuccess?: (model: ModelData) => void
   ) => {
-    if (!uploadTitle || !uploadFile_ || !selectedFactory) {
+    const title = uploadTitle.trim()
+    if (!title || !uploadFile_ || !selectedFactory) {
       toast.error('Please provide a title, select a factory category, and choose a model file.')
       return
     }
@@ -121,7 +122,7 @@ export function useModelUpload(userInfo?: any) {
       const preferredName = userInfo?.user_id ? 
         localStorage.getItem(`preferred_name_${userInfo.user_id}`) : null
       
-      const capitalizedTitle = uploadTitle.charAt(0).toUpperCase() + uploadTitle.slice(1)
+      const capitalizedTitle = title.charAt(0).toUpperCase() + title.slice(1)
       
       const userCustomAvatar = userInfo?.user_id
         ? localStorage.getItem(`user_avatar_${userInfo.user_id}`)

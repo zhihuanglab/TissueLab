@@ -8,6 +8,7 @@ import { communityService } from '@/services/community.service'
 import { classifiersService } from '@/services/classifier/community'
 import { usersService, UserProfile as APIUserProfile } from '@/services/users.service'
 import { apiFetch } from '@/utils/common/apiFetch'
+import { isApiError } from '@/utils/common/apiResponse'
 import { getErrorMessage } from '@/utils/common/apiResponse'
 import { InlineSpinner } from '@/components/assets/PageLoading'
 import { ClassifiersHeader } from '@/components/community/Classifiers-Header'
@@ -679,14 +680,16 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
             })
 
 
-            if (deleteResponse.success) {
-            } else {
+            if (!deleteResponse?.success) {
+              // The classifier is still in the community: keep the local copy and don't claim success.
               console.warn('Backend deletion returned success=false')
-              toast.warning('Deletion completed but may not have succeeded')
+              toast.error('Failed to delete classifier')
+              return
             }
           } catch (error) {
             console.error('Backend delete error:', error)
-            toast.warning(getErrorMessage(error, 'Backend deletion failed'))
+            toast.error(getErrorMessage(error, 'Failed to delete classifier'))
+            return
           }
         } else {
         }
@@ -872,55 +875,50 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
             });
 
             const tagsToShow = showAllTags ? displayTags : displayTags.slice(0, 2);
+            // "+N" counts the tags actually rendered above (a node tag hidden because it is part of
+            // the factory name must not be counted, or "+1" would reveal nothing).
+            const totalTags = displayTags.length;
 
-            return tagsToShow.map((displayTag, displayIndex) => {
-              const tagColor = getTagColor(displayTag.text, displayTag.isFactory, factoryDisplayName || '');
+            return (
+              <>
+                {tagsToShow.map((displayTag, displayIndex) => {
+                  const tagColor = getTagColor(displayTag.text, displayTag.isFactory, factoryDisplayName || '');
 
-              return (
-                <ColorTag
-                  key={`classifier-${displayIndex}`}
-                  color={tagColor}
-                  onClick={onTagClick ? () => onTagClick(displayTag.text) : undefined}
-                >
-                  {displayTag.text}
-                </ColorTag>
-              );
-            });
-          })()}
-          {(() => {
-            // Calculate total display tags to show the "+N" badge correctly
-            const factoryId = (classifier as any).factory;
-            const nodeId = (classifier as any).node;
-            const modalityTags = ['pathology', 'radiology', 'spatial transcriptomics'];
-
-            let totalTags = 0;
-            if (factoryId && factoryId !== 'undefined') totalTags++;
-            if (nodeId && nodeId !== 'undefined' && nodeId !== '') totalTags++;
-            totalTags += classifier.tags.filter(t => modalityTags.includes(t.toLowerCase())).length;
-
-            return totalTags > 2 && !showAllTags ? (
-              <ColorTag
-                color="default"
-                className="text-xs cursor-pointer"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setShowAllTags(true);
-                }}
-              >
-                +{totalTags - 2}
-              </ColorTag>
-            ) : showAllTags && totalTags > 2 ? (
-              <ColorTag
-                color="default"
-                className="text-xs cursor-pointer"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setShowAllTags(false);
-                }}
-              >
-                Show Less
-              </ColorTag>
-            ) : null;
+                  return (
+                    <ColorTag
+                      key={`classifier-${displayIndex}`}
+                      color={tagColor}
+                      onClick={onTagClick ? () => onTagClick(displayTag.text) : undefined}
+                    >
+                      {displayTag.text}
+                    </ColorTag>
+                  );
+                })}
+                {totalTags > 2 && !showAllTags ? (
+                  <ColorTag
+                    color="default"
+                    className="text-xs cursor-pointer"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setShowAllTags(true);
+                    }}
+                  >
+                    +{totalTags - 2}
+                  </ColorTag>
+                ) : showAllTags && totalTags > 2 ? (
+                  <ColorTag
+                    color="default"
+                    className="text-xs cursor-pointer"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setShowAllTags(false);
+                    }}
+                  >
+                    Show Less
+                  </ColorTag>
+                ) : null}
+              </>
+            );
           })()}
         </div>
         
@@ -977,7 +975,7 @@ const UserClassifierCard = React.memo(function UserClassifierCard({ classifier, 
             </div>
             <div className="flex flex-wrap items-center gap-4 pt-4 border-t border-border">
               <div className="text-sm text-muted-foreground">
-                <span className="font-medium">Classes:</span> {classifier.stats.classes ?? 'null'}
+                <span className="font-medium">Classes:</span> {classifier.stats.classes ?? '—'}
               </div>
               <div className="text-sm text-muted-foreground">
                 <span className="font-medium">Size:</span> {classifier.stats.size}
@@ -1457,6 +1455,7 @@ export default function UserProfile() {
       if (username) {
         try {
           let profileData: UserProfile | null = null
+          let userNotFound = false
 
           // Try to fetch real user data from API
           try {
@@ -1498,14 +1497,24 @@ export default function UserProfile() {
                     following: 0
                   }
                 }
+              } else if (publicProfile && publicProfile.found === false) {
+                // The community answered and does not know this user: go to not-found below
+                // instead of fabricating a "User xxxxxxxx" profile.
+                userNotFound = true
               }
             } catch (e) {
-              // ignore and fallback to localStorage
+              // The live community service answers an unknown user with an
+              // error envelope (code 404, USER_NOT_FOUND), which apiFetch
+              // throws: that is a definitive "not found" too. Anything else
+              // (network, auth) falls back to localStorage below.
+              if (isApiError(e) && (e.code === 404 || e.errorCode === 'USER_NOT_FOUND')) {
+                userNotFound = true
+              }
             }
           }
 
-          // If API/public fetch failed, create basic profile from localStorage data
-          if (!profileData) {
+          // If API/public fetch failed (network, not a definitive "not found"), create basic profile from localStorage data
+          if (!profileData && !userNotFound) {
             const preferredName = typeof window !== 'undefined'
               ? localStorage.getItem(`preferred_name_${username}`)
               : null;
@@ -1541,6 +1550,7 @@ export default function UserProfile() {
           if (!profileData) {
             // User not found, redirect to community
             console.warn(`User ${username} not found`)
+            toast.error('User not found')
             router.push('/community')
             return
           }
@@ -2003,7 +2013,7 @@ export default function UserProfile() {
               selectedTags={selectedTags}
               onTagClick={handleTagClick}
               useSimpleTagColor={true}
-              sort={classifierSort as any}
+              sort={classifierSort === 'most_likes' ? 'most_stars' : classifierSort}
               onSortChange={(value: any) => {
                 setClassifierSort(value === 'most_stars' ? 'most_likes' : value as any)
                 setCurrentPage(1) // Reset to first page when sorting changes

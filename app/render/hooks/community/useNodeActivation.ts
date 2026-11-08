@@ -23,6 +23,15 @@ type NodeInfo = {
 }
 
 type ActivationStatus = 'starting' | 'ready' | 'failed'
+
+/**
+ * Give up on an activation that has produced no ready/failed event for this long
+ * (e.g. the event stream dropped while the result was sent). Without it the
+ * card stayed on "Working..." forever.
+ */
+export const ACTIVATION_MAX_WAIT_MS = 10 * 60_000
+const ACTIVATION_RECONNECT_BASE_MS = 800
+const ACTIVATION_RECONNECT_MAX_MS = 8000
 type BusyStatus = 'activating' | 'deactivating'
 type ActivationMode = 'remote' | 'local'
 
@@ -66,9 +75,48 @@ export function useNodeActivation() {
   const remoteNodes = useRef<Set<string>>(new Set())
   // State to trigger effect when subscriptions change
   const [subscriptionTrigger, setSubscriptionTrigger] = useState(0)
+  // Per-node time (ms epoch) after which a silent activation is marked failed
+  const activationDeadlines = useRef<Map<string, number>>(new Map())
+  // Backoff reconnect of the activation stream after it drops
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const reconnectAttempts = useRef(0)
+
+  /** No ready/failed event arrived in time: end "Working..." with a clear failure. */
+  const timeOutActivation = (modelName: string) => {
+    activationDeadlines.current.delete(modelName)
+    if (!subscribedNodes.current.has(modelName)) return
+    const isRemote = remoteNodes.current.has(modelName)
+    const minutes = Math.round(ACTIVATION_MAX_WAIT_MS / 60_000)
+    const message = `No activation result from ${modelName} after ${minutes} minutes. Check the setup logs and try again.`
+    toast.error(`Activation timed out for ${modelName}`, { description: message })
+    setBusy((prev) => { const { [modelName]: _, ...rest } = prev; return rest })
+    if (isRemote) {
+      setActivationStatus((prev) => { const { [modelName]: _, ...rest } = prev; return rest })
+      setFailedMeta((prev) => { const { [modelName]: _, ...rest } = prev; return rest })
+      remoteNodes.current.delete(modelName)
+    } else {
+      setActivationStatus((prev) => ({ ...prev, [modelName]: 'failed' }))
+      setFailedMeta((prev) => ({ ...prev, [modelName]: { ...prev[modelName], message } }))
+    }
+    manuallyActivatedNodes.current.delete(modelName)
+    const callback = subscribedNodes.current.get(modelName)
+    subscribedNodes.current.delete(modelName)
+    if (subscribedNodes.current.size === 0) {
+      setSubscriptionTrigger(prev => prev + 1)
+    }
+    if (callback) {
+      callback(false)
+    }
+  }
 
   // Initialize single SSE connection
   useEffect(() => {
+    // Fail activations that outlived their deadline before (re)opening the stream.
+    const now = Date.now()
+    for (const [name, deadline] of Array.from(activationDeadlines.current)) {
+      if (now >= deadline) timeOutActivation(name)
+    }
+
     // Only create connection if we have subscribed nodes
     if (subscribedNodes.current.size === 0) {
       // Close connection if no subscriptions
@@ -81,9 +129,21 @@ export function useNodeActivation() {
       return
     }
 
+    // Re-run this effect at the earliest deadline so a silent activation is timed out.
+    let watchdog: ReturnType<typeof setTimeout> | null = null
+    const deadlines = Array.from(activationDeadlines.current.values())
+    if (deadlines.length > 0) {
+      watchdog = setTimeout(
+        () => setSubscriptionTrigger(prev => prev + 1),
+        Math.max(0, Math.min(...deadlines) - Date.now()) + 50,
+      )
+    }
+
     // If connection already exists, don't recreate it
     if (activationStream.current) {
-      return
+      return () => {
+        if (watchdog) clearTimeout(watchdog)
+      }
     }
 
     let cancelled = false
@@ -94,8 +154,13 @@ export function useNodeActivation() {
       const es = new EventSource(url)
       activationStream.current = es
 
+      es.onopen = () => {
+        reconnectAttempts.current = 0
+      }
+
       es.onmessage = async (ev) => {
       try {
+        reconnectAttempts.current = 0
         const payload = JSON.parse(ev.data || '{}')
         if (payload?.heartbeat === true) return
         const modelName = payload?.model
@@ -110,6 +175,8 @@ export function useNodeActivation() {
         }
 
         if (status === 'starting') {
+          // The service is working on it: restart the silence deadline.
+          activationDeadlines.current.set(modelName, Date.now() + ACTIVATION_MAX_WAIT_MS)
           setActivationStatus((prev) => {
             const newStatus: Record<string, ActivationStatus> = { ...prev, [modelName]: 'starting' }
             return newStatus
@@ -171,6 +238,7 @@ export function useNodeActivation() {
           
           // Clean up manual activation tracking
           manuallyActivatedNodes.current.delete(modelName)
+          activationDeadlines.current.delete(modelName)
           
           // Remove subscription first to prevent race conditions, then call callback
           const callback = subscribedNodes.current.get(modelName)
@@ -194,6 +262,7 @@ export function useNodeActivation() {
           
           // Clean up manual activation tracking
           manuallyActivatedNodes.current.delete(modelName)
+          activationDeadlines.current.delete(modelName)
           
           // Show success notification
           toast.success(`${modelName} activated successfully`, {
@@ -221,8 +290,25 @@ export function useNodeActivation() {
 
       es.onerror = (error) => {
         console.error('[Community] activation SSE connection error', error)
-        // EventSource reconnects with the same short-lived query token. A new
-        // subscription/effect creates a fresh token-backed stream.
+        // A native EventSource retry would reuse the same short-lived query
+        // token. Close it and reopen with a fresh token after a backoff; the
+        // deadline check above ends activations whose result was missed.
+        try {
+          es.onmessage = null
+          es.onerror = null
+          es.close()
+        } catch {}
+        if (activationStream.current === es) {
+          activationStream.current = null
+        }
+        if (cancelled || subscribedNodes.current.size === 0 || reconnectTimer.current) return
+        const attempt = reconnectAttempts.current + 1
+        reconnectAttempts.current = attempt
+        const delay = Math.min(ACTIVATION_RECONNECT_BASE_MS * Math.pow(2, attempt - 1), ACTIVATION_RECONNECT_MAX_MS)
+        reconnectTimer.current = setTimeout(() => {
+          reconnectTimer.current = null
+          setSubscriptionTrigger(prev => prev + 1)
+        }, delay)
       }
     }
     void openStream()
@@ -230,6 +316,11 @@ export function useNodeActivation() {
     // Cleanup on unmount
     return () => {
       cancelled = true
+      if (watchdog) clearTimeout(watchdog)
+      if (reconnectTimer.current) {
+        clearTimeout(reconnectTimer.current)
+        reconnectTimer.current = null
+      }
       if (activationStream.current) {
         try {
           activationStream.current.close()
@@ -247,6 +338,7 @@ export function useNodeActivation() {
       }
       // Add to subscribed nodes
       subscribedNodes.current.set(nodeName, onComplete || (() => {}))
+      activationDeadlines.current.set(nodeName, Date.now() + ACTIVATION_MAX_WAIT_MS)
       // Track if this is a remote node for proper failure handling
       if (isRemote) {
         remoteNodes.current.add(nodeName)
@@ -788,6 +880,11 @@ export function useNodeActivation() {
     }
     // Clear all subscriptions
     subscribedNodes.current.clear()
+    activationDeadlines.current.clear()
+    if (reconnectTimer.current) {
+      clearTimeout(reconnectTimer.current)
+      reconnectTimer.current = null
+    }
     // Reset subscription trigger
     setSubscriptionTrigger(0)
   }

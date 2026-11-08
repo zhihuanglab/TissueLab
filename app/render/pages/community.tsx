@@ -512,14 +512,13 @@ export default function Community() {
   // Read tab from query parameter on mount and when query changes
   useEffect(() => {
     const tabParam = router.query.tab as string
-    if (
-      tabParam &&
-      (tabParam === "home" ||
-        tabParam === "workflows" ||
-        tabParam === "factories" ||
-        tabParam === "datasets")
-    ) {
+    if (!tabParam) return
+    // Only tabs that still have a TabsContent; anything else (e.g. the old
+    // `datasets` tab, now the standalone /datasets page) falls back to home.
+    if (tabParam === "home" || tabParam === "workflows" || tabParam === "factories") {
       setActiveTab(tabParam as ActiveTab)
+    } else {
+      setActiveTab('home')
     }
   }, [router.query.tab])
 
@@ -917,14 +916,15 @@ export default function Community() {
         try {
           const deleteResponse = await classifiersService.deleteClassifier(classifierId)
 
-          if (deleteResponse.success) {
-            setFirebaseClassifiers(prev => prev.filter(c => c.id !== classifierId))
-          } else {
-            toast.warning('Firebase deletion completed but may not have been successful.')
+          if (!deleteResponse?.success) {
+            // Still public in the community: keep it listed locally so it doesn't "come back" on refresh.
+            toast.error('Failed to delete classifier')
+            return
           }
         } catch (error) {
-          console.error('Firebase delete error:', error)
-          toast.warning(getErrorMessage(error, 'Firebase deletion failed'))
+          console.error('Community delete error:', error)
+          toast.error(getErrorMessage(error, 'Failed to delete classifier'))
+          return
         }
       }
 

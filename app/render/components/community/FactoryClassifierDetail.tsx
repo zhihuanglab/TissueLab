@@ -65,7 +65,7 @@ export default function FactoryClassifierDetail({
       const query = searchQuery.toLowerCase()
       const matchesSearch =
         classifier.title.toLowerCase().includes(query) ||
-        classifier.description.toLowerCase().includes(query) ||
+        (classifier.description || "").toLowerCase().includes(query) ||
         (classifier.author?.name || '').toLowerCase().includes(query)
       if (!matchesSearch) return false
     }

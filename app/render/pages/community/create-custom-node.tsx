@@ -64,6 +64,8 @@ export default function CreateCustomNodePage() {
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
+  // Registered, but the node did not reach "running" within the poll window.
+  const [warning, setWarning] = useState<string | null>(null)
   const [pythonVersion, setPythonVersion] = useState("3.11")
   const [description, setDescription] = useState<string>("")
   const [envName, setEnvName] = useState<string>("")
@@ -108,6 +110,7 @@ export default function CreateCustomNodePage() {
     setOutputsText("")
     setError(null)
     setSuccess(null)
+    setWarning(null)
     setLogText("")
     setShowLogs(false)
     setStep(0)
@@ -239,23 +242,25 @@ export default function CreateCustomNodePage() {
     }
   }
 
+  const fetchLogTail = async (modelName: string) => {
+    try {
+      const resp = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/tasks/v1/logs/tail?model_name=${encodeURIComponent(modelName)}&n=200`, {
+        method: 'GET',
+        returnAxiosFormat: true,
+      })
+      // apiFetch has already unwrapped the {code,data} envelope.
+      const tail = payloadFromAxiosAppResponse<{ tail?: string }>(resp)?.tail || ''
+      setLogText(tail)
+    } catch (e) {
+      // ignore transient errors
+    }
+  }
+
   const startLogPolling = (modelName: string) => {
     try {
       setShowLogs(true)
       stopLogPolling()
-      logTimerRef.current = setInterval(async () => {
-        try {
-          const resp = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/tasks/v1/logs/tail?model_name=${encodeURIComponent(modelName)}&n=200`, {
-            method: 'GET',
-            returnAxiosFormat: true,
-          })
-          const data = resp.data
-          const tail = data?.data?.tail || ''
-          setLogText(tail)
-        } catch (e) {
-          // ignore transient errors
-        }
-      }, 1000)
+      logTimerRef.current = setInterval(() => { void fetchLogTail(modelName) }, 1000)
     } catch {}
   }
 
@@ -264,10 +269,34 @@ export default function CreateCustomNodePage() {
       return "Custom panel must have at least one field";
     }
 
+    // Same rules as VisualSchemaEditorDialog's Save (the inline editor has no Save button of its own).
+    const keyOf = (field: { key?: string }) => String(field.key || '').trim();
+
+    if (panel.content.some((field) => keyOf(field).toLowerCase() === 'path')) {
+      return "'path' is a reserved key and cannot be used.";
+    }
+
     for (const field of panel.content) {
-      if (field.type !== 'tips' && (!field.key || field.key.trim() === '')) {
+      if (field.type !== 'tips' && !keyOf(field)) {
         return "All fields except tips must have a key. Please fill in all key fields.";
       }
+    }
+
+    for (const field of panel.content) {
+      const options = (field as { options?: { value?: string }[] }).options;
+      if (field.type === 'select' && options?.some((opt) => !String(opt?.value ?? '').trim())) {
+        return `Select field "${keyOf(field)}" has empty option values. Please fill in all option values.`;
+      }
+    }
+
+    const counts: Record<string, number> = {};
+    for (const field of panel.content) {
+      const k = keyOf(field).toLowerCase();
+      if (k) counts[k] = (counts[k] || 0) + 1;
+    }
+    const duplicates = Object.keys(counts).filter((k) => counts[k] > 1);
+    if (duplicates.length > 0) {
+      return `Duplicate keys found: ${duplicates.join(', ')}. Please ensure all keys are unique.`;
     }
 
     return null;
@@ -329,6 +358,7 @@ export default function CreateCustomNodePage() {
       setIsLoading(true)
       setError(null)
       setSuccess(null)
+      setWarning(null)
       setLogText("")
       setShowLogs(true)
       setStep(4)
@@ -359,9 +389,10 @@ export default function CreateCustomNodePage() {
         startLogPolling(nodeName)
       }
 
+      let running = false;
+      const timeoutMs = 600000;
       try {
         const start = Date.now();
-        const timeoutMs = 600000;
         while (!statusCancelRef.current && (Date.now() - start < timeoutMs)) {
           try {
             const resp = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/tasks/v1/list_node_ports`, {
@@ -371,6 +402,7 @@ export default function CreateCustomNodePage() {
             const d = payloadFromAxiosAppResponse<{ nodes?: Record<string, { running?: boolean }> }>(resp) ?? {};
             const nodes = d.nodes || {};
             if (nodes[nodeName]?.running) {
+              running = true;
               break;
             }
           } catch {}
@@ -378,7 +410,16 @@ export default function CreateCustomNodePage() {
         }
       } catch {}
 
-      setSuccess(`Successfully registered node "${nodeName}"!`)
+      if (running) {
+        // Setup is over: stop hitting /logs/tail every second, after one last read of the log.
+        if (logTimerRef.current) {
+          stopLogPolling()
+          void fetchLogTail(nodeName)
+        }
+        setSuccess(`Successfully registered node "${nodeName}"!`)
+      } else if (!statusCancelRef.current) {
+        setWarning(`Registered node "${nodeName}", but it is not running after ${Math.round(timeoutMs / 60000)} minutes. Check the setup logs.`)
+      }
       
       if (createCustomPanel && latestPanelData) {
         try {
@@ -545,36 +586,6 @@ export default function CreateCustomNodePage() {
                     </div>
                   </div>
                 )}
-              </div>
-            )}
-
-            {/* Step 2: Environment (only for .py services) */}
-            {step === 1 && isPyService && (
-              <div className="space-y-4">
-                <div className="grid grid-cols-4 items-center gap-4">
-                  <Label htmlFor="dependency-path" className="text-right">Dependency Path</Label>
-                  <div className="col-span-3 flex gap-2">
-                    <Input id="dependency-path" value={dependencyPath} onChange={(e) => setDependencyPath(e.target.value)} className="flex-1" placeholder="/abs/path/to/requirements.txt (optional)" />
-                    <Button type="button" size="icon" variant="outline" onClick={async () => {
-                      try {
-                        const result = await (window as any).electron.invoke('open-file-dialog');
-                        if (result?.filePaths?.length) setDependencyPath(result.filePaths[0]);
-                      } catch (error) { console.error('Error selecting file:', error); }
-                    }}>
-                      <Folder className="h-4 w-4" />
-                    </Button>
-                  </div>
-                </div>
-                <div className="grid grid-cols-4 items-center gap-4">
-                  <Label htmlFor="python-version" className="text-right">Python Version</Label>
-                  <Input id="python-version" value="3.11" className="col-span-3" disabled />
-                </div>
-                {!enableRemote && (
-                  <div className="grid grid-cols-4 items-center gap-4">
-                    <Label htmlFor="env-name" className="text-right">Conda Env (optional)</Label>
-                    <Input id="env-name" value={envName} onChange={(e) => setEnvName(e.target.value)} className="col-span-3" placeholder="Leave blank to auto-create env" />
-                  </div>
-                )}
                 {enableRemote && (
                   <>
                     <div className="grid grid-cols-4 items-center gap-4">
@@ -608,6 +619,36 @@ export default function CreateCustomNodePage() {
                       />
                     </div>
                   </>
+                )}
+              </div>
+            )}
+
+            {/* Step 2: Environment (only for .py services) */}
+            {step === 1 && isPyService && (
+              <div className="space-y-4">
+                <div className="grid grid-cols-4 items-center gap-4">
+                  <Label htmlFor="dependency-path" className="text-right">Dependency Path</Label>
+                  <div className="col-span-3 flex gap-2">
+                    <Input id="dependency-path" value={dependencyPath} onChange={(e) => setDependencyPath(e.target.value)} className="flex-1" placeholder="/abs/path/to/requirements.txt (optional)" />
+                    <Button type="button" size="icon" variant="outline" onClick={async () => {
+                      try {
+                        const result = await (window as any).electron.invoke('open-file-dialog');
+                        if (result?.filePaths?.length) setDependencyPath(result.filePaths[0]);
+                      } catch (error) { console.error('Error selecting file:', error); }
+                    }}>
+                      <Folder className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-4 items-center gap-4">
+                  <Label htmlFor="python-version" className="text-right">Python Version</Label>
+                  <Input id="python-version" value="3.11" className="col-span-3" disabled />
+                </div>
+                {!enableRemote && (
+                  <div className="grid grid-cols-4 items-center gap-4">
+                    <Label htmlFor="env-name" className="text-right">Conda Env (optional)</Label>
+                    <Input id="env-name" value={envName} onChange={(e) => setEnvName(e.target.value)} className="col-span-3" placeholder="Leave blank to auto-create env" />
+                  </div>
                 )}
               </div>
             )}
@@ -661,6 +702,11 @@ export default function CreateCustomNodePage() {
                     />
                     <Label htmlFor="create-panel">Create a custom workflow panel for this node</Label>
                   </div>
+                  {/* The name re-check runs here too (e.g. a panel with this name already exists);
+                      say why "Create Node" is disabled instead of only on step 0. */}
+                  {nameValidationError && (
+                    <div className="text-red-500 text-xs">{nameValidationError}</div>
+                  )}
                   {createCustomPanel && (
                     <div>
                       <VisualSchemaEditorDialog
@@ -686,6 +732,7 @@ export default function CreateCustomNodePage() {
 
             {error && (<div className="text-red-500 text-sm mt-2">{error}</div>)}
             {success && (<div className="text-green-500 text-sm mt-2">{success}</div>)}
+            {warning && (<div className="text-amber-600 text-sm mt-2">{warning}</div>)}
             
             {(!showLogs && step === 4) && (
               <div className="mt-3 border rounded bg-slate-50 px-2 py-1 text-xs text-slate-600 flex items-center justify-between">
@@ -721,13 +768,13 @@ export default function CreateCustomNodePage() {
                   }} disabled={isLoading}>Back</Button>
                 )}
                 {step < 3 && (
-                  <Button type="button" onClick={() => setStep(step === 0 ? (isPyService ? 1 : 2) : step + 1)} disabled={isLoading || (step === 0 && (!nodeName || !servicePath || !!nameValidationError)) || (step === 2 && !factory)}>Next</Button>
+                  <Button type="button" onClick={() => setStep(step === 0 ? (isPyService ? 1 : 2) : step + 1)} disabled={isLoading || (step === 0 && (!nodeName || !!nameValidationError || (enableRemote ? (!remoteHost || !port) : !servicePath))) || (step === 2 && !factory)}>Next</Button>
                 )}
                 {step === 3 && (
                   <Button type="button" onClick={handleCreate} disabled={!nodeName || !factory || !!nameValidationError || isLoading || (!enableRemote && !servicePath) || (enableRemote && (!remoteHost || !port))}>{isLoading ? 'Creating...' : 'Create Node'}</Button>
                 )}
                 {step === 4 && (
-                  <Button type="button" variant="outline" onClick={() => { resetForm(); router.push('/community?tab=factories') }} disabled={isLoading}>{success ? 'Done' : 'Close'}</Button>
+                  <Button type="button" variant="outline" onClick={() => { resetForm(); router.push('/community?tab=factories') }} disabled={isLoading}>{success || warning ? 'Done' : 'Close'}</Button>
                 )}
               </div>
             </div>

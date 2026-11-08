@@ -121,7 +121,8 @@ export const DownloadArea: React.FC<DownloadAreaProps> = ({ className = '' }) =>
               const updated = [...prev];
               updated[existingIndex] = {
                 ...updated[existingIndex],
-                state: state as any,
+                // `interrupted` has no group of its own: show it (removable) under Failed.
+                state: state === 'interrupted' ? 'failed' : state,
                 error: error || 'Download interrupted'
               };
               return updated;

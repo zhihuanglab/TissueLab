@@ -92,10 +92,16 @@ export function useFactoryNodes() {
         method: 'GET',
         returnAxiosFormat: true,
       })
-      const data = resp.data
-      const nodes = data?.data?.nodes || {}
-      const catMap = data?.data?.category_map || {}
-      const catNames = data?.data?.category_display_names || {}
+      // apiFetch has already unwrapped the {code,data} envelope; the helper
+      // accepts either shape.
+      const payload = payloadFromAxiosAppResponse<{
+        nodes?: Record<string, any>
+        category_map?: Record<string, any>
+        category_display_names?: Record<string, string>
+      }>(resp) ?? {}
+      const nodes = payload.nodes || {}
+      const catMap = payload.category_map || {}
+      const catNames = payload.category_display_names || {}
       
       // Only update state if data actually changed to prevent unnecessary re-renders
       if (Object.keys(catMap).length) {
