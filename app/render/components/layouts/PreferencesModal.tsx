@@ -3,13 +3,14 @@
 import React, { useState, useEffect } from 'react'
 import { useTheme } from 'next-themes'
 import { useDispatch, useSelector } from 'react-redux'
+import { toast } from 'sonner'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Separator } from '@/components/ui/separator'
 import { useUserInfo } from '@/contexts/UserInfoProvider'
-import ModelSettingsSection from './ModelSettingsSection'
+import ModelSettingsSection, { type ModelSettingsHandle } from './ModelSettingsSection'
 import { RootState } from '@/store'
 import { setHighlightGtAnnotations } from '@/store/slices/viewer/viewerSettingsSlice'
 
@@ -34,6 +35,7 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
     showAdvancedOptions: false,
   })
   const [isLoading, setIsLoading] = useState(false)
+  const modelSettingsRef = React.useRef<ModelSettingsHandle>(null)
 
   // Get current theme (resolve system theme if needed)
   const currentTheme = React.useMemo(() => {
@@ -47,22 +49,62 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
     setPreferences(prev => ({ ...prev, [key]: value }))
   }
 
-  // Handle theme toggle
-  const handleThemeToggle = (checked: boolean) => {
-    const nextTheme = checked ? 'dark' : 'light'
+  // Apply a theme to the page and the Electron title bar overlay
+  const applyTheme = (nextTheme: string) => {
     setTheme(nextTheme)
-    
-    // Notify Electron to update title bar overlay colors
-    if (typeof window !== 'undefined' && window.electron) {
+
+    const resolved = nextTheme === 'system' ? systemTheme : nextTheme
+    if (typeof window !== 'undefined' && window.electron && resolved) {
       try {
-        window.electron.send('update-titlebar-theme', nextTheme)
+        window.electron.send('update-titlebar-theme', resolved)
       } catch (error) {
         console.error('Failed to update title bar theme:', error)
       }
     }
-    
+  }
+
+  // Handle theme toggle
+  const handleThemeToggle = (checked: boolean) => {
+    const nextTheme = checked ? 'dark' : 'light'
+    applyTheme(nextTheme)
     // Update local preferences state
     updatePreference('theme', nextTheme)
+  }
+
+  // Theme and GT highlight apply live; remember what they were when the
+  // dialog opened so Cancel / Escape / clicking outside can put them back.
+  const openedWith = React.useRef<{ theme?: string; highlightGt: boolean } | null>(null)
+  const wasOpen = React.useRef(false)
+  useEffect(() => {
+    if (isOpen && !wasOpen.current) {
+      openedWith.current = { theme, highlightGt: highlightGtAnnotations }
+    }
+    wasOpen.current = isOpen
+    // Only the open transition matters; later theme changes are the user's edits.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen])
+
+  // Close without saving: revert the live-applied settings, then close.
+  const dismiss = () => {
+    const initial = openedWith.current
+    if (initial) {
+      if (initial.theme && initial.theme !== theme) applyTheme(initial.theme)
+      if (initial.highlightGt !== highlightGtAnnotations) {
+        dispatch(setHighlightGtAnnotations(initial.highlightGt))
+      }
+    }
+    onClose()
+  }
+
+  // Reset to Defaults: application preferences and the theme (default dark).
+  const resetToDefaults = () => {
+    setPreferences({
+      theme: 'dark',
+      notifications: true,
+      autoSave: true,
+      showAdvancedOptions: false,
+    })
+    if (theme !== 'dark') applyTheme('dark')
   }
 
   // Mount check for theme
@@ -85,24 +127,48 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
     }
   }, [userInfo?.user_id])
 
-  // Save preferences to localStorage
+  // Save preferences to localStorage. Theme and viewer switches apply (and
+  // persist) as soon as they are flipped; only the per-user application
+  // preferences below need a signed-in user to be stored under.
   const savePreferences = async () => {
-    if (typeof window !== 'undefined' && userInfo?.user_id) {
-      setIsLoading(true)
-      try {
-        localStorage.setItem(`preferences_${userInfo.user_id}`, JSON.stringify(preferences))
-        console.log('Preferences saved:', preferences)
-        // Here you could also call an API to sync preferences to the server
-      } catch (error) {
-        console.error('Error saving preferences:', error)
-      } finally {
-        setIsLoading(false)
-      }
+    if (typeof window === 'undefined') return
+    // Unsaved AI model edits are saved too; if that fails the dialog stays
+    // open with the error shown in that section.
+    setIsLoading(true)
+    const modelsOk = (await modelSettingsRef.current?.saveIfChanged()) ?? true
+    setIsLoading(false)
+    if (!modelsOk) {
+      toast.error('Could not save AI model settings', {
+        description: 'See the AI Models section for details.',
+      })
+      return
+    }
+    if (!userInfo?.user_id) {
+      toast.info('Theme and viewer settings are applied', {
+        description: 'Sign in to save your other preferences.',
+      })
+      onClose()
+      return
+    }
+    setIsLoading(true)
+    try {
+      localStorage.setItem(`preferences_${userInfo.user_id}`, JSON.stringify(preferences))
+      console.log('Preferences saved:', preferences)
+      // Here you could also call an API to sync preferences to the server
+      toast.success('Preferences saved')
+      onClose()
+    } catch (error) {
+      console.error('Error saving preferences:', error)
+      toast.error('Could not save preferences', {
+        description: error instanceof Error ? error.message : String(error),
+      })
+    } finally {
+      setIsLoading(false)
     }
   }
 
   return (
-    <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
+    <Dialog open={isOpen} onOpenChange={(open) => !open && dismiss()}>
       <DialogContent className="max-w-5xl w-[90vw] max-h-[90vh] overflow-y-auto bg-card border-border text-foreground">
         <DialogHeader>
           <DialogTitle className="text-xl font-semibold text-foreground">
@@ -155,7 +221,7 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
           <Separator className="bg-border" />
 
           {/* LLM endpoints / keys: saved by the service, separately from the rest */}
-          <ModelSettingsSection isOpen={isOpen} />
+          <ModelSettingsSection ref={modelSettingsRef} isOpen={isOpen} />
 
           <Separator className="bg-border" />
 
@@ -209,12 +275,7 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
 
         <div className="flex justify-between items-center space-x-2 mt-6 pt-4 border-t border-border">
           <Button
-            onClick={() => setPreferences({
-              theme: 'dark',
-              notifications: true,
-              autoSave: true,
-              showAdvancedOptions: false,
-            })}
+            onClick={resetToDefaults}
             variant="outline"
             className="border-border text-foreground hover:bg-accent"
           >
@@ -223,7 +284,7 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
           
           <div className="flex space-x-2">
             <Button
-              onClick={onClose}
+              onClick={dismiss}
               variant="outline"
               className="border-border text-foreground hover:bg-accent"
             >

@@ -7,7 +7,7 @@ import Head from "next/head";
 import React, { useEffect, type ReactElement } from "react";
 import { Provider } from "react-redux";
 import { GoogleOAuthProvider } from "@react-oauth/google";
-import { Toaster } from "sonner";
+import { Toaster, toast } from "sonner";
 
 import { PreRunProgressWidget } from "@/components/dashboard/PreRunProgressWidget";
 import ErrorBoundary from "@/components/imageViewer/review/ErrorBoundary";
@@ -44,6 +44,28 @@ function App({ Component, pageProps }: AppPropsWithLayout) {
   useEffect(() => {
     document.documentElement.classList.add(inter.variable);
     // Batch restore runs once auth uid is ready (UserInfoProvider), not on bare mount.
+  }, []);
+
+  // Electron main forwards its own faults (uncaught errors, the backend being
+  // given up on after repeated crashes) on 'main-process-error'; show them.
+  useEffect(() => {
+    const bridge = typeof window !== "undefined" ? window.electron : undefined;
+    if (!bridge?.on) return;
+    const onMainProcessError = (payload?: { kind?: string; message?: string }) => {
+      const kind = payload?.kind || "Application error";
+      // Uncaught errors arrive with their stack; the first line is enough here.
+      const firstLine = String(payload?.message ?? "").split("\n")[0].trim();
+      const backendStopped = /backend/i.test(kind);
+      toast.error(backendStopped ? "Backend service stopped" : `Background error: ${kind}`, {
+        id: `main-process-error:${kind}`,
+        description: firstLine || undefined,
+        duration: backendStopped ? Infinity : 10000,
+      });
+    };
+    bridge.on("main-process-error", onMainProcessError);
+    return () => {
+      try { bridge.off?.("main-process-error", onMainProcessError); } catch { /* bridge gone */ }
+    };
   }, []);
 
   return (

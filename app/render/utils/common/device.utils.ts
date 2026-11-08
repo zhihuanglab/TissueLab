@@ -18,13 +18,19 @@ export const getOrCreateDeviceId = () => {
 };
 
 export const generateUUID = () => {
-  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
-  // Fallback for browsers without crypto.randomUUID
+  const c: Crypto | undefined = typeof crypto !== 'undefined' ? crypto : undefined;
+  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+  // Fallback for browsers without crypto.randomUUID (e.g. plain-HTTP LAN access):
+  // build an RFC 4122 v4 UUID by hand.
   const buffer = new Uint8Array(16);
-  crypto.getRandomValues(buffer);
-  const fallbackUUID = Array.from(buffer)
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-  return `${fallbackUUID.slice(0, 8)}-${fallbackUUID.slice(8, 12)}-4${fallbackUUID.slice(12, 15)}-${((buffer[8] & 0x3f) | 0x80).toString(16)}${fallbackUUID.slice(15, 18)}-${fallbackUUID.slice(18)}`;
+  if (c && typeof c.getRandomValues === 'function') {
+    c.getRandomValues(buffer);
+  } else {
+    for (let i = 0; i < 16; i++) buffer[i] = Math.floor(Math.random() * 256);
+  }
+  buffer[6] = (buffer[6] & 0x0f) | 0x40; // version 4
+  buffer[8] = (buffer[8] & 0x3f) | 0x80; // variant 10xx
+  const hex = Array.from(buffer, (b) => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 };
 

@@ -167,11 +167,11 @@ const AvatarCropper: React.FC<AvatarCropperProps> = ({
       const newHeight = Math.max(50, y - cropArea.y);
       const size = Math.min(newWidth, newHeight); // Keep it square
       
-      setCropArea(prev => ({
-        ...prev,
-        width: Math.min(size, canvas.width - prev.x),
-        height: Math.min(size, canvas.height - prev.y),
-      }));
+      setCropArea(prev => {
+        // Clamp to the canvas with ONE side length so the crop stays square at the edges too.
+        const side = Math.min(size, canvas.width - prev.x, canvas.height - prev.y);
+        return { ...prev, width: side, height: side };
+      });
     } else if (isDragging) {
       const newX = Math.max(0, Math.min(x - dragStart.x, canvas.width - cropArea.width));
       const newY = Math.max(0, Math.min(y - dragStart.y, canvas.height - cropArea.height));

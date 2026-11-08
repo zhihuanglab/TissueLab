@@ -48,4 +48,16 @@ contextBridge.exposeInMainWorld('electron', {
   deleteRefreshToken: () => ipcRenderer.invoke('delete-refresh-token'),
   // Backend port
   getBackendPort: () => ipcRenderer.invoke('get-backend-port'),
+  // The same port, read once while the preload runs. Main has chosen the port
+  // (and waited for the backend) before it opens this window, so the renderer
+  // can build its endpoints on the real port from the very first request
+  // instead of starting on 5001 and switching after the async IPC (S-15).
+  backendPort: (() => {
+    try {
+      const port = ipcRenderer.sendSync('get-backend-port-sync');
+      return Number.isInteger(port) && port > 0 ? port : null;
+    } catch {
+      return null;
+    }
+  })(),
 })

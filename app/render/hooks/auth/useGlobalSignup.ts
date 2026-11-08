@@ -288,8 +288,24 @@ const useGlobalSignup = ({
       setModalVisible?.(false);
       signupSuccess?.();
       signInSuccessWithAuthResult(authResult, 'google-login');
-    } catch (error) {
+    } catch (error: any) {
+      // User dismissed the popup (or a newer popup replaced it) — stay silent.
+      if (
+        error?.code === 'auth/popup-closed-by-user' ||
+        error?.code === 'auth/cancelled-popup-request' ||
+        error?.code === 'auth/user-cancelled'
+      ) {
+        return;
+      }
       console.error('Google login failed:', error);
+      const friendly: Record<string, string> = {
+        'auth/network-request-failed': 'Network error while signing in with Google. Check your connection and try again.',
+        'auth/popup-blocked': 'The Google sign-in popup was blocked. Allow popups for this site and try again.',
+        'auth/user-disabled': 'This account has been disabled.',
+        'auth/unauthorized-domain': 'Google sign-in is not enabled for this domain.',
+        'auth/too-many-requests': 'Too many sign-in attempts. Please wait a moment and try again.',
+      };
+      toast.error(friendly[error?.code] || error?.message || 'Failed to sign in with Google');
     }
   };
 

@@ -57,6 +57,9 @@ export default function Component() {
     }
 
     const isMobileRef = { current: false };
+    // Last applied breakpoint state: the rail is only forced when the window
+    // crosses 1024px, so a manual collapse/expand survives other resizes.
+    const narrowRef: { current: boolean | null } = { current: null };
 
     const handleResize = () => {
       const w = window.innerWidth;
@@ -75,7 +78,8 @@ export default function Component() {
       }
 
       // Icon rail when viewport is at most 1024px (Tailwind lg); full width above
-      if (!mobile) {
+      if (!mobile && narrow !== narrowRef.current) {
+        narrowRef.current = narrow;
         dispatch(setSidebarUnfoldable(narrow));
       }
     };
@@ -256,7 +260,9 @@ function NavItem({
   const router = useRouter();
   const pathname = router.pathname;
   const pathWithoutQuery = router.asPath.split("?")[0];
-  const isActive = pathname === href || pathWithoutQuery === href;
+  // A section stays highlighted on its sub-pages (e.g. /community/create-custom-node).
+  const inSection = (p: string) => p === href || p.startsWith(href + "/");
+  const isActive = inSection(pathname) || inSection(pathWithoutQuery);
 
   const sharedIconClasses = cn(
     "flex h-6 w-9 items-center justify-center rounded-[6px] ",

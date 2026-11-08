@@ -56,10 +56,19 @@ export const AnnouncementDialog: React.FC<AnnouncementDialogProps> = ({
   const [contentLoading, setContentLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const contentRef = React.useRef<HTMLDivElement>(null);
+  // Bumped whenever the open announcement changes (click, back, close) so a
+  // slow response for an announcement the user already left is dropped.
+  const contentRequestRef = React.useRef<{ id: number; controller: AbortController | null }>({ id: 0, controller: null });
+  const cancelContentRequest = () => {
+    contentRequestRef.current.controller?.abort();
+    contentRequestRef.current = { id: contentRequestRef.current.id + 1, controller: null };
+  };
 
   // Load announcements when dialog opens
   useEffect(() => {
     if (!open) {
+      cancelContentRequest();
+      setContentLoading(false);
       setSelectedAnnouncement(null);
       setAnnouncementContent('');
       return;
@@ -90,28 +99,40 @@ export const AnnouncementDialog: React.FC<AnnouncementDialogProps> = ({
 
   // Handle announcement item click to load content
   const handleAnnouncementClick = async (item: AnnouncementItem) => {
+    cancelContentRequest();
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const requestId = contentRequestRef.current.id;
+    contentRequestRef.current.controller = controller;
+    const isCurrent = () => contentRequestRef.current.id === requestId;
+
     setSelectedAnnouncement(item);
+    setAnnouncementContent('');
     setContentLoading(true);
     setError(null); // Clear previous error before loading new content
     
     try {
-      const response = await fetch(`/announcements/${item.file}`);
+      const response = await fetch(`/announcements/${item.file}`, controller ? { signal: controller.signal } : undefined);
+      if (!isCurrent()) return;
       if (response.ok) {
         const text = await response.text();
+        if (!isCurrent()) return;
         setAnnouncementContent(text);
       } else {
         setError('Failed to load announcement content');
       }
     } catch (err) {
+      if (!isCurrent()) return; // aborted or superseded
       setError('Failed to load announcement content');
       console.error('Error loading announcement content:', err);
     } finally {
-      setContentLoading(false);
+      if (isCurrent()) setContentLoading(false);
     }
   };
 
   // Navigate back to announcement list
   const handleBackToList = () => {
+    cancelContentRequest();
+    setContentLoading(false);
     setSelectedAnnouncement(null);
     setAnnouncementContent('');
     setError(null); // Clear error state when returning to list

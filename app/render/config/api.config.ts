@@ -4,8 +4,15 @@
 // is kept as an alias so the many call sites that still import it keep
 // compiling; both names always resolve to the same URL.
 
-// Cache for backend port
-let cachedPort: number | null = null;
+// Cache for backend port. In Electron the preload already read the port
+// synchronously (window.electron.backendPort), so endpoints start on the real
+// port; the async IPC below is only a fallback for an older preload (S-15).
+function readPreloadPort(): number | null {
+  if (typeof window === 'undefined') return null;
+  const port = (window as any).electron?.backendPort;
+  return Number.isInteger(port) && port > 0 ? port : null;
+}
+let cachedPort: number | null = readPreloadPort();
 let portPromise: Promise<number> | null = null;
 
 const DEFAULT_PORT = 5001;

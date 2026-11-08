@@ -604,6 +604,13 @@ ipcMain.handle('create-local-folder', async (event, folderPath) => {
 
 // rename file
 ipcMain.handle('rename-local-file', async (event, oldPath, newPath) => {
+  // A rename stays in its folder. A name carrying a separator or '..'
+  // ("x\..\..\a.svs" on Windows) would otherwise move the item elsewhere.
+  if (typeof oldPath !== 'string' || typeof newPath !== 'string'
+    || path.resolve(path.dirname(oldPath)) !== path.resolve(path.dirname(newPath))
+    || path.basename(newPath) === '..' || path.basename(newPath) === '.') {
+    throw new Error('Rename must keep the item in the same folder.');
+  }
   await fs.rename(oldPath, newPath);
   return true;
 });
@@ -682,6 +689,12 @@ ipcMain.handle('write-file', async (event, options) => {
 // Get backend port
 ipcMain.handle('get-backend-port', () => {
   return getBackendPort();
+});
+
+// Synchronous twin for the preload, so the renderer knows the port before its
+// first request (S-15).
+ipcMain.on('get-backend-port-sync', (event) => {
+  event.returnValue = getBackendPort();
 });
 
 

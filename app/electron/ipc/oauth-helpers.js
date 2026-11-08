@@ -1,3 +1,21 @@
+// The sign-in currently waiting for its browser callback, if any. Starting a
+// new sign-in cancels it so an abandoned attempt (browser tab closed) does not
+// keep its loopback port and pending promise alive for the 5-minute timeout.
+let pendingSignIn = null;
+
+function closeCallbackServer(callbackServer) {
+  if (!callbackServer || !callbackServer.server) return;
+  try {
+    callbackServer.server.close();
+    // Drop keep-alive browser connections too, otherwise close() waits on them.
+    if (typeof callbackServer.server.closeAllConnections === 'function') {
+      callbackServer.server.closeAllConnections();
+    }
+  } catch (e) {
+    // Ignore cleanup errors from an already-closed server.
+  }
+}
+
 /**
  * Google OAuth 2.0 PKCE-based authentication helper
  * Implements secretless PKCE flow for desktop applications
@@ -15,6 +33,8 @@ async function performGoogleOAuth({ clientId, openExternal }) {
   const { URLSearchParams } = require('url');
   
   let callbackServer = null;
+  let cancelSignIn = null;
+  const mySignIn = {};
   
   try {
     console.log('[OAuth] Starting PKCE OAuth flow in system browser...');
@@ -38,6 +58,24 @@ async function performGoogleOAuth({ clientId, openExternal }) {
     // Use '127.0.0.1' as per Google's Desktop app documentation
     callbackServer = await createCallbackServer(42813, '/');
     const redirectUri = `http://127.0.0.1:${callbackServer.port}`;
+
+    // Cancel an earlier sign-in that is still waiting for its callback. The new
+    // server is opened first so it gets a different port: a stale tab from the
+    // abandoned attempt then hits a closed port instead of this flow.
+    if (pendingSignIn) {
+      pendingSignIn.cancel();
+    }
+    let cancelled = false;
+    const cancelledPromise = new Promise((_, reject) => {
+      cancelSignIn = () => reject(new Error('Sign-in cancelled: a new sign-in was started'));
+    });
+    cancelledPromise.catch(() => {});
+    mySignIn.cancel = () => {
+      cancelled = true;
+      closeCallbackServer(callbackServer);
+      cancelSignIn();
+    };
+    pendingSignIn = mySignIn;
     
     // Step 4: Build authorization URL
     const scopes = ['openid', 'email', 'profile'].join(' ');
@@ -62,9 +100,17 @@ async function performGoogleOAuth({ clientId, openExternal }) {
     // Step 5: Open system browser
     await openExternal(authUrl.toString());
     
-    // Step 6: Wait for authorization code
+    // Step 6: Wait for authorization code (or until a newer sign-in cancels this one)
+    if (cancelled) {
+      throw new Error('Sign-in cancelled: a new sign-in was started');
+    }
     console.log('[OAuth] Waiting for authorization callback...');
-    const { code: authorizationCode, state: returnedState } = await callbackServer.getAuthorizationCode(300000); // 5 min timeout
+    const { code: authorizationCode, state: returnedState } = await Promise.race([
+      callbackServer.getAuthorizationCode(300000), // 5 min timeout
+      cancelledPromise,
+    ]);
+    // The code is in hand; a later sign-in no longer needs to cancel this one.
+    if (pendingSignIn === mySignIn) pendingSignIn = null;
     
     // Step 7: Verify state parameter (CSRF protection)
     if (returnedState !== state) {
@@ -163,15 +209,10 @@ async function performGoogleOAuth({ clientId, openExternal }) {
       error: error.message || 'Failed to authenticate with Google'
     };
   } finally {
+    if (pendingSignIn === mySignIn) pendingSignIn = null;
     // Close the callback server after the code exchange completes, rather
     // than from the HTTP callback itself.
-    if (callbackServer && callbackServer.server) {
-      try {
-        callbackServer.server.close();
-      } catch (e) {
-        // Ignore cleanup errors from an already-closed server.
-      }
-    }
+    closeCallbackServer(callbackServer);
   }
 }
 

@@ -118,9 +118,9 @@ const ProfileDropdown: React.FC<ProfileDropdownProps> = ({
             <div className='flex items-center justify-between min-w-0'>
               <span>Organization</span>
               <span className='text-[hsl(var(--success))] px-1 py-0.5 rounded text-xs ml-auto max-w-[60%] truncate flex-1 min-w-0 text-right'
-                title={organization || 'null'}
+                title={organization || undefined}
               >
-                {organization || 'null'}
+                {organization || '—'}
               </span>
             </div>
           </div>
@@ -130,9 +130,9 @@ const ProfileDropdown: React.FC<ProfileDropdownProps> = ({
             <div className='flex items-center justify-between min-w-0'>
               <span>Title</span>
               <span className='text-primary px-1 py-0.5 rounded text-xs ml-auto max-w-[60%] truncate flex-1 min-w-0 text-right'
-              title={customTitle || 'null'}
+              title={customTitle || undefined}
               >
-                {customTitle || 'null'}
+                {customTitle || '—'}
               </span>
             </div>
           </div>

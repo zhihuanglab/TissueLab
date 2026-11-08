@@ -12,6 +12,14 @@ const { setupProtocolHandlers, registerProtocolClient } = require('./ipc/protoco
 const { performGoogleOAuth, refreshGoogleToken } = require('./ipc/oauth-helpers');
 
 let mainWindow;
+// Set once the app starts quitting, so killing the backend during shutdown is
+// not mistaken for a crash (no respawn, no "backend stopped" notice).
+let appIsQuitting = false;
+// True once a main window has been created (the splash phase is over).
+let mainWindowEverShown = false;
+// "Backend stopped" notice raised while no window was open (macOS Dock); shown
+// by the next window.
+let pendingBackendNotice = null;
 let splashWindow;
 let nextjsStandaloneProcess;
 let backendServiceProcess;
@@ -250,7 +258,19 @@ function createWindow() {
 
   // Graphics Feature Status
   // mainWindow.loadURL('chrome://gpu');
+  mainWindowEverShown = true;
   mainWindow.loadURL(`http://localhost:${getNextjsPort()}`);
+  if (pendingBackendNotice) {
+    const notice = pendingBackendNotice;
+    const win = mainWindow;
+    win.webContents.once('did-finish-load', () => {
+      if (pendingBackendNotice !== notice) return;
+      pendingBackendNotice = null;
+      try {
+        win.webContents.send('main-process-error', { kind: 'Backend stopped', message: notice });
+      } catch (e) { /* window closed again */ }
+    });
+  }
   // const GPUFeatureStatus = app.getGPUFeatureStatus()
   // console.log(GPUFeatureStatus)
   
@@ -559,6 +579,13 @@ ipcMain.handle('create-local-folder', async (event, folderPath) => {
 
 // rename file
 ipcMain.handle('rename-local-file', async (event, oldPath, newPath) => {
+  // A rename stays in its folder. A name carrying a separator or '..'
+  // ("x\..\..\a.svs" on Windows) would otherwise move the item elsewhere.
+  if (typeof oldPath !== 'string' || typeof newPath !== 'string'
+    || path.resolve(path.dirname(oldPath)) !== path.resolve(path.dirname(newPath))
+    || path.basename(newPath) === '..' || path.basename(newPath) === '.') {
+    throw new Error('Rename must keep the item in the same folder.');
+  }
   await fs.rename(oldPath, newPath);
   return true;
 });
@@ -620,6 +647,12 @@ ipcMain.handle('get-backend-stderr', (event, lines = 50) => {
 // Get backend port
 ipcMain.handle('get-backend-port', () => {
   return getBackendPort();
+});
+
+// Synchronous twin for the preload, so the renderer knows the port before its
+// first request (S-15).
+ipcMain.on('get-backend-port-sync', (event) => {
+  event.returnValue = getBackendPort();
 });
 
 // Screen-space rectangle of the web-content area (the origin that CSS
@@ -1008,13 +1041,48 @@ ipcMain.on('update-titlebar-overlay', (event, { isModalOpen, currentTheme }) => 
   }
 });
 
+// How long the splash waits for a backend that is slow to come up (first launch,
+// antivirus scan) before telling the user and exiting.
+const BACKEND_WAIT_LIMIT_MS = 10 * 60_000;
+
+// Startup cannot finish (no main window yet): say why and exit, instead of
+// leaving a frameless, always-on-top splash the user cannot close.
+function failStartup(reason) {
+  if (backendMonitorInterval) {
+    clearInterval(backendMonitorInterval);
+    backendMonitorInterval = null;
+  }
+  console.error(`[ELECTRON] Startup failed: ${reason}`);
+  try {
+    if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close();
+  } catch (e) { /* already gone */ }
+  dialog.showErrorBox('Startup Error', `${reason}
+
+The application will now exit.`);
+  app.quit();
+}
+
 // Function to start monitoring backend service availability
 function startBackendMonitoring() {
   console.log('[ELECTRON] Starting backend service monitoring...');
   const port = getBackendPort();
-  
+  const startedAt = Date.now();
+
+  // The wait may be long: let the splash go behind other windows and show up in
+  // the taskbar / Dock so the user can still reach (and quit) the app.
+  try {
+    if (splashWindow && !splashWindow.isDestroyed()) {
+      splashWindow.setAlwaysOnTop(false);
+      splashWindow.setSkipTaskbar(false);
+    }
+  } catch (e) { /* splash closing */ }
+
   backendMonitorInterval = setInterval(async () => {
     const isReady = await checkBackendHealth(port);
+    if (!isReady && !mainWindow && Date.now() - startedAt >= BACKEND_WAIT_LIMIT_MS) {
+      failStartup(`The TissueLab backend service did not start within ${Math.round(BACKEND_WAIT_LIMIT_MS / 60_000)} minutes.`);
+      return;
+    }
     if (isReady) {
       console.log(`[ELECTRON] Backend service detected on port ${port}! Opening main window...`);
       
@@ -1053,8 +1121,9 @@ function checkBackendReady(port, callback, maxAttempts = 60) {
         clearInterval(backendCheckInterval);
         backendCheckInterval = null;
       }
-      console.error('[ELECTRON] Exiting application due to backend startup failure');
-      app.quit();
+      // Do not quit: a first launch or an antivirus scan can take longer than
+      // this. The caller keeps the splash window and hands over to
+      // startBackendMonitoring, which opens the window once the backend answers.
       callback(false);
     }
   };
@@ -1223,6 +1292,33 @@ async function spawnBackendService() {
   let spawnAttempts = 0;
   const maxSpawnAttempts = 3;
   const spawnTimeout = 30000; // 30 seconds timeout for first startup
+  // Once a (re)spawned backend has stayed up this long, its earlier crashes are
+  // forgiven: a crash hours later gets the full set of restarts again.
+  const stableResetMs = 60000;
+  let stableTimer = null;
+
+  // Tell the window the backend is gone for good, instead of leaving the user
+  // with scattered request failures. Uses the same channel as main-process faults.
+  const reportBackendGivenUp = (detail) => {
+    console.error('[ELECTRON] Max spawn attempts reached, giving up');
+    const message = `The TissueLab backend service stopped (${detail}) and could not be restarted after ${maxSpawnAttempts} attempts. Please restart TissueLab.`;
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      // Still on the splash: nothing would show the notice, and the splash would wait forever.
+      if (!mainWindowEverShown) {
+        failStartup(`The TissueLab backend service could not be started (${detail}).`);
+        return;
+      }
+      // macOS: the window was closed but the app lives on in the Dock. Keep the
+      // notice for the next window instead of dropping it.
+      pendingBackendNotice = message;
+      return;
+    }
+    try {
+      mainWindow.webContents.send('main-process-error', { kind: 'Backend stopped', message });
+    } catch (e) {
+      /* renderer may be tearing down */
+    }
+  };
 
     const attemptSpawn = () => {
       spawnAttempts++;
@@ -1251,10 +1347,23 @@ async function spawnBackendService() {
         if (startupTimeout) {
           clearTimeout(startupTimeout);
         }
+        if (stableTimer) clearTimeout(stableTimer);
+        stableTimer = setTimeout(() => {
+          stableTimer = null;
+          if (spawnAttempts > 1) {
+            console.log('[ELECTRON] Backend service has been stable, resetting restart counter');
+          }
+          spawnAttempts = 0;
+        }, stableResetMs);
       });
       
       backendServiceProcess.on('error', (error) => {
         console.error(`[ELECTRON] Backend Service process error (attempt ${spawnAttempts}):`, error);
+        if (stableTimer) {
+          clearTimeout(stableTimer);
+          stableTimer = null;
+        }
+        if (appIsQuitting) return;
         
         if (spawnAttempts < maxSpawnAttempts) {
           console.log(`[ELECTRON] Retrying backend service spawn in 2 seconds...`);
@@ -1267,7 +1376,7 @@ async function spawnBackendService() {
             attemptSpawn();
           }, 2000);
         } else {
-          console.error('[ELECTRON] Max spawn attempts reached, giving up');
+          reportBackendGivenUp(error && error.message ? error.message : String(error));
         }
       });
       
@@ -1297,6 +1406,14 @@ async function spawnBackendService() {
 
       backendServiceProcess.on('exit', (code, signal) => {
         console.log(`[ELECTRON] Backend Service process exited with code ${code}, signal: ${signal}`);
+        if (stableTimer) {
+          clearTimeout(stableTimer);
+          stableTimer = null;
+        }
+        if (appIsQuitting) {
+          backendServiceProcess = null;
+          return;
+        }
         
         if (spawnAttempts < maxSpawnAttempts && (code !== 0 || signal)) {
           console.log(`[ELECTRON] Backend service exited unexpectedly, retrying in 3 seconds...`);
@@ -1310,6 +1427,9 @@ async function spawnBackendService() {
           }, 3000);
         } else {
           backendServiceProcess = null;
+          if (code !== 0 || signal) {
+            reportBackendGivenUp(signal ? `signal ${signal}` : `exit code ${code}`);
+          }
         }
       });
     };
@@ -1666,6 +1786,7 @@ function cleanupProcesses() {
 // close backend processes
 app.on('before-quit', (event) => {
   console.log('[ELECTRON] Application is quitting...');
+  appIsQuitting = true;
   cleanupProcesses();
 });
 

@@ -2,6 +2,64 @@ const path = require('path');
 const fs = require('fs');
 
 /**
+ * True when `target` is `dir` itself or lies inside it (after resolving `..`).
+ */
+function isInsideDir(dir, target) {
+  const rel = path.relative(path.resolve(dir), path.resolve(target));
+  // '..' or '../x' leaves dir; a name that merely starts with dots ("..foo.zip") does not.
+  const leaves = rel === '..' || rel.startsWith(`..${path.sep}`) || rel.startsWith('../');
+  return rel === '' || (!leaves && !path.isAbsolute(rel));
+}
+
+/**
+ * Quote a value as a single-quoted PowerShell literal, so `$` and backticks
+ * are not expanded. PowerShell also treats the typographic single quotes as
+ * quote characters, so they are doubled as well.
+ */
+function psq(s) {
+  return `'${String(s).replace(/['\u2018\u2019\u201A\u201B]/g, '$&$&')}'`;
+}
+
+// Node names become a directory under storage/nodes and a registry key. Letters
+// in any script, digits, spaces and . _ - ( ) + are allowed ("GPT-4o Agent");
+// separators, shell / quote characters and names Windows cannot create are not.
+// isInsideDir is the containment check; this keeps the name one portable folder name.
+const MODEL_NAME_RE = /^[\p{L}\p{N} ._()+-]+$/u;
+function isSafeModelName(name) {
+  return typeof name === 'string'
+    && MODEL_NAME_RE.test(name)
+    && name.trim() === name
+    && name !== '.' && name !== '..'
+    && !/\.$/.test(name)
+    && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(name);
+}
+
+// Pending will-download listeners per session (url -> listener), and the
+// DownloadItems already bound to a request.
+const pendingBySession = new WeakMap();
+const claimedItems = new WeakSet();
+
+function sameUrl(a, b) {
+  try {
+    return new URL(a).href === new URL(b).href;
+  } catch {
+    return a === b;
+  }
+}
+
+/** The URLs a DownloadItem reports: its redirect chain plus its final URL. */
+function downloadItemUrls(item) {
+  const urls = [];
+  try {
+    if (typeof item.getURLChain === 'function') urls.push(...(item.getURLChain() || []));
+  } catch {}
+  try {
+    if (typeof item.getURL === 'function') urls.push(item.getURL());
+  } catch {}
+  return urls.filter((u) => typeof u === 'string' && u);
+}
+
+/**
  * Download a file via Chromium download manager
  * @param {Object} params
  * @param {string} params.url - Download URL
@@ -36,19 +94,46 @@ async function downloadFile({ url, filename, showSaveDialog, window, activeDownl
       const storagePath = path.join(serviceRoot || path.join(__dirname, '..', '..', 'service'), 'storage', 'tasknodes');
       fs.mkdirSync(storagePath, { recursive: true });
 
-      finalPath = path.join(storagePath, suggestion);
+      // The filename comes from the server: keep only its last segment (either
+      // separator style) so `../` cannot place the file outside storage/tasknodes.
+      let safeName = path.basename(String(suggestion).replace(/\\/g, '/'));
+      if (!safeName || safeName === '.' || safeName === '..') safeName = 'download.bin';
+
+      finalPath = path.join(storagePath, safeName);
       let counter = 1;
       while (fs.existsSync(finalPath)) {
-        const ext = path.extname(suggestion);
-        const baseName = path.basename(suggestion, ext);
+        const ext = path.extname(safeName);
+        const baseName = path.basename(safeName, ext);
         finalPath = path.join(storagePath, `${baseName}-${counter}${ext}`);
         counter++;
+      }
+      if (!isInsideDir(storagePath, finalPath) || path.resolve(finalPath) === path.resolve(storagePath)) {
+        throw new Error(`Refusing to save outside ${storagePath}: ${suggestion}`);
       }
     }
 
     const session = window.webContents.session;
+    // One listener per pending URL, and it only takes the DownloadItem whose
+    // URL (or redirect chain) is this download's, so concurrent installs each
+    // get their own item. A newer request for the same URL replaces the older
+    // listener so a stale one cannot take the retry's item.
+    let pending = pendingBySession.get(session);
+    if (!pending) {
+      pending = new Map();
+      pendingBySession.set(session, pending);
+    }
+    const previous = pending.get(url);
+    if (previous) session.removeListener('will-download', previous);
+
     const willDownload = (_evt, item) => {
+      if (claimedItems.has(item)) return;
+      const itemUrls = downloadItemUrls(item);
+      // Real DownloadItems always report their URL; only take an item that
+      // reports none when nothing better is known (it cannot be matched).
+      if (itemUrls.length && !itemUrls.some((u) => sameUrl(u, url))) return;
+      claimedItems.add(item);
       session.removeListener('will-download', willDownload);
+      if (pending.get(url) === willDownload) pending.delete(url);
       activeDownloads.set(url, item);
 
       try {
@@ -82,7 +167,8 @@ async function downloadFile({ url, filename, showSaveDialog, window, activeDownl
       });
     };
 
-    session.once('will-download', willDownload);
+    pending.set(url, willDownload);
+    session.on('will-download', willDownload);
     window.webContents.downloadURL(url);
     return { ok: true, started: true, target: finalPath };
   } catch (err) {
@@ -105,12 +191,19 @@ async function extractAndPersist({ zipPath, modelName, factory, window, url, ser
     if (!zipPath || !modelName) {
       return { success: false, error: 'Missing zipPath or modelName' };
     }
+    if (!isSafeModelName(modelName)) {
+      return { success: false, error: `Invalid model name: ${modelName}` };
+    }
 
     const { spawn } = require('child_process');
 
     // Extract to storage path
     const root = serviceRoot || path.join(__dirname, '..', '..', 'service');
-    const nodesDir = path.join(root, 'storage', 'nodes', modelName);
+    const nodesRoot = path.join(root, 'storage', 'nodes');
+    const nodesDir = path.join(nodesRoot, modelName);
+    if (!isInsideDir(nodesRoot, nodesDir) || path.resolve(nodesDir) === path.resolve(nodesRoot)) {
+      return { success: false, error: `Invalid model name: ${modelName}` };
+    }
     fs.mkdirSync(nodesDir, { recursive: true });
 
     // Emit extraction start event (use download-progress for DownloadArea compatibility)
@@ -161,7 +254,10 @@ async function extractAndPersist({ zipPath, modelName, factory, window, url, ser
         // Expand-Archive reports a corrupt archive as a *non-terminating* error,
         // which leaves powershell's exit code at 0; escalate it so the failure
         // is reported as one (and the tar fallback gets its turn).
-        const psCmd = `try { Expand-Archive -LiteralPath "${zipPath}" -DestinationPath "${nodesDir}" -Force -ErrorAction Stop } catch { Write-Error $_; exit 1 }`;
+        // Single-quoted PowerShell literals: a double-quoted "${path}" would
+        // expand `$` and backticks, and both paths carry user-controlled text
+        // (the Windows user name via userData, the bundle file name).
+        const psCmd = `try { Expand-Archive -LiteralPath ${psq(zipPath)} -DestinationPath ${psq(nodesDir)} -Force -ErrorAction Stop } catch { Write-Error $_; exit 1 }`;
         const res = await extractAsync('powershell.exe', ['-NoProfile', '-Command', psCmd]);
         extractOk = res.success;
         extractErr = res.stderr || '';
@@ -315,6 +411,8 @@ async function extractAndPersist({ zipPath, modelName, factory, window, url, ser
 
 module.exports = {
   downloadFile,
-  extractAndPersist
+  extractAndPersist,
+  psq,
+  isSafeModelName
 };
 

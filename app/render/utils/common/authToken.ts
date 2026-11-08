@@ -13,6 +13,26 @@ export const AUTH_MISSING_ERROR = 'Authentication required';
 let authReadyWaiter: Promise<void> | null = null;
 let resolveAuthReady: (() => void) | null = null;
 let authReadyTimeout: ReturnType<typeof setTimeout> | null = null;
+let unsubscribeAuthModal: (() => void) | null = null;
+
+const clearAuthReadyWaiter = () => {
+  if (authReadyTimeout) clearTimeout(authReadyTimeout);
+  unsubscribeAuthModal?.();
+  authReadyWaiter = null;
+  resolveAuthReady = null;
+  authReadyTimeout = null;
+  unsubscribeAuthModal = null;
+};
+
+/** A real (non-anonymous) Firebase user exists, even if UserInfoProvider has not caught up yet. */
+const hasSignedInUser = (): boolean => {
+  try {
+    const user = getAuth(app).currentUser;
+    return Boolean(user && !user.isAnonymous);
+  } catch {
+    return false;
+  }
+};
 
 export const notifyMissingAuth = () => {
   const now = Date.now();
@@ -29,6 +49,11 @@ export const notifyMissingAuth = () => {
  * Wait for the login modal to finish a real Firebase sign-in. Requests that
  * opened the modal can then retry themselves instead of leaving the page in a
  * stale, unauthenticated state.
+ *
+ * Dismissing the modal without signing in fails the waiters right away rather
+ * than leaving them hanging until the timeout. A successful sign-in also closes
+ * the modal, but Firebase already has the user by then, so those waiters keep
+ * waiting for notifyAuthReady.
  */
 export const waitForAuthReady = (timeoutMs = 120_000): Promise<void> => {
   if (authReadyWaiter) return authReadyWaiter;
@@ -38,10 +63,14 @@ export const waitForAuthReady = (timeoutMs = 120_000): Promise<void> => {
     authReadyTimeout = setTimeout(() => {
       toast.error('Sign-in timed out. Please try again.');
       reject(new Error(AUTH_MISSING_ERROR));
-      authReadyWaiter = null;
-      resolveAuthReady = null;
-      authReadyTimeout = null;
+      clearAuthReadyWaiter();
     }, timeoutMs);
+    unsubscribeAuthModal = signupModalStore.subscribe((state, prev) => {
+      if (!prev.isSignupModalOpen || state.isSignupModalOpen) return;
+      if (hasSignedInUser()) return;
+      reject(new Error(AUTH_MISSING_ERROR));
+      clearAuthReadyWaiter();
+    });
   });
 
   return authReadyWaiter;
@@ -50,11 +79,9 @@ export const waitForAuthReady = (timeoutMs = 120_000): Promise<void> => {
 /** Resolve all requests waiting for the login that opened the modal. */
 export const notifyAuthReady = () => {
   if (!resolveAuthReady) return;
-  if (authReadyTimeout) clearTimeout(authReadyTimeout);
-  resolveAuthReady();
-  authReadyWaiter = null;
-  resolveAuthReady = null;
-  authReadyTimeout = null;
+  const resolve = resolveAuthReady;
+  clearAuthReadyWaiter();
+  resolve();
 };
 
 export const AUTH_COOKIE_NAME = 'tissuelab_token';

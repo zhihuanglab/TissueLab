@@ -50,7 +50,15 @@ const hostOf = (url: string) => {
 const emptyPlain = (): Record<PlainName, string> =>
   Object.fromEntries(PLAIN.map((name) => [name, ''])) as Record<PlainName, string>
 
-const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
+// Lets the dialog's own "Save Changes" save this section too, so edits here
+// are never dropped just because the section's button wasn't pressed.
+export interface ModelSettingsHandle {
+  // true when nothing was changed or the save went through; false when it
+  // failed (the error is shown in the section).
+  saveIfChanged: () => Promise<boolean>
+}
+
+const ModelSettingsSection = React.forwardRef<ModelSettingsHandle, { isOpen: boolean }>(({ isOpen }, ref) => {
   const [settings, setSettings] = useState<ModelSettings | null>(null)
   const [plain, setPlain] = useState<Record<PlainName, string>>(emptyPlain)
   // A typed key replaces the saved one; untouched keys stay as they are.
@@ -89,7 +97,7 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
       .catch((e: any) => setError(`Could not load model settings: ${e?.message ?? e}`))
   }, [isOpen, show])
 
-  const save = async () => {
+  const save = async (): Promise<boolean> => {
     setSaving(true)
     setError(null)
     setSaved(false)
@@ -101,12 +109,24 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
     try {
       show((await apiFetch(API(), { method: 'PUT', body: JSON.stringify({ fields }) })) as ModelSettings)
       setSaved(true)
+      return true
     } catch (e: any) {
       setError(e?.message ?? String(e))
+      return false
     } finally {
       setSaving(false)
     }
   }
+
+  const isChanged = () =>
+    !!settings &&
+    (PLAIN.some((name) => plain[name] !== (settings.fields[name]?.value ?? '')) ||
+      SECRETS.some((name) => !!keys[name].trim() || clearKeys[name]) ||
+      usesAgent !== loadedUsesAgent)
+
+  React.useImperativeHandle(ref, () => ({
+    saveIfChanged: async () => (isChanged() ? save() : true),
+  }))
 
   const setField = (name: PlainName, value: string) => {
     setSaved(false)
@@ -331,6 +351,7 @@ const ModelSettingsSection: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
       </div>
     </div>
   )
-}
+})
+ModelSettingsSection.displayName = 'ModelSettingsSection'
 
 export default ModelSettingsSection

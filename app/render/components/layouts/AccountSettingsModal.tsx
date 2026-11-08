@@ -128,6 +128,8 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
   }
   const handleAvatarChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
+    // Clear the input so picking the same picture again (e.g. after cancelling the cropper) fires a change.
+    e.target.value = ''
     if (!file) return
 
     // File type validation - supported formats
@@ -193,6 +195,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
         const profileRef = doc(db, 'users', userInfo.user_id)
         const ts = Date.now()
         setDoc(profileRef, { avatar_url: '', avatarUpdatedAt: ts }, { merge: true })
+          .catch((e) => console.warn('Failed to clear avatar in Firestore:', e))
       } catch (e) {
         console.warn('Failed to clear avatar in Firestore:', e)
       }
@@ -227,6 +230,9 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
         localStorage.setItem(`custom_title_${userInfo.user_id}`, customTitle)
         localStorage.setItem(`preferred_name_${userInfo.user_id}`, preferredName)
         localStorage.setItem(`organization_${userInfo.user_id}`, organization)
+        // URL the upload below returns. avatarPreview (state from this render)
+        // still holds the base64 crop preview, which must never be stored.
+        let uploadedAvatarUrl = ''
         // Avatar uploading to backend if a new file is selected
         if (avatarFile) {
           try {
@@ -243,6 +249,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
             const data = resp.data
             const newUrl = data?.avatar_url || ''
             if (newUrl) {
+              uploadedAvatarUrl = newUrl
               try {
                 // Get authenticated URL for Firebase Storage
                 const authenticatedUrl = await getAuthenticatedStorageUrl(newUrl)
@@ -255,7 +262,9 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
                 try {
                   const db = getFirestoreDb()
                   const profileRef = doc(db, 'users', userInfo.user_id)
-                  await setDoc(profileRef, { avatar_url: newUrl, avatarUpdatedAt: ts }, { merge: true })
+                  // Not awaited: offline, setDoc only resolves on server ack (Firestore queues it).
+                  setDoc(profileRef, { avatar_url: newUrl, avatarUpdatedAt: ts }, { merge: true })
+                    .catch((e) => console.warn('Failed to write avatar to Firestore:', e))
                 } catch (e) {
                   console.warn('Failed to write avatar to Firestore:', e)
                 }
@@ -297,6 +306,7 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
             const data = resp.data
             const newUrl = data?.avatar_url || ''
             if (newUrl) {
+              uploadedAvatarUrl = newUrl
               try {
                 // Get authenticated URL for Firebase Storage
                 const authenticatedUrl = await getAuthenticatedStorageUrl(newUrl)
@@ -308,7 +318,9 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
                 try {
                   const db = getFirestoreDb()
                   const profileRef = doc(db, 'users', userInfo.user_id)
-                  await setDoc(profileRef, { avatar_url: newUrl, avatarUpdatedAt: ts }, { merge: true })
+                  // Not awaited: offline, setDoc only resolves on server ack (Firestore queues it).
+                  setDoc(profileRef, { avatar_url: newUrl, avatarUpdatedAt: ts }, { merge: true })
+                    .catch((e) => console.warn('Failed to write avatar to Firestore:', e))
                 } catch (e) {
                   console.warn('Failed to write avatar to Firestore:', e)
                 }
@@ -337,7 +349,11 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
               preferred_name: preferredName || "",
               custom_title: customTitle || "",
               organization: organization || "",
-              avatar_url: avatarPreview || "",
+              // Uploaded URL, else the unchanged current one; leave it out when
+              // only a data: preview is left (upload failed) so nothing is wiped.
+              ...((uploadedAvatarUrl || (avatarPreview && !avatarPreview.startsWith('data:')))
+                ? { avatar_url: uploadedAvatarUrl || avatarPreview }
+                : {}),
             }),
           })
           
@@ -368,8 +384,11 @@ const AccountSettingsModal: React.FC<AccountSettingsModalProps> = ({
           updateData.organization = organization || ""
           updateData.profileUpdatedAt = Date.now()
 
-          await setDoc(profileRef, updateData, { merge: true })
-          console.log('Profile data synced to Firestore successfully')
+          // Not awaited: offline, setDoc only resolves once the server acknowledges the write, which
+          // would leave the button on "Saving..." forever. Firestore queues the write and syncs later.
+          setDoc(profileRef, updateData, { merge: true })
+            .then(() => console.log('Profile data synced to Firestore successfully'))
+            .catch((e) => console.warn('Failed to sync profile to Firestore:', e))
         } catch (firestoreError) {
           console.warn('Failed to sync profile to Firestore:', firestoreError)
           // Don't break the flow if Firestore sync fails
