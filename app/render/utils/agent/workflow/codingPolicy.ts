@@ -10,10 +10,20 @@ export const SCRIPT_LAST_RUN_RAW_OUTPUT_KEY = "script_last_run_raw";
 
 export type ScriptRunPolicy = "auto_bypass" | "require_approval";
 
+/**
+ * Fingerprint of a script (length + FNV-1a 32-bit hash over the whole trimmed
+ * text), so any edit — including a same-length one deep in the body — counts
+ * as a new script that has not been run yet.
+ */
 export function digestScriptSource(code: string): string {
   const t = (code || "").trim();
   if (!t) return "";
-  return `${t.length}:${t.slice(0, 64)}`;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < t.length; i++) {
+    h ^= t.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return `${t.length}:${(h >>> 0).toString(16).padStart(8, "0")}`;
 }
 
 export function getScriptRunPolicy(content: ContentItem[] | undefined): ScriptRunPolicy {

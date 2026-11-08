@@ -23,6 +23,8 @@ export async function deleteNode(nodeName: string) {
       return { success: false, error: e.message }
     }
     console.error(e)
+    // The confirm dialog is already closed, so the user needs to hear that nothing was deleted.
+    toast.error('Delete failed: could not reach the local service')
     return { success: false, error: 'Network error' }
   }
 }
@@ -123,9 +125,9 @@ export async function downloadNodeForElectron(
           setInstalling(prev => { const { [node]: _, ...rest } = prev; return rest })
           ;(window as any).electron.off('download-progress', onProgress)
         }
-      } else if (payload.url === url && (payload.state === 'failed' || payload.state === 'cancelled')) {
+      } else if (payload.url === url && (payload.state === 'failed' || payload.state === 'cancelled' || payload.state === 'interrupted')) {
         ;(window as any).electron.off('download-progress', onProgress)
-        toast.error(`Download ${payload.state}: ${payload.error || ''}`, { duration: 5000 } as any)
+        toast.error(payload.error ? `Download ${payload.state}: ${payload.error}` : `Download ${payload.state}`, { duration: 5000 } as any)
         setInstalling(prev => { const { [node]: _, ...rest } = prev; return rest })
       }
     }

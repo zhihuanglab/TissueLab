@@ -81,7 +81,17 @@ export const PatchClassRow: React.FC<PatchClassRowProps> = ({
   }, [menuOpen]);
 
   return (
-    <div className="flex items-center justify-between py-2 pt-3 border-b border-border/20 last:border-b-0 text-sm">
+    <div
+      className={`flex items-center justify-between py-2 pt-3 border-b border-border/20 last:border-b-0 text-sm cursor-pointer rounded-sm transition-colors ${
+        isSelected ? "bg-primary/10 ring-1 ring-inset ring-primary/40" : "hover:bg-muted/50"
+      }`}
+      data-selected={isSelected ? "true" : undefined}
+      onClick={(e) => {
+        // The row's own controls (swatch, edit, menu, one-vs-rest) act on their own.
+        if ((e.target as HTMLElement).closest("button, input, a, [role='menu']")) return;
+        onSelect(index);
+      }}
+    >
       {/* Left side: name, color */}
       <div className="flex items-center gap-2 min-w-0">
         <span className="truncate font-medium" title={name}>

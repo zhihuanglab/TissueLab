@@ -23,6 +23,8 @@ export const NodeLogsDialog: React.FC<NodeLogsDialogProps> = ({
 }) => {
   const [logText, setLogText] = useState<string>('')
   const [paused, setPaused] = useState<boolean>(false)
+  // Last poll failed (backend unreachable / request error); cleared by the next success.
+  const [fetchError, setFetchError] = useState<string | null>(null)
   const timerRef = useRef<any>(null)
   const scrollRef = useRef<HTMLDivElement | null>(null)
 
@@ -39,12 +41,16 @@ export const NodeLogsDialog: React.FC<NodeLogsDialogProps> = ({
       clearInterval(timerRef.current)
       timerRef.current = null
     }
+    // Replies for a previous node / a closed dialog must not land here.
+    let active = true
     const timer = setInterval(async () => {
       try {
         const resp = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/tasks/v1/logs/tail?model_name=${encodeURIComponent(node)}&n=200`, {
           method: 'GET',
           returnAxiosFormat: true,
         })
+        if (!active) return
+        setFetchError(null)
         const data = resp.data as { tail?: string; error?: string }
         const tail = data?.tail || ''
         const error = data?.error
@@ -53,12 +59,15 @@ export const NodeLogsDialog: React.FC<NodeLogsDialogProps> = ({
         } else {
           setLogText(tail)
         }
-      } catch {
-        // ignore transient errors
+      } catch (e) {
+        // Keep polling (it may be transient) but say so instead of "Tailing logs...".
+        if (!active) return
+        setFetchError(e instanceof Error && e.message ? e.message : 'request failed')
       }
     }, Math.max(500, pollMs))
     timerRef.current = timer
     return () => {
+      active = false
       if (timerRef.current) {
         clearInterval(timerRef.current)
         timerRef.current = null
@@ -88,6 +97,7 @@ export const NodeLogsDialog: React.FC<NodeLogsDialogProps> = ({
             timerRef.current = null
           }
           setLogText('')
+          setFetchError(null)
           setPaused(false)
         }
       }}
@@ -122,9 +132,18 @@ export const NodeLogsDialog: React.FC<NodeLogsDialogProps> = ({
         </div>
         <div className="mt-2 border rounded overflow-hidden">
           <div className="px-2 py-1 text-xs bg-slate-900 text-slate-300">Setup / Runtime Logs</div>
+          {fetchError && logText ? (
+            <div role="alert" className="px-2 py-1 text-xs bg-red-950 text-red-300">
+              Could not fetch logs ({fetchError}). Showing the last received logs; retrying...
+            </div>
+          ) : null}
           <div className="bg-slate-950 h-80 overflow-y-auto overflow-x-hidden" ref={scrollRef}>
             <pre className="m-0 p-2 text-xs font-mono whitespace-pre-wrap break-words text-slate-100 leading-5 select-text w-full max-w-full">
-              {logText || (node ? 'Tailing logs...' : 'No log file to display.')}
+              {logText || (!node
+                ? 'No log file to display.'
+                : fetchError
+                  ? `Could not fetch logs (${fetchError}). Is the backend running? Retrying...`
+                  : 'Tailing logs...')}
             </pre>
           </div>
         </div>

@@ -257,6 +257,19 @@ export const VisualSchemaEditorDialog: React.FC<VisualSchemaEditorDialogProps> =
     }
   }, [inline, title, nodeType, fields, panel.id, onSave]);
 
+  // Dialog mode: every time the dialog opens, start from the current panel so
+  // edits discarded with Cancel / Esc / outside click do not come back.
+  const wasOpenRef = useRef(open);
+  useEffect(() => {
+    const opening = open && !wasOpenRef.current;
+    wasOpenRef.current = open;
+    if (!opening || inline) return;
+    setTitle(panel.title || "Custom Panel");
+    setNodeType(panel.type || "CustomNode");
+    setFields(initialFields);
+    setError(null);
+  }, [open, inline, panel.title, panel.type, initialFields]);
+
 
   // In inline mode, directly render the content
   if (inline) {

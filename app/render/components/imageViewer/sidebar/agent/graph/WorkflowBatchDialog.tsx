@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useEffect, useMemo, useState } from "react"
+import React, { useEffect, useMemo, useRef, useState } from "react"
 import { AlertCircle, CheckCircle2, Circle, Clock, FileWarning, History, Loader2, Search, Square, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -119,9 +119,24 @@ export function WorkflowBatchDialog(props: WorkflowBatchDialogProps) {
   const [stopOnFirstError, setStopOnFirstError] = useState(false)
   const [searchTerm, setSearchTerm] = useState("")
 
+  // Select everything when the dialog opens (or when the first files arrive).
+  // After that a refreshed list only drops paths that disappeared: resetting
+  // to "all" here made Start run files the user had unticked.
+  const seededRef = useRef(false)
   useEffect(() => {
-    setSelectedPaths(new Set(files.map((file) => file.path)))
-  }, [files])
+    if (!open) {
+      seededRef.current = false
+      return
+    }
+    const paths = files.map((file) => file.path)
+    if (!seededRef.current) {
+      if (paths.length > 0) seededRef.current = true
+      setSelectedPaths(new Set(paths))
+      return
+    }
+    const present = new Set(paths)
+    setSelectedPaths((prev) => new Set([...prev].filter((p) => present.has(p))))
+  }, [files, open])
 
   // Reset the search when the dialog closes so the next open starts clean.
   useEffect(() => {

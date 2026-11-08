@@ -141,6 +141,8 @@ export interface WorkflowGraphDialogsProps {
   saveForm: { name: string; description: string; author: string; tags: string; publish: boolean }
   setSaveForm: React.Dispatch<React.SetStateAction<{ name: string; description: string; author: string; tags: string; publish: boolean }>>
   submitSave: () => void
+  /** Inline error when the typed name belongs to a different library entry; Save stays disabled. */
+  saveNameConflict?: string | null
   activeWf: { nodes: GraphNode[]; connections: unknown[] }
   classifierSaveOpen: boolean
   setClassifierSaveOpen: React.Dispatch<React.SetStateAction<boolean>>
@@ -213,6 +215,7 @@ export function WorkflowGraphDialogs(props: WorkflowGraphDialogsProps) {
     saveForm,
     setSaveForm,
     submitSave,
+    saveNameConflict,
     activeWf,
     classifierSaveOpen,
     setClassifierSaveOpen,
@@ -465,7 +468,13 @@ export function WorkflowGraphDialogs(props: WorkflowGraphDialogsProps) {
                 value={saveForm.name}
                 onChange={(e) => setSaveForm((f) => ({ ...f, name: e.target.value }))}
                 placeholder="My Workflow"
+                aria-invalid={saveNameConflict ? true : undefined}
+                aria-describedby={saveNameConflict ? "wg-save-name-error" : undefined}
+                className={saveNameConflict ? "border-destructive focus-visible:ring-destructive" : undefined}
               />
+              {saveNameConflict && (
+                <p id="wg-save-name-error" role="alert" className="text-xs text-destructive">{saveNameConflict}</p>
+              )}
             </div>
             <div className="space-y-1">
               <UILabel htmlFor="wg-save-desc" className="text-xs">Description</UILabel>
@@ -521,7 +530,7 @@ export function WorkflowGraphDialogs(props: WorkflowGraphDialogsProps) {
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setSaveDialogOpen(false)}>Cancel</Button>
-            <Button onClick={submitSave}>{saveForm.publish ? "Save & Publish" : "Save to library"}</Button>
+            <Button onClick={submitSave} disabled={Boolean(saveNameConflict)}>{saveForm.publish ? "Save & Publish" : "Save to library"}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

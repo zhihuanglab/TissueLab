@@ -23,6 +23,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { upsertContentStringValue } from "@/utils/agent/workflow/panelContent";
+import { fallbackHighlight } from "@/utils/agent/workflow/fallbackHighlight";
 import { apiFetch } from "@/utils/common/apiFetch";
 import { AI_SERVICE_API_ENDPOINT } from "@/config/api.config";
 import { setIsGenerating } from "@/store/slices/chat/chatSlice";
@@ -131,22 +132,8 @@ export const CodePanelContent: React.FC<CodePanelContentProps> = ({
   const wfProgressPct = Math.max(0, Math.min(100, workflowNodeProgressPct ?? 0));
   const isWorkflowStepRunning = workflowNodeExecuting || scriptChainInFlight;
 
-  const highlight = (src: string) => {
-    try {
-      const keywords =
-        /(\bdef\b|\breturn\b|\bimport\b|\bfrom\b|\bas\b|\bif\b|\belif\b|\belse\b|\bfor\b|\bwhile\b|\bwith\b|\btry\b|\bexcept\b|\bclass\b)/g;
-      const numbers = /(\b\d+(?:\.\d+)?\b)/g;
-      const strings = /(["'])(?:\\.|(?!\1).)*\1/g;
-      const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      let out = esc(src);
-      out = out.replace(numbers, '<span class="text-warning">$1</span>');
-      out = out.replace(strings, '<span class="text-success">$&</span>');
-      out = out.replace(keywords, '<span class="text-primary">$1</span>');
-      return out;
-    } catch {
-      return src;
-    }
-  };
+  const highlight = (src: string) =>
+    fallbackHighlight(src, { number: "text-warning", string: "text-success", keyword: "text-primary" });
 
   const draftHtml = useMemo(() => {
     try {

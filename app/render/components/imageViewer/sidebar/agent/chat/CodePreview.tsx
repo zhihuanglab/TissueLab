@@ -2,6 +2,7 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { X } from "lucide-react"
+import { fallbackHighlight } from "@/utils/agent/workflow/fallbackHighlight"
 
 export const CodePreview: React.FC<{ code: string, language?: string }> = ({ code, language = "python" }) => {
   const [hljsHtml, setHljsHtml] = useState<string | null>(null)
@@ -9,21 +10,8 @@ export const CodePreview: React.FC<{ code: string, language?: string }> = ({ cod
   const previewScrollRef = useRef<HTMLDivElement>(null)
   const dialogScrollRef = useRef<HTMLDivElement>(null)
 
-  const highlightFallback = (src: string) => {
-    try {
-      const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-      const keywords = /(\bdef\b|\breturn\b|\bimport\b|\bfrom\b|\bas\b|\bif\b|\belif\b|\belse\b|\bfor\b|\bwhile\b|\bwith\b|\btry\b|\bexcept\b|\bclass\b)/g
-      const numbers = /(\b\d+(?:\.\d+)?\b)/g
-      const strings = /(["'])(?:\\.|(?!\1).)*\1/g
-      let out = esc(src)
-      out = out.replace(numbers, '<span class="text-amber-300">$1</span>')
-      out = out.replace(strings, '<span class="text-emerald-300">$&</span>')
-      out = out.replace(keywords, '<span class="text-sky-300">$1</span>')
-      return out
-    } catch {
-      return code
-    }
-  }
+  const highlightFallback = (src: string) =>
+    fallbackHighlight(src, { number: "text-amber-300", string: "text-emerald-300", keyword: "text-sky-300" })
 
   useEffect(() => {
     const ensureHljs = async () => {

@@ -678,6 +678,11 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
       // Clear selected cell state
       setSelectedCell(null);
 
+      // Class adds/renames not yet sent with an Update belong to the previous
+      // slide; drop them so they are not applied to this slide's classifier.
+      pendingRenameOpsRef.current = [];
+      pendingAddOpsRef.current = [];
+
       // Close review modal if open (the modal clears its own review state)
       setShowReviewModal(false);
 
@@ -1102,6 +1107,11 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
   
   // Function to open add/edit modal
   const openAddClassModal = () => {
+    // Always start from a blank form: a cancelled Edit leaves the edited
+    // class's name/colour in the shared fields.
+    setEditingIndex(null);
+    setNewClassName(cellTypeOptions[0]);
+    setNewClassColor(generateRandomColor(nucleiClasses.map(c => c.color)));
     setShowModal(true);
   };
   
@@ -1150,17 +1160,23 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
     if (!cls) return;
     const removedName = String(cls.name ?? "").trim();
 
+    if (!cls.persisted) {
+      dispatch(deleteNucleiClass(index));
+    } else {
+      try {
+        await performDelete(index, cls.name, NEGATIVE_CONTROL);
+      } catch (e) {
+        // Keep the row and its pending ops so nothing is lost; the user can retry.
+        toast.error(`Could not delete class "${cls.name}": ${e instanceof Error ? e.message : String(e)}`);
+        return;
+      }
+    }
+
     if (removedName) {
       pendingAddOpsRef.current = pendingAddOpsRef.current.filter(op => op.name !== removedName);
       pendingRenameOpsRef.current = pendingRenameOpsRef.current.filter(
         op => op.from !== removedName && op.to !== removedName
       );
-    }
-
-    if (!cls.persisted) {
-      dispatch(deleteNucleiClass(index));
-    } else {
-      await performDelete(index, cls.name, NEGATIVE_CONTROL);
     }
     // The row was the class's one-vs-rest attachment: a class added back under
     // this name starts without the old file instead of quietly running it.
@@ -1328,9 +1344,13 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
 
       } else {
         setIsResetting(false);
+        const reason = response.data?.message || response.data?.detail;
+        toast.error(`Reset failed${reason ? `: ${reason}` : ''}. Your classifications were not changed.`);
       }
     } catch (error) {
       setIsResetting(false);
+      const reason = error instanceof Error ? error.message : '';
+      toast.error(`Reset failed${reason ? `: ${reason}` : ''}. Your classifications were not changed.`);
     } finally {
         setShowResetModal(false);
     }

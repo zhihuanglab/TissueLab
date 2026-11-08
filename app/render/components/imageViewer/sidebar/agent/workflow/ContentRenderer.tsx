@@ -112,17 +112,13 @@ export const ContentRenderer: React.FC<ContentRendererProps> = ({ item, onChange
     }
   }, [item]);
 
+  // While a field has focus, keep Space away from global shortcuts (viewer /
+  // graph) but let the browser insert it normally: at the caret, and not at
+  // all in a read-only field.
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (isTyping && event.key === " ") {
         event.stopPropagation();
-        event.preventDefault();
-
-        setInputValue((prev) => {
-          const newValue = prev + " ";
-          onChange(newValue);
-          return newValue;
-        });
       }
     };
 
@@ -130,7 +126,7 @@ export const ContentRenderer: React.FC<ContentRendererProps> = ({ item, onChange
     return () => {
       document.removeEventListener("keydown", handleKeyDown, true);
     };
-  }, [isTyping, onChange]);
+  }, [isTyping]);
 
   // Prefer an explicit static label when the panel sets one (e.g. patch-embedding
   // params); otherwise fall back to the live key. Fields whose key the user can

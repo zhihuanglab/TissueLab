@@ -118,7 +118,7 @@ export class ModelsService {
    * Format file size for display
    */
   formatFileSize(bytes?: number): string {
-    if (!bytes) return 'Unknown';
+    if (bytes == null || Number.isNaN(bytes)) return 'Unknown';
     
     const sizes = ['Bytes', 'KB', 'MB', 'GB'];
     if (bytes === 0) return '0 Bytes';

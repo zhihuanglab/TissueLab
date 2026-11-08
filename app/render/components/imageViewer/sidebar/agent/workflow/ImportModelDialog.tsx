@@ -140,9 +140,13 @@ export const ImportModelDialog: React.FC<ImportModelDialogProps> = ({
         });
         const data: NodesExtendedPayload = (payloadFromAxiosAppResponse<NodesExtendedPayload>(response) ||
           {}) as NodesExtendedPayload;
-        setFactoryModels(data?.category_map || {});
-        setCategoryNames(data?.category_display_names || {});
-        setNodesMeta(data?.nodes || {});
+        // An empty/partial reply (registry not loaded yet) must not wipe the
+        // bundled fallback: only replace the sections the backend filled in.
+        const filled = (o: unknown): o is Record<string, any> =>
+          !!o && typeof o === 'object' && Object.keys(o as object).length > 0;
+        if (filled(data?.category_map)) setFactoryModels(data.category_map as Record<string, string[]>);
+        if (filled(data?.category_display_names)) setCategoryNames(data.category_display_names as Record<string, string>);
+        if (filled(data?.nodes)) setNodesMeta(data.nodes as Record<string, NodeMeta>);
       } catch (error) {
         console.error('Error fetching nodes metadata:', error);
       }
@@ -221,6 +225,14 @@ export const ImportModelDialog: React.FC<ImportModelDialogProps> = ({
   useEffect(() => {
     setSelectedNode("");
   }, [selectedModel]);
+
+  // A picked node whose process stops (its card greys out) is no longer
+  // importable: drop the selection so Import disables with it.
+  useEffect(() => {
+    if (selectedNode && runningNodes[selectedNode] !== true) {
+      setSelectedNode("");
+    }
+  }, [runningNodes, selectedNode]);
 
   // Cache available nodes and node type mapping
   const { availableNodes, nodeTypeMap: computedNodeTypeMap } = useMemo(() => {

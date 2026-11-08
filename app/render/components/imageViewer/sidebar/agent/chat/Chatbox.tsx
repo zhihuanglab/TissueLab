@@ -1,6 +1,6 @@
 import type React from "react"
 import { useState, useRef, useEffect, useCallback } from "react"
-import { Send, Search, ExternalLink, Globe, Brain, Zap, Bot, Plus, ThumbsUp, ThumbsDown } from "lucide-react"
+import { Send, Search, ExternalLink, Globe, Zap, Bot, Plus, ThumbsUp, ThumbsDown } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { cn } from "@/utils/common/twMerge"
@@ -195,10 +195,14 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
   // const [messages, setMessages] = useState<MessageType[]>([])f
   const [input, setInput] = useState("")
   const [isLoading, setIsLoading] = useState(false)
+  const sendInFlightRef = useRef(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const [mode] = useState<"qa" | "workflow">("workflow")
-  const [answerReceived, setAnswerReceived] = useState<boolean>(false);
+  // Bumped by New Chat / agent switch: replies to requests started in an
+  // earlier conversation are dropped instead of landing in the new one.
+  const sessionEpochRef = useRef(0)
+  // Set by a web-search preset; applies to the next question only.
   const [webSearchEnabled, setWebSearchEnabled] = useState<boolean>(false);
   // Clinician feedback on a planned workflow (strategy-level co-evolution): a thumbs
   // up/down on the card is recorded per (category, model) and re-ranks the candidate
@@ -225,15 +229,15 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
   // Push freshly-planned steps into the WorkflowGraph via the zustand bridge.
   const queueWorkflowFromChatCard = useRootStore((s) => s.queueWorkflowFromChatCard)
   const [isInputFocused, setIsInputFocused] = useState<boolean>(false);
-  const answerReceivedRef = useRef<boolean>(answerReceived);
+  // True once the current generation's answer has been posted; reset each time
+  // a new generation starts (see the get_answer polling effect).
+  const answerReceivedRef = useRef<boolean>(false);
   const [showWelcomeTyping, setShowWelcomeTyping] = useState(false);
   const [pendingWelcomeAnim, setPendingWelcomeAnim] = useState(false);
   type ThinkingStatus = 'pending' | 'active' | 'done';
   type ThinkingStage = { key: string; label: string; status: ThinkingStatus };
   const [showThinking, setShowThinking] = useState(false);
   const [thinkingStages, setThinkingStages] = useState<ThinkingStage[]>([]);
-  const [reasoningMenuOpen, setReasoningMenuOpen] = useState(false);
-  const [reasoningLevel, setReasoningLevel] = useState<'none' | 'medium' | 'high'>('medium');
 
   const presetQuestions = [
     { text: "Please calculate the number of tumor cells in this slide?", enableWebSearch: false },
@@ -268,8 +272,6 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
   const thinkingTimerRef = useRef<number | null>(null);
   const [wfStage, setWfStage] = useState<'init' | 'run' | 'done'>('init');
   const nodeStatus = useSelector((state: RootState) => state.workflow.nodeStatus);
-
-  const reasoningLabel = reasoningLevel === 'none' ? 'None' : reasoningLevel.charAt(0).toUpperCase() + reasoningLevel.slice(1);
 
   // Local avatar state: prefer Redux; fallback to localStorage
   const [avatarPreview, setAvatarPreview] = useState<string>("")
@@ -345,10 +347,21 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
     });
   };
 
-  const startNewSession = useCallback(async () => {
-    dispatch(clearMessages());
+  // Leave the current conversation: forget any request still in flight and
+  // stop waiting for a generated answer, so nothing from it reaches the new chat.
+  const abandonConversation = useCallback(() => {
+    sessionEpochRef.current += 1;
+    sendInFlightRef.current = false;
+    setIsLoading(false);
     setShowThinking(false);
+    setWebSearchEnabled(false);
+    dispatch(setIsGenerating(false));
+    dispatch(clearMessages());
   }, [dispatch]);
+
+  const startNewSession = useCallback(async () => {
+    abandonConversation();
+  }, [abandonConversation]);
 
   useEffect(() => {
     const handleAddAnnotationContext = (annotation: AnnotationContext) => {
@@ -374,18 +387,31 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }
 
+  // A new generation starts whenever isGenerating turns true: its answer has
+  // not been received yet, whatever happened to the previous one.
   useEffect(() => {
-    answerReceivedRef.current = answerReceived;
-  }, [answerReceived]);
+    if (isGenerating) answerReceivedRef.current = false;
+  }, [isGenerating]);
 
   useEffect(() => {
     if (!isGenerating) return;
 
+    const epoch = sessionEpochRef.current;
+    // Consecutive get_answer failures; after this many (~1 per second) the
+    // backend is treated as gone and polling stops.
+    const MAX_POLL_FAILURES = 10;
+    let failures = 0;
+    let stopped = false;
+
     const intervalId = setInterval(async () => {
+      if (stopped) return;
       try {
         // Only poll when code is being generated, not when workflow is running
         if (isWorkflowRunning) return;
         const response = await apiFetch(`${AI_SERVICE_API_ENDPOINT}/tasks/v1/get_answer`, { method: 'GET', returnAxiosFormat: true });
+        // Started before New Chat: the answer belongs to the old conversation.
+        if (stopped || epoch !== sessionEpochRef.current) return;
+        failures = 0;
         // apiFetch({ returnAxiosFormat: true }) already unwraps the envelope:
         // response.data is { message: "wait" | "done" | ..., answer }.
         const data = response.data;
@@ -393,6 +419,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
 
         // "wait" carries the partial stream so far, not the answer.
         if (!answerReceivedRef.current && data?.message !== "wait" && (data?.answer || data?.message === "done")) {
+          answerReceivedRef.current = true;
           let botMessage: MessageType | undefined;
           const ans = data?.answer;
           if (typeof ans === "string") {
@@ -418,9 +445,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
             dispatch(addMessage(botMessage));
           }
           dispatch(setIsGenerating(false));
-          setAnswerReceived(true);
-          answerReceivedRef.current = true;
-          
+
           // clear workflow
           try {
             await apiFetch(`${AI_SERVICE_API_ENDPOINT}/tasks/v1/clear_workflow`, {
@@ -435,10 +460,26 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
         }
       } catch (error) {
         console.error("Error polling get_answer:", error);
+        if (stopped || epoch !== sessionEpochRef.current) return;
+        failures += 1;
+        if (failures >= MAX_POLL_FAILURES) {
+          stopped = true;
+          clearInterval(intervalId);
+          dispatch(addMessage({
+            id: Date.now() + 1,
+            content: createTextPayload("Lost connection to the backend while waiting for the answer. Check that the TissueLab service is running, then ask again."),
+            sender: "bot",
+            type: "text" as const,
+          }));
+          dispatch(setIsGenerating(false));
+        }
       }
     }, 1000);
 
-    return () => clearInterval(intervalId);
+    return () => {
+      stopped = true;
+      clearInterval(intervalId);
+    };
   }, [isGenerating, isWorkflowRunning, dispatch]);
 
   useEffect(() => {
@@ -496,6 +537,15 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!input.trim()) return
+    // One request at a time: ignore Send / Ctrl+Enter while an answer is loading.
+    if (isLoading || sendInFlightRef.current) return
+    sendInFlightRef.current = true
+    // New Chat while this request is in flight makes it stale: its reply is dropped.
+    const epoch = sessionEpochRef.current
+    const isStale = () => epoch !== sessionEpochRef.current
+    // A web-search preset applies to this question only, not to later hand-typed ones.
+    const searchWeb = webSearchEnabled
+    setWebSearchEnabled(false)
 
     // Append user message to chat
     const userMessage: MessageType = {
@@ -557,6 +607,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
           setStageActive('workflow', 'Designing workflow…')
         }
       }
+      if (isStale()) return
 
       if (chosenAction === "qa") {
         const response = await apiFetch(`${CTRL_SERVICE_API_ENDPOINT}/agent/v1/chat`, {
@@ -571,11 +622,12 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
               slide_info: {
                 mpp: slideInfo?.mpp
               },
-              web_search_enabled: webSearchEnabled
+              web_search_enabled: searchWeb
             }
           }),
           returnAxiosFormat: true,
         });
+        if (isStale()) return;
         // apiFetch returns response.data as the unwrapped payload on success.
         const replyPayload: any = response.data;
         setIsLoading(false);
@@ -604,11 +656,12 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
               slide_info: {
                 mpp: slideInfo?.mpp
               },
-              web_search_enabled: webSearchEnabled
+              web_search_enabled: searchWeb
             }
           }),
           returnAxiosFormat: true,
         });
+        if (isStale()) return;
         // apiFetch returns response.data as the unwrapped payload (script string) on success.
         const responseData: any = response.data;
         setIsLoading(false);
@@ -641,11 +694,12 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
               slide_info: {
                 mpp: slideInfo?.mpp
               },
-              web_search_enabled: webSearchEnabled
+              web_search_enabled: searchWeb
             }
           }),
         })
       } catch (error: any) {
+        if (isStale()) return
         const message = typeof error === 'string' ? error : error?.message || 'Failed to fetch workflow steps.'
         setIsLoading(false)
         setStageDone('workflow')
@@ -659,26 +713,38 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
         dispatch(addMessage(errorMessage))
         return
       }
+      if (isStale()) return
 
       console.log(responseData)
       setIsLoading(false)
       setStageDone('workflow')
       setShowThinking(false)
 
-      // apiFetch already unwrapped the envelope and threw on non-zero code,
-      // so responseData is the steps array directly.
-      const steps: any[] = Array.isArray(responseData) ? responseData : []
+      // apiFetch already unwrapped the envelope and threw on non-zero code;
+      // parseWorkflowSteps also maps planner aliases (CodeAgent -> CodingAgent).
+      const steps: any[] = parseWorkflowSteps(responseData)
+
+      // Empty plan: say so plainly and keep whatever workflow is already loaded.
+      if (steps.length === 0) {
+        dispatch(addMessage({
+          id: Date.now() + 1,
+          content: createTextPayload("I couldn't design a pipeline for that request. Try rephrasing it or describing the analysis in more detail."),
+          sender: "bot",
+          type: "text" as const,
+        }))
+        return
+      }
       const formattedWorkflow = steps.map((item: { hasOwnProperty: (arg0: string) => any; input: any; impl?: string }) => {
         if (item.hasOwnProperty('input')) {
           return {
             ...item,
             prompt: typeof item.input === "string" ? item.input : "",
             impl: item.impl || undefined,
-            web_search_enabled: webSearchEnabled,
+            web_search_enabled: searchWeb,
             slide_mpp: slideInfo?.mpp ?? null,
           };
         }
-        return { ...item, web_search_enabled: webSearchEnabled, slide_mpp: slideInfo?.mpp ?? null };
+        return { ...item, web_search_enabled: searchWeb, slide_mpp: slideInfo?.mpp ?? null };
       });
 
       const formattedPath = formatPath(currentPath ?? "");
@@ -700,7 +766,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
           impl: s.impl ?? null,
           input: s.input,
           prompt: typeof s.input === 'string' ? s.input : undefined,
-          web_search_enabled: webSearchEnabled,
+          web_search_enabled: searchWeb,
           slide_mpp: slideInfo?.mpp ?? null,
         })),
         formattedPath,
@@ -711,7 +777,8 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
         model: step.model,
         impl: step.impl ?? null,
         input: step.input ?? null,
-        web_search_enabled: webSearchEnabled,
+        web_search_enabled: searchWeb,
+        slide_mpp: slideInfo?.mpp ?? null,
       }));
 
       // First, send the introduction message
@@ -733,6 +800,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
       dispatch(addMessage(workflowMessage));
     } catch (error: any) {
       console.error('[Chatbox] handleSend failed:', error)
+      if (isStale()) return
       const detail = error?.message ? `: ${error.message}` : ''
       const errorMessage: MessageType = {
         id: Date.now() + 1,
@@ -743,6 +811,9 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
       dispatch(addMessage(errorMessage))
       setIsLoading(false)
       setShowThinking(false)
+    } finally {
+      // A stale request must not clear the guard of one sent in the new chat.
+      if (!isStale()) sendInFlightRef.current = false
     }
   }
 
@@ -764,7 +835,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
               if (value !== selectedAgent) {
                 dispatch(setSelectedAgent(value));
                 startWelcomeTyping();
-                dispatch(clearMessages());
+                abandonConversation();
               }
             }}>
               <SelectTrigger className="h-7 w-[170px] border border-border/50 shadow-sm bg-background text-sm font-medium text-foreground hover:bg-muted/50 hover:border-border focus:ring-1 focus:ring-ring">
@@ -808,8 +879,20 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
                 const isAnnotationContext = message.type === "annotation-context" && isAnnotationContextPayload(message.content as ChatMessagePayload)
                 const rawMsg = payloadToString(message.content as ChatMessagePayload)
                 const codeMatch = rawMsg.match(/```(\w+)?[\r\n]+([\s\S]*?)```/)
-                const lang = codeMatch ? (codeMatch[1] || 'python').toLowerCase() : ''
-                const codeBody = codeMatch ? (codeMatch[2] || '') : ''
+                // Everything after the text that precedes the first fence: each
+                // code block and the text between / after them, in order.
+                const tailSegments: Array<{ kind: 'code'; lang: string; body: string } | { kind: 'text'; text: string }> = []
+                if (codeMatch) {
+                  let cursor = 0
+                  for (const m of rawMsg.matchAll(/```(\w+)?[\r\n]+([\s\S]*?)```/g)) {
+                    const between = rawMsg.slice(cursor, m.index ?? 0).trim()
+                    if (cursor > 0 && between) tailSegments.push({ kind: 'text', text: between })
+                    tailSegments.push({ kind: 'code', lang: (m[1] || 'python').toLowerCase(), body: m[2] || '' })
+                    cursor = (m.index ?? 0) + m[0].length
+                  }
+                  const after = rawMsg.slice(cursor).trim()
+                  if (after) tailSegments.push({ kind: 'text', text: after })
+                }
                 return (
                 <div key={message.id} className="space-y-2">
               <div
@@ -912,6 +995,9 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
                                   input: s.input,
                                   prompt: typeof s.input === 'string' ? s.input : undefined,
                                   web_search_enabled: s.web_search_enabled === true,
+                                  // Like the path, the MPP is the slide open now; the plan's
+                                  // own value covers a slide whose MPP is not loaded.
+                                  slide_mpp: slideInfo?.mpp ?? s.slide_mpp ?? null,
                                 }))
                                 if (steps.length > 0) {
                                   queueWorkflowFromChatCard({
@@ -1112,8 +1198,8 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
                   </div>
                 </div>
               </div>
-              {codeMatch && (
-                <div className={cn("flex relative", message.sender === "user" ? "justify-end" : "justify-start")}> 
+              {tailSegments.map((seg, segIdx) => (
+                <div key={`seg-${segIdx}`} className={cn("flex relative", message.sender === "user" ? "justify-end" : "justify-start")}> 
                   <div className={cn("flex gap-2 max-w-[85%] min-w-0", message.sender === "user" ? "flex-row-reverse" : "flex-row")}> 
                     <div className="h-full flex items-start">
                       {message.sender === "bot" ? (
@@ -1137,11 +1223,15 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
                       )}
                     </div>
                     <div className="flex-1 min-w-0">
-                      <CodePreview code={codeBody} language={lang} />
+                      {seg.kind === 'code' ? (
+                        <CodePreview code={seg.body} language={seg.lang} />
+                      ) : (
+                        <div className={`rounded-lg px-3 py-2 break-words whitespace-pre-wrap text-sm leading-5 ${message.sender === 'user' ? 'bg-primary text-primary-foreground' : 'bg-muted text-foreground'}`}>{seg.text}</div>
+                      )}
                     </div>
                   </div>
                 </div>
-              )}
+              ))}
               </div>
               )
             })
@@ -1208,37 +1298,15 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
 
       <div className="absolute bottom-0 left-0 right-0 bg-card border-t border-border z-20">
         <div className="p-2 h-24 relative">
-          {reasoningMenuOpen && (
-            <div className="absolute right-2 bottom-24 w-56 rounded-md border border-border bg-popover text-popover-foreground shadow-lg p-2">
-              <div className="text-xs font-medium text-muted-foreground px-2 pb-1">Reasoning Level</div>
-              {[
-                { id: 'none', label: 'None', desc: 'Fastest' },
-                { id: 'medium', label: 'Medium', desc: 'Balanced depth' },
-                { id: 'high', label: 'High', desc: 'Deeper search' },
-              ].map((opt) => (
-                <button
-                  key={opt.id}
-                  type="button"
-                  onClick={() => {
-                    setReasoningLevel(opt.id as typeof reasoningLevel)
-                    setReasoningMenuOpen(false)
-                  }}
-                  className={cn(
-                    "w-full text-left px-2 py-1.5 rounded-md hover:bg-muted flex items-center justify-between gap-2",
-                    reasoningLevel === opt.id ? "bg-muted" : ""
-                  )}
-                >
-                  <span className="text-sm">{opt.label}</span>
-                  <span className="text-[11px] text-muted-foreground">{opt.desc}</span>
-                </button>
-              ))}
-            </div>
-          )}
           <form onSubmit={handleSend} className="max-w-4xl mx-auto flex gap-2 h-full">
             <div className="w-full h-full flex flex-col relative rounded-md border border-input bg-transparent shadow-sm">
               <Textarea
                 value={input}
-                onChange={(e) => setInput(e.target.value)}
+                onChange={(e) => {
+                  setInput(e.target.value)
+                  // Clearing the box drops a web-search preset's flag along with its text.
+                  if (!e.target.value.trim()) setWebSearchEnabled(false)
+                }}
                 onFocus={() => setIsInputFocused(true)}
                 onBlur={() => setTimeout(() => setIsInputFocused(false), 200)}
                 placeholder="Type your message..."
@@ -1253,22 +1321,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
             </div>
             
             <div className="flex flex-col gap-2 h-full">
-              <button
-                type="button"
-                onClick={() => {
-                  setReasoningMenuOpen(!reasoningMenuOpen)
-                }}
-                title={`Reasoning level: ${reasoningLabel}`}
-                className={cn(
-                  "flex-1 h-9 w-9 rounded-md border transition-colors flex items-center justify-center",
-                  reasoningMenuOpen
-                    ? "bg-primary/10 border-primary/30 text-primary"
-                    : "bg-card border-border text-muted-foreground hover:bg-muted"
-                )}
-              >
-                <Brain className={cn("h-4 w-4", reasoningMenuOpen ? "text-primary" : "text-muted-foreground")} />
-              </button>
-              <Button type="submit" size="icon" className="flex-1 bg-primary hover:bg-primary/90">
+              <Button type="submit" size="icon" disabled={isLoading} className="flex-1 bg-primary hover:bg-primary/90">
                 <Send className="h-4 w-4" />
               </Button>
             </div>

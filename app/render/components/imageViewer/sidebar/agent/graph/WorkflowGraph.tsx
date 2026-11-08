@@ -194,6 +194,8 @@ import type { FileTreeNode } from "@/types/fileManager.types"
 
 type BottomMode = "none" | "chat" | "config"
 const FORCE_OVERRIDE_CANCELLED = "__workflow_force_override_cancelled__"
+const GRAPH_CYCLE_ERROR =
+  "Could not order graph: the connections form a cycle. Remove the connection that loops back before running."
 
 // loadedClassifier.name is consumed by BottomDock + ClassifierStatusBanner as a
 // display label. We keep it equal to the on-disk basename of the path so the
@@ -1206,11 +1208,12 @@ export const WorkflowGraph: React.FC = () => {
       return { id: n.id, y: n.y, backendName }
     })
     const sortedTopo = topoSortModelNodesForRun(topoNodes, activeWf.connections)
-    const orderedTopo =
-      sortedTopo === null
-        ? [...topoNodes].sort((a, b) => (a.y !== b.y ? a.y - b.y : a.id.localeCompare(b.id)))
-        : sortedTopo
-    const taskDeps = sortedTopo === null ? undefined : buildTaskDependenciesFromTopo(sortedTopo, activeWf.connections, idToBackend)
+    // A cycle has no valid execution order; refuse instead of guessing one.
+    if (sortedTopo === null) {
+      return { ok: false, error: GRAPH_CYCLE_ERROR }
+    }
+    const orderedTopo = sortedTopo
+    const taskDeps = buildTaskDependenciesFromTopo(sortedTopo, activeWf.connections, idToBackend)
     const orderedGraphNodes = orderedTopo
       .map((t) => executableModelNodes.find((n) => n.id === t.id))
       .filter((n): n is GraphNode => Boolean(n))
@@ -1360,7 +1363,7 @@ export const WorkflowGraph: React.FC = () => {
     ]
   )
 
-  const runWorkflow = useCallback(async () => {
+  const runWorkflowOnce = useCallback(async () => {
     if (isRunning || isWorkflowRuntimeActive(workflowStatus)) return
     if (!assertWritable("run workflow")) {
       return
@@ -1414,16 +1417,17 @@ export const WorkflowGraph: React.FC = () => {
       .filter((n) => n.backendName)
 
     const sortedTopo = topoNodes.length > 0 ? topoSortModelNodesForRun(topoNodes, activeWf.connections) : []
-    let orderedTopo = sortedTopo
-    let taskDeps: Record<string, string[]> | undefined
+    // Disconnected nodes were rejected above, so null here means a cycle: there
+    // is no valid execution order, so do not submit a guessed one.
     if (sortedTopo === null) {
-      toast.message("Could not order graph (cycle or disconnected nodes). Using vertical order; dependencies may be approximate.")
-      orderedTopo = [...topoNodes].sort((a, b) => (a.y !== b.y ? a.y - b.y : a.id.localeCompare(b.id)))
-    } else if (topoNodes.length > 0) {
-      taskDeps = buildTaskDependenciesFromTopo(sortedTopo, activeWf.connections, idToBackend)
+      toast.error(GRAPH_CYCLE_ERROR)
+      return
     }
+    const orderedTopo = sortedTopo
+    const taskDeps: Record<string, string[]> | undefined =
+      topoNodes.length > 0 ? buildTaskDependenciesFromTopo(sortedTopo, activeWf.connections, idToBackend) : undefined
 
-    const orderedGraphNodes = orderedTopo!
+    const orderedGraphNodes = orderedTopo
       .map((t) => executableModelNodes.find((n) => n.id === t.id))
       .filter((n): n is GraphNode => Boolean(n))
     const orderedScriptNodes = [...scriptOnlyNodes].sort((a, b) => (a.y !== b.y ? a.y - b.y : a.id.localeCompare(b.id)))
@@ -1526,6 +1530,23 @@ export const WorkflowGraph: React.FC = () => {
     dispatch,
     startWorkflowAllowingForceOverride,
   ])
+
+  // isRunning only flips once start_workflow has returned, so it cannot stop a
+  // quick second Run click; this ref holds the start in flight (incl. the
+  // prerequisite lookup and any force-override prompt).
+  const runStartingRef = useRef(false)
+  const [isStartingRun, setIsStartingRun] = useState(false)
+  const runWorkflow = useCallback(async () => {
+    if (runStartingRef.current) return
+    runStartingRef.current = true
+    setIsStartingRun(true)
+    try {
+      await runWorkflowOnce()
+    } finally {
+      runStartingRef.current = false
+      setIsStartingRun(false)
+    }
+  }, [runWorkflowOnce])
 
   // Open the model-config pane and focus the Active Learning tab for the given node
   const openActiveLearning = useCallback(
@@ -2312,6 +2333,16 @@ export const WorkflowGraph: React.FC = () => {
     tags: "",
     publish: false,
   })
+
+  // Library entry each tab was loaded from or last saved as (by tab id). Saving a
+  // tab under its own entry's name updates that entry; any other existing name
+  // is a conflict shown inline in the Save dialog (no overwrite, no prompt).
+  const [libraryNameByWfId, setLibraryNameByWfId] = useState<Record<string, string>>({})
+  const saveNameConflict = useMemo(() => {
+    const name = saveForm.name.trim()
+    if (!name || !savedList[name] || libraryNameByWfId[activeWf.id] === name) return null
+    return "A workflow with this name already exists. Choose a different name."
+  }, [saveForm.name, savedList, libraryNameByWfId, activeWf.id])
 
   const openSaveDialog = useCallback(() => {
     // Default Author: preferred name from profile localStorage, else the signed-in
@@ -3148,6 +3179,9 @@ export const WorkflowGraph: React.FC = () => {
       return
     }
     const all = loadAllSaved()
+    // Never replace a different workflow's library entry; the dialog shows the
+    // conflict inline. Re-saving the tab that was loaded/saved under this name updates it.
+    if (all[name] && libraryNameByWfId[activeWf.id] !== name) return
     const runtimeContext = buildRuntimeContextSnapshot()
     const snapshot: SerializedWorkflow = {
       name,
@@ -3176,6 +3210,7 @@ export const WorkflowGraph: React.FC = () => {
       return
     }
     setSavedList(all)
+    setLibraryNameByWfId((prev) => ({ ...prev, [activeWf.id]: name }))
     setSaveDialogOpen(false)
     notifyWorkflowLocalStorageChanged()
     toast.success(`Saved "${name}" (graph, chat, and node settings)`)
@@ -3183,7 +3218,7 @@ export const WorkflowGraph: React.FC = () => {
     if (saveForm.publish) {
       preparePublishWorkflow(name, snapshot)
     }
-  }, [saveForm, activeWf, panelStates, chatMessages, buildRuntimeContextSnapshot, preparePublishWorkflow, currentPath])
+  }, [saveForm, activeWf, panelStates, chatMessages, buildRuntimeContextSnapshot, preparePublishWorkflow, currentPath, libraryNameByWfId])
 
   // Submit the One-vs-rest Save dialog: for each chosen class, write a scoped
   // save_classifier_paths ({class: <folder>/<name>.tlcls}), run ONE training pass
@@ -3800,6 +3835,7 @@ export const WorkflowGraph: React.FC = () => {
       }
       setWorkflows((prev) => [...prev, loaded])
       setActiveWfId(loaded.id)
+      setLibraryNameByWfId((prev) => ({ ...prev, [loaded.id]: name }))
       const resolved = await ensureCommunityClassifiersResolved(wf)
       restoreSavedWorkflowPanelsAndChat(resolved)
       toast.success(`Loaded "${name}"`)
@@ -4118,7 +4154,17 @@ export const WorkflowGraph: React.FC = () => {
         connections: layout.graphConnections,
         selectedId: layout.graphNodes.find((n) => n.kind === "model")?.id ?? null,
       }))
-      setPanelStates(layout.generatedPanels)
+      // panelStates holds every tab's node settings: replace only this tab's
+      // (its old nodes are gone), never another tab's.
+      // (Start/End ids are shared by every tab, so only model nodes count.)
+      const replacedIds = new Set(activeWf.nodes.filter((n) => n.kind === "model").map((n) => n.id))
+      setPanelStates((prev) => {
+        const next: Record<string, WorkflowPanel> = {}
+        for (const [id, panel] of Object.entries(prev)) {
+          if (!replacedIds.has(id)) next[id] = panel
+        }
+        return { ...next, ...layout.generatedPanels }
+      })
       setBottomMode("none")
       setIntentPromptOpen(false)
       setIntentText("")
@@ -4130,7 +4176,7 @@ export const WorkflowGraph: React.FC = () => {
         )
       }
     },
-    [updateActiveWf, dockStripHeight]
+    [updateActiveWf, dockStripHeight, activeWf.nodes]
   )
 
   const pendingApplyFromChat = useRootStore((s) => s.pendingApplyFromChat)
@@ -4793,7 +4839,7 @@ export const WorkflowGraph: React.FC = () => {
                 size="sm"
                 className="h-8 gap-1 bg-primary text-primary-foreground hover:bg-primary/90"
                 onClick={runWorkflow}
-                disabled={modelNodeCount === 0 || !pathWritable}
+                disabled={modelNodeCount === 0 || !pathWritable || isStartingRun}
                 title={!pathWritable ? writeBlockTitle : modelNodeCount === 0 ? "Add at least one model node first" : "Run workflow"}
               >
                 <Play className="h-3.5 w-3.5 fill-current" />
@@ -5253,6 +5299,7 @@ export const WorkflowGraph: React.FC = () => {
         saveForm={saveForm}
         setSaveForm={setSaveForm}
         submitSave={submitSave}
+        saveNameConflict={saveNameConflict}
         activeWf={activeWf}
         classifierSaveOpen={classifierSaveOpen}
         setClassifierSaveOpen={setClassifierSaveOpen}

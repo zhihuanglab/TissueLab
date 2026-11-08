@@ -147,7 +147,7 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
   const updateClassifier = useSelector((state: any) => state.workflow.updateClassifier as boolean);
   const [showModal, setShowModal] = useState(false);
   const [newClassName, setNewClassName] = useState(cellTypeOptions[0]);
-  const [newClassColor, setNewClassColor] = useState('#' + Math.floor(Math.random()*16777215).toString(16));
+  const [newClassColor, setNewClassColor] = useState('#' + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0'));
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [selectedClassIndex, setSelectedClassIndex] = useState<number>(0);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
@@ -178,7 +178,17 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
   const { assertWritable, allowed: pathWritable, tooltip: writeBlockTitle } = usePathWriteAccess(currentPath || selectedFolder);
 
   const [formattedPath, setFormattedPath] = useState(formatPath(currentPath ?? ""));
-  
+
+  // Class adds/renames not yet sent with an Update belong to the slide they were
+  // made on; drop them on a slide switch so they are not applied to the next slide.
+  const pendingOpsPathRef = useRef(currentPath);
+  useEffect(() => {
+    if (pendingOpsPathRef.current === currentPath) return;
+    pendingOpsPathRef.current = currentPath;
+    pendingRenameOpsRef.current = [];
+    pendingAddOpsRef.current = [];
+  }, [currentPath]);
+
   // Get current path and selected model from FileBrowserSidebar
   const activeInstanceId = useSelector((state: RootState) => state.wsi.activeInstanceId);
 
@@ -564,11 +574,16 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
     
     setShowModal(false);
     setNewClassName(cellTypeOptions[0]);
-    setNewClassColor('#' + Math.floor(Math.random()*16777215).toString(16));
+    setNewClassColor('#' + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0'));
     setEditingIndex(null);
   };
   
   const openAddClassModal = () => {
+    // Always start from a blank form: a cancelled Edit leaves the edited
+    // class's name/colour in the shared fields (same fix as A-15).
+    setEditingIndex(null);
+    setNewClassName(cellTypeOptions[0]);
+    setNewClassColor('#' + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0'));
     setShowModal(true);
   };
   
