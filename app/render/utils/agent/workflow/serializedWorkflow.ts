@@ -141,6 +141,8 @@ export interface WorkflowGraphSessionDraftV1 {
   panelStates: Record<string, unknown>
   bottomMode: WorkflowGraphSessionBottomMode
   chatMessages: unknown[]
+  /** Library entry each tab was loaded from / saved as, so Save after a reload still updates it. */
+  libraryNameByWfId?: Record<string, string>
 }
 
 export function isWorkflowGraphSessionDraftV1(x: unknown): x is WorkflowGraphSessionDraftV1 {

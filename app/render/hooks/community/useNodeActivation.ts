@@ -25,11 +25,14 @@ type NodeInfo = {
 type ActivationStatus = 'starting' | 'ready' | 'failed'
 
 /**
- * Give up on an activation that has produced no ready/failed event for this long
- * (e.g. the event stream dropped while the result was sent). Without it the
- * card stayed on "Working..." forever.
+ * Give up on an activation once the event stream has been silent this long
+ * (no event, not even a heartbeat), e.g. it dropped and can't reconnect.
+ * Without it the card stayed on "Working..." forever. Any message on the
+ * stream restarts the clock, so a long env setup (conda/pip installing torch)
+ * on a live stream never times out.
  */
 export const ACTIVATION_MAX_WAIT_MS = 10 * 60_000
+const ACTIVATION_DEADLINE_CHECK_MS = 30_000
 const ACTIVATION_RECONNECT_BASE_MS = 800
 const ACTIVATION_RECONNECT_MAX_MS = 8000
 type BusyStatus = 'activating' | 'deactivating'
@@ -129,20 +132,19 @@ export function useNodeActivation() {
       return
     }
 
-    // Re-run this effect at the earliest deadline so a silent activation is timed out.
-    let watchdog: ReturnType<typeof setTimeout> | null = null
-    const deadlines = Array.from(activationDeadlines.current.values())
-    if (deadlines.length > 0) {
-      watchdog = setTimeout(
-        () => setSubscriptionTrigger(prev => prev + 1),
-        Math.max(0, Math.min(...deadlines) - Date.now()) + 50,
-      )
-    }
+    // Time out silent activations without touching the stream (re-running this
+    // effect would close and reopen it).
+    const watchdog = setInterval(() => {
+      const t = Date.now()
+      for (const [name, deadline] of Array.from(activationDeadlines.current)) {
+        if (t >= deadline) timeOutActivation(name)
+      }
+    }, ACTIVATION_DEADLINE_CHECK_MS)
 
     // If connection already exists, don't recreate it
     if (activationStream.current) {
       return () => {
-        if (watchdog) clearTimeout(watchdog)
+        clearInterval(watchdog)
       }
     }
 
@@ -161,6 +163,12 @@ export function useNodeActivation() {
       es.onmessage = async (ev) => {
       try {
         reconnectAttempts.current = 0
+        // The stream is alive (heartbeats included): a result can't be missed
+        // while it stays up, so restart every pending activation's clock.
+        const until = Date.now() + ACTIVATION_MAX_WAIT_MS
+        for (const name of Array.from(activationDeadlines.current.keys())) {
+          activationDeadlines.current.set(name, until)
+        }
         const payload = JSON.parse(ev.data || '{}')
         if (payload?.heartbeat === true) return
         const modelName = payload?.model
@@ -175,8 +183,6 @@ export function useNodeActivation() {
         }
 
         if (status === 'starting') {
-          // The service is working on it: restart the silence deadline.
-          activationDeadlines.current.set(modelName, Date.now() + ACTIVATION_MAX_WAIT_MS)
           setActivationStatus((prev) => {
             const newStatus: Record<string, ActivationStatus> = { ...prev, [modelName]: 'starting' }
             return newStatus
@@ -316,7 +322,7 @@ export function useNodeActivation() {
     // Cleanup on unmount
     return () => {
       cancelled = true
-      if (watchdog) clearTimeout(watchdog)
+      clearInterval(watchdog)
       if (reconnectTimer.current) {
         clearTimeout(reconnectTimer.current)
         reconnectTimer.current = null

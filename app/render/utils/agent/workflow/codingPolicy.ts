@@ -26,6 +26,18 @@ export function digestScriptSource(code: string): string {
   return `${t.length}:${(h >>> 0).toString(16).padStart(8, "0")}`;
 }
 
+/**
+ * Whether `stored` (a saved last-run digest) is the digest of `code`. Also
+ * accepts the older `length:first-64-chars` format, so scripts that already ran
+ * before the format change are not treated as new (and auto-run again).
+ */
+export function scriptDigestMatches(stored: string | undefined, code: string): boolean {
+  if (!stored) return false;
+  const t = (code || "").trim();
+  if (!t) return false;
+  return stored === digestScriptSource(t) || stored === `${t.length}:${t.slice(0, 64)}`;
+}
+
 export function getScriptRunPolicy(content: ContentItem[] | undefined): ScriptRunPolicy {
   const item = content?.find((c) => c.key === SCRIPT_RUN_POLICY_KEY);
   const v = item?.value;
@@ -67,15 +79,13 @@ export function getCodingAgentCardBadge(args: {
     executeInFlight,
     lastRunDigest,
   } = args;
-  const digest = digestScriptSource(scriptSource);
-
   if (executeInFlight) return "Running…";
 
   if (workflowRunning && gptBackendStatus === 1) {
     return "Generating code";
   }
 
-  if (hasGeneratedScript && digest && lastRunDigest !== digest) {
+  if (hasGeneratedScript && scriptSource.trim() && !scriptDigestMatches(lastRunDigest, scriptSource)) {
     if (policy === "require_approval") return "Pending for approval";
     // auto_bypass: auto-run is triggered asynchronously; show Running only while executeInFlight (handled above).
   }

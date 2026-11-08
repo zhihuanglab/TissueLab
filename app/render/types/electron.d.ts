@@ -24,6 +24,8 @@ declare global {
           expires_in?: number;
         };
         error?: string;
+        /** A newer sign-in superseded this one. */
+        cancelled?: boolean;
       }>;
       googleRefreshToken: (params: { refreshToken: string; clientId: string }) => Promise<{
         success: boolean;

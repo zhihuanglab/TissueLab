@@ -65,13 +65,12 @@ async function performGoogleOAuth({ clientId, openExternal }) {
     if (pendingSignIn) {
       pendingSignIn.cancel();
     }
-    let cancelled = false;
     const cancelledPromise = new Promise((_, reject) => {
       cancelSignIn = () => reject(new Error('Sign-in cancelled: a new sign-in was started'));
     });
     cancelledPromise.catch(() => {});
     mySignIn.cancel = () => {
-      cancelled = true;
+      mySignIn.cancelled = true;
       closeCallbackServer(callbackServer);
       cancelSignIn();
     };
@@ -101,7 +100,7 @@ async function performGoogleOAuth({ clientId, openExternal }) {
     await openExternal(authUrl.toString());
     
     // Step 6: Wait for authorization code (or until a newer sign-in cancels this one)
-    if (cancelled) {
+    if (mySignIn.cancelled) {
       throw new Error('Sign-in cancelled: a new sign-in was started');
     }
     console.log('[OAuth] Waiting for authorization callback...');
@@ -202,6 +201,10 @@ async function performGoogleOAuth({ clientId, openExternal }) {
       }
     };
   } catch (error) {
+    // Superseded by a newer sign-in: not a failure the user needs to see.
+    if (mySignIn.cancelled) {
+      return { success: false, cancelled: true, error: error.message };
+    }
     console.error('[OAuth] Error during Google OAuth:', error);
     
     return {

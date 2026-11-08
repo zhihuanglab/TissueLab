@@ -92,6 +92,7 @@ import {
 import { toLocalWorkflowZarrPath, toWorkflowZarrPath, workflowZarrPathsMatch } from "@/utils/agent/workflow/pathNorm"
 import {
   digestScriptSource,
+  scriptDigestMatches,
   getScriptRunPolicy,
   mergePanelContentWithFactoryDefaults,
   SCRIPT_LAST_RUN_DIGEST_KEY,
@@ -932,7 +933,7 @@ export const WorkflowGraph: React.FC = () => {
       if (!codingGenReadyForAutoBypassRef.current) continue
       const digest = digestScriptSource(script)
       const ran = merged.find((c: { key?: string }) => c.key === SCRIPT_LAST_RUN_DIGEST_KEY)?.value as string | undefined
-      if (ran === digest) continue
+      if (scriptDigestMatches(ran, script)) continue
       const attemptKey = `${node.id}:${digest}`
       if (autoBypassAttemptedRef.current.has(attemptKey)) continue
       // Skip arming auto-bypass on read-only paths (avoid ref churn / effect noise).
@@ -2453,6 +2454,14 @@ export const WorkflowGraph: React.FC = () => {
       if (Array.isArray(d.chatMessages) && d.chatMessages.length > 0) {
         dispatch(setMessages(d.chatMessages as ChatMessage[]))
       }
+      const names = d.libraryNameByWfId
+      if (names && typeof names === "object" && !Array.isArray(names)) {
+        const restored: Record<string, string> = {}
+        for (const w of nextWfs) {
+          if (typeof names[w.id] === "string") restored[w.id] = names[w.id]
+        }
+        setLibraryNameByWfId(restored)
+      }
     }
     setSessionReady(true)
   }, [dispatch])
@@ -2476,6 +2485,7 @@ export const WorkflowGraph: React.FC = () => {
       panelStates: mergedPanelStates as Record<string, unknown>,
       bottomMode,
       chatMessages: JSON.parse(JSON.stringify(chatMessages)) as unknown[],
+      libraryNameByWfId,
     }
     if (sessionSaveTimerRef.current) clearTimeout(sessionSaveTimerRef.current)
     sessionSaveTimerRef.current = setTimeout(() => {
@@ -2489,7 +2499,7 @@ export const WorkflowGraph: React.FC = () => {
       }
       writeWorkflowGraphSessionDraft(draft)
     }
-  }, [sessionReady, workflows, activeWfId, panelStates, bottomMode, chatMessages])
+  }, [sessionReady, workflows, activeWfId, panelStates, bottomMode, chatMessages, libraryNameByWfId])
 
   // Classifier Load dialog: current FM folder (.tlcls) + community list
   const [communityClassifiers, setCommunityClassifiers] = useState<CommunityClassifierOption[]>(COMMUNITY_CLASSIFIERS_FALLBACK)

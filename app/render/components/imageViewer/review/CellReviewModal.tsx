@@ -383,22 +383,17 @@ export const CellReviewModal: React.FC<CellReviewModalProps> = ({
   };
 
   // Every way of closing (Close button, Esc, X, click outside) saves the
-  // staged Yes/No actions first, so labels are never dropped silently. No
-  // "save changes?" prompt. A read-only slide can't be saved, so closing just
-  // closes it (Update is disabled there too).
-  const closingRef = useRef(false);
-  const closeWithSave = async () => {
-    if (closingRef.current) return;
-    closingRef.current = true;
-    try {
-      const panel = activeLearningPanelRef.current;
-      if (pathWritable && panel && panel.getPendingReclassificationsCount() > 0) {
-        await panel.submitPendingReclassifications();
-      }
-    } catch {
-      // Silent failure, don't disturb user
-    } finally {
-      closingRef.current = false;
+  // staged Yes/No actions, so labels are never dropped. No "save changes?"
+  // prompt. The save runs in the background so a slow or hung request never
+  // keeps the dialog open; the panel reports its own failures with a toast.
+  // A read-only slide can't be saved, so closing just closes it (Update is
+  // disabled there too).
+  const closeWithSave = () => {
+    const panel = activeLearningPanelRef.current;
+    if (pathWritable && panel && panel.getPendingReclassificationsCount() > 0) {
+      panel.submitPendingReclassifications().catch((error: unknown) => {
+        toast.error('Save failed', { description: getErrorMessage(error, 'Network error') });
+      });
     }
     onClose();
   };
@@ -406,7 +401,7 @@ export const CellReviewModal: React.FC<CellReviewModalProps> = ({
   return (
     <Dialog
       open={open}
-      onOpenChange={(o) => { if (!o) void closeWithSave(); }}
+      onOpenChange={(o) => { if (!o) closeWithSave(); }}
     >
       <DialogContent className="max-w-[1200px] w-full max-h-[90vh] overflow-hidden flex flex-col">
         <DialogHeader>
@@ -763,7 +758,7 @@ export const CellReviewModal: React.FC<CellReviewModalProps> = ({
         </Button>
         <Button
           variant="secondary"
-          onClick={() => { void closeWithSave(); }}
+          onClick={closeWithSave}
         >
           Close
         </Button>

@@ -115,7 +115,7 @@ import {
 import eventBus from '@/utils/common/eventBus';
 import { getBackendDefinedErrorMessage, getErrorMessage } from '@/utils/common/apiResponse';
 import { getWSIBaseName, isH5Convertible, isWSI, isZarr, isZarrDir, isZarrZip } from '@/utils/dashboard/fileType.utils';
-import { isPublicReadOnlyPath, isWriteBlockedPath, getRestrictedAccessMode } from '@/utils/common/pathAccess.utils';
+import { isPublicReadOnlyPath, isWriteBlockedPath } from '@/utils/common/pathAccess.utils';
 import { shortHashFromString, validateItemName } from '@/utils/common/string.utils';
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@radix-ui/react-hover-card";
 import {
@@ -2841,10 +2841,10 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     // item.path alone is not authoritative for extract permissions.
     const itemAccessPath = isInSamplesDir ? currentDirectory : item.path;
     const itemWritable = !isWriteBlockedPath(itemAccessPath);
-    // Public Samples are read-only but downloadable; only Viewer shares block
-    // taking the bytes (matches the backend extract ACL).
-    const itemDownloadable = getRestrictedAccessMode(itemAccessPath) !== 'viewer';
-    // Allow opening menu for files even in Samples to enable Download.
+    // The backend extract ACL refuses downloads from public Samples (and Viewer
+    // shares), so the write gate is also the download gate.
+    const itemDownloadable = itemWritable;
+    // Allow opening menu for files even in Samples so "Copy to Personal" is reachable.
     // Also allow for (non-zarr) directories inside Samples so "Copy folder to Personal" is accessible.
     const isSamplesSubfolder = item.is_dir && isInSamplesDir && !isZarr(item.name);
     const triggerDisabled = disabledAll && item.is_dir && !isSamplesSubfolder;

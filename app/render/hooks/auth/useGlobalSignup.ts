@@ -204,6 +204,8 @@ const useGlobalSignup = ({
         
         // Pass client ID to main process (secretless PKCE)
         const result = await window.electron.googleOAuth({ clientId });
+        // A newer sign-in replaced this one; that attempt reports its own result.
+        if (result?.cancelled) return 'superseded' as const;
         
         if (!result.success || !result.tokens) {
           throw new Error(result.error || 'OAuth failed - no tokens received');

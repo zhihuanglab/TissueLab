@@ -91,7 +91,8 @@ const GlobalSignupModal = ({
     if (isGooglePending) return;
     try {
       setIsGooglePending(true);
-      await loginViaGoogle();
+      // A newer sign-in now owns the pending state; leave it to that attempt.
+      if ((await loginViaGoogle()) === 'superseded') return;
       // loginViaGoogle handles modal closing and signupSuccess callback internally
       // onAuthStateChanged will also trigger to update global user state
       // Reset pending state to allow UI to update immediately

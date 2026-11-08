@@ -20,14 +20,17 @@ function psq(s) {
   return `'${String(s).replace(/['\u2018\u2019\u201A\u201B]/g, '$&$&')}'`;
 }
 
-// Node names become a directory under storage/nodes and a registry key. Letters
-// in any script, digits, spaces and . _ - ( ) + are allowed ("GPT-4o Agent");
-// separators, shell / quote characters and names Windows cannot create are not.
-// isInsideDir is the containment check; this keeps the name one portable folder name.
-const MODEL_NAME_RE = /^[\p{L}\p{N} ._()+-]+$/u;
+// Node names become a directory under storage/nodes and a registry key, so the
+// name must be one folder name every OS can create: no separators, no
+// characters Windows forbids (< > : " / \ | ? *), no control characters.
+// Anything else ("Lab's model, v2 & co") is fine: extraction passes the path as
+// a spawn argument or a psq-quoted PowerShell literal, never through a shell.
+// isInsideDir is the containment check.
+const MODEL_NAME_FORBIDDEN_RE = /[<>:"/\\|?*\u0000-\u001f\u007f]/;
 function isSafeModelName(name) {
   return typeof name === 'string'
-    && MODEL_NAME_RE.test(name)
+    && name.length > 0
+    && !MODEL_NAME_FORBIDDEN_RE.test(name)
     && name.trim() === name
     && name !== '.' && name !== '..'
     && !/\.$/.test(name)

@@ -53,16 +53,18 @@ export const useKeyboardHandlers = (params: UseKeyboardHandlersParams) => {
     mask: 0,
   });
 
-  // Button-like control the last mouse/touch press landed on; cleared by Tab,
-  // which moves focus with the keyboard.
-  const pointerControlRef = useRef<Element | null>(null);
+  // Whether focus was last moved with the keyboard (Tab) rather than a
+  // mouse/touch press. Tracks input modality, not an element: menus and dialogs
+  // hand focus back to their trigger after a click, and that still counts as
+  // mouse focus.
+  const keyboardFocusRef = useRef(false);
 
   useEffect(() => {
-    const handlePointerDown = (event: PointerEvent) => {
-      pointerControlRef.current = closestControl(event.target);
+    const handlePointerDown = () => {
+      keyboardFocusRef.current = false;
     };
     const handleTab = (event: KeyboardEvent) => {
-      if (event.key === 'Tab') pointerControlRef.current = null;
+      if (event.key === 'Tab') keyboardFocusRef.current = true;
     };
     const handleKeyDown = (event: KeyboardEvent) => {
       const {
@@ -94,16 +96,25 @@ export const useKeyboardHandlers = (params: UseKeyboardHandlersParams) => {
       if (event.repeat) return;
       // Bindings are single keys: Cmd/Ctrl/Alt combos (Cmd+X cut, Cmd+M
       // minimize, Ctrl+1 ...) belong to the app and OS, not to the viewer.
-      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      // AltGr (reported as Ctrl+Alt on Windows) types characters such as [ or @
+      // on many layouts, so it still reaches a binding.
+      const altGraph =
+        typeof event.getModifierState === 'function' && event.getModifierState('AltGraph');
+      if (event.metaKey || (!altGraph && (event.ctrlKey || event.altKey))) return;
       // Space/Enter on a button-like control reached with the keyboard (Tab)
       // activates that control; don't hijack it (and preventDefault) for an
-      // overlay shortcut. A control that only holds focus because it was just
-      // clicked (e.g. a toolbar tool) keeps the shortcut. :focus-visible can't
-      // tell these apart: Chromium sets it before keydown is dispatched.
-      if (event.key === ' ' || event.key === 'Enter') {
-        const control = closestControl(target);
-        if (control && control !== pointerControlRef.current) return;
+      // overlay shortcut. A control that holds focus after a click (a toolbar
+      // tool, or a menu trigger focus returned to) keeps the shortcut.
+      // :focus-visible can't tell these apart: Chromium sets it before keydown
+      // is dispatched.
+      if ((event.key === ' ' || event.key === 'Enter') && keyboardFocusRef.current && closestControl(target)) {
+        return;
       }
+      // A widget that already acted on Space/Enter (a Radix menu trigger opens
+      // on keydown, before this window listener) consumed it; toggling the
+      // overlay as well would do two things for one key. Plain buttons don't
+      // preventDefault on keydown, so a clicked toolbar tool keeps the shortcut.
+      if ((event.key === ' ' || event.key === 'Enter') && event.defaultPrevented) return;
 
       const eventKeyNorm =
         event.key === ' '
