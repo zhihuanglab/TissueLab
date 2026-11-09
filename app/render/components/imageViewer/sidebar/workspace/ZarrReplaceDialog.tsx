@@ -155,11 +155,14 @@ const ZarrReplaceDialog: React.FC<ZarrReplaceDialogProps> = ({
     if (prevTargetRef.current === targetSlidePath) return;
     prevTargetRef.current = targetSlidePath;
     ingestSeqRef.current++;
+    const hadSource = !!stagingRelRef.current;
     if (stagingRelRef.current) deleteZarrStaging(stagingRelRef.current);
     stagingRelRef.current = null;
     stagedForRef.current = null;
     resetAll();
     setUploadPct(null);
+    // Say why the picked source vanished instead of clearing it silently.
+    if (hadSource) setError('The open slide changed, so the source you picked was cleared. Pick it again for this slide.');
   }, [targetSlidePath, resetAll]);
 
   // Upload → stage → validate, as soon as something is picked.

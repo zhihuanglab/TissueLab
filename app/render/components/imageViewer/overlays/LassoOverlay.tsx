@@ -4,6 +4,7 @@ import { Origin } from "@annotorious/react";
 import OpenSeadragon from "openseadragon";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useDispatch, useSelector } from "react-redux";
+import { toast } from "sonner";
 
 import { RootState } from "@/store";
 import { setTool } from "@/store/slices/viewer/toolSlice";
@@ -132,9 +133,17 @@ const LassoOverlay: React.FC<LassoOverlayProps> = ({
 
     const item = viewer?.world.getItemAt(0);
     if (!viewer || !item || !annotator || screenPts.length < 3) return;
-    // A straight or near-straight stroke encloses nothing: drop it and keep
-    // the lasso tool so the user can simply draw again.
-    if ((2 * polygonArea(screenPts)) / polygonPerimeter(screenPts) < MIN_LASSO_THICKNESS_PX) return;
+    // A straight or near-straight stroke encloses nothing: drop it, say why,
+    // and keep the lasso tool so the user can simply draw again.
+    const tooThin = () =>
+      toast.info("Lasso region not added", {
+        id: "lasso-too-thin",
+        description: "Draw around an area; a line or a very thin loop is not a region.",
+      });
+    if ((2 * polygonArea(screenPts)) / polygonPerimeter(screenPts) < MIN_LASSO_THICKNESS_PX) {
+      tooThin();
+      return;
+    }
 
     // screen px -> image coords, dropping consecutive duplicates
     const points: [number, number][] = [];
@@ -145,7 +154,10 @@ const LassoOverlay: React.FC<LassoOverlayProps> = ({
       const prev = points[points.length - 1];
       if (!prev || prev[0] !== xy[0] || prev[1] !== xy[1]) points.push(xy);
     }
-    if (points.length < 3 || polygonArea(points) === 0) return;
+    if (points.length < 3 || polygonArea(points) === 0) {
+      tooThin();
+      return;
+    }
 
     let minX = points[0][0];
     let minY = points[0][1];

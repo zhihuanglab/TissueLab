@@ -2472,6 +2472,32 @@ export const WorkflowGraph: React.FC = () => {
           if (typeof names[w.id] === "string") restored[w.id] = names[w.id]
         }
         setLibraryNameByWfId(restored)
+      } else {
+        // Draft from before tabs remembered their library entry: a tab that is
+        // named like a saved workflow (it was loaded from it), or has the same
+        // nodes (it was saved as it), keeps the right to re-save under that
+        // name. One tab per name; the first match wins.
+        const saved = loadAllSaved()
+        const nodeKey = (nodes: { id: string }[] | undefined) =>
+          (nodes || []).map((n) => n.id).sort().join(" ")
+        const restored: Record<string, string> = {}
+        const taken = new Set<string>()
+        const claim = (wfId: string, name: string) => {
+          restored[wfId] = name
+          taken.add(name)
+        }
+        for (const w of nextWfs) {
+          if (saved[w.name] && !taken.has(w.name)) claim(w.id, w.name)
+        }
+        for (const w of nextWfs) {
+          if (restored[w.id] || !w.nodes.length) continue
+          const key = nodeKey(w.nodes)
+          const match = Object.entries(saved).find(
+            ([name, entry]) => !taken.has(name) && nodeKey(entry.nodes as { id: string }[]) === key
+          )
+          if (match) claim(w.id, match[0])
+        }
+        setLibraryNameByWfId(restored)
       }
     }
     setSessionReady(true)

@@ -58,6 +58,7 @@ import {
   prepareAndStartClassificationWorkflow,
   registerNucleiClassOperationsBridge,
   normalizePendingClassOperations,
+  pendingOpsForClasses,
 } from "@/utils/agent/workflow/workflow.utils";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LiaDrawPolygonSolid } from "react-icons/lia";
@@ -234,20 +235,28 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
   // Ref to track previous path for cleanup on image switch
   const prevPathRef = useRef<string | null>(null);
 
+  // Pending ops, limited to classes still listed (see pendingOpsForClasses).
+  const classNamesRef = useRef<string[]>([]);
+  classNamesRef.current = (nucleiClasses || []).map((cls) => cls.name);
+  const livePendingOps = useCallback(
+    () => pendingOpsForClasses(
+      { renames: pendingRenameOpsRef.current, adds: pendingAddOpsRef.current },
+      classNamesRef.current,
+    ),
+    [],
+  );
+
   // Expose pending class ops to Graph-owned auto-update while this panel is mounted.
   useEffect(() => {
     registerNucleiClassOperationsBridge(
-      () => ({
-        renames: pendingRenameOpsRef.current,
-        adds: pendingAddOpsRef.current,
-      }),
+      livePendingOps,
       () => {
         pendingRenameOpsRef.current = [];
         pendingAddOpsRef.current = [];
       }
     );
     return () => registerNucleiClassOperationsBridge(null, null);
-  }, []);
+  }, [livePendingOps]);
   
   
   
@@ -677,11 +686,6 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
 
       // Clear selected cell state
       setSelectedCell(null);
-
-      // Class adds/renames not yet sent with an Update belong to the previous
-      // slide; drop them so they are not applied to this slide's classifier.
-      pendingRenameOpsRef.current = [];
-      pendingAddOpsRef.current = [];
 
       // Close review modal if open (the modal clears its own review state)
       setShowReviewModal(false);
@@ -1397,10 +1401,7 @@ export const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
       hasSelectedModel: !!selectedModelForCurrentPath
     });
 
-    const classOperations = normalizePendingClassOperations({
-      renames: pendingRenameOpsRef.current,
-      adds: pendingAddOpsRef.current,
-    });
+    const classOperations = normalizePendingClassOperations(livePendingOps());
 
     // One-vs-rest writes back to the attached per-class files unless an
     // explicit save map (the One-vs-Rest Save dialog) overrides it; a remembered

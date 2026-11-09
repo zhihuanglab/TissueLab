@@ -74,6 +74,7 @@ import {
   uploadFiles as apiUploadFiles,
   compressItems,
   decompressZip,
+  isTaskStatusUnknown,
   downloadFile,
   getConfig,
   copyFileToPersonal,
@@ -1372,8 +1373,9 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     return paths;
   }, [fileTree, showNonImageFiles]);
 
-  // Entering a folder leaves search mode: a kept term would filter the new
-  // folder (or show `No files found for "..."`) and be saved for next visit.
+  // Any folder navigation (opening a folder, Go Up, a breadcrumb) leaves search
+  // mode: a kept term would filter the new folder (or show `No files found for
+  // "..."`) and be saved for next visit.
   const enterFolder = (path: string) => {
     if (searchTerm || searchDebounceRef.current) {
       if (searchDebounceRef.current) {
@@ -1834,7 +1836,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     if (!parentPath) {
       return;
     }
-    fetchFiles(parentPath);
+    enterFolder(parentPath);
   };
 
   // --- Drag and Drop Handlers ---
@@ -2605,6 +2607,17 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
         );
         exitMultiSelectMode();
     } catch(err: any) {
+        if (isTaskStatusUnknown(err)) {
+          // Lost track of the task, not a failure: show the folder as it is now.
+          await fetchFiles(currentDirectoryRef.current);
+          triggerStorageRefresh();
+          toast.info('Deletion may have finished', {
+            id: key,
+            description: 'Lost track of the task. The folder has been refreshed; check what is left.',
+            duration: 6000,
+          });
+          return;
+        }
         if (err.status === 404) await fetchFiles(currentDirectoryRef.current);
         const message = getErrorMessage(err, 'Failed to delete item');
         if (err.status === 409) {
@@ -2627,7 +2640,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
       <Breadcrumbs
         currentDirectory={currentDirectory}
         personalRoot={personalRoot}
-        onNavigate={(p) => fetchFiles(p)}
+        onNavigate={(p) => enterFolder(p)}
       />
     );
   };
@@ -2670,18 +2683,14 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
   // Handle copying a Samples file or folder to the user's Personal root.
   // Supports automatic retry when backend returns 503 COPY_BUSY_RETRY.
   const COPY_MAX_RETRIES = 10;
-  // Pending 503 retries (toast key -> timer). Cleared on unmount so a file
-  // manager that is gone stops re-issuing the copy; its "Queued…" toast goes too.
+  // Pending 503 retries (toast key -> timer), so a new attempt replaces an old
+  // one. They keep running after the file manager closes (e.g. the user opens a
+  // slide): a queued copy still completes, and its toast reports the result.
   const copyRetryTimersRef = useRef<Map<string, number>>(new Map());
+  const copyMountedRef = useRef(true);
   useEffect(() => {
-    const pending = copyRetryTimersRef.current;
-    return () => {
-      pending.forEach((timer, toastKey) => {
-        window.clearTimeout(timer);
-        toast.dismiss(toastKey);
-      });
-      pending.clear();
-    };
+    copyMountedRef.current = true;
+    return () => { copyMountedRef.current = false; };
   }, []);
   const handleCopyToPersonal = async (item: FileTreeNode, retryCount: number = 0, link: boolean = false, includeZarr: boolean = false) => {
     const itemKey = item.path;
@@ -2741,15 +2750,31 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
       }
 
       if (isStorageQuotaErrorCallback(e)) {
+        if (!copyMountedRef.current) {
+          toast.error('Not enough storage space', {
+            id: toastKey,
+            description: getErrorMessage(e, 'Please free up space before trying again.'),
+            duration: 6000,
+          });
+          return;
+        }
         toast.dismiss(toastKey);
         openUploadQuotaWarning(e);
         clearItemState();
         return;
       }
 
-      // 5b. Other errors → error dialog
-      toast.dismiss(toastKey);
+      // 5b. Other errors → error dialog (a toast if the file manager is gone)
       const backendDefinedMessage = getBackendDefinedErrorMessage(e);
+      if (!copyMountedRef.current) {
+        toast.error(backendDefinedMessage || 'Copy failed', {
+          id: toastKey,
+          description: backendDefinedMessage ? undefined : getErrorMessage(e, 'Failed to copy to Personal. Please try again.'),
+          duration: 6000,
+        });
+        return;
+      }
+      toast.dismiss(toastKey);
       if (backendDefinedMessage) {
         setCopyErrorTitle(backendDefinedMessage);
         setCopyErrorMessage('');
@@ -2956,6 +2981,15 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
         await fetchFiles(currentDirectory);
         toast.success('Compressed to zip', { id: key, duration: 2000 });
       } catch (e: any) {
+        if (isTaskStatusUnknown(e)) {
+          await fetchFiles(currentDirectory);
+          toast.info('Compression may have finished', {
+            id: key,
+            description: 'Lost track of the task. The folder has been refreshed; check for the zip.',
+            duration: 6000,
+          });
+          return;
+        }
         toast.error(getErrorMessage(e, 'Compression failed'), { id: key, duration: 4000 });
       }
     };
@@ -3002,6 +3036,15 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
         await fetchFiles(currentDirectory);
         toast.success('Extraction completed', { id: key, duration: 2000 });
       } catch (e: any) {
+        if (isTaskStatusUnknown(e)) {
+          await fetchFiles(currentDirectory);
+          toast.info('Extraction may have finished', {
+            id: key,
+            description: 'Lost track of the task. The folder has been refreshed; check the extracted files.',
+            duration: 6000,
+          });
+          return;
+        }
         const message = getErrorMessage(e, 'Extraction failed');
         // The archive's entries need not be named after the zip, so the
         // pre-check above can miss a clash the server then refuses. Offer the

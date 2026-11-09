@@ -56,10 +56,22 @@ function App({ Component, pageProps }: AppPropsWithLayout) {
       // Uncaught errors arrive with their stack; the first line is enough here.
       const firstLine = String(payload?.message ?? "").split("\n")[0].trim();
       const backendStopped = /backend/i.test(kind);
+      // The only way back from a stopped backend is a restart: offer it here.
+      const canRelaunch = backendStopped && typeof bridge.invoke === "function";
       toast.error(backendStopped ? "Backend service stopped" : `Background error: ${kind}`, {
         id: `main-process-error:${kind}`,
         description: firstLine || undefined,
         duration: backendStopped ? Infinity : 10000,
+        ...(canRelaunch
+          ? {
+              action: {
+                label: "Restart TissueLab",
+                onClick: () => {
+                  Promise.resolve(bridge.invoke!("relaunch-app")).catch(() => { /* older main */ });
+                },
+              },
+            }
+          : {}),
       });
     };
     bridge.on("main-process-error", onMainProcessError);

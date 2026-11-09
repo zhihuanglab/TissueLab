@@ -522,6 +522,13 @@ ipcMain.handle('take-pending-backend-notice', () => {
   return notice;
 });
 
+// "Restart TissueLab" on the backend-stopped notice: a fresh start also starts
+// a fresh backend. before-quit stops the old one first.
+ipcMain.handle('relaunch-app', () => {
+  app.relaunch();
+  app.quit();
+});
+
 ipcMain.handle('open-folder-dialog', async () => {
   const result = await dialog.showOpenDialog({
     properties: ['openDirectory']
@@ -1058,7 +1065,7 @@ function failStartup(reason) {
   } catch (e) { /* already gone */ }
   dialog.showErrorBox('Startup Error', `${reason}
 
-The application will now exit.`);
+The application will now exit. Start TissueLab again; if it keeps failing, restart your computer and then reinstall TissueLab.`);
   app.quit();
 }
 

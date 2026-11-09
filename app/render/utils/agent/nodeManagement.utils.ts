@@ -29,6 +29,20 @@ export async function deleteNode(nodeName: string) {
   }
 }
 
+// Same rule as isSafeModelName in app/electron/ipc/tasknode-helpers.js, which
+// refuses the name at extraction. Checked here too so a bad name fails before
+// a large bundle is downloaded.
+const NODE_NAME_FORBIDDEN_RE = /[<>:"/\\|?*\u0000-\u001f\u007f]/
+export function isInstallableNodeName(name: string): boolean {
+  return typeof name === 'string'
+    && name.length > 0
+    && !NODE_NAME_FORBIDDEN_RE.test(name)
+    && name.trim() === name
+    && name !== '.' && name !== '..'
+    && !/\.$/.test(name)
+    && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(name)
+}
+
 export async function downloadNodeForElectron(
   node: string,
   categories: Record<string, string[]>,
@@ -39,6 +53,10 @@ export async function downloadNodeForElectron(
   // Set installing state IMMEDIATELY to prevent duplicate clicks
   if (installing[node]) {
     toast.info('This tasknode is already being installed')
+    return
+  }
+  if (!isInstallableNodeName(node)) {
+    toast.error(`Cannot install "${node}": its name is not a valid folder name.`)
     return
   }
   

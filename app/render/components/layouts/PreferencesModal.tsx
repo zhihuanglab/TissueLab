@@ -72,7 +72,7 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
   }
 
   // Theme and GT highlight apply live; remember what they were when the
-  // dialog opened so Cancel / Escape / clicking outside can put them back.
+  // dialog opened so the Cancel button can put them back.
   const openedWith = React.useRef<{ theme?: string; highlightGt: boolean } | null>(null)
   const wasOpen = React.useRef(false)
   useEffect(() => {
@@ -84,7 +84,29 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen])
 
-  // Close without saving: revert the live-applied settings, then close.
+  // X / Escape / clicking outside: keep what the user sees and save it silently,
+  // like Cell Review. Only the explicit Cancel button reverts.
+  const closeAndKeep = () => {
+    onClose()
+    void (async () => {
+      const modelsOk = (await modelSettingsRef.current?.saveIfChanged()) ?? true
+      if (!modelsOk) {
+        toast.error('Could not save AI model settings', {
+          description: 'Reopen Preferences to try again.',
+        })
+      }
+      if (typeof window === 'undefined' || !userInfo?.user_id) return
+      try {
+        localStorage.setItem(`preferences_${userInfo.user_id}`, JSON.stringify(preferences))
+      } catch (error) {
+        toast.error('Could not save preferences', {
+          description: error instanceof Error ? error.message : String(error),
+        })
+      }
+    })()
+  }
+
+  // Cancel button: revert the live-applied settings, then close.
   const dismiss = () => {
     const initial = openedWith.current
     if (initial) {
@@ -168,7 +190,7 @@ const PreferencesModal: React.FC<PreferencesModalProps> = ({
   }
 
   return (
-    <Dialog open={isOpen} onOpenChange={(open) => !open && dismiss()}>
+    <Dialog open={isOpen} onOpenChange={(open) => !open && closeAndKeep()}>
       <DialogContent className="max-w-5xl w-[90vw] max-h-[90vh] overflow-y-auto bg-card border-border text-foreground">
         <DialogHeader>
           <DialogTitle className="text-xl font-semibold text-foreground">

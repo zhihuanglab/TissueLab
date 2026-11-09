@@ -42,6 +42,7 @@ import {
   prepareAndStartClassificationWorkflow,
   registerPatchClassOperationsBridge,
   normalizePendingClassOperations,
+  pendingOpsForClasses,
 } from '@/utils/agent/workflow/workflow.utils';
 import { PatchReviewDialog } from "@/components/imageViewer/review/PatchReviewDialog";
 import { setReviewSession } from "@/store/slices/reviewSlice";
@@ -158,36 +159,34 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
   const pendingRenameOpsRef = useRef<Array<{ from: string; to: string }>>([]);
   const pendingAddOpsRef = useRef<Array<{ name: string; color?: string }>>([]);
 
+  // Pending ops, limited to classes still listed (see pendingOpsForClasses):
+  // after a slide switch only ops for classes this slide still shows are sent.
+  const classNamesRef = useRef<ReadonlyArray<string>>([]);
+  const livePendingOps = useCallback(
+    () => pendingOpsForClasses(
+      { renames: pendingRenameOpsRef.current, adds: pendingAddOpsRef.current },
+      classNamesRef.current,
+    ),
+    [],
+  );
+
   // Expose pending class ops to Graph-owned auto-update while this panel is mounted.
   useEffect(() => {
     registerPatchClassOperationsBridge(
-      () => ({
-        renames: pendingRenameOpsRef.current,
-        adds: pendingAddOpsRef.current,
-      }),
+      livePendingOps,
       () => {
         pendingRenameOpsRef.current = [];
         pendingAddOpsRef.current = [];
       }
     );
     return () => registerPatchClassOperationsBridge(null, null);
-  }, []);
+  }, [livePendingOps]);
   
   const currentPath = useActiveSlidePath();
   const selectedFolder = useSelector((state: RootState) => state.fileManager.selectedFolder);
   const { assertWritable, allowed: pathWritable, tooltip: writeBlockTitle } = usePathWriteAccess(currentPath || selectedFolder);
 
   const [formattedPath, setFormattedPath] = useState(formatPath(currentPath ?? ""));
-
-  // Class adds/renames not yet sent with an Update belong to the slide they were
-  // made on; drop them on a slide switch so they are not applied to the next slide.
-  const pendingOpsPathRef = useRef(currentPath);
-  useEffect(() => {
-    if (pendingOpsPathRef.current === currentPath) return;
-    pendingOpsPathRef.current = currentPath;
-    pendingRenameOpsRef.current = [];
-    pendingAddOpsRef.current = [];
-  }, [currentPath]);
 
   // Get current path and selected model from FileBrowserSidebar
   const activeInstanceId = useSelector((state: RootState) => state.wsi.activeInstanceId);
@@ -217,6 +216,7 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
   });
 
   const normalizedPatchData = normalizePatchClassificationData(patchClassificationData as PatchClassificationData);
+  classNamesRef.current = normalizedPatchData?.class_name ?? [];
   // Patch classes in the shape the review panel (kind="patch") expects
   const patchReviewClasses: AnnotationClass[] = useMemo(
     () => (normalizedPatchData?.class_name || []).map((name: string, i: number) => ({
@@ -881,10 +881,7 @@ export const PatchClassificationPanel: React.FC<PatchClassificationPanelProps> =
       finalLoadPath = finalLoadPath ?? null;
       finalSavePath = finalSavePath ?? null;
 
-      const classOperations = normalizePendingClassOperations({
-        renames: pendingRenameOpsRef.current,
-        adds: pendingAddOpsRef.current,
-      });
+      const classOperations = normalizePendingClassOperations(livePendingOps());
 
       // One-vs-rest saves to the map the One-vs-Rest Save dialog wrote (only the
       // chosen classes), else back into the per-class files the run loads — as the

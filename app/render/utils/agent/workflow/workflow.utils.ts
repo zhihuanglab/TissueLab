@@ -113,6 +113,22 @@ export function normalizePendingClassOperations(
   return { renames, adds };
 }
 
+/**
+ * Pending class ops that still match the class list on screen. Ops survive a
+ * slide switch only while the classes they name are still listed (the list is
+ * what Update sends); ops for classes the new slide no longer shows are dropped.
+ */
+export function pendingOpsForClasses(
+  ops: PendingClassOperations,
+  classNames: ReadonlyArray<string | null | undefined>,
+): PendingClassOperations {
+  const listed = new Set(classNames.map((n) => String(n ?? "").trim()).filter(Boolean));
+  return {
+    renames: (ops.renames || []).filter((op) => listed.has(String(op.to ?? "").trim())),
+    adds: (ops.adds || []).filter((op) => listed.has(String(op.name ?? "").trim())),
+  };
+}
+
 export function peekNucleiClassOperations(): PendingClassOperations | null {
   return normalizePendingClassOperations(nucleiOpsProvider?.() ?? null);
 }
