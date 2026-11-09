@@ -948,8 +948,9 @@ export const subscribeTaskStatus = async (
         } catch (e: any) {
             // The service answers an unknown/reaped task with HTTP 200 + {code: 404}
             // (AppError envelope); apiFetch raises it as ApiError.code, handleResponse
-            // as FmApiError.status. Either way the task is gone — stop waiting.
-            if (e?.code === 404 || (e instanceof FmApiError && e.status === 404)) {
+            // as FmApiError.status, and a bare HTTP 404 (proxy, unknown route) as
+            // .status. Either way the task is gone — stop waiting.
+            if (e?.code === 404 || e?.status === 404) {
                 return notFound;
             }
             return { done: false };
