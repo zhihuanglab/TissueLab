@@ -7,7 +7,7 @@ export function LoadingMessage() {
             <div className="w-8 h-8 shrink-0">
                 <Avatar className="w-8 h-8 bg-muted">
                     <AvatarImage
-                        src="/brand/TissueLab_logo.png"
+                        src="/brand/agent_avatar.png"
                         alt="TissueLab Bot"
                         className="object-contain p-1"
                     />

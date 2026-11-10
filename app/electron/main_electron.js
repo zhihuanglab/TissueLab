@@ -6,7 +6,7 @@ const os = require('os');
 const http = require('http');
 const net = require('net');
 const { setupProtocolHandlers, registerProtocolClient } = require('./ipc/protocol-helpers');
-const { performGoogleOAuth, refreshGoogleToken } = require('./ipc/oauth-helpers');
+const { performGoogleOAuth, cancelGoogleOAuth, refreshGoogleToken } = require('./ipc/oauth-helpers');
 // const ProjectBehaviorRecording = require('./services/recording/projectBehaviorRecording');
 
 let mainWindow;
@@ -453,6 +453,9 @@ ipcMain.handle('google-oauth', async (event, { clientId }) => {
     openExternal: shell.openExternal.bind(shell)
   });
 });
+
+// Cancel a Google sign-in still waiting for the browser (sign-in dialog closed)
+ipcMain.handle('google-oauth-cancel', () => cancelGoogleOAuth());
 
 // Refresh Google OAuth token using refresh_token
 ipcMain.handle('google-refresh-token', async (event, { refreshToken, clientId }) => {

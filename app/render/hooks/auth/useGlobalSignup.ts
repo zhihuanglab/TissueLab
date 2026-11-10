@@ -204,6 +204,13 @@ const useGlobalSignup = ({
         
         // Pass client ID to main process (secretless PKCE)
         const result = await window.electron.googleOAuth({ clientId });
+        // Abandoned (dialog closed or a newer sign-in started): nothing to report.
+        if (result?.cancelled) return;
+        // Not finished in the browser in time — not an error, just let them retry.
+        if (result?.timedOut) {
+          toast.info('Google sign-in timed out. Click "Continue with Google" to try again.');
+          return;
+        }
         
         if (!result.success || !result.tokens) {
           throw new Error(result.error || 'OAuth failed - no tokens received');

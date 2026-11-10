@@ -19,7 +19,7 @@ export const ReasoningWidget: React.FC<ReasoningWidgetProps> = ({ stages, agentN
           <div className="w-4 h-4 shrink-0">
             <Avatar className="w-4 h-4 bg-muted">
               <AvatarImage
-                src="/brand/TissueLab_logo.png"
+                src="/brand/agent_avatar.png"
                 alt="TissueLab Bot"
                 className="object-contain"
               />

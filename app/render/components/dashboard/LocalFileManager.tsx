@@ -372,7 +372,7 @@ const LocalFileManager = () => {
         fileSize: uploadData.fileSize ?? null,
         mpp: uploadData.slideInfo.mpp ?? null,
         magnification: uploadData.slideInfo.magnification ?? null,
-        imageType: uploadData.slideInfo.imageType || (uploadData.slideInfo.fileFormat === 'qptiff' && uploadData.slideInfo.totalChannels && uploadData.slideInfo.totalChannels > 3) ? 'Multiplex Immunofluorescent' : 'Brightfield H&E'
+        imageType: uploadData.slideInfo.imageType || ((uploadData.slideInfo.fileFormat === 'qptiff' && uploadData.slideInfo.totalChannels && uploadData.slideInfo.totalChannels > 3) ? 'Multiplex Immunofluorescent' : 'Brightfield H&E')
       }));
       if (uploadData.slideInfo.totalChannels) {
         dispatch(setTotalChannels(uploadData.slideInfo.totalChannels));

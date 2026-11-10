@@ -880,6 +880,15 @@ export const moveFiles = async (items: string[], newPath: string) => {
     return handleResponse(response as Response);
 }; 
 
+/**
+ * The task's record is gone (the service drops finished tasks), so whether it
+ * succeeded is unknown. Callers refresh and tell the user to check the result
+ * instead of reporting a failure.
+ */
+export const TASK_STATUS_UNKNOWN = 'TASK_STATUS_UNKNOWN';
+export const isTaskStatusUnknown = (e: unknown): boolean =>
+    (e as { code?: unknown } | null)?.code === TASK_STATUS_UNKNOWN;
+
 // Subscribe to task status updates via Server-Sent Events (SSE)
 export const subscribeTaskStatus = async (
     taskId: string,
@@ -911,7 +920,14 @@ export const subscribeTaskStatus = async (
                 return { done: true, error: data.error || 'Task failed' };
             }
             return { done: false };
-        } catch {
+        } catch (e: any) {
+            // The service answers an unknown/reaped task with HTTP 200 + {code: 404}
+            // (an error envelope, thrown with .code), and a bare HTTP 404 (proxy,
+            // unknown route) is thrown with .status. Either way the task record is
+            // gone: stop here instead of polling until the 5-minute timeout.
+            if (e?.code === 404 || e?.status === 404) {
+                return { done: true, missing: true, error: 'Task not found or already finished' };
+            }
             return { done: false };
         }
     };
@@ -1036,7 +1052,9 @@ export const subscribeTaskStatus = async (
             const polled = await pollOnce();
             if (polled.done) {
                 if (polled.missing) {
-                    throw new Error(polled.error || 'Task not found or already finished');
+                    throw Object.assign(new Error(polled.error || 'Task not found or already finished'), {
+                        code: TASK_STATUS_UNKNOWN,
+                    });
                 }
                 if (polled.error) throw new Error(polled.error);
                 return polled.result;

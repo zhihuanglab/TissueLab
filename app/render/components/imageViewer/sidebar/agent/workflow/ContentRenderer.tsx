@@ -114,15 +114,11 @@ export const ContentRenderer: React.FC<ContentRendererProps> = ({ item, onChange
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      // Keep Space away from the viewer's shortcuts while typing, but let the
+      // browser insert it: it goes at the caret (not appended at the end) and
+      // a read-only field stays unchanged.
       if (isTyping && event.key === " ") {
         event.stopPropagation();
-        event.preventDefault();
-
-        setInputValue((prev) => {
-          const newValue = prev + " ";
-          onChange(newValue);
-          return newValue;
-        });
       }
     };
 
@@ -130,7 +126,7 @@ export const ContentRenderer: React.FC<ContentRendererProps> = ({ item, onChange
     return () => {
       document.removeEventListener("keydown", handleKeyDown, true);
     };
-  }, [isTyping, onChange]);
+  }, [isTyping]);
 
   // Prefer an explicit static label when the panel sets one (e.g. patch-embedding
   // params); otherwise fall back to the live key. Fields whose key the user can
