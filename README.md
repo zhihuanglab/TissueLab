@@ -312,11 +312,7 @@ activation is remembered for later launches.
 
 ## 🧬 Reproducing the Co-evolution Experiments
 
-TissueLab adapts at three levels (paper: *Model-level*, *Strategy-level* and *Slide-level
-co-evolution*; Methods, *Multi-level co-evolution mechanism*). Everything that improves a single
-analysis — fine-tuning the recognition models and improving the agent's ability on your own slides —
-is done in the app. The two cohort-scale co-evolution experiments of the paper, which iterate over a
-whole training set against ground truth, ship as command-line modules so they can be re-run exactly.
+TissueLab supports three levels of co-evolution: model-level, strategy-level, and slide-level (Methods, *Multi-level co-evolution mechanism*). Model-level co-evolution can be performed directly through the UI, while the strategy-level and slide-level co-evolution experiments involving entire cohorts are provided as command-line modules.
 
 ### In the app
 
