@@ -78,6 +78,7 @@ import {
   getConfig,
   copyFileToPersonal,
   copyFolderToPersonal,
+  isTaskStatusUnknown,
 } from '@/services/fileManager.service';
 import {
   listChunkUploadResumeHints,
@@ -1452,7 +1453,7 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
         fileSize: uploadData.fileSize ?? null,
         mpp: uploadData.slideInfo.mpp ?? null,
         magnification: uploadData.slideInfo.magnification ?? null,
-        imageType: uploadData.slideInfo.imageType || (uploadData.slideInfo.fileFormat === 'qptiff' && uploadData.slideInfo.totalChannels && uploadData.slideInfo.totalChannels > 3) ? 'Multiplex Immunofluorescent' : 'Brightfield H&E'
+        imageType: uploadData.slideInfo.imageType || ((uploadData.slideInfo.fileFormat === 'qptiff' && uploadData.slideInfo.totalChannels && uploadData.slideInfo.totalChannels > 3) ? 'Multiplex Immunofluorescent' : 'Brightfield H&E')
       }));
       if (uploadData.slideInfo.totalChannels) {
         dispatch(setTotalChannels(uploadData.slideInfo.totalChannels));
@@ -2517,6 +2518,17 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
         );
         exitMultiSelectMode();
     } catch(err: any) {
+        if (isTaskStatusUnknown(err)) {
+          // Lost track of the task, not a failure: show the folder as it is now.
+          await fetchFiles(currentDirectoryRef.current);
+          triggerStorageRefresh();
+          toast.info('Deletion may have finished', {
+            id: key,
+            description: 'Lost track of the task. The folder has been refreshed; check what is left.',
+            duration: 6000,
+          });
+          return;
+        }
         if (err.status === 404) await fetchFiles(currentDirectoryRef.current);
         const message = getErrorMessage(err, 'Failed to delete item');
         if (err.status === 409) {
@@ -2802,8 +2814,8 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
     const conversionJob = isH5File ? conversionJobs[item.path] : null;
     const isConverting = conversionJob && (conversionJob.status === 'pending' || conversionJob.status === 'running');
     const handleCompress = async (overwrite: boolean = false) => {
+      const key = `cmp_${Math.random().toString(36).slice(2)}`;
       try {
-        const key = `cmp_${Math.random().toString(36).slice(2)}`;
         const statusMessages: Record<string, string> = {
           'pending': 'Starting compression...',
           'processing': 'Compressing...',
@@ -2843,15 +2855,25 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
         await fetchFiles(currentDirectory);
         toast.success('Compressed to zip', { id: key, duration: 2000 });
       } catch (e: any) {
-        toast.error(getErrorMessage(e, 'Compression failed'));
+        if (isTaskStatusUnknown(e)) {
+          await fetchFiles(currentDirectory);
+          toast.info('Compression may have finished', {
+            id: key,
+            description: 'Lost track of the task. The folder has been refreshed; check for the zip.',
+            duration: 6000,
+          });
+          return;
+        }
+        // Same id as the loading toast, so the spinner is replaced, not left behind.
+        toast.error(getErrorMessage(e, 'Compression failed'), { id: key, duration: 4000 });
       }
     };
     const handleExtract = async (overwrite: boolean = false) => {
       if (denyWriteToast('extract this archive', itemAccessPath)) {
         return;
       }
+      const key = `ext_${Math.random().toString(36).slice(2)}`;
       try {
-        const key = `ext_${Math.random().toString(36).slice(2)}`;
         const statusMessages: Record<string, string> = {
           'pending': 'Starting extraction...',
           'processing': 'Extracting...',
@@ -2889,7 +2911,17 @@ const WebFileManager = ({ initialPath: initialPathProp }: WebFileManagerProps = 
         await fetchFiles(currentDirectory);
         toast.success('Extraction completed', { id: key, duration: 2000 });
       } catch (e: any) {
-        toast.error(getErrorMessage(e, 'Extraction failed'));
+        if (isTaskStatusUnknown(e)) {
+          await fetchFiles(currentDirectory);
+          toast.info('Extraction may have finished', {
+            id: key,
+            description: 'Lost track of the task. The folder has been refreshed; check the extracted files.',
+            duration: 6000,
+          });
+          return;
+        }
+        // Same id as the loading toast, so the spinner is replaced, not left behind.
+        toast.error(getErrorMessage(e, 'Extraction failed'), { id: key, duration: 4000 });
       }
     };
     return (

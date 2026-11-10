@@ -754,7 +754,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
           <div className="flex items-center gap-2">
             <Avatar className="w-6 h-6 bg-muted">
               <AvatarImage
-                src="/brand/TissueLab_logo.png"
+                src="/brand/agent_avatar.png"
                 alt="TissueLab Bot"
                 className="object-contain"
               />
@@ -807,9 +807,6 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
                 const isWorkflowCard = message.type === "workflow-card" && isWorkflowPayload(message.content as ChatMessagePayload)
                 const isAnnotationContext = message.type === "annotation-context" && isAnnotationContextPayload(message.content as ChatMessagePayload)
                 const rawMsg = payloadToString(message.content as ChatMessagePayload)
-                const codeMatch = rawMsg.match(/```(\w+)?[\r\n]+([\s\S]*?)```/)
-                const lang = codeMatch ? (codeMatch[1] || 'python').toLowerCase() : ''
-                const codeBody = codeMatch ? (codeMatch[2] || '') : ''
                 return (
                 <div key={message.id} className="space-y-2">
               <div
@@ -822,7 +819,7 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
                       <div className="w-8 h-8 shrink-0">
                         <Avatar className="w-8 h-8 bg-muted">
                           <AvatarImage
-                            src="/brand/TissueLab_logo.png"
+                            src="/brand/agent_avatar.png"
                             alt="TissueLab Bot"
                             className="object-contain"
                           />
@@ -1010,13 +1007,6 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
                       <div className={`break-words whitespace-pre-wrap text-sm leading-5 ${message.sender === 'user' ? 'text-primary-foreground' : 'text-foreground'} w-full overflow-hidden`}>
                         {(() => {
                           if (!rawMsg) return null;
-                          const fenced = rawMsg.match(/```(\w+)?[\r\n]+([\s\S]*?)```/)
-                          if (fenced) {
-                            const before = rawMsg.slice(0, fenced.index || 0).trim();
-                            return before ? (
-                              <div className="whitespace-pre-wrap break-words overflow-hidden">{before}</div>
-                            ) : null;
-                          }
                           // Highlight file paths like /Users/.../file.zarr or C:\\...\\file.zarr as inline code
                           const PATH_REGEX = /(\/[^\s)]+\.zarr|[A-Za-z]:\\[^\s)]+\.zarr)/g
                           const PATH_EXACT = /^(\/[^^\s)]+\.zarr|[A-Za-z]:\\[^\s)]+\.zarr)$/
@@ -1052,7 +1042,8 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
                                 : <span key={`t${idx}`}>{renderInlineCodes(tok)}</span>
                             )
                           }
-                          const lines = rawMsg.split('\n');
+                          const renderMarkdown = (text: string, keyPrefix: string) => {
+                          const lines = text.split('\n');
                           const elements: React.ReactNode[] = [];
                           let currentBullets: string[] = [];
 
@@ -1105,43 +1096,34 @@ export const Chatbox: React.FC<ChatboxProps> = ({ onWorkflowClick = () => {} }) 
                             }
                           });
                           flushBullets(true);
-                          return <div>{elements}</div>
+                          return <div key={keyPrefix}>{elements}</div>
+                          };
+
+                          // Render every fenced code block in place, with the text
+                          // between and after them (not just the first block).
+                          const FENCE = /```(\w+)?[\r\n]+([\s\S]*?)```/g;
+                          const segments: React.ReactNode[] = [];
+                          let last = 0;
+                          for (const m of rawMsg.matchAll(FENCE)) {
+                            const start = m.index ?? 0;
+                            const text = rawMsg.slice(last, start);
+                            if (text.trim()) segments.push(renderMarkdown(text, `t${start}`));
+                            segments.push(
+                              <div key={`c${start}`} className="my-2 min-w-0 whitespace-normal">
+                                <CodePreview code={m[2] || ''} language={(m[1] || 'python').toLowerCase()} />
+                              </div>
+                            );
+                            last = start + m[0].length;
+                          }
+                          const tail = rawMsg.slice(last);
+                          if (tail.trim()) segments.push(renderMarkdown(tail, `t${last}`));
+                          return <div>{segments}</div>
                         })()}
                       </div>
                     )}
                   </div>
                 </div>
               </div>
-              {codeMatch && (
-                <div className={cn("flex relative", message.sender === "user" ? "justify-end" : "justify-start")}> 
-                  <div className={cn("flex gap-2 max-w-[85%] min-w-0", message.sender === "user" ? "flex-row-reverse" : "flex-row")}> 
-                    <div className="h-full flex items-start">
-                      {message.sender === "bot" ? (
-                        <div className="w-8 h-8 shrink-0">
-                          <Avatar className="w-8 h-8 bg-muted">
-                            <AvatarImage
-                              src="/brand/TissueLab_logo.png"
-                              alt="TissueLab Bot"
-                              className="object-contain"
-                            />
-                            <AvatarFallback className="bg-foreground text-background">TL</AvatarFallback>
-                          </Avatar>
-                        </div>
-                      ) : (
-                        <div className="w-8 h-8 shrink-0">
-                          <Avatar className="w-8 h-8">
-                            <AvatarImage src={avatarPreview} alt={preferredName || userInfo?.email || 'User'} className="object-cover"/>
-                            <AvatarFallback>{(preferredName || userInfo?.email || 'U').charAt(0).toUpperCase()}</AvatarFallback>
-                          </Avatar>
-                        </div>
-                      )}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <CodePreview code={codeBody} language={lang} />
-                    </div>
-                  </div>
-                </div>
-              )}
               </div>
               )
             })

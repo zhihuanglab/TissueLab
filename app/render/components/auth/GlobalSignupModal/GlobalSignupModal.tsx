@@ -254,6 +254,10 @@ const GlobalSignupModal = ({
   // Reset states when modal closes
   useEffect(() => {
     if (!isSignupModalOpen) {
+      // Stop a Google sign-in still waiting for the browser, so it does not
+      // time out (and report an error) minutes after the dialog was closed.
+      // No-op after a successful sign-in: that attempt has already finished.
+      Promise.resolve(window.electron?.cancelGoogleOAuth?.()).catch(() => {});
       setIsGooglePending(false);
       setIsUPennPending(false);
       setIsEmailPending(false);

@@ -33,16 +33,18 @@ export const useShortcuts = () => {
     if (loaded) dispatch(setAllShortcuts({ ...DEFAULT_SHORTCUTS, ...loaded }))
   }, [dispatch])
 
-  useEffect(() => {
-    saveToLocalStorage(bindings)
-  }, [bindings])
-
+  // Save only on an explicit change. Saving whenever `bindings` changed wrote
+  // the not-yet-loaded defaults on mount; with several consumers mounting
+  // together (toolbar, keyboard handler, settings), the next one then loaded
+  // those defaults and the user's custom shortcuts were lost on reload.
   const updateShortcut = useCallback((action: ShortcutActionKey, key: string) => {
     dispatch(setShortcut({ action: action, key }))
-  }, [dispatch])
+    saveToLocalStorage({ ...bindings, [action]: key })
+  }, [dispatch, bindings])
 
   const reset = useCallback(() => {
     dispatch(resetShortcuts())
+    saveToLocalStorage({ ...DEFAULT_SHORTCUTS })
   }, [dispatch])
 
   const isConflict = (key: string, self?: ShortcutActionKey) => {

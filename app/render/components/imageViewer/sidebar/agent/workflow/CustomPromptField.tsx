@@ -10,15 +10,11 @@ export const CustomPromptField: React.FC<CustomPromptFieldProps> = ({ value, onC
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      // Keep Space away from the viewer's shortcuts while typing, but let the
+      // browser insert it: it goes at the caret (not appended at the end) and
+      // a read-only field stays unchanged.
       if (isTyping && event.key === " ") {
         event.stopPropagation();
-        event.preventDefault();
-
-        setInputValue((prev) => {
-          const newValue = prev + " ";
-          onChange(newValue);
-          return newValue;
-        });
       }
     };
 
@@ -26,7 +22,7 @@ export const CustomPromptField: React.FC<CustomPromptFieldProps> = ({ value, onC
     return () => {
       document.removeEventListener("keydown", handleKeyDown, true);
     };
-  }, [isTyping, onChange]);
+  }, [isTyping]);
 
   return (
     <div className="space-y-1.5">

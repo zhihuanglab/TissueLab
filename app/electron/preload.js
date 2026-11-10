@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld('electron', {
   writeFile: (options) => ipcRenderer.invoke('write-file', options),
   // OAuth methods
   googleOAuth: (credentials) => ipcRenderer.invoke('google-oauth', credentials),
+  cancelGoogleOAuth: () => ipcRenderer.invoke('google-oauth-cancel'),
   googleRefreshToken: (params) => ipcRenderer.invoke('google-refresh-token', params),
   // Refresh token storage methods
   saveRefreshToken: (params) => ipcRenderer.invoke('save-refresh-token', params),

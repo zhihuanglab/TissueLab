@@ -329,14 +329,16 @@ const ShortcutsCard: React.FC = () => {
                     </div>
                 )}
                 <div className="space-y-0">
+                    {/* Same left-to-right order as the viewer toolbar. */}
+                    <Row label="Tool: Move" actionKey={'tool.move'} value={bindings['tool.move']} onChange={(k) => updateShortcut('tool.move', k)} />
+                    <Row label="Tool: Lasso" actionKey={'tool.lasso'} value={bindings['tool.lasso']} onChange={(k) => updateShortcut('tool.lasso', k)} />
+                    <Row label="Tool: Rectangle" actionKey={'tool.rectangle'} value={bindings['tool.rectangle']} onChange={(k) => updateShortcut('tool.rectangle', k)} />
+                    <Row label="Tool: Polygon" actionKey={'tool.polygon'} value={bindings['tool.polygon']} onChange={(k) => updateShortcut('tool.polygon', k)} />
+                    <Row label="Tool: Ruler" actionKey={'tool.line'} value={bindings['tool.line']} onChange={(k) => updateShortcut('tool.line', k)} />
+                    <Row label="Tool: Filter" actionKey={'tool.filter'} value={bindings['tool.filter']} onChange={(k) => updateShortcut('tool.filter', k)} />
                     <Row label="Toggle Nuclei Annotations" actionKey={'toggleNuclei'} value={bindings.toggleNuclei} onChange={(k) => updateShortcut('toggleNuclei', k)} />
                     <Row label="Toggle Patch Annotations" actionKey={'togglePatches'} value={bindings.togglePatches} onChange={(k) => updateShortcut('togglePatches', k)} />
                     <Row label="Toggle Tissue Overlay" actionKey={'toggleMask'} value={bindings.toggleMask} onChange={(k) => updateShortcut('toggleMask', k)} />
-                    <Row label="Tool: Move" actionKey={'tool.move'} value={bindings['tool.move']} onChange={(k) => updateShortcut('tool.move', k)} />
-                    <Row label="Tool: Polygon" actionKey={'tool.polygon'} value={bindings['tool.polygon']} onChange={(k) => updateShortcut('tool.polygon', k)} />
-                    <Row label="Tool: Rectangle" actionKey={'tool.rectangle'} value={bindings['tool.rectangle']} onChange={(k) => updateShortcut('tool.rectangle', k)} />
-                    <Row label="Tool: Ruler" actionKey={'tool.line'} value={bindings['tool.line']} onChange={(k) => updateShortcut('tool.line', k)} />
-                    <Row label="Tool: Filter" actionKey={'tool.filter'} value={bindings['tool.filter']} onChange={(k) => updateShortcut('tool.filter', k)} />
                 </div>
             </CardContent>
         </Card>

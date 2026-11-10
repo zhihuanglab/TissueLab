@@ -9,7 +9,7 @@ const net = require('net');
 const { downloadFile, extractAndPersist } = require('./ipc/tasknode-helpers');
 const { getServiceRoot } = require('./ipc/service-root');
 const { setupProtocolHandlers, registerProtocolClient } = require('./ipc/protocol-helpers');
-const { performGoogleOAuth, refreshGoogleToken } = require('./ipc/oauth-helpers');
+const { performGoogleOAuth, cancelGoogleOAuth, refreshGoogleToken } = require('./ipc/oauth-helpers');
 
 let mainWindow;
 let splashWindow;
@@ -712,6 +712,9 @@ ipcMain.handle('google-oauth', async (event, { clientId }) => {
     openExternal: shell.openExternal.bind(shell)
   });
 });
+
+// Cancel a Google sign-in still waiting for the browser (sign-in dialog closed)
+ipcMain.handle('google-oauth-cancel', () => cancelGoogleOAuth());
 
 // Refresh Google OAuth token using refresh_token
 ipcMain.handle('google-refresh-token', async (event, { refreshToken, clientId }) => {

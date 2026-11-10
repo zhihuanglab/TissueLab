@@ -1,3 +1,18 @@
+// The sign-in currently waiting for the browser callback, if any. Closing the
+// sign-in dialog or starting a new sign-in cancels it, so an abandoned attempt
+// neither keeps its loopback port nor reports a timeout minutes later.
+let activeSignIn = null;
+
+/**
+ * Cancel the sign-in that is waiting for the browser, if there is one.
+ * @returns {boolean} whether a sign-in was cancelled
+ */
+function cancelGoogleOAuth() {
+  if (!activeSignIn) return false;
+  activeSignIn.cancel();
+  return true;
+}
+
 /**
  * Google OAuth 2.0 PKCE-based authentication helper
  * Implements secretless PKCE flow for desktop applications
@@ -5,8 +20,12 @@
  * @param {Object} params
  * @param {string} params.clientId - Google OAuth Client ID (UWP/Desktop app type)
  * @param {Function} params.openExternal - Function to open URL in system browser (shell.openExternal)
- * @returns {Promise<{success: boolean, tokens?: Object, error?: string}>}
+ * @returns {Promise<{success: boolean, tokens?: Object, error?: string, cancelled?: boolean, timedOut?: boolean}>}
+ *   `cancelled`: the attempt was abandoned (dialog closed / newer sign-in);
+ *   `timedOut`: the user did not finish in the browser within 5 minutes.
  */
+const CANCELLED = Symbol('oauth-cancelled');
+
 async function performGoogleOAuth({ clientId, openExternal }) {
   const { generatePKCEPair } = require('../oauth/pkce');
   const { createCallbackServer } = require('../oauth/server');
@@ -15,6 +34,12 @@ async function performGoogleOAuth({ clientId, openExternal }) {
   const { URLSearchParams } = require('url');
   
   let callbackServer = null;
+  // A newer sign-in replaces any attempt still waiting for the browser.
+  cancelGoogleOAuth();
+  let cancel;
+  const cancelled = new Promise((resolve) => { cancel = () => resolve(CANCELLED); });
+  const mySignIn = { cancel: () => { mySignIn.cancelled = true; cancel(); } };
+  activeSignIn = mySignIn;
   
   try {
     console.log('[OAuth] Starting PKCE OAuth flow in system browser...');
@@ -37,6 +62,7 @@ async function performGoogleOAuth({ clientId, openExternal }) {
     // For Desktop apps, Google expects callback at root path (no subpath)
     // Use '127.0.0.1' as per Google's Desktop app documentation
     callbackServer = await createCallbackServer(42813, '/');
+    if (mySignIn.cancelled) return { success: false, cancelled: true };
     const redirectUri = `http://127.0.0.1:${callbackServer.port}`;
     
     // Step 4: Build authorization URL
@@ -64,7 +90,22 @@ async function performGoogleOAuth({ clientId, openExternal }) {
     
     // Step 6: Wait for authorization code
     console.log('[OAuth] Waiting for authorization callback...');
-    const { code: authorizationCode, state: returnedState } = await callbackServer.getAuthorizationCode(300000); // 5 min timeout
+    let callback;
+    try {
+      // 5 min timeout; a cancel (dialog closed / newer sign-in) ends the wait early.
+      callback = await Promise.race([callbackServer.getAuthorizationCode(300000), cancelled]);
+    } catch (waitError) {
+      if (/OAuth timeout/.test(waitError?.message || '')) {
+        console.log('[OAuth] Sign-in timed out waiting for the browser');
+        return { success: false, timedOut: true, error: 'Google sign-in timed out' };
+      }
+      throw waitError;
+    }
+    if (callback === CANCELLED) {
+      console.log('[OAuth] Sign-in cancelled before the browser callback');
+      return { success: false, cancelled: true };
+    }
+    const { code: authorizationCode, state: returnedState } = callback;
     
     // Step 7: Verify state parameter (CSRF protection)
     if (returnedState !== state) {
@@ -163,6 +204,7 @@ async function performGoogleOAuth({ clientId, openExternal }) {
       error: error.message || 'Failed to authenticate with Google'
     };
   } finally {
+    if (activeSignIn === mySignIn) activeSignIn = null;
     // Close the callback server after the code exchange completes, rather
     // than from the HTTP callback itself.
     if (callbackServer && callbackServer.server) {
@@ -287,6 +329,7 @@ async function refreshGoogleToken({ refreshToken, clientId }) {
 
 module.exports = {
   performGoogleOAuth,
+  cancelGoogleOAuth,
   refreshGoogleToken
 };
 

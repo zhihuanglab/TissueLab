@@ -90,10 +90,24 @@ export const PatchReviewDialog: React.FC<PatchReviewDialogProps> = ({
     setSelectedPatchPreview(null);
   };
 
+  // Every way of closing (Close button, Esc, X, click outside) saves the
+  // staged YES/NO labels, as the cell review does. The save runs in the
+  // background so a slow request never keeps the dialog open; a read-only
+  // slide can't be saved, so closing just closes it.
+  const closeWithSave = () => {
+    const panel = patchReviewPanelRef.current;
+    if (pathWritable && panel && panel.getPendingReclassificationsCount() > 0) {
+      panel.submitPendingReclassifications().catch((error: unknown) => {
+        toast.error('Save failed', { description: getErrorMessage(error, 'Network error') });
+      });
+    }
+    handleClose();
+  };
+
   return (
     <Dialog
       open={open}
-      onOpenChange={(o) => { if (!o) handleClose(); }}
+      onOpenChange={(o) => { if (!o) closeWithSave(); }}
     >
       <DialogContent className="max-w-[1200px] w-full max-h-[90vh] overflow-hidden flex flex-col">
         <DialogHeader>
@@ -237,18 +251,7 @@ export const PatchReviewDialog: React.FC<PatchReviewDialogProps> = ({
           </Button>
           <Button
             variant="secondary"
-            onClick={async () => {
-              // Auto-save staged labels before closing, like the cell modal.
-              try {
-                if (patchReviewPanelRef.current
-                    && patchReviewPanelRef.current.getPendingReclassificationsCount() > 0) {
-                  await patchReviewPanelRef.current.submitPendingReclassifications();
-                }
-              } catch {
-                /* closing — don't block on a save error */
-              }
-              handleClose();
-            }}
+            onClick={closeWithSave}
           >
             Close
           </Button>

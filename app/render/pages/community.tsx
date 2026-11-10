@@ -913,18 +913,20 @@ export default function Community() {
 
   const handleDeleteClassifier = async (classifierId: string) => {
     try {
+      // Community (cloud) classifiers: only drop the card once the server has
+      // deleted it (404 = already gone counts). On failure keep the card, so
+      // the user doesn't believe it is gone while it is still public.
       if (classifierId.startsWith('uploaded-')) {
         try {
           const deleteResponse = await classifiersService.deleteClassifier(classifierId)
-
-          if (deleteResponse.success) {
-            setFirebaseClassifiers(prev => prev.filter(c => c.id !== classifierId))
-          } else {
-            toast.warning('Firebase deletion completed but may not have been successful.')
+          if (!deleteResponse?.success) {
+            toast.error('Failed to delete classifier', { description: deleteResponse?.message || 'The server did not confirm the deletion.' })
+            return
           }
         } catch (error) {
-          console.error('Firebase delete error:', error)
-          toast.warning(getErrorMessage(error, 'Firebase deletion failed'))
+          console.error('Community classifier delete error:', error)
+          toast.error('Failed to delete classifier', { description: getErrorMessage(error, 'Network error') })
+          return
         }
       }
 

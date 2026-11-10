@@ -81,7 +81,15 @@ export const PatchClassRow: React.FC<PatchClassRowProps> = ({
   }, [menuOpen]);
 
   return (
-    <div className="flex items-center justify-between py-2 pt-3 border-b border-border/20 last:border-b-0 text-sm">
+    <div
+      className={`flex items-center justify-between py-2 pt-3 border-b border-border/20 last:border-b-0 text-sm cursor-pointer rounded-sm px-1 -mx-1 ${isSelected ? 'bg-muted' : 'hover:bg-muted/50'}`}
+      // Selecting a row picks the class that Review opens. Clicks on the
+      // row's own controls (colour, menu, OvR buttons) keep their own action.
+      onClick={(e) => {
+        if ((e.target as HTMLElement).closest('button, input, a, [role="menu"], [role="menuitem"]')) return;
+        onSelect(index);
+      }}
+    >
       {/* Left side: name, color */}
       <div className="flex items-center gap-2 min-w-0">
         <span className="truncate font-medium" title={name}>

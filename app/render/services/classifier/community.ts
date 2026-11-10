@@ -97,7 +97,9 @@ export class ClassifiersService {
       });
       return result;
     } catch (error) {
-      const status = (error as any)?.status;
+      // A transport 404 sets `status`; Ctrl's RESOURCE_NOT_FOUND arrives as an
+      // envelope (HTTP 200, code 404), which apiFetch throws with `code`.
+      const status = (error as any)?.status ?? (error as any)?.code;
       // If classifier is already deleted (404), treat as success
       if (status === 404) {
         console.warn(`Classifier ${classifierId} not found - may have been deleted or does not exist`);
